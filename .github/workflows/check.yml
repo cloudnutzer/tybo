@@ -1,0 +1,20 @@
+name: Check
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bash -n deploy.sh
+      - run: shellcheck -s sh install.sh
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.5
+      - run: deno check --frozen --lock=supabase/deno.lock supabase/functions/embed-knowledge/index.ts supabase/functions/search-memory/index.ts supabase/functions/store-telegram-message/index.ts

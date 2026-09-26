@@ -1,0 +1,58 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+logs/
+temp/
+uploads/
+models/
+bot.lock
+session-state.json
+memory.json
+credit-tally.json
+checkin-state.json
+config/profile.md
+config/schedule.json
+config/patterns.md
+config/.google-tokens.json
+config/agent-overrides.json
+config/settings.json
+news-history.json
+last-processed-call.json
+meeting-actions-state.json
+CLAUDE.local.md
+
+# Bot-Zustand (node-local Claude CLI session bindings)
+data/
+
+# Arbeitskopien und Zwischenstaende, nie committen
+tmp/
+
+# Eigene Installation: Topic-Zuordnung und Agenten-Katalog (Vorlage: config/topics.example.json)
+config/topics.json
+config/agents.json
+
+# Private lokale Daten
+knowledge-base/
+.elevenlabs-*
+
+# Private authorization and local state
+config/tool-policy.json
+config/whatsapp-groups.json
+config/reminders.json
+config/*-state.json
+
+.releases/
+
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+.wrangler/
+
+# Private Webprojekte (Worker und Anleitungen), bleiben nur lokal
+scripts/why-workshop-worker/
+docs/foto-fit-worker.js
+docs/foto-x100vi-anleitung.html
+docs/voice-bridge-reference/pages-password-worker.js

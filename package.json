@@ -1,0 +1,86 @@
+{
+  "name": "tybo",
+  "version": "2.12.0",
+  "description": "Always-on AI assistant on Telegram and in the browser, powered by Claude Code, with agents, persistent memory and background jobs",
+  "homepage": "https://tybo.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cloudnutzer/tybo.git"
+  },
+  "bugs": "https://github.com/cloudnutzer/tybo/issues",
+  "type": "module",
+  "bin": {
+    "tybo": "scripts/tybo.ts"
+  },
+  "scripts": {
+    "start": "bun run src/bot.ts",
+    "restart:request": "bun run scripts/request-restart.ts",
+    "notify": "bun run scripts/notify.ts",
+    "job": "bun --no-env-file scripts/job.ts",
+    "vps": "bun run src/vps-gateway.ts",
+    "checkin": "bun run src/smart-checkin.ts",
+    "briefing": "bun run src/morning-briefing.ts",
+    "watchdog": "bun run src/watchdog.ts",
+    "setup": "bun --no-env-file scripts/tybo.ts setup",
+    "setup:install": "bun run setup/install.ts",
+    "setup:launchd": "bun run setup/configure-launchd.ts",
+    "setup:services": "bun run setup/configure-services.ts",
+    "setup:verify": "bun run setup/verify.ts",
+    "setup:google": "bun run setup/setup-google-oauth.ts",
+    "test:telegram": "bun run setup/test-telegram.ts",
+    "test:supabase": "bun run setup/test-supabase.ts",
+    "test:convex": "bun run setup/test-convex.ts",
+    "setup:convex": "bun run setup/configure-convex.ts",
+    "migrate:convex": "bun run scripts/migrate-to-convex.ts",
+    "uninstall": "bun run setup/uninstall.ts",
+    "upgrade": "bun run setup/upgrade.ts",
+    "feedback": "bun run src/feedback.ts",
+    "whatsapp": "bun run src/whatsapp-gateway.ts",
+    "test:tools": "bun run setup/test-builtin-tools.ts",
+    "typecheck": "tsc --noEmit --pretty false && tsc --noEmit --pretty false -p convex/tsconfig.json",
+    "test": "bun test tests src/lib/voice-bridge",
+    "check": "bun run typecheck && bun run test",
+    "voice": "bun run src/voice-bridge.ts",
+    "web:dev": "bun run scripts/web-dev.ts",
+    "tybo": "bun --no-env-file scripts/tybo.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.1.77",
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@supabase/supabase-js": "^2.116.0",
+    "convex": "^1.45.0",
+    "grammy": "^1.46.0",
+    "htmlparser2": "^12.0.0",
+    "marked": "^18.0.14",
+    "pdfkit": "^0.17.2",
+    "pptxgenjs": "^4.0.1",
+    "puppeteer": "^25.10.0",
+    "telegram": "^2.26.22",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "css-select": "^7.0.0",
+    "css-tree": "^3.2.1",
+    "domutils": "^4.0.2",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "bun": ">=1.3.10"
+  },
+  "license": "MIT",
+  "overrides": {
+    "@hono/node-server": "1.19.17",
+    "body-parser": "2.3.0",
+    "fast-uri": "3.1.7",
+    "form-data": "4.0.6",
+    "hono": "4.13.7",
+    "image-size": "1.2.1",
+    "ip-address": "10.7.0",
+    "qs": "6.16.0"
+  },
+  "patchedDependencies": {
+    "image-size@1.2.1": "patches/image-size@1.2.1.patch"
+  }
+}

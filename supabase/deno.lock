@@ -1,0 +1,40 @@
+{
+  "version": "5",
+  "remote": {
+    "https://esm.sh/@supabase/supabase-js@2.116.0": "a38014743786a06c7dbf095a99e9ef3b38c0ec16bff076fc7cd403991192b34e"
+  },
+  "workspace": {
+    "packageJson": {
+      "dependencies": [
+        "npm:@anthropic-ai/claude-agent-sdk@~0.1.77",
+        "npm:@anthropic-ai/sdk@0.39",
+        "npm:@modelcontextprotocol/sdk@^1.30.0",
+        "npm:@supabase/supabase-js@^2.116.0",
+        "npm:@types/bun@1.4.2",
+        "npm:convex@^1.45.0",
+        "npm:css-select@7",
+        "npm:css-tree@^3.2.1",
+        "npm:domutils@^4.0.2",
+        "npm:grammy@^1.46.0",
+        "npm:htmlparser2@12",
+        "npm:marked@^18.0.14",
+        "npm:pdfkit@~0.17.2",
+        "npm:pptxgenjs@^4.0.1",
+        "npm:puppeteer@^25.10.0",
+        "npm:telegram@^2.26.22",
+        "npm:typescript@^5.9.3",
+        "npm:zod@^3.25.76"
+      ],
+      "overrides": {
+        "@hono/node-server": "1.19.17",
+        "body-parser": "2.3.0",
+        "fast-uri": "3.1.7",
+        "form-data": "4.0.6",
+        "hono": "4.13.7",
+        "image-size": "1.2.1",
+        "ip-address": "10.7.0",
+        "qs": "6.16.0"
+      }
+    }
+  }
+}

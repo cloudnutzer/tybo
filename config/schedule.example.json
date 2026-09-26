@@ -1,0 +1,32 @@
+{
+  "timezone": "UTC",
+  "check_in_hours": {
+    "start": 10,
+    "end": 19,
+    "comment": "Only check in during these hours (24h format)"
+  },
+  "morning_briefing": {
+    "hour": 9,
+    "minute": 0,
+    "enabled": true,
+    "comment": "When to send the morning briefing"
+  },
+  "check_in_intervals": [
+    { "hour": 10, "minute": 30 },
+    { "hour": 11, "minute": 30 },
+    { "hour": 12, "minute": 30 },
+    { "hour": 13, "minute": 30 },
+    { "hour": 14, "minute": 30 },
+    { "hour": 15, "minute": 30 },
+    { "hour": 16, "minute": 30 },
+    { "hour": 17, "minute": 30 },
+    { "hour": 18, "minute": 30 }
+  ],
+  "quiet_hours": {
+    "start": 21,
+    "end": 8,
+    "comment": "No check-ins during these hours"
+  },
+  "minimum_gap_minutes": 90,
+  "comment": "Minimum minutes between check-ins"
+}

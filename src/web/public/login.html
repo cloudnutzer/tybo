@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1f2023" media="(prefers-color-scheme: dark)">
+  <script src="/theme.js"></script>
+  <title>{{brand.name}} Anmeldung</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <script src="/brand.js"></script>
+  <script src="/login.js" defer></script>
+</head>
+<body class="login">
+  <main class="login-panel">
+    <h1 class="wordmark wordmark-large">{{brand.name}}</h1>
+    <p class="login-lead">Dein Assistent, mit demselben Gedächtnis wie in Telegram.</p>
+    <form id="login-form" class="login-form" method="post" action="/api/login" novalidate>
+      <label for="password">Passwort</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+      <button type="submit" id="login-button" class="primary-button">Anmelden</button>
+      <p id="login-error" class="error" role="alert" hidden></p>
+    </form>
+  </main>
+</body>
+</html>

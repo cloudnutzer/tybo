@@ -1,0 +1,14 @@
+{
+  "_comment": "Topic→Agent-Mapping pro Telegram-Chat. Kopiere diese Datei nach config/topics.json. Aeussere Keys: Chat-IDs (Forum-Gruppen) oder '*' fuer alle Chats. Innere Keys: Topic-IDs (message_thread_id, per /topics im Topic anzeigen). Werte: Agent-Namen (general, research, content, finance, strategy, critic, cto, coo). Aenderungen greifen ohne Bot-Neustart.",
+  "*": {
+    "3": "research",
+    "4": "content",
+    "5": "finance",
+    "6": "strategy",
+    "122": "coo",
+    "123": "cto"
+  },
+  "-1001234567890": {
+    "988": "research"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "description": "MCP servers tybo starts for model-agnostic tool access (fallback path + VPS direct API). Supports type stdio (local subprocess) and http (remote, no process). ${VAR} placeholders resolve via the Credential Registry (.env). Sources merged with ~/.claude.json auto-discovery; entries here win on name collision.",
+  "servers": {
+    "firecrawl": {
+      "type": "http",
+      "url": "https://mcp.firecrawl.dev/v2/mcp",
+      "headers": {
+        "Authorization": "Bearer ${FIRECRAWL_API_KEY}"
+      }
+    }
+  }
+}

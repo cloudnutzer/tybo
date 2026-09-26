@@ -1,0 +1,17 @@
+{
+  "description": "MCP servers tybo should start for model-agnostic tool access. Only bun-based servers recommended (npx servers risk zombie processes). If this file doesn't exist, tybo auto-discovers bun servers from ~/.claude.json.",
+  "servers": {
+    "notion": {
+      "command": "/path/to/.bun/bin/bun",
+      "args": ["run", "/path/to/mcp-servers/notion/server.ts"],
+      "env": {
+        "NOTION_TOKEN": "${NOTION_TOKEN}"
+      }
+    },
+    "example-server": {
+      "command": "/path/to/.bun/bin/bun",
+      "args": ["run", "/path/to/your-mcp-server/index.ts"],
+      "env": {}
+    }
+  }
+}

@@ -1,0 +1,1697 @@
+/* tybo WebUI: Login und Chat. Vertraut wie ChatGPT und Telegram Desktop,
+   ruhig, hell und dunkel nach Geräteeinstellung oder eigener Wahl. Design: src/web/DESIGN.md */
+
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --sidebar: #f5f6f8;
+  --raised: #ffffff;
+  --ink: #1a1c20;
+  --muted: #5c626c;
+  --placeholder: #6b717b;
+  --line: #e4e6ea;
+  --hover: #eceef1;
+  --active: #e2e9f5;
+  --accent: #1f6fd6;
+  --accent-ink: #ffffff;
+  --bubble: #e8effb;
+  --bubble-ink: #14233a;
+  --code: #f4f5f7;
+  --error: #b42318;
+  --error-bg: #fdf1f0;
+  --error-line: #f3c9c4;
+  --shadow: 0 2px 10px rgba(20, 24, 31, 0.07);
+  --scrim: rgba(15, 18, 23, 0.36);
+
+  --agent-general: #cf6a2e;
+  --agent-research: #0f8b7f;
+  --agent-cto: #7357c6;
+  --agent-coo: #9a7a14;
+  --agent-finance: #3b8540;
+  --agent-strategy: #b0409f;
+  --agent-content: #0e7490;
+  --agent-critic: #c0392b;
+
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --column: 47.5rem;
+  --sidebar-width: 17.5rem;
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+/* Dunkle Werte. Gelten bei gewählter Darstellung „Dunkel" (data-theme aus
+   theme.js) und bei System-Dunkel, solange nicht „Hell" gewählt ist. CSS kann
+   beides nicht in einer Regel ausdrücken, daher steht der Block zweimal;
+   tests/web-theme-css.test.ts prüft, dass beide gleich sind. */
+:root[data-theme="light"] { color-scheme: light; }
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #1f2023;
+  --sidebar: #18191b;
+  --raised: #27292d;
+  --ink: #e7e8eb;
+  --muted: #a2a7b0;
+  --placeholder: #8c929c;
+  --line: #303237;
+  --hover: #2a2c30;
+  --active: #25324a;
+  --accent: #5b9bf0;
+  --accent-ink: #0d1726;
+  --bubble: #283548;
+  --bubble-ink: #e6eefb;
+  --code: #17181a;
+  --error: #f2877d;
+  --error-bg: #3a2220;
+  --error-line: #5a302c;
+  --shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+  --scrim: rgba(0, 0, 0, 0.5);
+
+  --agent-general: #f0a070;
+  --agent-research: #3cc2b3;
+  --agent-cto: #a28cf0;
+  --agent-coo: #d8b64a;
+  --agent-finance: #74c07a;
+  --agent-strategy: #e08ad4;
+  --agent-content: #4cc3dc;
+  --agent-critic: #ef7b6f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #1f2023;
+    --sidebar: #18191b;
+    --raised: #27292d;
+    --ink: #e7e8eb;
+    --muted: #a2a7b0;
+    --placeholder: #8c929c;
+    --line: #303237;
+    --hover: #2a2c30;
+    --active: #25324a;
+    --accent: #5b9bf0;
+    --accent-ink: #0d1726;
+    --bubble: #283548;
+    --bubble-ink: #e6eefb;
+    --code: #17181a;
+    --error: #f2877d;
+    --error-bg: #3a2220;
+    --error-line: #5a302c;
+    --shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+    --scrim: rgba(0, 0, 0, 0.5);
+
+    --agent-general: #f0a070;
+    --agent-research: #3cc2b3;
+    --agent-cto: #a28cf0;
+    --agent-coo: #d8b64a;
+    --agent-finance: #74c07a;
+    --agent-strategy: #e08ad4;
+    --agent-content: #4cc3dc;
+    --agent-critic: #ef7b6f;
+  }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Grundlagen und Browser-Flächen                                            */
+/* ------------------------------------------------------------------------- */
+
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.5 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  caret-color: var(--accent);
+  scrollbar-color: var(--line) transparent;
+}
+
+::selection { background: color-mix(in srgb, var(--accent) 24%, transparent); }
+
+button, input, textarea { font: inherit; color: inherit; }
+
+button {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button:disabled { cursor: default; }
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+svg {
+  width: 1.25rem;
+  height: 1.25rem;
+  flex-shrink: 0;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+a { color: var(--accent); text-underline-offset: 0.18em; }
+
+.wordmark {
+  font-size: 1.0625rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Login                                                                     */
+/* ------------------------------------------------------------------------- */
+
+body.login {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+  padding-bottom: max(1.5rem, env(safe-area-inset-bottom));
+}
+
+.login-panel { width: 100%; max-width: 21rem; }
+
+.wordmark-large { margin: 0; font-size: 1.75rem; }
+
+.login-lead { margin: 0.35rem 0 2rem; color: var(--muted); }
+
+.login-form { display: grid; gap: 0.6rem; }
+
+.login-form label { font-size: 0.875rem; font-weight: 600; }
+
+.login-form input {
+  width: 100%;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  background: var(--raised);
+  font-size: 1rem;
+}
+
+.login-form input:focus-visible { outline-offset: 1px; }
+
+.primary-button {
+  margin-top: 0.4rem;
+  padding: 0.75rem 1rem;
+  border-radius: 0.75rem;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.primary-button:hover:not(:disabled) { filter: brightness(1.08); }
+.primary-button:disabled { opacity: 0.6; }
+
+.error { margin: 0.2rem 0 0; color: var(--error); font-size: 0.9375rem; }
+
+/* ------------------------------------------------------------------------- */
+/* App-Rahmen: Seitenleiste und Hauptbereich                                 */
+/* ------------------------------------------------------------------------- */
+
+body.app {
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  display: flex;
+}
+
+.sidebar {
+  position: fixed;
+  inset: 0 auto 0 0;
+  z-index: 30;
+  width: min(var(--sidebar-width), 86vw);
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.75rem;
+  padding-top: max(0.75rem, env(safe-area-inset-top));
+  padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+  background: var(--sidebar);
+  border-right: 1px solid var(--line);
+  transform: translateX(-102%);
+  /* Geschlossen unsichtbar für Tastatur und Screenreader, erst nach dem Gleiten */
+  visibility: hidden;
+  transition: transform 220ms var(--ease), visibility 0s linear 220ms;
+}
+
+.sidebar[data-open="true"] {
+  transform: none;
+  visibility: visible;
+  box-shadow: 0 0 40px rgba(0, 0, 0, 0.2);
+  transition: transform 220ms var(--ease);
+}
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  background: var(--scrim);
+}
+
+.sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 2.5rem;
+  padding: 0 0.25rem 0 0.5rem;
+}
+
+.new-chat {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+  margin: 0.4rem 0 0.25rem;
+  padding: 0.6rem 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 0.65rem;
+  background: var(--raised);
+  font-size: 0.9375rem;
+  font-weight: 500;
+}
+
+.new-chat svg { width: 1.1rem; height: 1.1rem; color: var(--muted); }
+.new-chat:hover:not(:disabled) { background: var(--hover); }
+.new-chat:disabled { opacity: 0.6; }
+
+.conversations {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  margin: 0 -0.25rem;
+  padding: 0 0.25rem;
+}
+
+.group-label {
+  margin: 1.1rem 0.5rem 0.35rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+/* Filterfeld über den Gruppen: wie das Passwortfeld, kompakter */
+.sidebar-search {
+  width: 100%;
+  margin: 0.25rem 0 0;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  background: var(--raised);
+  font-size: 0.9375rem;
+}
+
+.sidebar-search::placeholder { color: var(--placeholder); }
+.sidebar-search:focus-visible { outline-offset: 1px; }
+
+/* „Ältere Topics (n)": aufklappbar, sieht aus wie ein Gruppenlabel */
+.group-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  width: 100%;
+  margin-top: 0.35rem;
+  padding: 0.35rem 0.5rem;
+  border-radius: 0.6rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-align: left;
+}
+
+.group-toggle:hover { background: var(--hover); color: var(--ink); }
+.group-toggle[aria-expanded="true"] .chevron { transform: rotate(180deg); }
+
+.sidebar-note { margin: 1.1rem 0.5rem; color: var(--muted); font-size: 0.9375rem; }
+
+.conversation-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 1px; }
+
+.conversation {
+  display: grid;
+  width: 100%;
+  gap: 0.1rem;
+  padding: 0.5rem 0.6rem;
+  border-radius: 0.55rem;
+  text-align: left;
+}
+
+.conversation:hover { background: var(--hover); }
+.conversation[aria-current="true"] { background: var(--active); }
+
+.conversation-title {
+  overflow: hidden;
+  font-size: 0.9375rem;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.conversation-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+/* Letzte Aktivität eines Telegram-Gesprächs, rechtsbündig wie in Telegram */
+.conversation-time { margin-left: auto; padding-left: 0.5rem; white-space: nowrap; }
+
+/* Neue Nachricht seit dem letzten Öffnen: Punktformat der Agenten, aber neutral (Blau bleibt Handlung) */
+.unread-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  flex-shrink: 0;
+  margin-left: auto;
+  border-radius: 50%;
+  background: var(--ink);
+}
+
+.conversation-time + .unread-dot { margin-left: 0; }
+
+/* Agentenauswahl unter „Neues Gespräch" (Issue #21): Liste in der Seitenleiste, kein Dialog */
+.agent-picker { margin-bottom: 0.25rem; }
+.agent-picker .group-label { margin-top: 0.6rem; }
+.agent-option-name { display: flex; align-items: center; gap: 0.4rem; font-size: 0.9375rem; }
+/* Markierter Eintrag wie Hover; Auswahlblau bleibt dem offenen Gespräch vorbehalten */
+.agent-option[aria-selected="true"] { background: var(--hover); }
+
+/* Web-Gespräch mit Menü-Knopf rechts; das Menü klappt darunter auf */
+.conversation-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 0.125rem;
+}
+
+/* Am Desktop erst bei Hover oder Fokus sichtbar, beim offenen Gespräch immer */
+.entry-menu { opacity: 0; }
+.conversation-row:hover .entry-menu,
+.entry-menu:focus-visible,
+.entry-menu[aria-expanded="true"],
+.conversation[aria-current="true"] + .entry-menu { opacity: 1; }
+.entry-menu svg, .topbar-menu svg { stroke-width: 2.2; }
+
+/* Menü eines Eintrags: hängt an einer Haarlinie wie die Fortschrittsliste */
+.entry-actions {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 1px;
+  /* rechts Platz für den Fokusring, die Liste scrollt und schneidet sonst ab */
+  margin: 0.125rem 0.25rem 0.35rem 0.6rem;
+  padding-left: 0.5rem;
+  border-left: 1px solid var(--line);
+}
+
+.actions-question { margin: 0.35rem 0.6rem 0.15rem; font-size: 0.9375rem; font-weight: 600; }
+/* Bestätigen ohne Rot: Rot bleibt Fehlern vorbehalten */
+.action-confirm { color: var(--ink); font-weight: 600; }
+.quiet-button:disabled { opacity: 0.6; }
+
+/* Topics verwalten (Issue #30) */
+/* Geschlossenes Topic: gedämpfter Titel, Schloss in der Meta-Zeile */
+.conversation[data-closed="true"] .conversation-title { color: var(--muted); }
+.closed-mark { display: inline-flex; flex-shrink: 0; }
+.closed-mark svg { width: 0.75rem; height: 0.75rem; stroke-width: 2.2; }
+
+/* Erklärung unter einem Menüpunkt (fehlendes Recht) und Meldung des Servers */
+.actions-hint { margin: 0.15rem 0.6rem 0.35rem; color: var(--muted); font-size: 0.8125rem; }
+.actions-error { margin: 0.15rem 0.6rem 0.35rem; color: var(--error); font-size: 0.8125rem; }
+
+/* Rückfrage vor dem endgültigen Löschen eines Topics. Eine Spalte, die nie
+   breiter wird als das Menü: lange Namen ohne Leerzeichen brechen um */
+.delete-confirm { grid-template-columns: minmax(0, 1fr); gap: 0.35rem; }
+.delete-confirm > * { min-width: 0; max-width: 100%; }
+.delete-confirm .actions-question, .delete-confirm .actions-hint, .delete-confirm .actions-error { overflow-wrap: anywhere; }
+.actions-list.delete-confirm { width: min(20rem, calc(100vw - 2.5rem)); padding: 0.25rem; }
+.delete-confirm .danger-button { margin-top: 0.25rem; }
+.delete-confirm .actions-question, .delete-confirm .actions-hint { margin-left: 0.25rem; margin-right: 0.25rem; }
+.confirm-label { margin: 0.35rem 0.25rem 0; font-size: 0.8125rem; font-weight: 600; }
+/* Wie das Passwortfeld; 16 px verhindert das Hineinzoomen in iOS Safari */
+.confirm-input {
+  width: 100%;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  background: var(--raised);
+  font-size: 1rem;
+}
+
+.confirm-input:focus-visible { outline-offset: 1px; }
+
+/* Der einzige rote Knopf: endgültiges Löschen eines Topics. Gesperrt wie Senden ohne Text */
+.danger-button {
+  padding: 0.6rem 0.9rem;
+  border-radius: 0.75rem;
+  background: var(--error);
+  color: var(--bg);
+  font-size: 0.9375rem;
+  font-weight: 600;
+}
+
+.danger-button:hover:not(:disabled) { filter: brightness(1.08); }
+.danger-button:disabled { background: var(--hover); color: var(--placeholder); }
+
+.sidebar-foot { padding-top: 0.5rem; border-top: 1px solid var(--line); }
+
+/* Schalter System / Hell / Dunkel: Segment-Steuerung über „Abmelden" */
+.theme-switch {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.125rem;
+  margin-bottom: 0.25rem;
+  padding: 0.125rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+}
+
+.theme-option {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  min-width: 0;
+  padding: 0.35rem 0.25rem;
+  border: 1px solid transparent;
+  border-radius: 0.45rem;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.theme-option svg { width: 1rem; height: 1rem; }
+.theme-option:hover { background: var(--hover); color: var(--ink); }
+.theme-option[aria-checked="true"] { border-color: var(--line); background: var(--raised); color: var(--ink); }
+
+.quiet-button {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+  padding: 0.55rem 0.6rem;
+  border-radius: 0.55rem;
+  color: var(--muted);
+  font-size: 0.9375rem;
+}
+
+.quiet-button svg { width: 1.1rem; height: 1.1rem; }
+.quiet-button:hover { background: var(--hover); color: var(--ink); }
+
+.icon-button {
+  display: inline-grid;
+  place-items: center;
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: 0.6rem;
+  color: var(--muted);
+}
+
+.icon-button:hover { background: var(--hover); color: var(--ink); }
+
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Agentenfarbe: Punkt vor Namen, Farbe aus data-agent */
+[data-agent] { --agent: var(--agent-general); }
+[data-agent="research"] { --agent: var(--agent-research); }
+[data-agent="cto"] { --agent: var(--agent-cto); }
+[data-agent="coo"] { --agent: var(--agent-coo); }
+[data-agent="finance"] { --agent: var(--agent-finance); }
+[data-agent="strategy"] { --agent: var(--agent-strategy); }
+[data-agent="content"] { --agent: var(--agent-content); }
+[data-agent="critic"] { --agent: var(--agent-critic); }
+
+.agent-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--agent, var(--muted));
+}
+
+/* ------------------------------------------------------------------------- */
+/* Kopfzeile                                                                 */
+/* ------------------------------------------------------------------------- */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 3.25rem;
+  padding: 0.35rem 0.75rem;
+  padding-top: max(0.35rem, env(safe-area-inset-top));
+  border-bottom: 1px solid var(--line);
+}
+
+.chat-title {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  font-size: 1rem;
+  font-weight: 600;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* Titel antippen zum Umbenennen (Issue #21); bei Telegram-Gesprächen gesperrt, sieht dann aus wie Text */
+.title-button {
+  display: block;
+  max-width: 100%;
+  margin-left: -0.4rem;
+  padding: 0.2rem 0.4rem;
+  overflow: hidden;
+  border-radius: 0.6rem;
+  font-weight: 600;
+  text-align: left;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.title-button:hover:not(:disabled) { background: var(--hover); }
+
+.title-input {
+  flex: 1;
+  min-width: 0;
+  margin-left: -0.4rem;
+  padding: 0.2rem 0.4rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  background: var(--raised);
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.title-input:focus-visible { outline-offset: 1px; }
+.title-input[aria-invalid="true"] { border-color: var(--error-line); }
+
+.topbar { position: relative; }
+.topbar-menu { margin-left: auto; }
+
+/* Menü der Kopfzeile: rechts unter dem Knopf, flach mit Haarlinie (kein Schatten) */
+.actions-panel {
+  position: absolute;
+  top: calc(100% + 0.25rem);
+  right: 0.75rem;
+  z-index: 10;
+  min-width: 12rem;
+  /* Lange Erklärungen (fehlendes Recht, Issue #30) umbrechen statt die Fläche zu verbreitern */
+  max-width: min(22rem, calc(100vw - 1.5rem));
+  padding: 0.25rem;
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  background: var(--raised);
+}
+
+.actions-list { display: grid; gap: 1px; }
+
+.agent-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-shrink: 0;
+  padding: 0.15rem 0.6rem 0.15rem 0.5rem;
+  border-radius: 999px;
+  background: var(--hover);
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.agent-chip:empty { display: none; }
+
+.agent-chip::before {
+  content: "";
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--agent, var(--muted));
+}
+
+.connection {
+  margin: 0;
+  padding: 0.4rem 1rem;
+  background: var(--hover);
+  color: var(--muted);
+  font-size: 0.8125rem;
+  text-align: center;
+}
+
+/*
+ * Neue Version (Issue #111): ruhige Zeile wie der Verbindungsbalken, mit
+ * leisem Knopf; leer unsichtbar, die status-Region bleibt dabei im Dokument
+ */
+.update-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem 0.75rem;
+  padding: 0.4rem 1rem;
+  background: var(--hover);
+  color: var(--ink);
+  font-size: 0.8125rem;
+  text-align: center;
+}
+
+.update-note:empty { display: none; }
+.update-text { margin: 0; }
+.update-actions { display: flex; gap: 0.5rem; }
+
+.update-button {
+  padding: 0.2rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  background: var(--raised);
+  color: var(--ink);
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.update-button:hover { border-color: var(--muted); }
+.update-button.primary { border-color: var(--accent); background: var(--accent); color: var(--accent-ink); }
+.update-button.primary:hover { filter: brightness(1.08); }
+
+/* ------------------------------------------------------------------------- */
+/* Verlauf                                                                   */
+/* ------------------------------------------------------------------------- */
+
+.chat-log {
+  flex: 1;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.column {
+  width: 100%;
+  max-width: var(--column);
+  margin: 0 auto;
+  padding: 1.25rem 1rem 2rem;
+}
+
+.empty { margin-top: 18vh; text-align: center; }
+.empty-title { margin: 0; font-size: 1.5rem; font-weight: 600; letter-spacing: -0.01em; }
+.empty-text { max-width: 26rem; margin: 0.5rem auto 0; color: var(--muted); font-size: 0.9375rem; }
+/* Leerzustand ohne Gespräch (Issue #30): derselbe Knopf wie in der Seitenleiste */
+.empty-new { width: fit-content; margin: 1.25rem auto 0; }
+
+/* Telegram-Verlauf: Nachladen älterer Nachrichten über dem Verlauf */
+.load-older { width: fit-content; margin: 0 auto 1.5rem; justify-content: center; }
+.load-older:disabled { opacity: 0.6; }
+
+.messages { display: flex; flex-direction: column; gap: 1.75rem; }
+
+.msg { display: flex; min-width: 0; }
+
+.msg[data-fresh] { animation: msg-in 180ms var(--ease); }
+
+@keyframes msg-in {
+  from { opacity: 0.2; transform: translateY(4px); }
+}
+
+.bubble { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+
+.msg-user { justify-content: flex-end; }
+
+.msg-user .bubble {
+  max-width: min(85%, 36rem);
+  padding: 0.6rem 0.95rem;
+  border-radius: 1.15rem 1.15rem 0.35rem 1.15rem;
+  background: var(--bubble);
+  color: var(--bubble-ink);
+  white-space: pre-wrap;
+}
+
+.msg-assistant { flex-direction: column; }
+.msg-assistant .bubble { width: 100%; }
+
+/* Kopf der Antwort: steht im DOM hinter dem Inhalt, wird aber davor gezeigt */
+.msg-head {
+  order: -1;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-bottom: 0.4rem;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+/*
+ * Fußzeile der Antwort (Issue #22): Kopieren-Knopf, leise Metazeile
+ * „Agent · Modell · Dauer" und der Kopierstatus. Der Knopf ist ein
+ * Icon-Knopf; der negative Rand lässt sein Symbol mit der Textkante fluchten.
+ */
+.msg-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 0.25rem;
+  margin: 0.25rem 0 0 -0.7rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.copy-button svg { width: 1.1rem; height: 1.1rem; }
+.msg-meta { min-width: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.copy-status:empty { display: none; }
+.copy-status { margin-left: 0.5rem; color: var(--ink); }
+.msg-foot[data-copy="failed"] .copy-status { color: var(--error); }
+
+/* Ersatzweg fürs Kopieren ohne Clipboard-API: unsichtbar, 16 px gegen das Zoomen in iOS Safari */
+.copy-buffer {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+  font-size: 16px;
+}
+
+/* Stopp auf eigenen Wunsch: ruhige Notiz, kein Fehler */
+.msg-note .bubble {
+  display: inline-flex;
+  padding: 0.3rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+/*
+ * Meldung eines Dienstes (Issue #47): keine Blase, kein Agentenkopf. Kleine
+ * Zeile „Absender · Uhrzeit", Text in muted an einer Haarlinie wie die
+ * Fortschrittsliste, Dateien als Karte mit Linie statt Schatten.
+ */
+.msg-notice { flex-direction: column; gap: 0.35rem; }
+
+.notice-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 0.4rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.notice-source { font-weight: 600; }
+.notice-time { font-variant-numeric: tabular-nums; }
+.notice-time::before { content: "·"; margin-right: 0.4rem; }
+
+.notice-body {
+  min-width: 0;
+  padding-left: 0.75rem;
+  border-left: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.9375rem;
+  overflow-wrap: anywhere;
+}
+
+.file { display: flex; flex-direction: column; gap: 0.5rem; min-width: 0; max-width: 28rem; }
+
+.file-preview {
+  display: block;
+  max-width: 100%;
+  max-height: 20rem;
+  width: auto;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  object-fit: contain;
+}
+
+.file-card {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  min-width: 0;
+  padding: 0.55rem 0.55rem 0.55rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  background: var(--raised);
+}
+
+.file-card > svg { flex: none; width: 1.25rem; height: 1.25rem; color: var(--muted); }
+.file-info { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.file-name { color: var(--ink); font-size: 0.9375rem; overflow-wrap: anywhere; }
+.file-size { color: var(--muted); font-size: 0.75rem; font-variant-numeric: tabular-nums; }
+.file-download { flex: none; width: auto; text-decoration: none; }
+
+/*
+ * Rückfrage-Knöpfe (M10, Entscheidung 0017): eine Reihe leiser Knöpfe unter der
+ * Nachricht, der erste in der Handlungsfarbe; nach der Entscheidung eine
+ * Zeile in muted statt der Knöpfe. Keine Fläche, kein Schatten, keine Bewegung.
+ */
+.choice { display: flex; flex-direction: column; align-items: flex-start; gap: 0.35rem; min-width: 0; margin-top: 0.4rem; }
+.choice-actions { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.choice-button { width: auto; min-height: 2.25rem; overflow-wrap: anywhere; text-align: left; }
+.choice-button.primary { background: var(--accent); color: var(--accent-ink); font-weight: 500; }
+.choice-button.primary:hover { background: var(--accent); color: var(--accent-ink); filter: brightness(1.08); }
+.choice-status { margin: 0; color: var(--muted); font-size: 0.8125rem; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.choice-open { margin-left: -0.6rem; }
+.choice-error { margin: 0; color: var(--error); font-size: 0.8125rem; }
+/* Eigene Anhänge (Issue #73): Dateikarten rechtsbündig über der Blase */
+.msg-with-attachments { flex-direction: column; align-items: flex-end; gap: 0.4rem; }
+.msg-attachments { display: flex; flex-direction: column; align-items: flex-end; gap: 0.4rem; width: min(85%, 28rem); }
+.msg-attachments .file { width: 100%; align-items: flex-end; }
+.msg-attachments .file-card { width: 100%; }
+
+.msg-error .bubble {
+  width: 100%;
+  padding: 0.6rem 0.9rem;
+  border: 1px solid var(--error-line);
+  border-radius: 0.75rem;
+  background: var(--error-bg);
+  color: var(--error);
+  white-space: pre-wrap;
+}
+
+/* Antwort-Inhalt aus dem Markdown des Servers */
+.content { line-height: 1.65; }
+.content > :first-child { margin-top: 0; }
+.content > :last-child { margin-bottom: 0; }
+.content p, .content ul, .content ol, .content blockquote, .content pre, .content table { margin: 0 0 0.9rem; }
+.content h1, .content h2, .content h3, .content h4 {
+  margin: 1.6rem 0 0.5rem;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+}
+.content h1 { font-size: 1.375rem; }
+.content h2 { font-size: 1.1875rem; }
+.content h3 { font-size: 1.0625rem; }
+.content h4 { font-size: 1rem; }
+.content ul, .content ol { padding-left: 1.4rem; }
+.content li + li { margin-top: 0.3rem; }
+.content blockquote > :last-child, .content li > :last-child { margin-bottom: 0; }
+.content li::marker { color: var(--muted); }
+.content strong { font-weight: 650; }
+.content hr { margin: 1.4rem 0; border: 0; border-top: 1px solid var(--line); }
+
+.content blockquote {
+  padding: 0.5rem 0.9rem;
+  border-radius: 0.6rem;
+  background: var(--code);
+  color: var(--muted);
+}
+
+.content code {
+  padding: 0.1em 0.35em;
+  border-radius: 0.3rem;
+  background: var(--code);
+  font: 0.875em/1.5 var(--mono);
+}
+
+/* Codeblöcke und breite Tabellen scrollen in sich, nie die Seite */
+.content pre {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 0.8rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  background: var(--code);
+}
+
+.content pre code { padding: 0; background: none; white-space: pre; overflow-wrap: normal; }
+
+.content table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.9375rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.45;
+  overflow-wrap: normal;
+}
+
+.content th, .content td {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
+.content th { border-bottom-color: var(--muted); font-weight: 600; white-space: nowrap; }
+.content tr:last-child td { border-bottom: 0; }
+.content img { max-width: 100%; height: auto; }
+
+/* ------------------------------------------------------------------------- */
+/* Statuszeile eines laufenden Turns                                          */
+/* ------------------------------------------------------------------------- */
+
+.activity { margin-top: 1.5rem; }
+
+.activity-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  max-width: 100%;
+  padding: 0.35rem 0.7rem 0.35rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.activity-line:hover { background: var(--hover); color: var(--ink); }
+
+.activity-text { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+.activity-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.chevron { width: 1rem; height: 1rem; }
+.activity-line[aria-expanded="true"] .chevron { transform: rotate(180deg); }
+
+.progress {
+  margin: 0.6rem 0 0 0.85rem;
+  padding: 0 0 0 0.9rem;
+  border-left: 1px solid var(--line);
+  list-style: none;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.step { padding: 0.2rem 0; overflow-wrap: anywhere; }
+.step-snippet em { font-style: italic; }
+
+.step-notice {
+  margin: 0.35rem 0;
+  padding: 0.45rem 0.7rem;
+  border-radius: 0.6rem;
+  background: var(--hover);
+  color: var(--ink);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Eingabe                                                                   */
+/* ------------------------------------------------------------------------- */
+
+.composer {
+  padding: 0.5rem 0.75rem;
+  padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+}
+
+.composer-box {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.5rem;
+  max-width: var(--column);
+  margin: 0 auto;
+  padding: 0.35rem 0.35rem 0.35rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 1.5rem;
+  background: var(--raised);
+  box-shadow: var(--shadow);
+}
+
+.composer-box:focus-within { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
+
+/* Ziel (/goal, Issue #76): Status-Karte über der Eingabe, gebaut wie die Dateikarte */
+.goal-card {
+  display: grid;
+  gap: 0.2rem;
+  width: calc(100% - 1.5rem);
+  max-width: var(--column);
+  margin: 0.25rem auto 0;
+  padding: 0.6rem 0.75rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  background: var(--raised);
+}
+
+.goal-card[hidden] { display: none; }
+.goal-head { display: flex; align-items: center; gap: 0.5rem; }
+.goal-label { color: var(--muted); font-size: 0.75rem; font-weight: 600; }
+.goal-state {
+  padding: 0.05rem 0.5rem;
+  border-radius: 999px;
+  background: var(--hover);
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+.goal-state[data-state="running"] { color: var(--ink); }
+.goal-text { margin: 0; color: var(--ink); font-size: 0.9375rem; overflow-wrap: anywhere; }
+.goal-meta { margin: 0; color: var(--muted); font-size: 0.75rem; font-variant-numeric: tabular-nums; }
+.goal-note { margin: 0; color: var(--muted); font-size: 0.8125rem; overflow-wrap: anywhere; }
+.goal-actions { display: flex; flex-wrap: wrap; gap: 0.25rem; margin: 0.15rem 0 0 -0.6rem; }
+.goal-button { width: auto; }
+.goal-error { margin: 0; color: var(--error); font-size: 0.8125rem; }
+
+/* Geschlossenes Topic (Issue #30): Hinweis über der gesperrten Eingabe */
+/*
+ * Befehlsliste beim Tippen von / (Issue #77): flache Fläche wie das Menü der
+ * Kopfzeile (raised, Haarlinie, 0.75rem, kein Schatten), direkt über der
+ * Eingabebox. Einträge mindestens 44 px hoch, markierter Eintrag in hover.
+ */
+.command-list {
+  display: grid;
+  gap: 1px;
+  max-width: var(--column);
+  max-height: min(16rem, 40dvh);
+  margin: 0 auto 0.4rem;
+  padding: 0.25rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  background: var(--raised);
+  list-style: none;
+}
+
+.command-option {
+  display: grid;
+  align-content: center;
+  gap: 0.1rem;
+  min-height: 2.75rem;
+  padding: 0.35rem 0.6rem;
+  border-radius: 0.6rem;
+  cursor: pointer;
+}
+
+.command-option:hover,
+.command-option[aria-selected="true"] { background: var(--hover); }
+
+.command-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 0.4rem; }
+.command-name { font-family: var(--mono); font-size: 0.9375rem; font-weight: 600; }
+.command-args { color: var(--muted); font-family: var(--mono); font-size: 0.8125rem; }
+.command-desc { color: var(--muted); font-size: 0.8125rem; overflow-wrap: anywhere; }
+.command-note { padding: 0.6rem; color: var(--muted); font-size: 0.8125rem; }
+
+.composer-note { max-width: var(--column); margin: 0 auto 0.4rem; color: var(--muted); font-size: 0.8125rem; text-align: center; }
+
+/*
+ * Anhänge vor dem Senden (Issue #73): Chips über der Eingabebox, gebaut wie
+ * die Dateikarte (raised, Haarlinie, 0.6rem, kein Schatten). Bild als kleine
+ * Vorschau, sonst Symbol; Fehler im Fehlerstil der Nachrichten.
+ */
+.attach-note { color: var(--error); }
+
+.attachment-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  max-width: var(--column);
+  margin: 0 auto 0.4rem;
+  padding: 0;
+  list-style: none;
+}
+
+.attachment-chip {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  min-width: 0;
+  max-width: min(100%, 17rem);
+  padding: 0.3rem 0.15rem 0.3rem 0.3rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  background: var(--raised);
+}
+
+.attachment-thumb {
+  flex: none;
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: 0.4rem;
+  background: var(--hover);
+  object-fit: cover;
+}
+
+.attachment-symbol { display: grid; place-items: center; color: var(--muted); }
+.attachment-symbol svg { width: 1.2rem; height: 1.2rem; }
+.attachment-info { display: flex; flex: 1; flex-direction: column; min-width: 0; }
+.attachment-name { overflow: hidden; font-size: 0.875rem; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-meta { color: var(--muted); font-size: 0.75rem; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.attachment-chip[data-status="uploading"] .attachment-meta { color: var(--ink); }
+.attachment-chip[data-status="error"] { border-color: var(--error-line); background: var(--error-bg); }
+.attachment-chip[data-status="error"] .attachment-meta { color: var(--error); }
+.attachment-remove { flex: none; width: 2rem; height: 2rem; }
+.attachment-remove svg { width: 1rem; height: 1rem; }
+.attachment-remove:disabled { opacity: 0.4; }
+
+/* Büroklammer links in der Box: leiser Knopf, die Box rückt dafür nach links */
+.composer-box:has(> .attach:not([hidden])) { padding-left: 0.35rem; }
+.attach { color: var(--muted); }
+.attach:hover:not(:disabled) { background: var(--hover); color: var(--ink); }
+.attach:disabled { opacity: 0.5; }
+.attach svg { stroke-width: 1.9; }
+
+/*
+ * Sprachaufnahme (Issue #109): Mikrofon leise wie die Büroklammer, rechts vor
+ * Senden. Während der Aufnahme steht an Stelle des Felds eine Zeile mit
+ * rotem Punkt (Ausnahme von der Rot-Regel, siehe DESIGN.md), Zeit, Verwerfen
+ * und Stopp. Der Punkt steht still, keine Animation.
+ */
+.record { color: var(--muted); }
+.record:hover:not(:disabled) { background: var(--hover); color: var(--ink); }
+.record:disabled { opacity: 0.5; }
+.record svg { stroke-width: 1.9; }
+
+.recorder {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+  min-height: 2.25rem;
+}
+
+.recorder[hidden] { display: none; }
+.recorder-dot { flex: none; width: 0.625rem; height: 0.625rem; border-radius: 50%; background: var(--error); }
+.recorder-label { color: var(--muted); font-size: 0.875rem; }
+.recorder-time { margin-right: auto; color: var(--ink); font-size: 0.9375rem; font-variant-numeric: tabular-nums; }
+.recorder-button {
+  flex: none;
+  min-height: 2.25rem;
+  padding: 0 0.75rem;
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+.recorder-button:hover:not(:disabled) { background: var(--hover); color: var(--ink); }
+.recorder-stop { background: var(--ink); color: var(--bg); }
+.recorder-stop:hover:not(:disabled) { background: var(--ink); color: var(--bg); }
+.recorder-button:disabled { opacity: 0.5; }
+
+/* Abspielen einer Aufnahme im Chip, gleiche Größe wie Entfernen */
+.attachment-play { flex: none; width: 2rem; height: 2rem; }
+.attachment-play svg { width: 1rem; height: 1rem; }
+
+/* Dateien über dem Chat: ruhige gestrichelte Linie um die Lesefläche, keine Animation */
+.main[data-drop="true"] .chat-log {
+  outline: 2px dashed color-mix(in srgb, var(--accent) 45%, transparent);
+  outline-offset: -0.75rem;
+  background: color-mix(in srgb, var(--accent) 4%, var(--bg));
+}
+
+.composer textarea {
+  flex: 1;
+  min-width: 0;
+  max-height: calc(8 * 1.5em + 1rem);
+  padding: 0.5rem 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  font-size: 1rem;
+  line-height: 1.5;
+  resize: none;
+  overflow-y: hidden;
+}
+
+.composer textarea::placeholder { color: var(--placeholder); }
+
+.round-button {
+  display: grid;
+  place-items: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  flex-shrink: 0;
+  border-radius: 50%;
+}
+
+.round-button svg { width: 1.15rem; height: 1.15rem; stroke-width: 2.2; }
+
+.send { background: var(--accent); color: var(--accent-ink); }
+.send:hover:not(:disabled) { filter: brightness(1.08); }
+.send:disabled { background: var(--hover); color: var(--placeholder); }
+
+.stop { background: var(--ink); color: var(--bg); }
+.stop svg { fill: currentColor; stroke: none; }
+.stop:disabled { opacity: 0.5; }
+
+/* ------------------------------------------------------------------------- */
+/* Einstellungen (Issue #38): im Hauptbereich, gleiche Lesespalte            */
+/* Nur vorhandene Bausteine: Segment-Steuerung als Reiter, Felder wie das    */
+/* Passwortfeld, Primärknopf, leise Knöpfe, Haarlinien, Fehlerstil.          */
+/* ------------------------------------------------------------------------- */
+
+/* Einstellungen offen: Kopfzeile, Verlauf und Eingabe des Chats treten zurück */
+.main[data-view="settings"] > :not(.settings) { display: none !important; }
+
+.settings {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.settings-title:focus { outline: none; }
+
+.settings-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* Einstieg im Seitenleisten-Fuß; offen wie das aktuelle Gespräch markiert */
+.settings-entry[aria-current="page"] { background: var(--active); color: var(--ink); }
+
+/* Reiter: dieselbe Segment-Steuerung wie System / Hell / Dunkel */
+.settings-tabs { margin-bottom: 1.25rem; }
+/* Vier Reiter (Issue #63); der Darstellungs-Schalter behält seine drei Spalten */
+.theme-switch.settings-tabs { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.settings-tab { font-size: 0.875rem; }
+.settings-tab[aria-selected="true"] { border-color: var(--line); background: var(--raised); color: var(--ink); }
+.settings-tab:disabled { opacity: 0.6; }
+.settings-tab:disabled:hover { background: none; color: var(--muted); }
+
+.settings-intro { margin: 0 0 1rem; color: var(--muted); font-size: 0.9375rem; }
+.settings-empty { margin: 0; color: var(--muted); font-size: 0.9375rem; }
+
+/* Datei ungültig: im Stil der Fehlernachricht */
+.settings-notice {
+  margin: 0 0 1rem;
+  padding: 0.6rem 0.9rem;
+  border: 1px solid var(--error-line);
+  border-radius: 0.75rem;
+  background: var(--error-bg);
+  color: var(--error);
+  font-size: 0.9375rem;
+}
+
+.settings-agents { list-style: none; margin: 0; padding: 0; display: grid; gap: 1px; }
+
+/* Agentenzeile wie ein Gesprächseintrag: Punkt und Name, darunter Modell und Effort */
+.settings-agent-head {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 0.75rem;
+}
+
+.settings-agent-head .chevron { grid-column: 2; grid-row: 1 / span 2; color: var(--muted); }
+.settings-agent-head[aria-expanded="true"] .chevron { transform: rotate(180deg); }
+.settings-agent-name { display: flex; align-items: center; gap: 0.4rem; font-size: 0.9375rem; font-weight: 500; }
+.settings-agent-meta { min-width: 0; overflow-wrap: anywhere; }
+
+/* Aufgeklappt: hängt an einer Haarlinie wie das Menü eines Eintrags */
+.settings-agent-body {
+  display: grid;
+  gap: 0.75rem;
+  margin: 0.25rem 0 1.25rem 0.6rem;
+  padding: 0.25rem 0 0.25rem 1rem;
+  border-left: 1px solid var(--line);
+}
+
+.settings-agent-body > *, .settings-section > * { min-width: 0; }
+.settings-agent-body .actions-hint,
+.settings-agent-body .actions-error,
+.settings-agent-body .actions-question { margin: 0; overflow-wrap: anywhere; }
+
+.settings-field { display: grid; gap: 0.35rem; }
+.settings-label { margin: 0; font-size: 0.875rem; font-weight: 600; }
+
+/* Felder und Auswahl wie das Passwortfeld; 16 px verhindert das Hineinzoomen in iOS Safari */
+.settings-input {
+  width: 100%;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  background: var(--raised);
+  color: var(--ink);
+  font: inherit;
+  font-size: 1rem;
+}
+
+.settings-input:focus-visible { outline-offset: 1px; }
+.settings-input:disabled { opacity: 0.6; }
+.settings-input::placeholder { color: var(--placeholder); }
+.settings-textarea { min-height: 4.75rem; resize: vertical; line-height: 1.5; }
+
+/* Auswahl ohne Systempfeil, dafür der Chevron der übrigen Oberfläche */
+.settings-select { position: relative; display: block; }
+.settings-select select { appearance: none; -webkit-appearance: none; padding-right: 2.5rem; text-overflow: ellipsis; }
+.settings-select::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  right: 1rem;
+  width: 0.45rem;
+  height: 0.45rem;
+  border-right: 1.8px solid var(--muted);
+  border-bottom: 1.8px solid var(--muted);
+  transform: translateY(-70%) rotate(45deg);
+  pointer-events: none;
+}
+
+.settings-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; }
+.settings-actions .quiet-button { width: auto; }
+.settings-save { margin-top: 0; }
+.settings-status { margin: 0; color: var(--ink); font-size: 0.8125rem; }
+.settings-status:empty { display: none; }
+.settings-restart, .settings-sync { display: grid; justify-items: start; gap: 0.25rem; }
+.settings-restart .quiet-button, .settings-sync .quiet-button { width: auto; }
+/* Laden fehlgeschlagen, vorhandener Stand bleibt sichtbar */
+.settings-sync { margin: 0 0 1rem; }
+.settings-sync .actions-error { margin: 0; }
+
+.settings-section { display: grid; gap: 0.5rem; padding-top: 0.75rem; border-top: 1px solid var(--line); }
+.settings-section h3 { margin-top: 0.25rem; }
+
+.settings-instructions {
+  display: grid;
+  gap: 0.3rem;
+  margin: 0;
+  padding-left: 1.4rem;
+  font-size: 0.9375rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.settings-instructions li::marker { color: var(--muted); }
+
+/* Reiter „Modelle" (Issue #39): Nebenmodell als Gruppe, Anbieter-Label leiser */
+.settings-section h4 { margin: 0.5rem 0 0; }
+.settings-section .actions-hint,
+.settings-section .actions-error,
+.settings-section .actions-question { margin: 0; overflow-wrap: anywhere; }
+.settings-aux { gap: 0.4rem; }
+.settings-sublabel { margin: 0; color: var(--muted); font-size: 0.8125rem; font-weight: 600; }
+.settings-aux .settings-field { margin-top: 0.25rem; }
+.settings-lists-failed { margin: 0 0 1rem; }
+/* „Nur offline": Segment-Steuerung wie System / Hell / Dunkel, nur so breit wie nötig */
+.settings-switch { width: fit-content; max-width: 100%; }
+.settings-switch .theme-option { padding-left: 0.9rem; padding-right: 0.9rem; font-size: 0.875rem; }
+
+/* Reiter „Status" (Issue #39): Begriff links, Wert rechts; am Handy untereinander */
+.settings-status-head { justify-content: space-between; margin-bottom: 0.75rem; }
+.settings-status-head .settings-intro { margin: 0; }
+.settings-facts {
+  display: grid;
+  grid-template-columns: minmax(0, 14rem) minmax(0, 1fr);
+  gap: 0.5rem 1rem;
+  margin: 0 0 1.25rem;
+  font-size: 0.9375rem;
+}
+.settings-facts dt { color: var(--muted); }
+.settings-facts dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.settings-group-label { margin: 0.5rem 0 0; color: var(--muted); font-size: 0.75rem; font-weight: 600; }
+.settings-keys { list-style: none; margin: 0; padding: 0; display: grid; gap: 1px; font-size: 0.9375rem; }
+.settings-keys li {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.75rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--line);
+}
+.settings-key-name { min-width: 0; overflow-wrap: anywhere; font-family: var(--mono); font-size: 0.8125rem; }
+.settings-key-state { flex-shrink: 0; }
+.settings-keys li[data-set="false"] .settings-key-state { color: var(--muted); }
+.settings-section > .settings-actions { margin-top: 0.25rem; }
+
+/* Reiter „Schlüssel" (Issue #63): Name und Zustand oben, darunter Beschreibung und Knöpfe */
+.settings-keys-edit li { display: grid; grid-template-columns: minmax(0, 1fr); justify-content: stretch; align-items: start; gap: 0.35rem; padding: 0.6rem 0; }
+.settings-key-head { display: flex; justify-content: space-between; align-items: baseline; gap: 0.75rem; min-width: 0; }
+.settings-keys-edit li[data-set="false"] .settings-key-state { color: var(--muted); }
+.settings-key-state { font-variant-numeric: tabular-nums; }
+.settings-key-desc { margin: 0; color: var(--muted); font-size: 0.8125rem; overflow-wrap: anywhere; }
+.settings-keys-edit .actions-hint,
+.settings-keys-edit .actions-error,
+.settings-keys-edit .actions-question { margin: 0; overflow-wrap: anywhere; }
+.settings-key-actions .quiet-button { padding-left: 0; padding-right: 0.9rem; }
+.settings-key-editor { display: grid; gap: 0.4rem; margin-top: 0.25rem; }
+.settings-keys-readonly {
+  margin: 0 0 1rem;
+  padding: 0.6rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  color: var(--muted);
+  font-size: 0.9375rem;
+  overflow-wrap: anywhere;
+}
+.settings-keys-restart { margin: 0 0 1rem; }
+.settings-keys-restart .actions-hint { margin: 0; }
+
+/* Agenten verwalten (Issue #51): Prompt lesbar in fester Höhe, scrollt in sich */
+.settings-prompt-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+/* Kennzeichnung als Pille wie der Agent-Chip, ohne Punkt */
+.settings-badge {
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  background: var(--hover);
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+.settings-badge[data-prompt-source="custom"], .settings-badge[data-prompt-source="own"] { color: var(--ink); }
+.settings-prompt {
+  max-height: 16rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  background: var(--code);
+  font-size: 0.875rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.settings-prompt-edit { min-height: 12rem; font-size: 0.9375rem; }
+.settings-count { font-variant-numeric: tabular-nums; }
+.settings-affected {
+  margin: 0;
+  padding-left: 1.2rem;
+  font-size: 0.9375rem;
+  overflow-wrap: anywhere;
+}
+.settings-agent-notice { margin: 0 0 1rem; }
+.settings-agent-notice:focus { outline: none; }
+.settings-create-open { margin: 0 0 1rem; }
+.settings-create { margin-bottom: 1.25rem; }
+.settings-deleted { list-style: none; margin: 0; padding: 0; display: grid; gap: 1px; }
+.settings-deleted li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.25rem 0.75rem;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--line);
+}
+.settings-deleted .quiet-button { width: auto; }
+.settings-deleted-text { display: grid; gap: 0.1rem; min-width: 0; }
+.settings-deleted-error { border-bottom: none; }
+.settings-agents + .settings-section { margin-top: 1.5rem; }
+/* Board-Schalter: zwei statt drei Segmente */
+.settings-board { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 0; }
+
+/* „Agent ändern …" im Topic-Menü (Issue #38): aktueller Agent in hover wie in der Auswahl beim Anlegen */
+.agent-choice[aria-current="true"] { background: var(--hover); color: var(--ink); }
+.agent-choice .agent-option-name { color: inherit; }
+
+/* ------------------------------------------------------------------------- */
+/* Einrichtung im Browser (Issue #66): Schritte links wie die Seitenleiste,  */
+/* der aktuelle Schritt rechts wie der Reiter „Einstellungen"                 */
+/* ------------------------------------------------------------------------- */
+
+body.setup { min-height: 100vh; min-height: 100dvh; display: flex; }
+
+.setup-nav {
+  width: var(--sidebar-width);
+  flex-shrink: 0;
+  padding: 1rem 0.75rem;
+  border-right: 1px solid var(--line);
+  background: var(--sidebar);
+}
+
+.setup-brand { display: flex; align-items: baseline; gap: 0.5rem; padding: 0.35rem 0.6rem 1rem; }
+.setup-brand-label { color: var(--muted); font-size: 0.9375rem; }
+
+.setup-steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 1px; }
+
+/* Schritt wie ein Gesprächseintrag: Nummer oder Haken, Titel, darunter der Zustand */
+.setup-step {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  width: 100%;
+  padding: 0.5rem 0.6rem;
+  border-radius: 0.6rem;
+  text-align: left;
+}
+.setup-step:hover:not(:disabled) { background: var(--hover); }
+.setup-step[aria-current="step"] { background: var(--active); }
+.setup-step:disabled { cursor: default; opacity: 0.6; }
+
+.setup-step-mark {
+  display: inline-grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 1.5rem;
+  height: 1.5rem;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.setup-step[data-state="erledigt"] .setup-step-mark { border-color: var(--accent); background: var(--accent); color: var(--accent-ink); }
+.setup-step[data-state="teilweise"] .setup-step-mark { border-color: var(--accent); color: var(--accent); }
+
+.setup-step-text { display: grid; min-width: 0; }
+.setup-step-title { font-size: 0.9375rem; overflow-wrap: anywhere; }
+.setup-step-meta { color: var(--muted); font-size: 0.75rem; }
+
+.setup-main { flex: 1; min-width: 0; }
+.setup-column { max-width: 40rem; padding: 2rem 1.5rem 3rem; }
+
+.setup-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem 0.6rem; margin-bottom: 0.35rem; }
+.setup-count { flex-basis: 100%; margin: 0; color: var(--muted); font-size: 0.8125rem; }
+.setup-title { margin: 0; font-size: 1.5rem; font-weight: 600; letter-spacing: -0.01em; line-height: 1.3; }
+.setup-title:focus { outline: none; }
+
+.setup-status { margin: 0 0 1rem; font-size: 0.9375rem; }
+.setup-status[data-state="erledigt"] { color: var(--ink); }
+.setup-status[data-state="fehlt"], .setup-status[data-state="teilweise"] { color: var(--muted); }
+
+.setup-form { display: grid; gap: 1.25rem; margin: 0 0 1.25rem; }
+.setup-field-head { display: flex; justify-content: space-between; align-items: baseline; gap: 0.75rem; }
+.setup-field-state { flex-shrink: 0; color: var(--muted); font-size: 0.75rem; }
+.setup-help { margin: 0; color: var(--muted); font-size: 0.8125rem; overflow-wrap: anywhere; }
+
+.setup-note { margin: 0 0 1rem; color: var(--muted); font-size: 0.9375rem; }
+.setup-actions { margin-bottom: 1rem; }
+
+.setup-result { display: grid; gap: 0.5rem; }
+.setup-result > p { margin: 0; overflow-wrap: anywhere; }
+.setup-result .actions-error { font-size: 0.9375rem; }
+.setup-result-ok { color: var(--ink); font-size: 0.9375rem; }
+
+.setup-items { list-style: none; margin: 0 0 1rem; padding: 0; display: grid; gap: 0.35rem; font-size: 0.9375rem; }
+.setup-items li { display: flex; gap: 0.5rem; min-width: 0; }
+.setup-item-mark { flex-shrink: 0; width: 1rem; color: var(--accent); font-weight: 600; text-align: center; }
+.setup-items li[data-ok="false"] .setup-item-mark { color: var(--error); }
+.setup-items li[data-optional="true"] .setup-item-mark { color: var(--muted); }
+.setup-item-body { min-width: 0; overflow-wrap: anywhere; }
+.setup-item-label { font-weight: 600; }
+.setup-item-fix { display: block; color: var(--muted); font-size: 0.8125rem; }
+.setup-item-fix code, .setup-command code { font-family: var(--mono); }
+
+/* Abläufe und Auswahl vom Anbieter (Issue #161) */
+.setup-load { margin-top: 0.5rem; }
+.setup-choices-error { margin: 0.35rem 0 0; font-size: 0.9375rem; }
+.setup-run-intro { margin: 0; font-size: 0.9375rem; font-weight: 600; }
+.setup-plan, .setup-run-events { margin: 0 0 0.5rem; padding-left: 1.25rem; display: grid; gap: 0.25rem; font-size: 0.9375rem; overflow-wrap: anywhere; }
+.setup-run-events { font-family: var(--mono); font-size: 0.8125rem; color: var(--muted); }
+.setup-run-events li:last-child { color: var(--ink); }
+
+.setup-check { display: flex; align-items: center; gap: 0.6rem; margin: 0 0 0.75rem; font-size: 0.9375rem; }
+.setup-check input { width: 1.1rem; height: 1.1rem; accent-color: var(--accent); }
+
+.setup-command {
+  margin: 0 0 1rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  background: var(--code);
+  font-size: 0.875rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Desktop: Seitenleiste fest, Schublade entfällt                            */
+/* ------------------------------------------------------------------------- */
+
+@media (min-width: 56rem) {
+  .sidebar {
+    position: static;
+    width: var(--sidebar-width);
+    flex-shrink: 0;
+    transform: none;
+    visibility: visible;
+    transition: none;
+  }
+  .sidebar[data-open="true"] { box-shadow: none; }
+  .scrim { display: none !important; }
+  .mobile-only { display: none !important; }
+  .topbar { padding-left: 1.25rem; }
+  .column { padding: 1.75rem 1.5rem 2.5rem; }
+  .composer { padding: 0.5rem 1.5rem 1.25rem; }
+}
+
+/* Handy: Daumen-taugliche Ziele für Senden, Stopp, Statuszeile und Darstellungs-Schalter */
+@media (max-width: 55.99rem) {
+  .round-button { width: 2.75rem; height: 2.75rem; }
+  .activity-line { min-height: 2.75rem; }
+  .theme-option { min-height: 2.75rem; }
+  .group-toggle, .load-older { min-height: 2.75rem; }
+  /* 16 px verhindert das automatische Hineinzoomen in iOS Safari */
+  .sidebar-search { min-height: 2.75rem; font-size: 1rem; }
+  /* Verwaltung der Web-Gespräche (Issue #21): ohne Hover sichtbar, Daumen-Ziele */
+  .entry-menu { opacity: 1; }
+  .entry-menu, .topbar-menu { width: 2.75rem; height: 2.75rem; }
+  .agent-option, .entry-actions .quiet-button, .actions-list .quiet-button { min-height: 2.75rem; }
+  .title-input { font-size: 1rem; min-height: 2.75rem; }
+  /* Topics verwalten (Issue #30) */
+  .confirm-input, .danger-button, .empty-new { min-height: 2.75rem; }
+  /* Kopieren unter Antworten (Issue #22): 44 px Tippfläche */
+  .copy-button { width: 2.75rem; height: 2.75rem; }
+  .msg-foot { margin-left: -0.825rem; }
+  /* Ziel-Karte (Issue #76): Knöpfe als Daumen-Ziele */
+  .goal-button { min-height: 2.75rem; }
+  /* Rückfrage-Knöpfe (M10): Daumen-Ziele */
+  .choice-button { min-height: 2.75rem; }
+  /* Meldungen (Issue #47): Herunterladen als Daumen-Ziel */
+  .file-download { min-height: 2.75rem; }
+  /* Anhänge (Issue #73): Entfernen als Daumen-Ziel */
+  .attachment-remove { width: 2.75rem; height: 2.75rem; }
+  /* Sprachaufnahme (Issue #109): Abspielen, Stopp und Verwerfen als Daumen-Ziele */
+  .attachment-play { width: 2.75rem; height: 2.75rem; }
+  .recorder, .recorder-button { min-height: 2.75rem; }
+  /* Einstellungen (Issue #38): Daumen-Ziele */
+  .settings-tab, .settings-agent-head, .settings-input, .settings-actions button, .settings-restart button,
+  .settings-agent-body > .quiet-button, .settings-sync button, .agent-choice { min-height: 2.75rem; }
+  /* Modelle und Status (Issue #39) */
+  .settings-section button, .settings-status-head button { min-height: 2.75rem; }
+  /* Agenten verwalten (Issue #51) */
+  .settings-create-open button, .settings-deleted button, .settings-agent-body .theme-option { min-height: 2.75rem; }
+  .settings-facts { grid-template-columns: minmax(0, 1fr); gap: 0.1rem; }
+  .settings-facts dd { margin-bottom: 0.5rem; }
+  /* Einrichtung (Issue #66): Schritte als waagrechte Leiste über dem Schritt, sie scrollt in sich */
+  body.setup { flex-direction: column; }
+  .setup-nav { width: auto; padding: 0.75rem 0 0.5rem; border-right: none; border-bottom: 1px solid var(--line); }
+  .setup-brand { padding: 0 1rem 0.5rem; }
+  .setup-steps { display: flex; gap: 0.25rem; overflow-x: auto; padding: 0 1rem 0.25rem; scrollbar-width: none; }
+  .setup-steps li { flex-shrink: 0; }
+  .setup-step { width: auto; min-height: 2.75rem; }
+  .setup-step-meta { display: none; }
+  .setup-column { padding: 1.25rem 1rem 2.5rem; }
+  .setup-check { min-height: 2.75rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar, .sidebar[data-open="true"] { transition: none; }
+  .msg[data-fresh] { animation: none; }
+}
