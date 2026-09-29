@@ -5,7 +5,9 @@
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { defaultFetch, defaultRun, defaultSleep, KILL_GRACE_MS } from "../src/setup/context";
 import { registerTransientFields } from "../src/setup/model";
 import { waitForEnvWrites, writeEnv } from "../src/setup/steps/common";
@@ -120,6 +122,39 @@ describe("defaultRun mit signal", () => {
     const controller = new AbortController();
     expect(await defaultRun(["sh", "-c", "echo hallo; exit 3"], { signal: controller.signal })).toMatchObject({ code: 3, stdout: "hallo" });
     expect(await defaultRun(["sh", "-c", "echo ohne"])).toMatchObject({ code: 0, stdout: "ohne", timedOut: false });
+  });
+});
+
+describe("defaultRun: warum ein Befehl nicht startete", () => {
+  const made: string[] = [];
+  afterAll(async () => {
+    for (const dir of made) await rm(dir, { recursive: true, force: true });
+  });
+  async function binDir(name: string, content: string, mode: number) {
+    const dir = await mkdtemp(join(tmpdir(), "tybo-run-"));
+    made.push(dir);
+    await mkdir(join(dir, "bin"));
+    await writeFile(join(dir, "bin", name), content, { mode });
+    return join(dir, "bin");
+  }
+
+  test("in keinem PATH-Ordner: ENOENT", async () => {
+    const dir = await binDir("anderes", "", 0o755);
+    expect(await defaultRun(["pm2"], { env: { PATH: dir } })).toMatchObject({ code: -1, spawnError: "ENOENT" });
+  });
+
+  test("liegt im PATH, aber nicht ausführbar: EACCES, nicht ENOENT", async () => {
+    const dir = await binDir("pm2", "#!/bin/sh\necho 6.0.0\n", 0o644);
+    const r = await defaultRun(["pm2", "--version"], { env: { PATH: dir } });
+    expect(r.code).toBe(-1);
+    expect(r.spawnError).toBe("EACCES");
+  });
+
+  test("Interpreter fehlt: startet, Exit 127, kein spawnError", async () => {
+    const dir = await binDir("pm2", "#!/usr/bin/env tybo-interpreter-fehlt\n", 0o755);
+    const r = await defaultRun(["pm2", "--version"], { env: { PATH: `${dir}:/usr/bin:/bin` } });
+    expect(r.code).toBe(127);
+    expect(r.spawnError).toBeUndefined();
   });
 });
 

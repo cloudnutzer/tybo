@@ -45,6 +45,7 @@ export const HELP_TEXT = `🤖 **${BRAND.name} Spickzettel**
 
 **Sessions & Routinen:**
 /new - Gespraech in diesem Topic frisch starten
+/motor - Motor dieses Gespraechs zeigen · /motor codex · /motor opencode · /motor claude · /motor standard
 /routine [Hinweis] - den hier gezeigten Ablauf als Routine einfrieren
 Beim Session-Ende schlage ich Merk-Eintraege und Routinen selbst per Buttons vor.
 
@@ -103,8 +104,11 @@ async function runRoutine(ctx: CommandContext): Promise<void> {
     );
     return;
   }
+  // Vor der Auswahl: ein /new ab hier (auch während der Startmeldung) verwirft
+  // die Session der Routine (Issue #189)
+  const epoch = ctx.services.sessionEpoch?.(ctx.sessionKey);
   const session = (await ctx.services.sessionsForKey(ctx.sessionKey))
-    .filter(s => s.claudeSessionId)
+    .filter(s => s.engineSessionId)
     .sort((a, b) => b.lastActivity - a.lastActivity)[0];
   if (!session) {
     await ctx.reply("Keine aktive Session in diesem Topic. Erst den Ablauf einmal im Chat durchspielen, dann /routine.");
@@ -113,7 +117,7 @@ async function runRoutine(ctx: CommandContext): Promise<void> {
   await ctx.notice("Ich friere den Ablauf dieser Session als Routine ein. Das kann ein paar Minuten dauern...");
   const stop = ctx.working();
   try {
-    const result = await ctx.services.createRoutine(session, hint);
+    const result = await ctx.services.createRoutine(session, hint, epoch);
     const reply =
       result.isError || !result.text ? "Die Routine-Destillation ist fehlgeschlagen. Details: logs/telegram-relay.error.log" : result.text;
     await ctx.reply(reply, markdown);
@@ -162,7 +166,7 @@ async function runStop(ctx: CommandContext): Promise<void> {
     );
     return;
   }
-  const killed = services.abortClaudeCalls(sessionKey);
+  const killed = services.abortEngineCalls(sessionKey);
   const parts: string[] = [];
   if (killed > 0) parts.push(`${killed} laufende Verarbeitung${killed > 1 ? "en" : ""} abgebrochen`);
   if (activeGoal?.status === "active") parts.push("Ziel pausiert (/goal weiter setzt fort)");
@@ -228,7 +232,7 @@ async function runGoal(ctx: CommandContext): Promise<void> {
   if (GOAL_STOP_WORDS.includes(sub)) {
     const result = await goals.action(sessionKey, "stop");
     // Wie bisher: auch ohne Ziel laufende Aufrufe des Gesprächs abbrechen
-    if (result.status !== "ok") ctx.services.abortClaudeCalls(sessionKey);
+    if (result.status !== "ok") ctx.services.abortEngineCalls(sessionKey);
     await ctx.reply(result.status === "ok" ? GOAL_TEXT.stopped(result.goal.goal) : GOAL_TEXT.noGoal);
     return;
   }
@@ -368,6 +372,115 @@ async function runLearn(ctx: CommandContext): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// /motor (Issue #125, Entscheidung 0018): Motor pro Gespräch
+// ---------------------------------------------------------------------------
+
+export const MOTOR_TEXT = {
+  unavailable: "Die Motor-Wahl ist hier nicht verfügbar.",
+  usage: "Wechseln: /motor claude · /motor codex · /motor opencode · /motor standard",
+  busy: "In diesem Gespräch läuft gerade eine Antwort. Erst /stop, dann /motor.",
+  fileInvalid: "config/settings.json ist ungültig, der Motor wurde nicht geändert. Bitte die Datei reparieren oder löschen.",
+  notSaved: "Der Motor konnte nicht gespeichert werden.",
+  newSession: "Das beginnt eine neue Session, das Gedächtnis bleibt.",
+} as const;
+
+const MOTOR_SOURCE_TEXT = {
+  topic: "mit /motor für dieses Gespräch gesetzt",
+  settings: "Standard aus den Einstellungen",
+  env: "Standard aus TYBO_ENGINE in .env",
+  code: "eingebauter Standard",
+} as const;
+
+const MOTOR_STANDARD_WORDS = ["standard", "default"];
+
+function motorLabel(list: { engine: string; label: string }[], engine: string): string {
+  return list.find(e => e.engine === engine)?.label ?? engine;
+}
+
+async function runMotor(ctx: CommandContext): Promise<void> {
+  const engines = ctx.services.engines;
+  if (!engines) return ctx.reply(MOTOR_TEXT.unavailable);
+  const arg = ctx.args.trim().toLowerCase();
+  const list = await engines.available();
+  const label = (engine: string) => motorLabel(list, engine);
+  const notReadyNote = (engine: string) => {
+    const status = list.find(e => e.engine === engine);
+    if (!status || status.ready) return "";
+    return `\n${status.label} ist gerade nicht bereit${status.message ? ` (${status.message})` : ""}, bis dahin antwortet ${label("claude")}.`;
+  };
+
+  if (!arg) {
+    const current = engines.configured(ctx.sessionKey);
+    const standard = engines.standard();
+    const available = list.map(e => (e.ready ? `${e.label} ✓` : `${e.label} (${e.message ?? "nicht bereit"})`)).join(", ");
+    await ctx.reply(
+      [
+        `Motor dieses Gesprächs: ${label(current.engine)} (${MOTOR_SOURCE_TEXT[current.source]})`,
+        `Standard: ${label(standard.engine)} (${MOTOR_SOURCE_TEXT[standard.source]})`,
+        `Verfügbar: ${available}`,
+        MOTOR_TEXT.usage,
+      ].join("\n") + notReadyNote(current.engine)
+    );
+    return;
+  }
+
+  const toStandard = MOTOR_STANDARD_WORDS.includes(arg);
+  if (!toStandard && !list.some(e => e.engine === arg)) {
+    const names = [...list.map(e => e.engine), "standard"].join(", ");
+    await ctx.reply(`Unbekannter Motor „${ctx.args.trim().slice(0, 40)}". Möglich: ${names}.`);
+    return;
+  }
+
+  const before = engines.configured(ctx.sessionKey);
+  const after = toStandard ? engines.standard().engine : arg;
+  const changes = before.engine !== after;
+  let written = false;
+  let writeError: unknown;
+  const write = async () => {
+    written = true;
+    try {
+      if (toStandard) {
+        if (before.source === "topic") await engines.setTopic(ctx.sessionKey, null);
+      } else {
+        await engines.setTopic(ctx.sessionKey, arg);
+      }
+    } catch (e) {
+      writeError = e ?? new Error("Motor nicht gespeichert");
+    }
+  };
+  // Bei einem Wechsel: Session beenden (alle Agenten des Gesprächs, laufende
+  // Turns speichern danach nichts mehr) und die Einstellung schreiben, beides
+  // unter der Sperre des Gesprächs. Läuft eine Antwort, ändert sich nichts;
+  // ein neuer Turn kann nicht zwischen Reset und Schreiben mit dem alten Motor starten.
+  let sessionMode = false;
+  if (changes) {
+    const reset = await ctx.resetSession({ whileBlocked: write });
+    if (reset.status === "busy") return ctx.reply(MOTOR_TEXT.busy);
+    sessionMode = reset.status === "done" && reset.sessionMode;
+  }
+  // Ohne Wechsel oder ohne ermittelbare Session (unavailable): direkt schreiben
+  if (!written) await write();
+  if (writeError !== undefined) {
+    const e = writeError;
+    await ctx.reply(e instanceof Error && e.name === "SettingsFileInvalidError" ? MOTOR_TEXT.fileInvalid : MOTOR_TEXT.notSaved);
+    return;
+  }
+
+  const lines: string[] = [];
+  if (toStandard) {
+    lines.push(
+      before.source === "topic"
+        ? `Ausnahme entfernt: dieses Gespräch nimmt wieder den Standard, ${label(after)}.`
+        : `Dieses Gespräch nimmt schon den Standard, ${label(after)}.`
+    );
+  } else {
+    lines.push(changes ? `Dieses Gespräch läuft jetzt mit ${label(after)}.` : `Dieses Gespräch läuft schon mit ${label(after)}.`);
+  }
+  if (changes && sessionMode) lines.push(MOTOR_TEXT.newSession);
+  await ctx.reply(lines.join(" ") + notReadyNote(after));
+}
+
 async function runCritic(ctx: CommandContext): Promise<void> {
   await ctx.agentTurn("critic", ctx.args);
 }
@@ -413,6 +526,15 @@ export const BUILTIN_COMMANDS: readonly CommandDefinition[] = [
   },
   { name: "new", aliases: ["reset"], description: "Gespräch frisch starten, der Verlauf bleibt", args: "none", channels: ALL_CHANNELS, run: runNew },
   { name: "topics", aliases: [], description: "Welches Topic welchem Agenten gehört", args: "none", channels: ALL_CHANNELS, run: runTopics },
+  {
+    name: "motor",
+    aliases: ["engine"],
+    description: "Motor dieses Gesprächs zeigen oder wechseln (Claude Code, Codex, OpenCode)",
+    args: "optional",
+    argsHint: "[claude|codex|opencode|standard]",
+    channels: ALL_CHANNELS,
+    run: runMotor,
+  },
   {
     name: "agent",
     aliases: [],

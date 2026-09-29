@@ -34,6 +34,7 @@ import {
   createDemoAgents,
   createDemoInstructions,
   createDemoCommands,
+  createDemoEngines,
   createDemoKeys,
   demoSessionReset,
   createDemoModels,
@@ -99,6 +100,8 @@ if (process.env.WEB_DEV_DEMO === "1") {
     // Einstellungen und Anweisungen nur im Speicher, Modell-Listen ohne Netz (Issue #38):
     // nie config/settings.json oder config/agent-overrides.json des Checkouts
     settings: demoAgents.settings,
+    // Motor (Issue #126): Standard und Ausnahmen aus denselben Demo-Einstellungen, feste Verfügbarkeit
+    engines: createDemoEngines(demoAgents.settings),
     agentCatalog: demoAgents.catalog,
     instructions: createDemoInstructions(),
     models: createDemoModels(),

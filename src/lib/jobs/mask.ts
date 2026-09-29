@@ -133,3 +133,18 @@ export function readDotenv(root: string): Env {
 export function projectSecrets(root: string, processEnv: Env = process.env): SecretValue[] {
   return secretValues(readDotenv(root), processEnv);
 }
+
+/**
+ * Wie projectSecrets, aber nur eine fehlende .env gilt als leer. Andere
+ * Lesefehler (keine Rechte, Ordner statt Datei) werfen, damit der Aufrufer
+ * nicht mit einer unvollständigen Liste maskiert.
+ */
+export function projectSecretsOrThrow(root: string, processEnv: Env = process.env): SecretValue[] {
+  let content = "";
+  try {
+    content = readFileSync(join(root, ".env"), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return secretValues(parseEnvContent(content), processEnv);
+}

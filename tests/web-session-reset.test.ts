@@ -135,6 +135,26 @@ describe("createConversationSessionReset", () => {
     expect(calls).toEqual([]);
   });
 
+  test("whileBlocked (/motor) läuft nach dem Reset, noch unter der Sperre; bei busy gar nicht", async () => {
+    let blocked = false;
+    const { reset, calls } = setup({
+      block: () => {
+        blocked = true;
+        return () => {
+          blocked = false;
+        };
+      },
+    });
+    const whileBlocked = async () => void calls.push(`schreiben gesperrt=${blocked}`);
+    expect((await reset("topic-5", whileBlocked)).status).toBe("done");
+    expect(calls).toEqual(["distill key:topic-5:general", "reset key:topic-5", "schreiben gesperrt=true"]);
+    expect(blocked).toBe(false);
+
+    const busy = setup({ isActive: () => true });
+    expect(await busy.reset("topic-5", async () => void busy.calls.push("schreiben"))).toEqual({ status: "busy" });
+    expect(busy.calls).toEqual([]);
+  });
+
   test("ohne Schlüssel: unavailable", async () => {
     const { reset } = setup();
     expect(await reset("kaputt")).toEqual({ status: "unavailable" });

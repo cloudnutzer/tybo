@@ -21,7 +21,17 @@ describe("Befehls-Register: Erkennung", () => {
       expect(name("/routine", channel)).toBe("routine");
       expect(name("/board", channel)).toBe("board");
       expect(name("/board Newsletter starten?", channel)).toBe("board");
+      // Issue #125
+      expect(name("/motor", channel)).toBe("motor");
+      expect(name("/motor codex", channel)).toBe("motor");
+      expect(name("/engine standard", channel)).toBe("motor");
     }
+  });
+
+  test("/motor (Issue #125): Alias /engine, Argument optional, kein Treffer für /motoren", () => {
+    expect(commandRegistry.match("/engine claude", "terminal")).toMatchObject({ invoked: "engine", args: "claude", command: { name: "motor" } });
+    expect(commandRegistry.match("/motor", "telegram")).toMatchObject({ args: "", command: { name: "motor" } });
+    expect(name("/motoren", "web")).toBeNull();
   });
 
   test("/board (Issue #75): Thema optional; „board meeting“ ohne Schrägstrich nur in Telegram, wie bisher", () => {
@@ -133,7 +143,7 @@ describe("Befehls-Register: Liste je Kanal", () => {
   test("Name, Beschreibung, Argumente; /voice überall (Issue #78)", () => {
     const web = commandRegistry.list("web");
     const names = web.map(c => c.name);
-    expect(names).toEqual(["help", "stop", "new", "topics", "agent", "goal", "goals", "learn", "plan", "critic", "board", "routine", "jobs", "voice"]);
+    expect(names).toEqual(["help", "stop", "new", "topics", "motor", "agent", "goal", "goals", "learn", "plan", "critic", "board", "routine", "jobs", "voice"]);
     expect(commandRegistry.list("terminal").map(c => c.name)).toEqual(names);
     expect(commandRegistry.list("telegram").map(c => c.name)).toEqual(names);
     expect(web.find(c => c.name === "voice")).toEqual({ name: "voice", aliases: [], description: "Antwort als Sprachnachricht", args: "required", argsHint: "<text>" });

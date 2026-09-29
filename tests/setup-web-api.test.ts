@@ -44,7 +44,7 @@ describe("Übersicht und Schritte", () => {
     expect(res.headers.get("cache-control")).toBe("no-store");
     const { text, data } = await body(res);
     expect(data.steps.map((x: any) => x.id)).toEqual([
-      "voraussetzungen", "telegram", "gruppe", "datenbank", "profil", "modelle", "webui", "autostart", "pruefung",
+      "voraussetzungen", "telegram", "gruppe", "datenbank", "suche", "profil", "modelle", "webui", "autostart", "pruefung",
     ]);
     expect(data.steps.find((x: any) => x.id === "telegram")).toEqual({
       id: "telegram", title: "Telegram", optional: false, state: "erledigt", detail: "Token und Nutzer-ID sind gesetzt.",
@@ -73,7 +73,7 @@ describe("Übersicht und Schritte", () => {
     expect(leakedSecrets(text)).toEqual([]);
     expect(text).not.toContain(FAKE.userId);
 
-    for (const id of ["voraussetzungen", "gruppe", "datenbank", "profil", "modelle", "webui", "autostart", "pruefung"]) {
+    for (const id of ["voraussetzungen", "gruppe", "datenbank", "suche", "profil", "modelle", "webui", "autostart", "pruefung"]) {
       const step = await body(await get(s, `/api/setup/steps/${id}`, cookie));
       expect(leakedSecrets(step.text)).toEqual([]);
       expect(step.text).not.toContain(FAKE.convexUrl);
@@ -288,7 +288,9 @@ describe("kein Claude-Aufruf, kein Autostart über „Speichern“", () => {
     expect(summary.items.find((i: any) => i.label === "Autostart")).toEqual({
       label: "Autostart", ok: false, optional: true, detail: "Noch kein Autostart über launchd. Kann bei „Fertig“ eingerichtet werden.",
     });
-    expect(summary.items.filter((i: any) => !i.ok).map((i: any) => i.label)).toEqual(["Autostart"]);
+    // Convex: Semantische Suche gilt nur für Supabase, optional und offen (Issue #166)
+    expect(summary.items.filter((i: any) => !i.ok).map((i: any) => i.label)).toEqual(["Semantische Suche", "Autostart"]);
+    expect(summary.items.find((i: any) => i.label === "Semantische Suche")).toMatchObject({ ok: false, optional: true });
     expect(summary.items.find((i: any) => i.label === "Telegram")).toMatchObject({ ok: true, optional: false });
     expect(s.ctx.providers.calls.some(c => c.method === "claudeProbe")).toBe(false);
     expect(leakedSecrets(text)).toEqual([]);

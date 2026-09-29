@@ -121,6 +121,11 @@ function resolveDeps(deps?: Partial<MediaDeps>): MediaDeps {
   return deps ? { ...defaultDeps, ...deps } : defaultDeps;
 }
 
+/** Name einer Arbeitsdatei: Art, Zeitpunkt und UUID, z. B. photo_1700000000000_<uuid>.jpg (Issue #190) */
+export function uploadName(prefix: string, ts: number, uuid: string, dot: string): string {
+  return `${prefix}_${ts}_${uuid}${dot}`;
+}
+
 const SAFE_EXT = /^[a-zA-Z0-9]{1,10}$/;
 const FALLBACK_EXT: Record<MediaKind, string> = { image: "jpg", document: "", audio: "ogg" };
 
@@ -151,9 +156,10 @@ export async function prepareMedia(input: MediaInput, deps?: Partial<MediaDeps>)
   if (!SAFE_EXT.test(ext)) ext = FALLBACK_EXT[kind];
   const dot = ext ? `.${ext}` : "";
 
+  // Zeit plus UUID (Issue #190): zwei Uploads in derselben Millisekunde bekommen verschiedene Namen
   const ts = d.now();
   const storedName =
-    kind === "image" ? `photo_${ts}${dot}` : kind === "audio" ? `voice_${ts}${dot}` : `${d.uuid()}${dot}`;
+    kind === "image" ? uploadName("photo", ts, d.uuid(), dot) : kind === "audio" ? uploadName("voice", ts, d.uuid(), dot) : `${d.uuid()}${dot}`;
   const localPath = join(d.uploadsDir, storedName);
 
   await d.mkdir(d.uploadsDir, { recursive: true });

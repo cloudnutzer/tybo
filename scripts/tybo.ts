@@ -12,6 +12,10 @@
  *                          tybo setup <schritt> und tybo setup --liste
  *   tybo setup --web       Einrichtung im Browser (Issue #66, src/setup/web-mode.ts)
  *   tybo job …             Hintergrund-Jobs (Issue #103), wie `bun run job …`
+ *   tybo datenbank …       Supabase auf diesem Rechner: start, stop, status,
+ *                          sichern (Issue #165, src/setup/local-supabase.ts)
+ *   tybo suche …           Embeddings nach Anbieterwechsel neu berechnen,
+ *                          Stand (Issue #168, src/setup/search-reindex.ts)
  *   tybo help              Kurzhilfe
  *
  * Startet nie selbst einen Bot: läuft keiner, sagt tybo das und nennt den
@@ -59,7 +63,8 @@ export interface TyboOptions {
   setup?: {
     ctx?: SetupContext;
     prompter?: Prompter;
-    onInterrupt?(handler: () => void): () => void;
+    /** Strg+C (bei tybo datenbank auch SIGTERM); gibt die Abmeldung zurück */
+    onInterrupt?(handler: (signal?: NodeJS.Signals) => void): () => void;
     /** Schonfrist nach Strg+C (Standard: RUN_GRACE_MS) */
     runGraceMs?: number;
     /** tybo setup --web: fester Code, Port 0, Strg+C-Attrappe, Meldung beim Start, Schonfrist */
@@ -95,6 +100,8 @@ function usage(): string {
     `  ${BRAND.cli} setup <Schritt>  nur ein Schritt (etwa telegram); --liste nur die Übersicht`,
     `  ${BRAND.cli} setup --web      Einrichtung im Browser (nur dieser Rechner, mit Einmal-Code)`,
     `  ${BRAND.cli} job <start|list|stop|log>  Hintergrund-Jobs (${BRAND.cli} job help)`,
+    `  ${BRAND.cli} datenbank <start|stop|status|sichern>  Supabase auf diesem Rechner (${BRAND.cli} datenbank help)`,
+    `  ${BRAND.cli} suche <neu-berechnen|status>  Suche nach Anbieterwechsel neu berechnen (${BRAND.cli} suche help)`,
     `  ${BRAND.cli} help             Diese Hilfe`,
     "",
     "Im Chat: Enter sendet, Alt+Enter oder \\ am Zeilenende für eine neue Zeile,",
@@ -357,6 +364,80 @@ async function job(options: TyboOptions, root: string, args: string[]): Promise<
   return code;
 }
 
+/**
+ * tybo datenbank … (Issue #165): Supabase auf diesem Rechner starten,
+ * anhalten, Zustand zeigen, sichern. Läuft auch unter launchd bzw. PM2
+ * (Dienst ai.tybo.supabase / tybo-supabase ruft `datenbank start` auf);
+ * die Ausgabe landet dann in logs/supabase.log und enthält nur feste Sätze.
+ * Strg+C (SIGINT) wie auch SIGTERM (pm2 stop, launchd, Weitergabe durch die
+ * Hülle run-once-and-stay) bricht Warten, Start und Sicherung ab; der Befehl
+ * endet erst nach Bereinigung und Schutzprüfung bzw. Schutz-Stopp, mit 130
+ * nach SIGINT und 143 nach SIGTERM.
+ */
+async function datenbank(options: TyboOptions, root: string, env: Env, args: string[]): Promise<number> {
+  const { EXIT_ABORTED, runDatabaseCommand } = await import("../src/setup/local-supabase");
+  const { createSetupContext } = await import("../src/setup/context");
+  const ctx = options.setup?.ctx ?? createSetupContext({ root });
+  const controller = new AbortController();
+  let received: NodeJS.Signals | undefined;
+  const onInterrupt =
+    options.setup?.onInterrupt ??
+    ((handler: (signal: NodeJS.Signals) => void) => {
+      const onInt = () => handler("SIGINT");
+      const onTerm = () => handler("SIGTERM");
+      process.on("SIGINT", onInt);
+      process.on("SIGTERM", onTerm);
+      return () => {
+        process.off("SIGINT", onInt);
+        process.off("SIGTERM", onTerm);
+      };
+    });
+  const release = onInterrupt(signal => {
+    received ??= signal;
+    controller.abort();
+  });
+  try {
+    const code = await runDatabaseCommand(args, {
+      ctx,
+      env,
+      out: options.out ?? console.log,
+      err: options.err ?? console.error,
+      signal: controller.signal,
+    });
+    return code === EXIT_ABORTED && received === "SIGTERM" ? 143 : code;
+  } finally {
+    release();
+  }
+}
+
+/**
+ * tybo suche … (Issue #168): Neuberechnung der Embeddings nach einem
+ * Anbieterwechsel. Strg+C und SIGTERM brechen nach dem laufenden Eintrag ab;
+ * der Stand bis zum letzten bestätigten Stapel bleibt, derselbe Befehl setzt fort.
+ */
+async function suche(options: TyboOptions, root: string, env: Env, args: string[]): Promise<number> {
+  const { runSearchCommand } = await import("../src/setup/search-reindex");
+  const controller = new AbortController();
+  const onInterrupt =
+    options.setup?.onInterrupt ??
+    ((handler: (signal: NodeJS.Signals) => void) => {
+      const onInt = () => handler("SIGINT");
+      const onTerm = () => handler("SIGTERM");
+      process.on("SIGINT", onInt);
+      process.on("SIGTERM", onTerm);
+      return () => {
+        process.off("SIGINT", onInt);
+        process.off("SIGTERM", onTerm);
+      };
+    });
+  const release = onInterrupt(() => controller.abort());
+  try {
+    return await runSearchCommand(args, { root, env, out: options.out ?? console.log, err: options.err ?? console.error, signal: controller.signal });
+  } finally {
+    release();
+  }
+}
+
 /** Verteilt die Unterbefehle; gibt den Exit-Code zurück */
 export async function runTybo(options: TyboOptions): Promise<number> {
   const out = options.out ?? console.log;
@@ -372,6 +453,8 @@ export async function runTybo(options: TyboOptions): Promise<number> {
   }
   if (command === "setup") return setup(options, root, rest);
   if (command === "job") return job(options, root, rest);
+  if (command === "datenbank") return datenbank(options, root, env, rest);
+  if (command === "suche") return suche(options, root, env, rest);
   if (command === undefined || command.startsWith("--")) {
     const args = parseChatArgs(options.args);
     if (args) return chat(options, root, env, args);

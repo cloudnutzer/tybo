@@ -124,7 +124,7 @@ async function start(): Promise<Ctx> {
     },
     saveMessage: (m: WebSavedMessage) => ctx.saveMessage(m),
     processIntents: async () => {},
-    abortClaudeCalls: (key: string) => abortExecutions(key),
+    abortEngineCalls: (key: string) => abortExecutions(key),
     isShuttingDown: () => false,
     scheduleRestartCheck: () => {},
     log: () => {},
@@ -140,7 +140,7 @@ async function start(): Promise<Ctx> {
     isSessionModeEnabled: () => true,
     getGoal: async () => undefined,
     pauseGoal: async () => {},
-    abortClaudeCalls: (key: string) => abortExecutions(key),
+    abortEngineCalls: (key: string) => abortExecutions(key),
     requestBoardStop,
     listAgentNames: () => ["general", "research", "finance", "critic"],
   } as unknown as CommandServices;
@@ -621,12 +621,35 @@ describe("/board im Telegram-Gespräch: Werkzeug-Freigabe über die gemeinsamen 
 });
 
 describe("Terminal (tybo)", () => {
-  async function openTybo(ctx: Ctx, stops: string[] = []) {
+  /**
+   * slowMs: langsame Leitung wie in der CI. Nach dem Senden kommen die
+   * POST-Antwort und die Live-Ereignisse erst nach slowMs beim Terminal an,
+   * der Server rechnet aber schon (ctx.pending)
+   */
+  async function openTybo(ctx: Ctx, stops: string[] = [], slowMs = 0) {
+    let holdUntil = 0;
+    const hold = async () => {
+      const wait = holdUntil - Date.now();
+      if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    };
     // Stopp-Anfragen mitschreiben, sobald der Server sie beantwortet hat
     const recording = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = String(input);
+      if (slowMs && init?.method === "POST" && url.endsWith("/messages")) holdUntil = Date.now() + slowMs;
       const res = await fetch(input, init);
-      if (String(input).endsWith("/stop")) stops.push(String(input));
-      return res;
+      if (url.endsWith("/stop")) stops.push(url);
+      if (!slowMs) return res;
+      await hold();
+      if (!res.body || !(res.headers.get("content-type") ?? "").includes("text/event-stream")) return res;
+      const delayed = res.body.pipeThrough(
+        new TransformStream<Uint8Array, Uint8Array>({
+          async transform(chunk, controller) {
+            await hold();
+            controller.enqueue(chunk);
+          },
+        })
+      );
+      return new Response(delayed, { status: res.status, headers: res.headers });
     }) as typeof fetch;
     const client = new ApiClient({ base: ctx.origin.replace(/\/$/, ""), getToken: async () => ctx.bearer, fetch: recording });
     const conversation = (await client.listConversations()).find(c => c.id === "topic-443")!;
@@ -671,9 +694,13 @@ describe("Terminal (tybo)", () => {
     const ctx = await start();
     ctx.manual = true;
     const stops: string[] = [];
-    const { stdin, stdout, exit } = await openTybo(ctx, stops);
+    // Langsame Leitung (CI-Befund in PR #200): der Server rechnet schon, das
+    // Terminal weiß es noch nicht. Strg+C erst, wenn es den Lauf anzeigt,
+    // sonst zählt es als erster Druck zum Beenden
+    const { stdin, stdout, exit } = await openTybo(ctx, stops, 300);
     stdin.type("/board\r");
     await waitUntil(() => ctx.pending.length === 1);
+    await waitUntil(() => stdout.text.includes("Denkt nach …"));
     stdin.type("\u0003");
     await waitUntil(() => stops.length === 1);
     expect(stops[0]).toEndWith("/api/conversations/topic-443/stop");

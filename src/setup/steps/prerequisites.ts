@@ -8,6 +8,8 @@
  * entfällt der Probeaufruf, die Meldung sagt das.
  */
 
+import { stat } from "node:fs/promises";
+import { join } from "node:path";
 import type { SetupContext } from "../context";
 import { stateFromCount, type SetupStep, type StatusItem } from "../model";
 import { versionOnly } from "../providers";
@@ -35,18 +37,70 @@ function gitFix(platform: NodeJS.Platform): string {
   return "sudo apt install git";
 }
 
-export const CLAUDE_INSTALL = "npm install -g @anthropic-ai/claude-code";
+/**
+ * Nativer Installer von Anthropic (Linux, macOS, WSL): braucht weder Node.js
+ * noch sudo und legt claude in ~/.local/bin ab. Gleichlauf mit
+ * CLAUDE_INSTALL_CMD in install.sh (tests/install-sh.test.ts).
+ */
+export const CLAUDE_INSTALL = "curl -fsSL https://claude.ai/install.sh | bash";
+/** Windows ohne WSL: der bisherige Weg über npm */
+export const CLAUDE_INSTALL_WINDOWS = "npm install -g @anthropic-ai/claude-code";
+/** claude liegt in ~/.local/bin, der Ordner ist in dieser Sitzung nicht im PATH */
+export const CLAUDE_NOT_IN_PATH =
+  "Claude CLI liegt in ~/.local/bin, das ist noch nicht im PATH: neue Sitzung öffnen. Hilft das nicht, die Zeile darunter in ~/.bashrc bzw. ~/.zshrc eintragen.";
+export const LOCAL_BIN_PATH_FIX = 'export PATH="$HOME/.local/bin:$PATH"';
 /** Einrichtungsmodus im Browser: kein Probeaufruf, ehrlich gesagt */
 export const CLAUDE_LOGIN_NOT_CHECKED =
   "Ob die Claude CLI angemeldet ist, prüft die Einrichtung im Browser nicht (kein Modellaufruf). Im Terminal mit „claude“ prüfen.";
 
+function claudeInstall(platform: NodeJS.Platform): string {
+  return platform === "win32" ? CLAUDE_INSTALL_WINDOWS : CLAUDE_INSTALL;
+}
+
+async function configuredClaudePath(ctx: SetupContext): Promise<string | undefined> {
+  return (await envValues(ctx, ["CLAUDE_PATH"])).CLAUDE_PATH;
+}
+
 async function claudePath(ctx: SetupContext): Promise<string> {
-  return (await envValues(ctx, ["CLAUDE_PATH"])).CLAUDE_PATH ?? "claude";
+  return (await configuredClaudePath(ctx)) ?? "claude";
+}
+
+async function isFile(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Claude CLI prüfen. Sonderfall (Issue #212): claude ist im PATH nicht zu
+ * finden, liegt aber in ~/.local/bin (nativer Installer, gleiche Sitzung).
+ * Dann ein PATH-Hinweis statt einer Neuinstallation, aber nur, wenn
+ * CLAUDE_PATH nicht gesetzt ist und die Datei dort selbst eine Version meldet.
+ */
+async function claudeItem(ctx: SetupContext): Promise<StatusItem> {
+  const configured = await configuredClaudePath(ctx);
+  const claude = await ctx.providers.claudeVersion(configured ?? "claude");
+  const item: StatusItem = {
+    label: "Claude CLI",
+    ok: claude.ok,
+    detail: claude.message,
+    fix: claude.ok ? undefined : claudeInstall(ctx.platform),
+  };
+  if (claude.ok || !claude.notFound || configured || ctx.platform === "win32") return item;
+  const local = join(ctx.home, ".local", "bin", "claude");
+  if (!(await isFile(local))) return item;
+  const direct = await ctx.providers.claudeVersion(local);
+  if (!direct.ok) {
+    return { ...item, detail: "Claude CLI liegt in ~/.local/bin, startet dort aber nicht. Neu installieren." };
+  }
+  return { ...item, detail: CLAUDE_NOT_IN_PATH, fix: LOCAL_BIN_PATH_FIX };
 }
 
 async function checks(ctx: SetupContext): Promise<StatusItem[]> {
   const bunOk = versionAtLeast(ctx.bunVersion, MIN_BUN_VERSION);
-  const claude = await ctx.providers.claudeVersion(await claudePath(ctx));
+  const claude = await claudeItem(ctx);
   const git = await ctx.run(["git", "--version"], { timeoutMs: 10_000 });
   const gitOk = git.code === 0;
   // Nur die Versionsnummer, nie die rohe Ausgabe
@@ -58,12 +112,7 @@ async function checks(ctx: SetupContext): Promise<StatusItem[]> {
       detail: bunOk ? `Bun ${ctx.bunVersion}` : `Bun ${ctx.bunVersion} ist zu alt, nötig ist ${MIN_BUN_VERSION} oder neuer.`,
       fix: bunOk ? undefined : "bun upgrade",
     },
-    {
-      label: "Claude CLI",
-      ok: claude.ok,
-      detail: claude.message,
-      fix: claude.ok ? undefined : CLAUDE_INSTALL,
-    },
+    claude,
     {
       label: "Git",
       ok: gitOk,

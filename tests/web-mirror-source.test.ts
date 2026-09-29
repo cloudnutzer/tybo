@@ -49,7 +49,7 @@ function telegramChat(state: { plain: { chatId: string; text: string; threadId?:
       return true;
     },
     processIntents: async () => {},
-    abortClaudeCalls: key => abortExecutions(key),
+    abortEngineCalls: key => abortExecutions(key),
     isShuttingDown: () => false,
     scheduleRestartCheck: () => {},
     sendPlain: async (chatId, text, threadId) => {

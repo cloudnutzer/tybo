@@ -56,7 +56,7 @@ describe("Texte in Telegram, WebUI-Server und Terminal", () => {
   });
 
   test("Neustart- und Schlüssel-Meldungen", () => {
-    expect(STATUS_TEXT.noSupervisor).toStartWith(`${BRAND.name} läuft nicht unter launchd oder PM2.`);
+    expect(STATUS_TEXT.noSupervisor).toStartWith(`${BRAND.name} läuft nicht unter launchd, PM2 oder systemd.`);
     expect(STATUS_TEXT.requested).toContain(`${BRAND.name} startet nach der laufenden Antwort neu`);
     expect(KEYS_TEXT.readOnly).toContain(`${BRAND.name} neu starten`);
   });

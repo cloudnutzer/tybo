@@ -1,7 +1,9 @@
 /**
  * Port zur Management-API von Supabase (Issue #163): Organisationen,
- * Projekte, Migrationen, Schlüssel. Nur für den Ablauf „Supabase in der
- * Cloud“ (src/setup/supabase-cloud.ts).
+ * Projekte, Migrationen, Schlüssel. Für den Ablauf „Supabase in der
+ * Cloud“ (src/setup/supabase-cloud.ts) und, seit Issue #166, für Edge
+ * Functions und Geheimnisse der semantischen Suche
+ * (src/setup/semantic-search.ts).
  *
  * Regeln:
  * - Netz nur über das fetch aus dem Kontext (Tests: Attrappe).
@@ -110,6 +112,20 @@ export interface SupabaseMigration {
   name?: string;
 }
 
+/** Eine Datei einer Edge Function; path relativ zum Projektordner, mit / */
+export interface FunctionFile {
+  path: string;
+  content: string;
+}
+
+export interface DeployFunctionInput {
+  slug: string;
+  /** Einstiegsdatei, einer der Pfade aus files */
+  entrypoint: string;
+  files: FunctionFile[];
+  verifyJwt: boolean;
+}
+
 export interface CreateProjectInput {
   name: string;
   organizationSlug: string;
@@ -133,6 +149,15 @@ export interface SupabaseManagement {
   query(ref: string, sql: string, signal?: AbortSignal): Promise<unknown[]>;
   apiKeys(ref: string, signal?: AbortSignal): Promise<SupabaseApiKey[]>;
   createSecretKey(ref: string, name: string, signal?: AbortSignal): Promise<SupabaseApiKey>;
+  /**
+   * Edge Function ausliefern (anlegen oder ersetzen), Issue #166:
+   * POST /v1/projects/{ref}/functions/deploy?slug=<slug> als multipart
+   */
+  deployFunction(ref: string, input: DeployFunctionInput, signal?: AbortSignal): Promise<void>;
+  /** Namen der Geheimnisse der Edge Functions, nie Werte */
+  secretNames(ref: string, signal?: AbortSignal): Promise<string[]>;
+  /** Geheimnisse setzen (vorhandene gleichen Namens werden ersetzt) */
+  setSecrets(ref: string, secrets: Array<{ name: string; value: string }>, signal?: AbortSignal): Promise<void>;
 }
 
 export interface ManagementDeps {
@@ -217,6 +242,8 @@ export function createSupabaseManagement(token: string, deps: ManagementDeps): S
   interface Call {
     method?: string;
     body?: unknown;
+    /** multipart statt JSON; Content-Type setzt fetch samt Grenze selbst */
+    form?: FormData;
     headers?: Record<string, string>;
     timeoutMs?: number;
     signal?: AbortSignal;
@@ -237,10 +264,10 @@ export function createSupabaseManagement(token: string, deps: ManagementDeps): S
           headers: {
             Authorization: `Bearer ${token}`,
             Accept: "application/json",
-            ...(call.body !== undefined ? { "Content-Type": "application/json" } : {}),
+            ...(call.body !== undefined && !call.form ? { "Content-Type": "application/json" } : {}),
             ...call.headers,
           },
-          body: call.body !== undefined ? JSON.stringify(call.body) : undefined,
+          body: call.form ?? (call.body !== undefined ? JSON.stringify(call.body) : undefined),
           timeoutMs,
           signal: call.signal,
         });
@@ -410,6 +437,32 @@ export function createSupabaseManagement(token: string, deps: ManagementDeps): S
       });
       if (!res.ok) throw failure(res);
       return toKey(await json(res, signal));
+    },
+
+    async deployFunction(ref, input, signal) {
+      const form = new FormData();
+      form.append("metadata", JSON.stringify({ entrypoint_path: input.entrypoint, name: input.slug, verify_jwt: input.verifyJwt }));
+      for (const f of input.files) form.append("file", new Blob([f.content], { type: "application/typescript" }), f.path);
+      const res = await send(`/v1/projects/${checkRef(ref)}/functions/deploy?slug=${encodeURIComponent(input.slug)}`, {
+        method: "POST",
+        signal,
+        timeoutMs: SQL_TIMEOUT_MS,
+        form,
+      });
+      await res.body?.cancel().catch(() => {});
+      if (!res.ok) throw failure(res);
+    },
+
+    async secretNames(ref, signal) {
+      return list(await getJson(`/v1/projects/${checkRef(ref)}/secrets`, signal))
+        .map(x => str(x?.name))
+        .filter(Boolean);
+    },
+
+    async setSecrets(ref, secrets, signal) {
+      const res = await send(`/v1/projects/${checkRef(ref)}/secrets`, { method: "POST", signal, body: secrets });
+      await res.body?.cancel().catch(() => {});
+      if (!res.ok) throw failure(res);
     },
   };
 }

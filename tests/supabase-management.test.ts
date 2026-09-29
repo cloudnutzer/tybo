@@ -51,6 +51,8 @@ describe("SCHEMA_FILES", () => {
       "tybo_schema",
       "tybo_2026_07_02_fable_topics_memory",
       "tybo_20260909_security_knowledge",
+      "tybo_20260927_embedding_provider",
+      "tybo_20260928_embedding_reindex",
     ]);
   });
 

@@ -46,13 +46,15 @@ import type {
   CommandContext,
   CommandServices,
   ReplyOptions,
+  SessionResetOptions,
   SessionResetOutcome,
   VoiceMessagePort,
   VoiceMessageResult,
   VoiceSynthesis,
 } from "../lib/commands/types";
 import { sessionKeyFor } from "../lib/convex";
-import { currentExecution, runCancelable, runExecution } from "../lib/execution-context";
+import { currentExecution, isRestartPendingError, RESTART_PENDING_REPLY, runCancelable, runExecution } from "../lib/execution-context";
+import { createQueueNotifier } from "../lib/queue-notice";
 import type { SendAndRecordInput } from "../lib/outbox";
 import type { TurnTools } from "../lib/turn-tools";
 import type { MessageSource, RunTurnOptions } from "./chat";
@@ -112,6 +114,10 @@ export interface BotCommandDeps {
   approvals?: Pick<ApprovalTurns, "register">;
   /** Nie Nachrichtentexte oder Zugangsdaten übergeben */
   log?(message: string): void;
+  /** Topic-Namen für den Wartehinweis (Issue #188); ohne sie „Topic <id>" */
+  topicNames?(): Promise<Record<string, string>>;
+  /** Wartezeit bis zum Hinweis, Standard QUEUE_NOTICE_DELAY_MS; anders nur in Tests */
+  queueNoticeMs?: number;
 }
 
 function errorName(e: unknown): string {
@@ -124,10 +130,11 @@ function isAbortError(e: unknown): boolean {
 
 /**
  * Laufen ohne den Bereich unter dem Session-Schlüssel, wie in Telegram
- * (handleUpdateScope): /stop bräche sich sonst selbst ab, /new scheiterte an
- * der eigenen Sperre des Resets.
+ * (handleUpdateScope): /stop bräche sich sonst selbst ab, /new und /motor
+ * (Issue #125, beginnt eine neue Session) scheiterten an der eigenen Sperre
+ * des Resets. Läuft eine Antwort, meldet der Reset „busy" und /motor ändert nichts.
  */
-const UNSCOPED_COMMANDS = new Set(["stop", "new"]);
+const UNSCOPED_COMMANDS = new Set(["stop", "new", "motor"]);
 
 /** Knöpfe außerhalb von Telegram: nur die Beschriftungen als Text (keine Freigabe-Oberfläche im Web) */
 export function buttonsAsText(text: string, rows: CommandButton[][]): string {
@@ -373,7 +380,7 @@ export function createBotCommands(deps: BotCommandDeps): CommandPort {
         },
         async contribution(c) {
           // Live in Browser und Terminal mit der ID aus dem Verlauf (Feed meldet channel "web" nur als Aktivität)
-          await req.answer(c.text, pickReplyInfo({ agent: c.agent, model: c.model, durationMs: c.durationMs }), c.msgId);
+          await req.answer(c.text, pickReplyInfo({ agent: c.agent, model: c.model, engine: c.engine, durationMs: c.durationMs }), c.msgId);
           if (telegram) await logged("Board-Beitrag", () => telegram.contribution(c));
         },
         async failed(agent) {
@@ -405,7 +412,12 @@ export function createBotCommands(deps: BotCommandDeps): CommandPort {
         const response = await withApprovals(turn);
         // Nur ein harter Abbruch (zweites /stop, Beenden) zählt; der Stopp-Knopf wartet den Beitrag ab
         if (response === ABORT_REPLY || scope?.signal.aborted) return { text: "", aborted: true };
-        return { text: response, ...(turnInfo?.model ? { model: turnInfo.model } : {}), ...(turnInfo ? { durationMs: turnInfo.durationMs } : {}) };
+        return {
+          text: response,
+          ...(turnInfo?.model ? { model: turnInfo.model } : {}),
+          ...(turnInfo?.engine ? { engine: turnInfo.engine } : {}),
+          ...(turnInfo ? { durationMs: turnInfo.durationMs } : {}),
+        };
       };
       gracefulStop = () => requestBoardStop(sessionKey);
       try {
@@ -428,13 +440,13 @@ export function createBotCommands(deps: BotCommandDeps): CommandPort {
       }
     }
 
-    async function resetSession(): Promise<SessionResetOutcome> {
+    async function resetSession(options?: SessionResetOptions): Promise<SessionResetOutcome> {
       // Letzte Gelegenheit für einen Stopp; ab dem Reset gilt der Befehl als
       // ausgeführt, ein späterer Stopp meldet keinen Abbruch mehr
       if (isAborted()) throw new DOMException("Befehl gestoppt", "AbortError");
       committed = true;
       req.commit();
-      const result = await deps.resetConversation(conversationId);
+      const result = await deps.resetConversation(conversationId, options?.whileBlocked);
       return result.status === "done" ? { status: "done", reset: result.reset, sessionMode: result.sessionMode } : result;
     }
 
@@ -563,9 +575,15 @@ export function createBotCommands(deps: BotCommandDeps): CommandPort {
               if (stopped()) scope.abort();
               scope.signal.throwIfAborted();
               return execute();
+            }, {
+              // Wartehinweis (Issue #188) für /critic, /board, /voice: nur im Browser, nie gespeichert
+              onQueueWait: createQueueNotifier(text => createWebSink(req.sink).notice(text), deps.topicNames),
+              ...(deps.queueNoticeMs !== undefined ? { queueNoticeMs: deps.queueNoticeMs } : {}),
             });
       if (early) return early;
     } catch (e) {
+      // Neustart läuft (Issue #190): Befehl nicht angenommen, klare Meldung
+      if (isRestartPendingError(e)) return { failed: RESTART_PENDING_REPLY };
       if (!committed && (isAbortError(e) || isAborted())) aborted = true;
       else throw e;
     } finally {

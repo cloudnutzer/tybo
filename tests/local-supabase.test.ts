@@ -166,7 +166,7 @@ describe("Erfolg", () => {
     const r = await s.run();
     expect(r.ok).toBe(true);
     expect(r.message).toContain("Supabase läuft auf diesem Rechner und ist eingerichtet.");
-    expect(s.f.trail()).toEqual(["docker --version", "docker info", "supabase --version", "docker network inspect", "docker network create", "supabase start", "docker ps", "supabase status"]);
+    expect(s.f.trail()).toEqual(["docker --version", "docker info", "supabase --version", "docker network inspect", "docker network create", "supabase start", "docker ps", "supabase status", "docker info", "docker context"]);
     // Eigenes Netz, das alle Ports an 127.0.0.1 bindet (daemon.json "ip" gilt dort nicht)
     const create = s.f.run.calls.find(c => shortName(c.cmd) === "docker network create")!;
     expect(create.cmd).toEqual(["docker", "network", "create", "--driver", "bridge", "-o", "com.docker.network.bridge.host_binding_ipv4=127.0.0.1", LOCAL_NETWORK]);

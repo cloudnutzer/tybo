@@ -12,12 +12,13 @@
  * 3100) starten, Adresse und Code ins Terminal bzw. Log schreiben, dann auf
  * „Fertig“ oder Strg+C warten. Nach „Fertig“ schließt erst der Server (damit
  * der Port für die WebUI des Bots frei ist), dann:
- * - restart: der Prozess läuft unter launchd oder PM2; er endet, der
+ * - restart: der Prozess läuft unter launchd, PM2 oder systemd; er endet, der
  *   Supervisor startet ihn neu, und diesmal startet der Bot normal. Ein
  *   Neustart-Marker (data/restart-requested) genügt hier nicht: den liest
  *   nur der laufende Bot.
  * - autostart: ohne Supervisor, aber gewünscht: jetzt erst richtet
- *   autostartStep den Dienst ein, der den Bot sofort startet.
+ *   autostartStep den Dienst ein, der den Bot sofort startet, auf dem im
+ *   Browser gewählten Weg (Issue #207: systemd oder PM2).
  * - manual: der Startbefehl steht im Terminal bzw. Log.
  * Der Rückgabewert ist der Exit-Code; beenden muss der Aufrufer.
  *
@@ -35,11 +36,12 @@
  */
 
 import { BRAND } from "../brand";
-import type { Supervisor } from "../lib/restart-request";
+import { supervisorName, type Supervisor } from "../lib/restart-request";
 import { DEFAULT_WEB_PORT } from "../web/config";
 import { createSetupContext, type SetupContext } from "./context";
 import type { StartMode } from "./start-mode";
 import { autostartStep } from "./steps/autostart";
+import { probeCleanupWarning, probeMark, probeRunning, waitForProbes } from "./semantic-search";
 import { pendingSafetyWarnings, takeSafetyOutcomes, waitForSafetyWork } from "./steps/common";
 import { createSetupServer, formatSetupCode, generateSetupCode, type FinishPlan, type SetupServerOptions } from "./web-server";
 
@@ -146,6 +148,8 @@ export async function runSetupMode(options: SetupModeOptions): Promise<number> {
   off();
 
   if (outcome === "interrupted") {
+    // Nachweise ab hier: ihr Ergebnis ruft kein Browser mehr ab
+    const mark = probeMark();
     const runGraceMs = options.runGraceMs ?? RUN_GRACE_MS;
     // Warnungen früherer Abläufe gelten weiter; ihre übrigen Ausgänge standen schon im Browser
     const earlier = takeSafetyOutcomes().filter(o => o.alert);
@@ -168,6 +172,10 @@ export async function runSetupMode(options: SetupModeOptions): Promise<number> {
     for (const text of new Set(outcomes.map(o => o.text))) log(text);
     if (waited && !outcomes.some(o => o.alert)) log("Die Prüfung ist fertig.");
     if (result === "frist") log("Die Einrichtung endet trotzdem.");
+    // Eine angefangene Probe der semantischen Suche nie stehen lassen (Issue #166)
+    if (probeRunning()) log("Räume vorher die Probe der semantischen Suche auf …");
+    const probeWarning = probeCleanupWarning((await waitForProbes(mark)).uncleaned);
+    if (probeWarning) log(probeWarning);
     await server.stop();
     log(`Einrichtung ohne Abschluss beendet. Gespeicherte Schritte bleiben; weiter mit: ${BRAND.name} setup`);
     return EXIT_INTERRUPTED;
@@ -178,14 +186,16 @@ export async function runSetupMode(options: SetupModeOptions): Promise<number> {
   await server.stop();
 
   if (outcome.kind === "restart") {
-    log(`Einrichtung abgeschlossen, ${outcome.supervisor === "launchd" ? "launchd" : "PM2"} startet ${BRAND.name} neu.`);
+    log(`Einrichtung abgeschlossen, ${supervisorName(outcome.supervisor)} startet ${BRAND.name} neu.`);
     return 0;
   }
   if (outcome.kind === "autostart") {
-    const result = await autostartStep.apply!({}, ctx);
+    // Gewählter Weg aus dem Browser (Issue #207), sonst der Standard
+    const result = await autostartStep.apply!(outcome.manager ? { manager: outcome.manager } : {}, ctx);
     log(result.message);
     if (!result.ok) {
-      log(`Von Hand starten mit: ${startCommand}`);
+      // Läuft der Bot schon (nur der Start ohne Anmeldung fehlt oder Supabase scheiterte), kein zweiter Start von Hand
+      if (!result.running) log(`Von Hand starten mit: ${startCommand}`);
       return 1;
     }
     return 0;

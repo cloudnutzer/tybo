@@ -5,6 +5,25 @@ Zeitlimit einer Antwort (Entscheidung `docs/webui/decisions/0016-hintergrund-job
 Issue #103). Ein Wächter-Prozess startet Claude, wartet auf das Ende und
 meldet sich immer, auch wenn Claude abstürzt oder keinen Bericht schreibt.
 
+## Wann ein Job statt einer Chat-Antwort
+
+Ein Chat-Turn endet nach einer Zeit ohne Aktivität und spätestens an einer
+Obergrenze (`src/lib/turn-limits.ts`, einstellbar über `TYBO_CLAUDE_IDLE_MIN`
+und `TYBO_CLAUDE_MAX_MIN`). Der Block `LONG TASKS` im Basis-Prompt aller
+Agenten (`LONG_TASK_RULES` in `src/agents/base.ts`, Issue #180) sagt Claude
+deshalb:
+
+- Aufträge, die voraussichtlich länger als 15 Minuten dauern oder mehrere
+  Hilfs-Agenten nacheinander abwarten, als Job starten: kurze Antwort mit
+  Plan, eigenständiger Auftrag in einer Datei, dann `bun run job start`.
+  Bestätigt wird erst, wenn der Start eine Job-ID ausgegeben hat.
+- Nie länger als 2 Minuten in einem Befehl mit `sleep` oder Polling warten.
+- Hilfs-Agenten im Vordergrund starten und ihr Ergebnis direkt nutzen.
+- Bei längeren Turns früh den Plan melden (`bun run notify --source agent --text …`).
+
+Die Regel ist ein Hinweis im Prompt, keine Sperre. Bestehende Sessions sehen
+sie erst ab der nächsten frischen Session (`/new`).
+
 ## Befehle
 
 ```bash

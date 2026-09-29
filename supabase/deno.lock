@@ -20,7 +20,6 @@
         "npm:marked@^18.0.14",
         "npm:pdfkit@~0.17.2",
         "npm:pptxgenjs@^4.0.1",
-        "npm:puppeteer@^25.10.0",
         "npm:telegram@^2.26.22",
         "npm:typescript@^5.9.3",
         "npm:zod@^3.25.76"

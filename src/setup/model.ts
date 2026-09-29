@@ -42,6 +42,7 @@ export const STEP_IDS = [
   "telegram",
   "gruppe",
   "datenbank",
+  "suche",
   "profil",
   "modelle",
   "webui",
@@ -126,6 +127,13 @@ export interface ApplyResult {
   message: string;
   /** Geänderte Variablennamen oder Dateipfade, nie Werte */
   changed: string[];
+  /**
+   * Nur Autostart (Issue #207): der Dienst läuft, auch wenn ok false ist
+   * (etwa weil der Start ohne Anmeldung noch fehlt oder danach der
+   * Supabase-Dienst scheiterte). Dann nicht zum Starten
+   * von Hand auffordern.
+   */
+  running?: boolean;
 }
 
 export type ChoicesResult = { choices: FieldChoice[] } | { error: string };
@@ -151,8 +159,11 @@ export interface SetupStep {
   optional: boolean;
   fields: SetupField[];
   status(ctx: SetupContext): Promise<StepStatus>;
-  /** Verbindungstest; fehlt bei Schritten ohne Gegenstelle */
-  test?(values: SetupValues, ctx: SetupContext): Promise<TestResult>;
+  /**
+   * Verbindungstest; fehlt bei Schritten ohne Gegenstelle. signal: Abbruch
+   * (Strg+C); ein Test, der etwas anlegt, räumt danach trotzdem auf.
+   */
+  test?(values: SetupValues, ctx: SetupContext, signal?: AbortSignal): Promise<TestResult>;
   /** Schreiben; fehlt bei Schritten, die nichts schreiben */
   apply?(values: SetupValues, ctx: SetupContext): Promise<ApplyResult>;
   /**

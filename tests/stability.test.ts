@@ -77,11 +77,11 @@ test("nondefault model resumes and retains the memory watermark", async () => {
   try {
     const module = resolve("src/lib/session-manager.ts");
     const code = `const m = await import(${JSON.stringify(module)});
-      await Promise.all([m.recordSessionTurn('topic:a','general','custom-model','session-a',123),m.recordSessionTurn('topic:b','general','custom-model','session-b',456)]);
-      const s = await m.getResumableSession('topic:a','general','custom-model');
-      if(s?.claudeSessionId!=='session-a'||s?.memoryWatermark!==123) process.exit(1);
-      if(await m.getResumableSession('topic:a','general','other-model')) process.exit(2);
-      if(!(await m.getResumableSession('topic:b','general','custom-model'))) process.exit(3);`;
+      await Promise.all([m.recordSessionTurn('topic:a','general','custom-model','claude','session-a',123),m.recordSessionTurn('topic:b','general','custom-model','claude','session-b',456)]);
+      const s = await m.getResumableSession('topic:a','general','custom-model','claude');
+      if(s?.engineSessionId!=='session-a'||s?.memoryWatermark!==123) process.exit(1);
+      if(await m.getResumableSession('topic:a','general','other-model','claude')) process.exit(2);
+      if(!(await m.getResumableSession('topic:b','general','custom-model','claude'))) process.exit(3);`;
     const child = Bun.spawn([process.execPath, "-e", code], { cwd: dir, stdout: "pipe", stderr: "pipe" });
     const error = await new Response(child.stderr).text();
     expect(await child.exited).toBe(0);

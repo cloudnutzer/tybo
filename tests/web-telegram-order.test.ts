@@ -118,7 +118,7 @@ async function start(core: () => Promise<string>) {
     // wie webTurnDeps in src/bot.ts: das echte saveMessage aus src/lib/convex.ts
     saveMessage,
     processIntents: async () => {},
-    abortClaudeCalls: key => abortExecutions(key),
+    abortEngineCalls: key => abortExecutions(key),
     isShuttingDown: () => false,
     scheduleRestartCheck: () => {},
     sendPlain: async () => {},

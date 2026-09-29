@@ -38,4 +38,4 @@ test("deployment validates first and rolls back an unhealthy release", async () 
       }
     }
   } finally { await rm(dir, { recursive: true }); }
-}, 15_000);
+}, 60_000); // drei echte deploy.sh-Läufe, unter Last über 15 s

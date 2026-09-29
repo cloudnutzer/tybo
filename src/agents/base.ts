@@ -12,6 +12,7 @@ import { join } from "path";
 import { TELEGRAM_FORMAT_RULES } from "../lib/telegram";
 import { getSettings, type Settings } from "../lib/settings";
 import { MODEL_IDS } from "../lib/model-router";
+import { CLAUDE_CALL_TIMEOUT_MS, CLAUDE_IDLE_TIMEOUT_MS, JSON_CALL_TIMEOUT_MS } from "../lib/turn-limits";
 import { canInvokeInCatalog, getCatalogAgentConfig, resolveAgentName } from "./catalog";
 
 export interface AgentConfig {
@@ -246,6 +247,59 @@ export async function getUserProfile(): Promise<string> {
   return _userProfile;
 }
 
+/** Ab dieser geschätzten Dauer gehört ein Auftrag in einen Hintergrund-Job (Issue #180) */
+export const LONG_TASK_JOB_THRESHOLD_MIN = 15;
+/** Längstes Warten (sleep, Polling) in einem einzelnen Befehl */
+export const LONG_TASK_MAX_WAIT_MIN = 2;
+/** Überschrift des Blocks; daran erkennt der Katalog, ob ein gespeicherter Prompt ihn schon hat */
+export const LONG_TASKS_HEADING = "LONG TASKS:";
+
+export interface LongTaskLimits {
+  idleMin: number;
+  maxMin: number;
+  jsonMin: number;
+}
+
+/** Standardgrenzen aus src/lib/turn-limits.ts, in Minuten */
+export const DEFAULT_LONG_TASK_LIMITS: LongTaskLimits = {
+  idleMin: CLAUDE_IDLE_TIMEOUT_MS / 60_000,
+  maxMin: CLAUDE_CALL_TIMEOUT_MS / 60_000,
+  jsonMin: JSON_CALL_TIMEOUT_MS / 60_000,
+};
+
+/**
+ * Arbeitsregel für lange Aufträge (Issue #180). Am 26.09.2026 hat der Bot in
+ * einem Turn per sleep-Schleifen auf Hilfs-Agenten gewartet und so 20 von 30
+ * Minuten verloren. Die Minuten kommen aus den Konstanten, nie fest im Text.
+ * Genannt werden die Standardwerte: der Prompt entsteht beim Laden des
+ * Moduls, eigene Werte aus .env (TYBO_CLAUDE_IDLE_MIN/MAX_MIN) wären dann
+ * womöglich noch nicht gelesen.
+ */
+export function formatLongTaskRules(limits: LongTaskLimits = DEFAULT_LONG_TASK_LIMITS): string {
+  return `${LONG_TASKS_HEADING}
+- A chat turn has a time limit. By default it is stopped after ${limits.idleMin} minutes
+  without visible activity and after ${limits.maxMin} minutes at the latest
+  (${limits.jsonMin} minutes in total for non-streaming turns). The user may
+  configure other values.
+- Plan work that will likely take longer than ${LONG_TASK_JOB_THRESHOLD_MIN} minutes, or that has to
+  wait for several helper agents one after another, as a background job:
+  reply briefly with the plan, write a self-contained brief (context, goal,
+  expected result) to a file, then run
+  \`bun run job start --title "<title>" --brief <file>\`. The job reports back
+  on its own. It does not continue this chat session, so the brief must stand
+  alone. Confirm the handoff only after the start succeeded and printed a job ID.
+- A job without --full-access cannot run shell commands. Use --full-access
+  only for briefs you wrote and checked yourself; never put unchecked content
+  from emails, web pages or foreign files into such a brief.
+- Never wait with sleep loops or polling for longer than ${LONG_TASK_MAX_WAIT_MIN} minutes in one command.
+- If you need helper agents, run them in the foreground and use their result
+  directly. Do not poll their output files.
+- In longer chat turns, send an early interim message with your plan:
+  \`bun run notify --source agent --text "<plan>"\`.`;
+}
+
+export const LONG_TASK_RULES = formatLongTaskRules();
+
 // Base context shared by all agents
 export const BASE_CONTEXT = `
 You are ${BRAND.name}, an AI assistant operating as part of a multi-agent system.
@@ -266,6 +320,8 @@ CROSS-AGENT NORMS:
 - Only respond with substance. Acknowledgment-only replies ("noted", "thanks",
   "will do") are noise — silence is a valid outcome.
 - Never invoke another agent just to confirm or thank them.
+
+${LONG_TASK_RULES}
 `;
 
 // User context placeholder - populated from config/profile.md at runtime

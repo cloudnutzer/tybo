@@ -12,6 +12,20 @@ export const PM2_PREFIX = "tybo-";
 /** Dienst des Bots selbst */
 export const BOT_SERVICE = "telegram-relay";
 
+/**
+ * Supabase auf diesem Rechner (Issue #165): einmaliger Aufruf von
+ * `tybo datenbank start` beim Anmelden bzw. beim Start von PM2, kein Daemon
+ */
+export const SUPABASE_SERVICE = "supabase";
+
+/**
+ * Startzustand und Ergebnis von tybo-supabase unter PM2 (Issue #165), relativ
+ * zum Projektordner: geschrieben von scripts/run-once-and-stay.ts, gelesen von
+ * setup/verify.ts. Der PM2-Eintrag bleibt auch nach einem gescheiterten
+ * Start „online“, der Status allein sagt darum nichts über den Start.
+ */
+export const SUPABASE_START_STATE = "data/supabase-start.json";
+
 export function launchdLabel(service: string): string {
   return `${LAUNCHD_PREFIX}${service}`;
 }
@@ -52,4 +66,16 @@ export function isServicePlist(fileName: string): boolean {
 /** Läuft in `launchctl list` irgendein tybo-Dienst? (für setup/upgrade.ts) */
 export function hasServiceLabels(stdout: string): boolean {
   return stdout.split("\n").some(line => lineLabel(line).startsWith(LAUNCHD_PREFIX));
+}
+
+/**
+ * systemd-Benutzerdienste (Issue #207) heißen wie die PM2-Prozesse,
+ * `tybo-<dienst>`, die Datei `tybo-<dienst>.service`.
+ */
+export function systemdUnit(service: string): string {
+  return `${PM2_PREFIX}${service}`;
+}
+
+export function systemdUnitFile(service: string): string {
+  return `${systemdUnit(service)}.service`;
 }

@@ -7,7 +7,7 @@
  */
 
 import { markdownToTelegramHTML } from "../telegram";
-import type { AgentTurnOptions, CommandContext, CommandMatch, CommandServices, SessionResetOutcome } from "./types";
+import type { AgentTurnOptions, CommandContext, CommandMatch, CommandServices, SessionResetOptions, SessionResetOutcome } from "./types";
 
 /** Was von grammYs Context gebraucht wird */
 export interface TelegramReplier {
@@ -24,7 +24,7 @@ export interface TelegramCommandInput {
   match: CommandMatch;
   services: CommandServices;
   working(): () => void;
-  resetSession(): Promise<SessionResetOutcome>;
+  resetSession(options?: SessionResetOptions): Promise<SessionResetOutcome>;
   /** Telegram liefert die Antwort selbst aus und gibt undefined zurück */
   agentTurn(agent: string, prompt: string, options?: AgentTurnOptions): Promise<string | undefined>;
   boardMeeting(extraContext: string): Promise<void>;
@@ -61,6 +61,54 @@ export function createTelegramCommandContext(input: TelegramCommandInput): Comma
     agentTurn: input.agentTurn,
     boardMeeting: input.boardMeeting,
     services: input.services,
+  };
+}
+
+/** Bausteine des Telegram-Resets; src/bot.ts reicht die echten aus execution-context und session-manager herein */
+export interface TelegramSessionResetDeps<S> {
+  /** Läuft unter dem Schlüssel gerade eine Ausführung? */
+  isActive(sessionKey: string): boolean;
+  /** Sperrt neue Ausführungen unter dem Schlüssel bis zur zurückgegebenen Freigabe */
+  block(sessionKey: string): () => void;
+  sessionsForKey(sessionKey: string): Promise<S[]>;
+  shouldDistill(session: S): boolean;
+  distill(session: S): Promise<unknown>;
+  /** Alle Sessions des Schlüssels (alle Agenten) entfernen, Anzahl zurück */
+  reset(sessionKey: string): Promise<number>;
+  sessionModeEnabled(): boolean;
+}
+
+/**
+ * Session-Reset eines Telegram-Gesprächs. Ohne whileBlocked (/new) wie
+ * bisher ohne Sperre: endende Sessions destillieren, dann verwerfen; ein
+ * laufender Turn speichert danach nichts mehr (Epoche). Mit whileBlocked
+ * (/motor, Issue #125) wie im Browser: läuft im Gespräch eine Antwort,
+ * „busy" und keine Wirkung; sonst sind neue Ausführungen des Schlüssels von
+ * vor dem Reset bis nach whileBlocked gesperrt (sie enden wie nach /stop).
+ * Prüfen und Sperren geschehen ohne await dazwischen.
+ */
+export function createTelegramSessionReset<S>(
+  sessionKey: string,
+  deps: TelegramSessionResetDeps<S>
+): (options?: SessionResetOptions) => Promise<SessionResetOutcome> {
+  const resetNow = async (): Promise<SessionResetOutcome> => {
+    for (const s of await deps.sessionsForKey(sessionKey)) {
+      if (deps.shouldDistill(s)) void Promise.resolve(deps.distill(s)).catch(() => {});
+    }
+    const reset = await deps.reset(sessionKey);
+    return { status: "done", reset, sessionMode: deps.sessionModeEnabled() };
+  };
+  return async options => {
+    if (!options?.whileBlocked) return resetNow();
+    if (deps.isActive(sessionKey)) return { status: "busy" };
+    const release = deps.block(sessionKey);
+    try {
+      const outcome = await resetNow();
+      await options.whileBlocked();
+      return outcome;
+    } finally {
+      release();
+    }
   };
 }
 

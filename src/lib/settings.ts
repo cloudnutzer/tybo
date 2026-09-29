@@ -44,6 +44,61 @@ const auxSpec = z
   .refine((v) => parseAuxSpec(v) !== null, "Format <claude|openrouter|ollama>:<modell>");
 const modelAndEffort = z.object({ model: modelName.optional(), effort: effort.optional() });
 
+/**
+ * Rechte-Stufen von Codex (Entscheidung 0018, Issue #124): full = alles ohne
+ * Sandbox (Standard), workspace-write = Schreiben im Projekt mit Netz,
+ * read-only = nur lesen.
+ */
+export const CODEX_SANDBOX_LEVELS = ["read-only", "workspace-write", "full"] as const;
+export type CodexSandbox = (typeof CODEX_SANDBOX_LEVELS)[number];
+export const DEFAULT_CODEX_SANDBOX: CodexSandbox = "full";
+
+/**
+ * Rechte von OpenCode (Entscheidung 0019, Issue #128): auto = `--auto`,
+ * Fragen werden bestätigt, was die OpenCode-Konfiguration ausdrücklich
+ * verbietet (deny), bleibt verboten (Standard); ask-deny = ohne `--auto`,
+ * jede Frage wird abgelehnt.
+ */
+export const OPENCODE_PERMISSION_LEVELS = ["ask-deny", "auto"] as const;
+export type OpenCodePermission = (typeof OPENCODE_PERMISSION_LEVELS)[number];
+export const DEFAULT_OPENCODE_PERMISSION: OpenCodePermission = "auto";
+
+/**
+ * Wählbare Motoren (Issue #125, OpenCode seit #129). Hier und nicht aus
+ * engines/, weil engines/codex.ts und engines/opencode.ts diese Datei
+ * importieren.
+ */
+export const SELECTABLE_ENGINES = ["claude", "codex", "opencode"] as const;
+export type SelectableEngine = (typeof SELECTABLE_ENGINES)[number];
+
+/** Effort für Codex: dieselben Stufen wie Claude, zusätzlich max */
+export const CODEX_EFFORT_LEVELS = [...EFFORT_LEVELS, "max"] as const;
+
+/** Wie MODEL in engines/codex.ts: was dort als -m durchgeht */
+const codexModelName = modelName.regex(/^[A-Za-z0-9][\w.:/-]*$/, "ungültiger Modellname");
+
+/**
+ * OpenCode-Modell als <anbieter>/<modell>, auch mit weiteren Schrägstrichen
+ * (openrouter/anthropic/claude-opus-5.5); wie MODEL in engines/opencode.ts.
+ */
+export const OPENCODE_MODEL_PATTERN = /^[A-Za-z0-9][\w.:/@-]*$/;
+/**
+ * Variante (Effort) von OpenCode, anbieterabhängig und deshalb frei: 1 bis 20
+ * Zeichen aus Kleinbuchstaben, Ziffern und Bindestrich, auch mit Bindestrich
+ * vorn. Der Motor übergibt den Wert deshalb nur als `--variant=<wert>` (ein
+ * Argument), nie als eigenes Argument, das OpenCode als Option lesen könnte.
+ * Wie EFFORT in engines/opencode.ts.
+ */
+export const OPENCODE_VARIANT_PATTERN = /^[a-z0-9-]{1,20}$/;
+const opencodeModelName = modelName.regex(OPENCODE_MODEL_PATTERN, "ungültiger Modellname");
+const opencodeVariant = z.string().regex(OPENCODE_VARIANT_PATTERN, "1 bis 20 Zeichen aus a-z, 0-9 und -");
+
+/**
+ * Session-Schlüssel eines Gesprächs (sessionKeyFor in supabase.ts):
+ * topic:<chat>:<topic>, group:<chat>, dm:<chat>, web:<id>
+ */
+export const CONVERSATION_KEY_PATTERN = /^(topic:-?\d{1,20}:\d{1,12}|group:-\d{1,20}|dm:-?\d{1,20}|web:[A-Za-z0-9-]{1,64})$/;
+
 export const settingsSchema = z.object({
   defaults: modelAndEffort.optional(),
   // Schluessel: jede gueltige Kennung (Issue #49). Welche Agenten aktiv sind,
@@ -59,6 +114,29 @@ export const settingsSchema = z.object({
       openrouterModel: modelName.optional(),
       ollamaModel: modelName.optional(),
       offlineOnly: z.boolean().optional(),
+    })
+    .optional(),
+  // Motoren (Entscheidungen 0018/0019, Issues #124/#125/#129): Standard,
+  // Ausnahmen pro Gespräch (Session-Schlüssel), Modell/Effort/Rechte für
+  // Codex, Modell/Variante/Rechte für OpenCode (leer = OpenCode-Konfiguration)
+  engine: z
+    .object({
+      default: z.enum(SELECTABLE_ENGINES).optional(),
+      topics: z.record(z.string().regex(CONVERSATION_KEY_PATTERN, "ungültiger Gesprächsschlüssel"), z.enum(SELECTABLE_ENGINES)).optional(),
+      codex: z
+        .object({
+          model: codexModelName.optional(),
+          effort: z.enum(CODEX_EFFORT_LEVELS).optional(),
+          sandbox: z.enum(CODEX_SANDBOX_LEVELS).optional(),
+        })
+        .optional(),
+      opencode: z
+        .object({
+          model: opencodeModelName.optional(),
+          variant: opencodeVariant.optional(),
+          permission: z.enum(OPENCODE_PERMISSION_LEVELS).optional(),
+        })
+        .optional(),
     })
     .optional(),
 });
@@ -129,4 +207,56 @@ export function getSettings(): Settings {
 export async function writeSettings(settings: Settings): Promise<void> {
   const parsed = settingsSchema.parse(settings);
   await atomicWriteFile(settingsPath, JSON.stringify(parsed, null, 2) + "\n");
+}
+
+/** Die Datei ist ungültig: updateSettings schreibt dann nichts */
+export class SettingsFileInvalidError extends Error {
+  constructor() {
+    super(`${settingsPath} ist ungültig`);
+    this.name = "SettingsFileInvalidError";
+  }
+}
+
+let lockChain: Promise<unknown> = Promise.resolve();
+
+/**
+ * Eine Schreibkette für alle Änderungen an der Einstellungsdatei (Issue
+ * #125): /motor und die Einstellungsseite lesen und schreiben nacheinander,
+ * keiner überschreibt die Änderung des anderen.
+ */
+export function withSettingsLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = lockChain.catch(() => {}).then(fn);
+  lockChain = run;
+  return run;
+}
+
+/**
+ * Liest die Datei frisch, wendet mutate auf eine Kopie an und schreibt das
+ * Ergebnis, alles in der Schreibkette. Eine ungültige Datei wird nicht
+ * überschrieben (SettingsFileInvalidError); fehlt sie, gilt {}.
+ */
+export function updateSettings(mutate: (current: Settings) => Settings): Promise<Settings> {
+  return withSettingsLock(async () => {
+    let raw: string | undefined;
+    try {
+      raw = readFileSync(settingsPath, "utf-8");
+    } catch (err: any) {
+      if (err?.code !== "ENOENT") throw err;
+    }
+    let current: Settings = {};
+    if (raw !== undefined) {
+      let json: unknown;
+      try {
+        json = JSON.parse(raw);
+      } catch {
+        throw new SettingsFileInvalidError();
+      }
+      const parsed = settingsSchema.safeParse(json);
+      if (!parsed.success) throw new SettingsFileInvalidError();
+      current = parsed.data;
+    }
+    const next = settingsSchema.parse(mutate(structuredClone(current)));
+    await writeSettings(next);
+    return next;
+  });
 }

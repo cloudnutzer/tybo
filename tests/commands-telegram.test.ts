@@ -23,7 +23,7 @@ function fakeServices(over: Partial<CommandServices> = {}): CommandServices & { 
     isSessionModeEnabled: () => true,
     getGoal: async () => undefined,
     pauseGoal: async (key, reason) => log.push(`pause ${key} ${reason}`),
-    abortClaudeCalls: key => (log.push(`abort ${key}`), 0),
+    abortEngineCalls: key => (log.push(`abort ${key}`), 0),
     listAllOverrides: () => overrides,
     listAgentNames: () => ["general", "research", "critic"],
     resolveAgentName: raw => (["general", "research", "critic"].includes(raw.toLowerCase()) ? raw.toLowerCase() : raw.toLowerCase() === "cfo" ? "finance" : undefined),
@@ -121,13 +121,13 @@ describe("Telegram: Texte wie vor der Umstellung", () => {
     ]);
     const hints: string[] = [];
     const sessions: RoutineSession[] = [
-      { claudeSessionId: "alt", lastActivity: 1 },
-      { claudeSessionId: "neu", lastActivity: 5 },
-      { claudeSessionId: null, lastActivity: 9 },
+      { engineSessionId: "alt", lastActivity: 1 },
+      { engineSessionId: "neu", lastActivity: 5 },
+      { engineSessionId: null, lastActivity: 9 },
     ];
     const services = fakeServices({
       sessionsForKey: async () => sessions,
-      createRoutine: async (s, hint) => (hints.push(`${s.claudeSessionId}|${hint}`), { text: "Routine **fertig**" }),
+      createRoutine: async (s, hint) => (hints.push(`${s.engineSessionId}|${hint}`), { text: "Routine **fertig**" }),
     });
     expect(await run("/routine jeden Montag", { services })).toEqual([
       { text: "Ich friere den Ablauf dieser Session als Routine ein. Das kann ein paar Minuten dauern..." },
@@ -176,9 +176,13 @@ recall <frage> - alte Gespraeche durchsuchen
 /voice <text> - Antwort als Sprachnachricht · "call me ..." - Anruf
 /credit · /plan - Verbrauch · /k3 <frage> - Kimi K3 direkt`;
     // Einzige gewollte Änderung: der /k3-Hinweis ist weg (24.09.2026)
-    // /jobs (Issue #103) kam dazu
+    // /jobs (Issue #103) und /motor (Issue #125) kamen dazu
     const expected = before
       .replace(" · /k3 <frage> - Kimi K3 direkt", "")
+      .replace(
+        "/new - Gespraech in diesem Topic frisch starten\n",
+        "/new - Gespraech in diesem Topic frisch starten\n/motor - Motor dieses Gespraechs zeigen · /motor codex · /motor opencode · /motor claude · /motor standard\n"
+      )
       .replace("/voice <text> - Antwort", "/jobs - Hintergrund-Jobs: laufende und zuletzt beendete\n/voice <text> - Antwort");
     expect(await run("/help")).toEqual([html(expected)]);
     expect(await run("/hilfe")).toEqual([html(expected)]);
@@ -190,12 +194,12 @@ recall <frage> - alte Gespraeche durchsuchen
     expect(await run("/stop", { services })).toEqual([{ text: "Hier laeuft gerade nichts, das ich abbrechen koennte." }]);
     expect(services.log).toEqual(["abort group:-1001"]);
 
-    const busy = fakeServices({ abortClaudeCalls: () => 2, getGoal: async () => ({ status: "active" }) });
+    const busy = fakeServices({ abortEngineCalls: () => 2, getGoal: async () => ({ status: "active" }) });
     expect(await run("/abbruch", { services: busy, topicId: 4 })).toEqual([
       { text: "⏹️ 2 laufende Verarbeitungen abgebrochen, Ziel pausiert (/goal weiter setzt fort)." },
     ]);
     expect(busy.log).toEqual(["pause topic:-1001:4 Vom User gestoppt (/stop)"]);
-    const one = fakeServices({ abortClaudeCalls: () => 1 });
+    const one = fakeServices({ abortEngineCalls: () => 1 });
     expect(await run("/stop", { services: one })).toEqual([{ text: "⏹️ 1 laufende Verarbeitung abgebrochen." }]);
   });
 
@@ -203,7 +207,7 @@ recall <frage> - alte Gespraeche durchsuchen
     let calls = 0;
     const services = fakeServices({
       requestBoardStop: key => (services.log.push(`board ${key}`), ++calls === 1 ? "requested" : "again"),
-      abortClaudeCalls: key => (services.log.push(`abort ${key}`), 1),
+      abortEngineCalls: key => (services.log.push(`abort ${key}`), 1),
     });
     expect(await run("/stop", { services, topicId: 4 })).toEqual([{ text: "⏹️ Board-Sitzung endet nach dem laufenden Beitrag." }]);
     expect(services.log).toEqual(["board topic:-1001:4"]);
@@ -335,7 +339,7 @@ describe("src/bot.ts nutzt das Register (als Text gelesen)", () => {
   test("/memory, /tasks, /credit bleiben in Telegram; /board (Issue #75) und /goal (Issue #76) kommen aus dem Register", () => {
     expect(source).not.toContain('lowerText === "/goal"');
     // /goal pause und /goal stop laufen in Telegram weiter ohne Update-Bereich
-    expect(source).toContain("/^\\/(stop|new|goal\\s+(pause|stop))\\b/i");
+    expect(source).toContain("/^\\/(stop|new|motor|engine|goal\\s+(pause|stop))\\b/i");
     expect(source).not.toContain('lowerText.startsWith("/board ")');
     expect(source).not.toContain('lowerText === "board meeting"');
     expect(source).toContain('lowerText === "/memory"');

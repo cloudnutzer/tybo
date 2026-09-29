@@ -116,8 +116,9 @@ async function storeKnowledge(entry: KnowledgeEntry): Promise<string> {
 
 /**
  * Generate and store an embedding for a knowledge entry.
- * Uses the embed-knowledge edge function (OpenAI text-embedding-3-small).
- * Silently skips if OpenAI key is not configured on the edge function.
+ * Uses the embed-knowledge edge function (Anbieter aus EMBEDDING_PROVIDER,
+ * Standard OpenAI text-embedding-3-small, Issue #167).
+ * Silently skips if no key is configured on the edge function.
  */
 async function generateEmbedding(knowledgeId: string, text: string): Promise<void> {
   const supabaseUrl = process.env.SUPABASE_URL;

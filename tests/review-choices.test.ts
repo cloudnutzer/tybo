@@ -342,7 +342,7 @@ describe("Akzeptanz: nach 7 Tagen abgelaufen", () => {
 });
 
 describe("Routine-Angebot", () => {
-  const session = { key: `topic:${GROUP}:9:research`, claudeSessionId: "s1", agentName: "research", messageCount: 9 } as BotSession;
+  const session = { key: `topic:${GROUP}:9:research`, engine: "claude", engineSessionId: "s1", agentName: "research", messageCount: 9 } as BotSession;
 
   async function offer() {
     const id = await stageRoutineReview({ chatId: GROUP, topicId: 9, description: "Wochenbericht bauen", session });
@@ -358,7 +358,7 @@ describe("Routine-Angebot", () => {
     await Promise.all(w.background);
     expect(w.routines).toHaveLength(1);
     expect(w.routines[0].hint).toBe("Wochenbericht bauen");
-    expect(w.routines[0].session.claudeSessionId).toBe("s1");
+    expect(w.routines[0].session.engineSessionId).toBe("s1");
     expect(notices()).toEqual([{ chatId: GROUP, topicId: 9, text: routineStartText("Wochenbericht bauen") }]);
     expect(w.plain).toEqual([{ chatId: GROUP, text: "Routine gespeichert: skill wochenbericht", topicId: 9 }]);
     expect(w.saved).toEqual([
@@ -485,7 +485,7 @@ describe("Reines Web-Gespräch", () => {
   });
 
   test("Routine-Bericht: im Web-Gespräch als Antwort, routine_report im Gedächtnis des Web-Gesprächs, Kopie im Direktchat", async () => {
-    const session = { key: `web:${WEB_ID}:general`, claudeSessionId: "s2", agentName: "general", messageCount: 9 } as BotSession;
+    const session = { key: `web:${WEB_ID}:general`, engine: "claude", engineSessionId: "s2", agentName: "general", messageCount: 9 } as BotSession;
     await stageRoutineReview({ chatId: `web:${WEB_ID}`, description: "Ablauf", session });
     const { choice } = await onlyChoice();
     await w.browser(WEB_ID, choice.id, "routine");
@@ -499,7 +499,7 @@ describe("Reines Web-Gespräch", () => {
 });
 
 describe("Session-Ende im Web-Gespräch", () => {
-  const session = { key: `web:${WEB_ID}:research`, claudeSessionId: "s3", agentName: "research", messageCount: 9 } as BotSession;
+  const session = { key: `web:${WEB_ID}:research`, engine: "claude", engineSessionId: "s3", agentName: "research", messageCount: 9 } as BotSession;
   const aux = (text: string) => async () => ({ text, isError: false }) as any;
 
   test("Schlüssel web:<id>:<agent> ergibt das Web-Gespräch; Telegram-Schlüssel wie bisher", () => {
@@ -591,7 +591,7 @@ describe("Alte rev|-Knöpfe", () => {
   });
 
   test("Routine-Angebot von vor dem Update: einfrieren im Hintergrund, Bericht wie bisher", async () => {
-    const session = { key: `dm:${USER}:general`, claudeSessionId: "s4", agentName: "general", messageCount: 9 } as BotSession;
+    const session = { key: `dm:${USER}:general`, engine: "claude", engineSessionId: "s4", agentName: "general", messageCount: 9 } as BotSession;
     await stagePendingReview({ id: "rout", type: "routine", chatId: USER, routineDescription: "X", session, createdAt: Date.now() });
     expect(await w.results.legacy("routine", "rout")).toEqual({ text: "✓ Als Routine speichern (in Telegram)" });
     await Promise.all(w.background);
@@ -653,7 +653,7 @@ describe("Verdrahtung in src/bot.ts", async () => {
 
   test("Handler der Art review über decideReview, Ergebnis über sendAndRecord, Routine wie bisher", () => {
     expect(bot).toContain('onChoiceDecided("review", reviewResults.handler);');
-    expect(bot).toContain("createRoutine: (session, hint) => createRoutineFromSession(session, hint),");
+    expect(bot).toContain("createRoutine: (session, hint, epoch) => createRoutineFromSession(session, hint, {}, epoch),");
     expect(bot).toContain("sendTelegram: (chatId, text, topicId) => sendDirectMessage(chatId, text, topicId),");
     expect(bot).toContain("saveMessage: (message) => saveMessage(message),");
     // Die Routine-Ausführung steht nicht mehr im Callback-Handler

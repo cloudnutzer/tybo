@@ -1,10 +1,29 @@
 name: Check
-on: [push, pull_request]
+# PR-Branches prüft pull_request; push nur auf master, sonst läuft jeder PR doppelt
+on:
+  push:
+    branches: [master]
+  pull_request:
 permissions:
   contents: read
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Echtes PostgreSQL mit pgvector für tests/embedding-reindex-pg.test.ts (Issue #168)
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2

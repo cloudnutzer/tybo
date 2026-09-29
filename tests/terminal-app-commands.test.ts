@@ -169,7 +169,7 @@ describe("Befehle im Vollmodus", () => {
     const { s, stdin, stdout, exit } = await start("topic-443");
     const before = (await s.client().messages("topic-443")).messages.length;
     stdin.type("/new\r");
-    await waitFor(() => stdout.text.includes("new ausgeführt"), 3000, "Meldung");
+    await waitFor(() => stdout.text.includes("new ausgeführt"), 10_000, "Meldung");
     expect(stdout.text).toContain("Meldung von befehl");
     expect(s.commandRuns.map(r => [r.conversationId, r.text, r.source])).toEqual([["topic-443", "/new", "terminal"]]);
     expect(s.telegramChat.calls).toHaveLength(0);
@@ -181,7 +181,7 @@ describe("Befehle im Vollmodus", () => {
     expect((await s.client().messages("topic-443")).messages.length).toBe(before);
     stdin.type("\u0004");
     await exit;
-  });
+  }, 30_000); // echter Kindprozess, unter Last über 5 s
 
   test("/agent geht an den Server (Bedeutung wie in Telegram), /zuordnen ändert den Agenten", async () => {
     const { s, stdin, stdout, exit } = await start("topic-443");

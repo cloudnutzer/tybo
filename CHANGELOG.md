@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.13.0: choose your engine, guided search, Raspberry Pi
+
+- **Choose the engine:** besides Claude Code, tybo can now run on **Codex**
+  (with your ChatGPT login) or **OpenCode** (with OpenRouter or another
+  provider). Pick a default in the WebUI settings or switch per conversation
+  with `/motor`; sessions remember their engine.
+- **Local Supabase for good:** Supabase on your own machine now starts
+  with the system and comes with a backup command (`tybo datenbank`).
+- **Semantic search, guided:** `tybo setup suche` deploys the Edge Functions
+  and tests them; choose OpenAI, Google Gemini or a local Ollama model for
+  embeddings, and switch later with a background recompute.
+- **Raspberry Pi and Linux:** a systemd user service via `tybo setup
+  autostart`, parallel jobs sized to the available memory, clearer installer
+  hints, and a guide for running tybo around the clock on a Raspberry Pi 5
+  (`docs/raspberry-pi.md`).
+- **Parallel work, safer:** a notice when all slots are busy, `/stop` works
+  immediately, `/new` no longer comes back, button answers land in the right
+  topic, goals resume after a restart.
+- **Long runs:** the time limit counts idle time instead of total time, and
+  after a timeout tybo reports the state instead of restarting with a
+  fallback model.
+- **WebUI:** timestamps on all messages.
+
 ## 2.12.0: first public release
 
 The first public version of tybo, an always-on AI assistant on Telegram and

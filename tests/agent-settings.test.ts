@@ -11,6 +11,7 @@ import { sessionKeyFor } from "../src/lib/convex";
 import type { ClaudeResult, ClaudeStreamOptions } from "../src/lib/claude";
 import type { BotSession } from "../src/lib/session-manager";
 import { isolateAgentCatalog } from "./catalog-fixture";
+import { createClaudeEngine } from "../src/lib/engines";
 
 // Vorrang: config/settings.json (Agent, dann Standard) vor .env vor Agenten-Datei.
 // Einstellungen kommen hier aus temporären Dateien oder Fakes, Claude ist gefälscht.
@@ -158,8 +159,7 @@ function fakeTurnDeps(results: ClaudeResult[]) {
     return next;
   };
   const deps: Partial<ChatTurnDeps> = {
-    callClaude: fakeCall,
-    callClaudeStreaming: fakeCall,
+    getEngine: () => createClaudeEngine({ callClaude: fakeCall, callClaudeStreaming: fakeCall }),
     callFallbackLLMWithSource: async () => ({ text: "fallback", source: "none" }),
     buildPromptContext: async () => ({ fullPrompt: "voll", fallbackContext: "" }),
     buildResumePrompt: async () => "resume",
@@ -174,12 +174,12 @@ function fakeTurnDeps(results: ClaudeResult[]) {
       store.delete(`${key}|${agent}`);
       return s;
     },
-    recordSessionTurn: async (key, agent, model, sid) => {
+    recordSessionTurn: async (key, agent, model, _engine, sid) => {
       recorded.push({ model, sid });
       store.set(`${key}|${agent}`, {
         key: `${key}|${agent}`,
         agentName: agent,
-        claudeSessionId: sid,
+        engine: "claude", engineSessionId: sid,
         model,
         startedAt: 1,
         lastActivity: 1,
@@ -284,7 +284,7 @@ describe("Telegram-Button-Antwort nach Modellwechsel", () => {
     // Button-Antwort wie in src/bot.ts: Session mit MODEL_IDS.opus gefunden,
     // Resume ohne Modell, finalizeClaudeSession ohne Modell
     const topicSession = await t.deps.getResumableSession!(KEY, "general", MODEL_IDS.opus);
-    expect(topicSession?.claudeSessionId).toBe("sid-a");
+    expect(topicSession?.engineSessionId).toBe("sid-a");
     await finalizeClaudeSession(KEY, "general", ok("antwort", "sid-a"), undefined, undefined, t.deps);
     expect(t.recorded.at(-1)).toEqual({ model: MODEL_IDS.opus, sid: "sid-a" });
     expect(t.store.get(`${KEY}|general`)!.model).toBe(MODEL_IDS.opus);
@@ -311,12 +311,12 @@ describe("Telegram-Button-Antwort überlappt mit neuem Turn", () => {
 
     // Button-Antwort beginnt wie in src/bot.ts: Session sid-a gefunden, Resume läuft
     const topicSession = await t.deps.getResumableSession!(KEY, "general", MODEL_IDS.opus);
-    expect(topicSession?.claudeSessionId).toBe("sid-a");
+    expect(topicSession?.engineSessionId).toBe("sid-a");
 
     // Währenddessen: Einstellungen auf B, ein Chat-Turn schließt als sid-b/B ab
     putSettings({ defaults: { model: "modell-b" } });
     expect(await turn()).toBe("b1");
-    expect(t.store.get(`${KEY}|general`)).toMatchObject({ claudeSessionId: "sid-b", model: "modell-b" });
+    expect(t.store.get(`${KEY}|general`)).toMatchObject({ engine: "claude", engineSessionId: "sid-b", model: "modell-b" });
 
     // Jetzt erst wird die alte Button-Antwort finalisiert
     const before = t.recorded.length;
@@ -324,8 +324,8 @@ describe("Telegram-Button-Antwort überlappt mit neuem Turn", () => {
 
     // sid-b/B bleibt, sid-a wird nirgends unter B gespeichert
     expect(t.recorded.length).toBe(before);
-    expect(t.store.get(`${KEY}|general`)).toMatchObject({ claudeSessionId: "sid-b", model: "modell-b" });
+    expect(t.store.get(`${KEY}|general`)).toMatchObject({ engine: "claude", engineSessionId: "sid-b", model: "modell-b" });
     expect(t.recorded).not.toContainEqual({ model: "modell-b", sid: "sid-a" });
-    expect(await t.deps.getResumableSession!(KEY, "general", "modell-b")).toMatchObject({ claudeSessionId: "sid-b" });
+    expect(await t.deps.getResumableSession!(KEY, "general", "modell-b")).toMatchObject({ engine: "claude", engineSessionId: "sid-b" });
   });
 });

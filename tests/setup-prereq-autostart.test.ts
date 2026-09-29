@@ -11,7 +11,15 @@ import { PROJECT_ROOT } from "../src/setup/context";
 import { createProviders } from "../src/setup/providers";
 import { checkStep } from "../src/setup/steps";
 import { autostartStep, PM2_INSTALL } from "../src/setup/steps/autostart";
-import { CLAUDE_INSTALL, MIN_BUN_VERSION, prerequisitesStep, versionAtLeast } from "../src/setup/steps/prerequisites";
+import {
+  CLAUDE_INSTALL,
+  CLAUDE_INSTALL_WINDOWS,
+  CLAUDE_NOT_IN_PATH,
+  LOCAL_BIN_PATH_FIX,
+  MIN_BUN_VERSION,
+  prerequisitesStep,
+  versionAtLeast,
+} from "../src/setup/steps/prerequisites";
 import { backupsOf, cleanup, FAKE, FULL_ENV, fakeRun, leakedSecrets, makeCtx, root } from "./setup-fixture";
 
 afterAll(cleanup);
@@ -117,12 +125,149 @@ describe("Schritt voraussetzungen", () => {
     expect(leakedSecrets(s2)).toEqual([]);
   });
 
+  test("empfohlener Installationsweg: nativer Installer, unter Windows npm", async () => {
+    expect(CLAUDE_INSTALL).toBe("curl -fsSL https://claude.ai/install.sh | bash");
+    for (const [platform, fix] of [
+      ["linux", CLAUDE_INSTALL],
+      ["darwin", CLAUDE_INSTALL],
+      ["win32", CLAUDE_INSTALL_WINDOWS],
+    ] as const) {
+      const ctx = await makeCtx({ overrides: { platform } });
+      ctx.providers.results.claudeVersion = { ok: false, message: "Claude CLI nicht gefunden.", notFound: true };
+      const s = await prerequisitesStep.status(ctx);
+      expect(s.items?.find(i => i.label === "Claude CLI")?.fix).toBe(fix);
+    }
+    expect(CLAUDE_INSTALL_WINDOWS).toBe("npm install -g @anthropic-ai/claude-code");
+  });
+
   test("schreibt nichts", async () => {
     const ctx = await makeCtx();
     await prerequisitesStep.status(ctx);
     await prerequisitesStep.test!({}, ctx);
     expect(prerequisitesStep.apply).toBeUndefined();
     expect(await Bun.file(ctx.envPath).exists()).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #212: claude in ~/.local/bin, aber nicht im PATH
+// ---------------------------------------------------------------------------
+
+describe("Schritt voraussetzungen: Claude CLI in ~/.local/bin", () => {
+  type Answer = { ok: boolean; message: string; notFound?: true };
+  const NOT_FOUND: Answer = { ok: false, message: "Claude CLI nicht gefunden.", notFound: true };
+  const BROKEN: Answer = { ok: false, message: "Die Claude CLI ist da, startet aber nicht richtig („claude --version“ scheitert). Neu installieren." };
+  const WORKS: Answer = { ok: true, message: "Claude CLI 2.1.300" };
+
+  /**
+   * Kontext mit Antworten je Pfad: "claude" (Suche im PATH) und die Datei in
+   * ~/.local/bin. localFile: Datei anlegen (sonst fehlt sie).
+   */
+  async function ctxWith(options: { inPath: Answer; local?: Answer; localFile?: boolean; env?: string; platform?: NodeJS.Platform }) {
+    const ctx = await makeCtx({ env: options.env, overrides: { platform: options.platform ?? "linux" } });
+    const local = join(ctx.home, ".local", "bin", "claude");
+    if (options.localFile !== false) {
+      await mkdir(dirname(local), { recursive: true });
+      await writeFile(local, "#!/bin/sh\n");
+      await chmod(local, 0o755);
+    }
+    const asked: string[] = [];
+    ctx.providers.claudeVersion = async path => {
+      asked.push(path);
+      return path === local ? (options.local ?? WORKS) : options.inPath;
+    };
+    return { ctx, local, asked };
+  }
+
+  const claudeOf = (items?: { label: string; ok: boolean; detail: string; fix?: string }[]) => items?.find(i => i.label === "Claude CLI");
+
+  test("vorhanden, nicht im PATH: PATH-Hinweis statt Installationsbefehl (status und test)", async () => {
+    const { ctx, local, asked } = await ctxWith({ inPath: NOT_FOUND });
+    const s = await prerequisitesStep.status(ctx);
+    const item = claudeOf(s.items);
+    expect(item?.ok).toBe(false);
+    expect(item?.detail).toStartWith("Claude CLI liegt in ~/.local/bin, das ist noch nicht im PATH: neue Sitzung öffnen.");
+    expect(item?.detail).toBe(CLAUDE_NOT_IN_PATH);
+    expect(item?.fix).toBe(LOCAL_BIN_PATH_FIX);
+    expect(item?.fix).toBe('export PATH="$HOME/.local/bin:$PATH"');
+    expect(asked).toEqual(["claude", local]);
+
+    const r = await prerequisitesStep.test!({}, ctx);
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain(CLAUDE_NOT_IN_PATH);
+    expect(claudeOf(r.items)?.fix).toBe(LOCAL_BIN_PATH_FIX);
+    // Kein Probeaufruf, keine Installation
+    expect(ctx.providers.calls.map(c => c.method)).not.toContain("claudeProbe");
+    expect(ctx.run.calls).toEqual([["git", "--version"], ["git", "--version"]]);
+  });
+
+  test("auch im Einrichtungsmodus des Browsers", async () => {
+    const { ctx } = await ctxWith({ inPath: NOT_FOUND });
+    ctx.noModelCalls = true;
+    const r = await prerequisitesStep.test!({}, ctx);
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain(CLAUDE_NOT_IN_PATH);
+  });
+
+  test("fehlt ganz: Installationsbefehl", async () => {
+    const { ctx, asked } = await ctxWith({ inPath: NOT_FOUND, localFile: false });
+    const item = claudeOf((await prerequisitesStep.status(ctx)).items);
+    expect(item?.detail).toBe("Claude CLI nicht gefunden.");
+    expect(item?.fix).toBe("curl -fsSL https://claude.ai/install.sh | bash");
+    expect(asked).toEqual(["claude"]);
+  });
+
+  test("schon im PATH erreichbar: ok, ~/.local/bin wird nicht extra gefragt", async () => {
+    const { ctx, asked } = await ctxWith({ inPath: WORKS });
+    const s = await prerequisitesStep.status(ctx);
+    expect(claudeOf(s.items)?.ok).toBe(true);
+    expect(claudeOf(s.items)?.fix).toBeUndefined();
+    expect(asked).toEqual(["claude"]);
+    const r = await prerequisitesStep.test!({}, ctx);
+    expect(r.ok).toBe(true);
+  });
+
+  test("im PATH, aber defekt: kein PATH-Hinweis, Neuinstallation", async () => {
+    const { ctx, asked } = await ctxWith({ inPath: BROKEN });
+    const item = claudeOf((await prerequisitesStep.status(ctx)).items);
+    expect(item?.detail).toBe(BROKEN.message);
+    expect(item?.fix).toBe(CLAUDE_INSTALL);
+    expect(asked).toEqual(["claude"]);
+  });
+
+  test("in ~/.local/bin, startet dort aber nicht: kein PATH-Hinweis", async () => {
+    const { ctx } = await ctxWith({ inPath: NOT_FOUND, local: BROKEN });
+    const item = claudeOf((await prerequisitesStep.status(ctx)).items);
+    expect(item?.detail).toBe("Claude CLI liegt in ~/.local/bin, startet dort aber nicht. Neu installieren.");
+    expect(item?.fix).toBe(CLAUDE_INSTALL);
+  });
+
+  test("CLAUDE_PATH gesetzt: gilt, ~/.local/bin wird nicht als Ersatz genommen", async () => {
+    const { ctx, asked } = await ctxWith({ inPath: NOT_FOUND, env: "CLAUDE_PATH=/opt/claude/bin/claude\n" });
+    const item = claudeOf((await prerequisitesStep.status(ctx)).items);
+    expect(item?.detail).toBe("Claude CLI nicht gefunden.");
+    expect(item?.fix).toBe(CLAUDE_INSTALL);
+    expect(asked).toEqual(["/opt/claude/bin/claude"]);
+  });
+
+  test("Ordner ~/.local/bin/claude statt Datei: Installationsbefehl", async () => {
+    const { ctx, local } = await ctxWith({ inPath: NOT_FOUND, localFile: false });
+    await mkdir(local, { recursive: true });
+    expect(claudeOf((await prerequisitesStep.status(ctx)).items)?.fix).toBe(CLAUDE_INSTALL);
+  });
+
+  test("nutzt ctx.home, nicht das echte HOME", async () => {
+    const { ctx, asked } = await ctxWith({ inPath: NOT_FOUND });
+    await prerequisitesStep.status(ctx);
+    expect(asked[1]).toStartWith(ctx.home);
+    expect(ctx.home).not.toBe(process.env.HOME);
+  });
+
+  test("Windows: kein Sonderfall, npm-Weg", async () => {
+    const { ctx, asked } = await ctxWith({ inPath: NOT_FOUND, platform: "win32" });
+    const item = claudeOf((await prerequisitesStep.status(ctx)).items);
+    expect(item?.fix).toBe(CLAUDE_INSTALL_WINDOWS);
+    expect(asked).toEqual(["claude"]);
   });
 });
 
@@ -169,7 +314,21 @@ describe("Claude-Port", () => {
     const found = createProviders({ fetch: async () => new Response(""), run: fakeRun({ "claude --version": { stdout: "2.1.300 (Claude Code)" } }) });
     expect(await found.claudeVersion("claude")).toEqual({ ok: true, message: "Claude CLI 2.1.300" });
     const missing = createProviders({ fetch: async () => new Response(""), run: fakeRun() });
-    expect((await missing.claudeVersion("claude")).ok).toBe(false);
+    expect(await missing.claudeVersion("claude")).toEqual({ ok: false, message: "Claude CLI nicht gefunden.", notFound: true });
+  });
+
+  test("Version: vorhanden, aber defekt oder nicht ausführbar gilt nicht als „nicht gefunden“ (Issue #212)", async () => {
+    for (const answer of [
+      { code: -1, stdout: "", stderr: "Befehl ließ sich nicht starten", spawnError: "EACCES" },
+      { code: 1, stdout: "", stderr: "Fehler" },
+      { code: -1, stdout: "", stderr: "", timedOut: true },
+    ]) {
+      const broken = createProviders({ fetch: async () => new Response(""), run: (async () => answer) as any });
+      const r = await broken.claudeVersion("claude");
+      expect(r.ok).toBe(false);
+      expect(r.notFound).toBeUndefined();
+      expect(r.message).toContain("startet aber nicht richtig");
+    }
   });
 
   test("Version: Geheimnisse in der Ausgabe werden vollständig unterdrückt", async () => {

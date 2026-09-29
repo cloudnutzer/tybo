@@ -54,6 +54,7 @@ export const OPEN_CONTAINERS = ["supabase_kong_tybo\t0.0.0.0:54421->8000/tcp, [:
 /** Kurzname eines Befehls: "docker info", "docker network inspect" bzw. "supabase start" */
 export function shortName(cmd: string[]): string {
   if (cmd[0] === "docker" && cmd[1] === "network") return `docker network ${cmd[2]}`;
+  if (cmd[0] === "tar") return "tar";
   if (cmd[0] === "docker") return `docker ${cmd[1]}`;
   if (cmd.slice(0, CLI_PREFIX.length).join("\0") === CLI_PREFIX.join("\0")) return `supabase ${cmd[CLI_PREFIX.length]}`;
   return cmd.join(" ");

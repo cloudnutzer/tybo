@@ -49,6 +49,7 @@ import { COMMANDS_TEXT, type CommandListEntry, type CommandPort } from "./comman
 import { CLAUDE_MODELS, type ModelCatalog } from "./models";
 import type { EffectiveSettings, ModelAndEffort, SettingsData, SettingsPort, ValidateResult } from "./settings";
 import { keyStatus, type StatusPort, type Supervisor } from "./status";
+import type { EngineAvailability, EnginePort } from "./engines";
 import { UploadStore } from "./uploads";
 import type { KeysPort } from "./keys";
 import { ConversationStore, type ReplyInfo } from "./store";
@@ -189,12 +190,21 @@ function demoDirectChat(now: number): DemoRow[] {
   return rows;
 }
 
-function demoTopicChat(prefix: string, lastAt: number, agent: string, pairs: [string, string][]): DemoRow[] {
+function demoTopicChat(prefix: string, lastAt: number, agent: string, pairs: ([string, string] | [string, string, ReplyInfo])[]): DemoRow[] {
   const rows: DemoRow[] = [];
-  pairs.forEach(([question, answer], i) => {
+  pairs.forEach(([question, answer, info], i) => {
     const time = lastAt - (pairs.length - 1 - i) * 30 * MINUTE;
     rows.push({ id: `${prefix}-${2 * i}`, role: "user", text: question, createdAt: micro(time - 2 * MINUTE, i) });
-    rows.push({ id: `${prefix}-${2 * i + 1}`, role: "assistant", text: answer, createdAt: micro(time, i), agent, model: "claude-opus-5-5", durationMs: 8_000 + i * 5_000 });
+    rows.push({
+      id: `${prefix}-${2 * i + 1}`,
+      role: "assistant",
+      text: answer,
+      createdAt: micro(time, i),
+      agent,
+      model: "claude-opus-5-5",
+      durationMs: 8_000 + i * 5_000,
+      ...info,
+    });
   });
   return rows;
 }
@@ -401,15 +411,19 @@ export function createDemoTelegram(now: number = Date.now(), options: DemoTelegr
     {
       id: "topic-443", title: "Recherche", agent: "research", lastActivity: null,
       rows: demoTopicChat("r", now - 5 * MINUTE, "research", [
-        ["Was kostet ein kleiner VPS bei Hetzner?", "Ab etwa **4 Euro** im Monat für 2 vCPU und 4 GB RAM."],
-        ["Und bei anderen Anbietern?", "Meist ähnlich, im ersten Jahr oft günstiger, danach teurer."],
+        ["Was kostet ein kleiner VPS bei Hetzner?", "Ab etwa **4 Euro** im Monat für 2 vCPU und 4 GB RAM.", { engine: "claude" }],
+        // Nach /motor codex (Issue #126): Antwort-Angabe mit Codex, Modell aus der Codex-Konfiguration
+        ["Und bei anderen Anbietern?", "Meist ähnlich, im ersten Jahr oft günstiger, danach teurer.", { engine: "codex", model: "gpt-5.6-sol" }],
       ]),
     },
     // Meldungen und Dateien (Issue #47)
     { id: "topic-60", title: "Pipeline", agent: "general", lastActivity: null, rows: demoNoticeRows(now) },
     {
       id: "topic-12", title: "Finanzen", agent: "finance", lastActivity: null,
-      rows: demoTopicChat("f", now - 26 * 60 * MINUTE, "finance", [["Wie hoch waren die API-Kosten im August?", "Rund **38 Euro**, davon 80 % Opus."]]),
+      // Nach /motor opencode (Issue #129): Antwort-Angabe mit OpenCode und OpenRouter-Modell
+      rows: demoTopicChat("f", now - 26 * 60 * MINUTE, "finance", [
+        ["Wie hoch waren die API-Kosten im August?", "Rund **38 Euro**, davon 80 % Opus.", { engine: "opencode", model: "openrouter/anthropic/claude-opus-5.5" }],
+      ]),
     },
     {
       id: "topic-31", title: "Strategie", agent: "strategy", lastActivity: null,
@@ -700,6 +714,7 @@ export function createDemoStatus(options: { supervisor?: Supervisor | null; now?
     startedAt: () => startedAt,
     supervisor: async () => supervisor,
     storage: () => "supabase",
+    semanticSearch: async () => "aktiv",
     sessions: async () => ({ mode: "resume", stored: 4, resumable: 3 }),
     activeExecutions: () => 0,
     activeClaudeCalls: () => 0,
@@ -708,6 +723,8 @@ export function createDemoStatus(options: { supervisor?: Supervisor | null; now?
       restartNotes.push(note);
     },
     keys: () => keys,
+    // Motoren (Issue #126): feste Angaben, nie ein echter Prüfbefehl
+    engines: async () => structuredClone(DEMO_ENGINE_AVAILABILITY),
     now,
   };
 }
@@ -817,8 +834,10 @@ export async function startDemoServer(
     topicRights?: TopicRights;
     /** Status-Attrappe (Issue #37), Standard: createDemoStatus() */
     status?: StatusPort;
+    /** Motor-Attrappe (Issue #126), Standard: createDemoEngines über den Demo-Einstellungen */
+    engines?: EnginePort;
     /** Einstellungen, Anweisungen, Modell-Listen (Issue #38), Standard: Attrappen im Speicher */
-    settings?: SettingsPort;
+    settings?: SettingsPort & { data?(): SettingsData };
     instructions?: InstructionsPort;
     models?: ModelCatalog;
     /** Agenten-Katalog (Issue #50), Standard: createDemoAgentCatalog mit den Demo-Topics */
@@ -845,7 +864,7 @@ export async function startDemoServer(
     // Beispieldateien der Meldungen (Issue #47) in einer eigenen Ablage
     const filesDir = join(dir, "outbox");
     await writeDemoFiles(filesDir);
-    const agents = createDemoAgents({ rights: deps.topicRights, log: deps.log });
+    const agents = createDemoAgents({ rights: deps.topicRights, log: deps.log, settings: DEMO_SETTINGS });
     const choices = deps.choices ?? createDemoChoices();
     const demoTopics = agents.topics;
     const { telegram, topics } = demoTopics;
@@ -897,6 +916,9 @@ export async function startDemoServer(
       status: deps.status ?? createDemoStatus(),
       // Einstellungen nur im Speicher, Modell-Listen ohne Netz (Issue #38)
       settings: deps.settings ?? agents.settings,
+      // Motor (Issue #126): Codex verfügbar, „Recherche" weicht ab; nie ein echter Prüfbefehl.
+      // Über denselben Einstellungen wie /api/settings, auch wenn sie hereingereicht werden
+      engines: deps.engines ?? createDemoEngines(deps.settings?.data ? (deps.settings as SettingsPort & { data(): SettingsData }) : agents.settings),
       // Agenten verwalten nur im Speicher, mit Topics und Einstellungen verbunden (Issue #50)
       agentCatalog: deps.agentCatalog ?? agents.catalog,
       instructions: deps.instructions ?? createDemoInstructions(),
@@ -958,6 +980,13 @@ export const DEMO_COMMANDS: readonly CommandListEntry[] = [
   { name: "stop", aliases: ["abbruch"], description: "Laufende Antwort oder Ziel-Arbeit sofort abbrechen", args: "none" },
   { name: "new", aliases: ["reset"], description: "Gespräch frisch starten, der Verlauf bleibt", args: "none" },
   { name: "topics", aliases: [], description: "Welches Topic welchem Agenten gehört", args: "none" },
+  {
+    name: "motor",
+    aliases: ["engine"],
+    description: "Motor dieses Gesprächs zeigen oder wechseln (Claude Code, Codex, OpenCode)",
+    args: "optional",
+    argsHint: "[claude|codex|opencode|standard]",
+  },
   {
     name: "agent",
     aliases: [],
@@ -1029,10 +1058,120 @@ export function createDemoCommands(): CommandPort {
  * Session-Reset für Demo und web:dev (Issue #61): es gibt keine Claude-
  * Sessions, also ist nie etwas zurückzusetzen.
  */
-export const demoSessionReset: ConversationSessionReset = async () => ({ status: "done", reset: 0, sessionMode: true });
+export const demoSessionReset: ConversationSessionReset = async (_id, whileBlocked) => {
+  if (whileBlocked) await whileBlocked();
+  return { status: "done", reset: 0, sessionMode: true };
+};
 
 /** Effort-Stufen wie EFFORT_LEVELS in src/lib/settings.ts (die Demo importiert src/lib nicht) */
 const DEMO_EFFORT_LEVELS = ["low", "medium", "high", "xhigh"] as const;
+
+/**
+ * Motoren der Demo (Issue #126), wie SELECTABLE_ENGINES, CODEX_EFFORT_LEVELS,
+ * CODEX_SANDBOX_LEVELS in src/lib/settings.ts; ein Test gleicht sie ab.
+ */
+export const DEMO_ENGINE_OPTIONS = {
+  engines: [
+    { id: "claude", label: "Claude Code" },
+    { id: "codex", label: "Codex" },
+    { id: "opencode", label: "OpenCode" },
+  ],
+  codexEffortLevels: [...DEMO_EFFORT_LEVELS, "max"],
+  codexSandboxLevels: ["read-only", "workspace-write", "full"],
+  codexDefaultSandbox: "full",
+  opencodePermissionLevels: ["ask-deny", "auto"],
+  opencodeDefaultPermission: "auto",
+} as const;
+
+/** Verfügbarkeit in der Demo: alle Motoren angemeldet, erfundene Versionen */
+export const DEMO_ENGINE_AVAILABILITY: EngineAvailability[] = [
+  { engine: "claude", label: "Claude Code", installed: true, loggedIn: true, version: "2.1.281" },
+  { engine: "codex", label: "Codex", installed: true, loggedIn: true, version: "0.155.1" },
+  { engine: "opencode", label: "OpenCode", installed: true, loggedIn: true, version: "1.18.33" },
+];
+
+/** Session-Schlüssel des Direktchats der Demo (erfundene Nutzer-ID) */
+export const DEMO_DM_SESSION_KEY = "dm:1000000001";
+/** Das Topic „Recherche" der Demo läuft mit Codex (Ausnahme wie nach /motor codex) */
+export const DEMO_CODEX_TOPIC = "topic-443";
+/** Das Topic „Finanzen" der Demo läuft mit OpenCode (Ausnahme wie nach /motor opencode, Issue #129) */
+export const DEMO_OPENCODE_TOPIC = "topic-12";
+
+/** Session-Schlüssel wie conversationSessionKey im Bot, für die Demo-Gespräche */
+export function demoSessionKey(conversationId: string): string | null {
+  if (conversationId === "dm") return DEMO_DM_SESSION_KEY;
+  const topic = /^topic-(\d{1,10})$/.exec(conversationId);
+  // General kommt wie in Telegram ohne Thread-ID an: group:<chat>
+  if (topic) return topic[1] === "1" ? `group:${DEMO_GROUP_ID}` : `topic:${DEMO_GROUP_ID}:${topic[1]}`;
+  return /^[A-Za-z0-9-]{1,64}$/.test(conversationId) ? `web:${conversationId}` : null;
+}
+
+/** Beispielstand der Einstellungen in der Demo, mit der Codex-Ausnahme für „Recherche" und OpenCode für „Finanzen" */
+export const DEMO_SETTINGS: SettingsData = {
+  agents: { research: { model: "claude-sonnet-5" }, critic: { effort: "xhigh" } },
+  engine: { topics: { [`topic:${DEMO_GROUP_ID}:443`]: "codex", [`topic:${DEMO_GROUP_ID}:12`]: "opencode" } },
+};
+
+/**
+ * Motor-Attrappe (Issue #126) über den Einstellungen der Demo: Standard und
+ * Ausnahmen aus settings.data(), Verfügbarkeit fest. Änderungen erkennt ein
+ * Abgleich wie im Bot (createBotEngines), auch nach PATCH /api/settings.
+ */
+export function createDemoEngines(
+  settings: Pick<SettingsPort, "readForWrite" | "write"> & { data(): SettingsData },
+  options: { availability?: EngineAvailability[]; watchMs?: number } = {}
+): EnginePort {
+  const standard = () => {
+    const own = settings.data().engine?.default;
+    return own ? { engine: own, source: "settings" as const } : { engine: "claude", source: "code" as const };
+  };
+  const overrides = (): Record<string, string> => ({ ...(settings.data().engine?.topics ?? {}) });
+  const listeners = new Set<() => void>();
+  let timer: ReturnType<typeof setInterval> | null = null;
+  let last = "";
+  const snapshot = () => JSON.stringify({ standard: standard(), overrides: overrides() });
+  return {
+    engines: DEMO_ENGINE_OPTIONS.engines,
+    standard,
+    overrides,
+    sessionKey: demoSessionKey,
+    availability: async () => structuredClone(options.availability ?? DEMO_ENGINE_AVAILABILITY),
+    async removeOverride(key) {
+      const current = await settings.readForWrite();
+      const topics = { ...(current.engine?.topics ?? {}) };
+      if (!Object.hasOwn(topics, key)) return false;
+      delete topics[key];
+      const engine = { ...(current.engine ?? {}) };
+      if (Object.keys(topics).length) engine.topics = topics;
+      else delete engine.topics;
+      const next = { ...current };
+      if (Object.keys(engine).length) next.engine = engine;
+      else delete next.engine;
+      await settings.write(next);
+      return true;
+    },
+    subscribe(listener) {
+      if (!listeners.size) {
+        last = snapshot();
+        timer = setInterval(() => {
+          const now = snapshot();
+          if (now === last) return;
+          last = now;
+          for (const l of [...listeners]) l();
+        }, options.watchMs ?? 500);
+        timer.unref?.();
+      }
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+        if (!listeners.size && timer) {
+          clearInterval(timer);
+          timer = null;
+        }
+      };
+    },
+  };
+}
 /** Voreinstellung der Demo, wenn weder Agent noch Standard etwas setzen */
 const DEMO_CODE_DEFAULTS = { model: "claude-opus-5-5", effort: "high" } as const;
 
@@ -1050,6 +1189,7 @@ export function createDemoSettings(
   let data: SettingsData = structuredClone(
     initial ?? { agents: { research: { model: "claude-sonnet-5" }, critic: { effort: "xhigh" } } }
   );
+  const oneOf = (list: readonly string[]) => `erlaubt: ${list.join(", ")}`;
   const text = (v: unknown) => typeof v === "string" && v.trim().length > 0 && v.length <= 200 && !/\p{Cc}/u.test(v);
 
   function validate(value: unknown): ValidateResult {
@@ -1066,6 +1206,34 @@ export function createDemoSettings(
       if (entry?.effort !== undefined && !(DEMO_EFFORT_LEVELS as readonly string[]).includes(entry.effort)) {
         issues.push({ path: `${path}.effort`, message: `erlaubt: ${DEMO_EFFORT_LEVELS.join(", ")}` });
       }
+    }
+    // Motor (Issue #126) grob wie das Schema: bekannte Motoren und Stufen, Modellname ohne Leerzeichen
+    const engineIds = DEMO_ENGINE_OPTIONS.engines.map(e => e.id);
+    const engine = v.engine;
+    if (engine?.default !== undefined && !engineIds.includes(engine.default as never)) {
+      issues.push({ path: "engine.default", message: oneOf(engineIds) });
+    }
+    for (const [key, value] of Object.entries(engine?.topics ?? {})) {
+      if (!engineIds.includes(value as never)) issues.push({ path: `engine.topics.${key}`, message: oneOf(engineIds) });
+    }
+    const codex = engine?.codex;
+    if (codex?.model !== undefined && !/^[A-Za-z0-9][\w.:/-]*$/.test(codex.model)) issues.push({ path: "engine.codex.model", message: "ungültiger Modellname" });
+    if (codex?.effort !== undefined && !(DEMO_ENGINE_OPTIONS.codexEffortLevels as readonly string[]).includes(codex.effort)) {
+      issues.push({ path: "engine.codex.effort", message: oneOf(DEMO_ENGINE_OPTIONS.codexEffortLevels) });
+    }
+    if (codex?.sandbox !== undefined && !(DEMO_ENGINE_OPTIONS.codexSandboxLevels as readonly string[]).includes(codex.sandbox)) {
+      issues.push({ path: "engine.codex.sandbox", message: oneOf(DEMO_ENGINE_OPTIONS.codexSandboxLevels) });
+    }
+    // OpenCode (Issue #129) wie das Schema: Modell <anbieter>/<modell>, freie Variante mit Prüfung, zwei Rechte-Stufen
+    const opencode = engine?.opencode;
+    if (opencode?.model !== undefined && !/^[A-Za-z0-9][\w.:/@-]*$/.test(opencode.model)) {
+      issues.push({ path: "engine.opencode.model", message: "ungültiger Modellname" });
+    }
+    if (opencode?.variant !== undefined && !/^[a-z0-9-]{1,20}$/.test(opencode.variant)) {
+      issues.push({ path: "engine.opencode.variant", message: "1 bis 20 Zeichen aus a-z, 0-9 und -" });
+    }
+    if (opencode?.permission !== undefined && !(DEMO_ENGINE_OPTIONS.opencodePermissionLevels as readonly string[]).includes(opencode.permission)) {
+      issues.push({ path: "engine.opencode.permission", message: oneOf(DEMO_ENGINE_OPTIONS.opencodePermissionLevels) });
     }
     return issues.length ? { ok: false, issues } : { ok: true, value: v };
   }
@@ -1093,6 +1261,7 @@ export function createDemoSettings(
         ollamaModel: { value: settings.fallback?.ollamaModel ?? "qwen3:8b", source: settings.fallback?.ollamaModel ? "settings" : "code" },
         offlineOnly: { value: settings.fallback?.offlineOnly ?? false, source: settings.fallback?.offlineOnly !== undefined ? "settings" : "code" },
       },
+      engine: { default: settings.engine?.default ? { value: settings.engine.default, source: "settings" } : { value: "claude", source: "code" } },
     };
   }
 
@@ -1108,6 +1277,7 @@ export function createDemoSettings(
       data = structuredClone(value);
     },
     effective,
+    engineOptions: DEMO_ENGINE_OPTIONS,
     data: () => structuredClone(data),
   };
 }
@@ -1151,9 +1321,18 @@ export function createDemoModels(): ModelCatalog {
       claude: { models: [...CLAUDE_MODELS], custom: true },
       openrouter: { models: [{ id: "minimax/minimax-m2.7", name: "MiniMax M2.7" }] },
       ollama: { models: ["qwen3:8b"] },
+      opencode: { models: [...DEMO_OPENCODE_MODELS] },
     }),
   };
 }
+
+/** Kleine Liste wie aus `opencode models` für Demo und web:dev (Issue #129), OpenRouter-Kennungen mit weiterem Schrägstrich */
+export const DEMO_OPENCODE_MODELS = [
+  "openai/gpt-5.5",
+  "openrouter/anthropic/claude-opus-5.5",
+  "openrouter/moonshotai/kimi-k2",
+  "openrouter/openai/gpt-5.5",
+] as const;
 
 /** Kurzbeschreibungen der mitgelieferten Agenten in der Demo */
 const DEMO_BUILTIN_DESCRIPTIONS: Record<string, string> = {

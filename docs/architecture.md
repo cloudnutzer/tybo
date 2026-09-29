@@ -329,21 +329,16 @@ falls back to starting a new session without `--resume`.
 
 ### Timeout Handling
 
-The 30-minute timeout is generous because Claude may be executing
-complex tool chains (web searches, file reads, etc.):
+Chat-Turns über den Streaming-Weg haben zwei Grenzen (Issue #178):
+Leerlauf (Standard 15 Minuten ohne stream-json-Zeile) und eine Obergrenze
+(Standard 90 Minuten). Ein Lauf, der sichtbar arbeitet, darf also länger
+laufen; einer, der hängt, wird früher beendet. Der JSON-Weg liefert erst am
+Ende Ausgabe und bleibt bei 30 Minuten Gesamtzeit. Werte und `.env`-Schalter:
+`docs/troubleshooting.md`, Abschnitt "Claude Timeout".
 
-```typescript
-timeoutMs: 1_800_000, // 30 minutes
-```
-
-On timeout, the subprocess is **killed** (not just abandoned):
-
-```typescript
-const timeoutId = setTimeout(() => {
-  timedOut = true;
-  try { proc.kill(); } catch {}
-}, timeoutMs);
-```
+On timeout, the subprocess tree is **killed** (not just abandoned), via
+`terminateProcessTree()` in `src/lib/process-tree.ts` (SIGTERM an die
+Prozessgruppe, SIGKILL nach 1,5 Sekunden).
 
 This prevents zombie processes from accumulating.
 

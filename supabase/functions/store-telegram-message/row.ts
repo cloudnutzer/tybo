@@ -8,6 +8,8 @@ export function messageRow(
   body: Record<string, any>,
   embedding: number[] | null,
   now: number = Date.now(),
+  /** Womit der Vektor entstand, „anbieter:modell“ (Spalte embedding_model, Issue #168); die Datenbank prüft es */
+  embeddingModel?: string,
 ): Record<string, unknown> {
   const { chat_id, role, content, metadata, topic_id, session_key, created_at } = body;
 
@@ -38,6 +40,6 @@ export function messageRow(
     topic_id: topicId,
     session_key: sessionKey,
     ...(createdAt ? { created_at: createdAt } : {}),
-    ...(embedding ? { embedding } : {}),
+    ...(embedding ? { embedding, ...(embeddingModel ? { embedding_model: embeddingModel } : {}) } : {}),
   };
 }

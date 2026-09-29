@@ -32,6 +32,8 @@ const quiet = {
   activeClaudeCalls: () => 0,
   restartMarker: "/nicht/vorhanden/restart-requested",
   requestRestart: async () => {},
+  // Nie ein echtes claude oder codex (Issue #126)
+  inspectEngine: async (id: "claude" | "codex" | "opencode") => ({ engine: id, checked: true, installed: true, loggedIn: true }),
   now: () => 1000,
 };
 

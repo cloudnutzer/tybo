@@ -104,7 +104,7 @@ export function fakeSupabaseApi(init: Partial<FakeState> = {}): FakeApi {
     const u = new URL(url);
     let body: any;
     try {
-      body = request.body ? JSON.parse(request.body) : undefined;
+      body = typeof request.body === "string" ? JSON.parse(request.body) : request.body;
     } catch {
       body = request.body;
     }

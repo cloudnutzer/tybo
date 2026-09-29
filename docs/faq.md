@@ -35,6 +35,12 @@ If you want your local machine to handle messages while it's awake (saving on AP
 
 ---
 
+### Can tybo run around the clock on a Raspberry Pi?
+
+Yes, on a Raspberry Pi 5 with the 64-bit Raspberry Pi OS (8 GB recommended, 4 GB works with fewer parallel tasks). It runs in local mode with your Claude subscription or an API key, starts as a systemd user service and draws little power. Mac apps and MCP servers from your Mac are not available there. Step-by-step guide (German): [raspberry-pi.md](raspberry-pi.md).
+
+---
+
 ### I want to offer this as a service to clients (e.g., "CEO Operating System for SMBs"). What's the best architecture?
 
 Use the **VPS + API key** approach. For each client:

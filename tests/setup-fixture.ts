@@ -84,7 +84,7 @@ export function fakeRun(answers: Record<string, Partial<CommandResult>> = {}): F
     const key = Object.keys(answers)
       .sort((a, b) => b.length - a.length)
       .find(k => cmd.join(" ").startsWith(k));
-    if (!key) return { code: -1, stdout: "", stderr: "Befehl nicht gefunden" };
+    if (!key) return { code: -1, stdout: "", stderr: "Befehl nicht gefunden", spawnError: "ENOENT" };
     return { code: 0, stdout: "", stderr: "", ...answers[key] };
   }) as FakeRun;
   run.calls = calls;
@@ -120,6 +120,10 @@ export async function makeCtx(
     launchAgentsDir: join(dir, "home", "Library", "LaunchAgents"),
     // Ausdrücklich im Testordner, nie PM2_HOME oder ~/.pm2 des Rechners
     pm2DumpPath: join(dir, "home", ".pm2", "dump.pm2"),
+    // systemd nur im Testordner; ohne diesen Ordner gilt: kein systemd (Issue #207)
+    systemdUserDir: join(dir, "home", ".config", "systemd", "user"),
+    systemdRunDir: join(dir, "run", "systemd", "system"),
+    user: "alex",
     run,
     // Kein Netz in Tests (Issue #163): wer fetch braucht, setzt eine Attrappe
     fetch: async () => {

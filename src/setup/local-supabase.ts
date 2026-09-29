@@ -30,17 +30,25 @@
  * Postgres werden nur eingeordnet, nie weitergereicht. Jeder Befehl geht als
  * Liste an ctx.run, nie als Shell-Zeile. Nie --no-backup (löscht die Daten),
  * nie --all (träfe fremde Supabase-Projekte).
+ *
+ * Dauerbetrieb (Issue #165): tybo datenbank start|stop|status|sichern, mit
+ * derselben Dienstauswahl, demselben Netz und derselben Schutzprüfung; der
+ * Dienst ai.tybo.supabase bzw. tybo-supabase ruft tybo datenbank start auf.
+ * Abschnitt „Dauerbetrieb“ am Ende dieser Datei.
  */
 
+import { readFileSync } from "node:fs";
+import { chmod, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { connect } from "node:net";
 import { networkInterfaces, totalmem } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { BRAND } from "../brand";
 import { assetsBucket } from "../lib/asset-store";
 import { isSecretName } from "../lib/subprocess-env";
 import { readSetupEnv, type CommandResult, type SetupContext } from "./context";
 import type { ApplyResult, RunReport, SetupValues } from "./model";
 import { trackSafetyWork, writeEnv } from "./steps/common";
+import { isSupabaseCloudUrl } from "./supabase-management";
 import { bucketSql, isValidBucketName, RELOAD_SCHEMA_SQL, SCHEMA_FILES } from "./supabase-schema";
 
 // ---------------------------------------------------------------------------
@@ -69,9 +77,11 @@ export const AUSGELASSEN = EXCLUDED_SERVICES.join(",");
 /** Ports aus supabase/config.toml (ein Test hält sie fest) */
 export const LOCAL_API_PORT = 54421;
 export const LOCAL_DB_PORT = 54422;
+export const LOCAL_STUDIO_PORT = 54423;
 export const LOCAL_SUPABASE_URL = `http://127.0.0.1:${LOCAL_API_PORT}`;
-/** Ports, die nie aus dem Heimnetz erreichbar sein dürfen */
-export const GUARDED_PORTS = [LOCAL_API_PORT, LOCAL_DB_PORT];
+export const LOCAL_STUDIO_URL = `http://127.0.0.1:${LOCAL_STUDIO_PORT}`;
+/** Ports, die nie aus dem Heimnetz erreichbar sein dürfen (Studio mit, Issue #165) */
+export const GUARDED_PORTS = [LOCAL_API_PORT, LOCAL_DB_PORT, LOCAL_STUDIO_PORT];
 
 /**
  * Docker-Netz, in dem die CLI die Container startet: ohne --network-id heißt
@@ -93,6 +103,22 @@ export const START_TIMEOUT_MS = 20 * 60 * 1000;
 export const CLI_TIMEOUT_MS = 5 * 60 * 1000;
 export const STATUS_TIMEOUT_MS = 2 * 60 * 1000;
 export const DOCKER_TIMEOUT_MS = 30_000;
+/**
+ * Frist, die PM2 tybo-supabase beim Beenden (pm2 stop, pm2 delete) lässt,
+ * bevor es SIGKILL schickt (--kill-timeout, Issue #165; ohne die Option
+ * 1,6 Sekunden). So lange kann ein abgebrochenes `tybo datenbank start` im
+ * ungünstigsten Fall brauchen: Bereinigung des abgebrochenen CLI-Aufrufs,
+ * ein laufendes Anhalten für den Neustart (STATUS_TIMEOUT_MS), docker ps,
+ * Heimnetz-Prüfung, Schutz-Stopp (STATUS_TIMEOUT_MS) und Nachprüfung, jeweils
+ * mit Schonfrist; zusammen rund sechs Minuten, dazu Reserve.
+ */
+export const PM2_KILL_TIMEOUT_MS = 10 * 60 * 1000;
+/**
+ * Dieselbe Frist für launchd (ExitTimeOut in ai.tybo.supabase, in Sekunden;
+ * ohne den Schlüssel 20 Sekunden): so lange wartet launchd nach SIGTERM beim
+ * Entladen, bevor es SIGKILL schickt
+ */
+export const LAUNCHD_EXIT_TIMEOUT_S = PM2_KILL_TIMEOUT_MS / 1000;
 /** Empfehlung der Supabase-Doku sind 7 GB für alle Dienste */
 export const MIN_RAM_BYTES = 8 * 1024 ** 3;
 /** Fortschritt beim langen Start */
@@ -310,8 +336,9 @@ export function startProblem(r: CommandResult): StartProblem {
   return "sonst";
 }
 
-export function startProblemText(problem: StartProblem, root: string): string {
-  const retry = `Danach die Einrichtung erneut starten (${BRAND.cli} setup datenbank).`;
+/** retryCmd: Befehl für den zweiten Versuch; ohne ihn die Einrichtung (tybo datenbank start nennt sich selbst) */
+export function startProblemText(problem: StartProblem, root: string, retryCmd?: string): string {
+  const retry = retryCmd ? `Danach erneut: ${retryCmd}.` : `Danach die Einrichtung erneut starten (${BRAND.cli} setup datenbank).`;
   switch (problem) {
     case "port":
       return `Supabase startet nicht, weil ein Port im Bereich 54420 bis 54429 belegt ist: ein anderes Programm oder ein altes Supabase auf 544xx. Mit docker ps nachsehen, was dort läuft, und es beenden. ${retry}`;
@@ -320,7 +347,7 @@ export function startProblemText(problem: StartProblem, root: string): string {
     case "zeitlimit":
       return `Supabase ist nach 20 Minuten noch nicht gestartet. Beim ersten Mal lädt Docker mehrere GB; bei langsamer Leitung dauert das. Die schon geladenen Teile bleiben, ein zweiter Versuch macht dort weiter. ${retry}`;
     case "abgebrochen":
-      return `Abgebrochen. Die .env ist unverändert. ${retry}`;
+      return retryCmd ? `Abgebrochen. ${retry}` : `Abgebrochen. Die .env ist unverändert. ${retry}`;
     default:
       return `Supabase ließ sich nicht starten. Genauer zeigt es im Projektordner: ${startHint(root)} --debug. ${retry}`;
   }
@@ -414,6 +441,15 @@ export function guardPendingText(root: string): string {
   return `Achtung: Noch nicht bestätigt, dass Supabase nur auf diesem Rechner erreichbar ist. Der Assistent prüft die Ports und hält Supabase nötigenfalls an; das kann einige Minuten dauern. Endet die Einrichtung vorher (etwa weil das Terminal geschlossen wird), Supabase sofort von Hand anhalten: im Projektordner ${stopHint(root)}; zeigt docker ps --filter label=${PROJECT_LABEL} danach noch Container, diese mit docker stop <name> anhalten.`;
 }
 
+/**
+ * Prüfung und Schutz-Stopp ohne Anmeldung als Schutzschritt: für
+ * tybo datenbank (Issue #165), das als eigener Prozess läuft und den Ausgang
+ * selbst meldet (guardText). Der Einrichtungsablauf nutzt guardExposure.
+ */
+export function checkExposure(ctx: SetupContext, deps: LocalSupabaseDeps = localDeps(ctx)): Promise<Guard> {
+  return checkAndStop(ctx, deps);
+}
+
 async function checkAndStop(ctx: SetupContext, deps: LocalSupabaseDeps): Promise<Guard> {
   const bindings = await containerBindings(ctx);
   if (bindings === "keine") return { state: "keine" };
@@ -445,6 +481,22 @@ export interface LocalStatus {
   dbUrl: string;
   service: string;
   anon: string;
+}
+
+/**
+ * Genau die Adresse, die der lokale Ablauf schreibt (Port aus
+ * supabase/config.toml). Nur dann gelten tybo datenbank und der Dienst
+ * ai.tybo.supabase (Issue #165); ein anderer Server auf 127.0.0.1 bleibt
+ * unberührt.
+ */
+export function isLocalSupabaseUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  try {
+    const u = new URL(url.trim());
+    return u.protocol === "http:" && (u.hostname === "127.0.0.1" || u.hostname === "localhost") && u.port === String(LOCAL_API_PORT);
+  } catch {
+    return false;
+  }
 }
 
 /** Nur lokale Adressen: die Datenbank soll auf diesem Rechner laufen */
@@ -505,7 +557,7 @@ function fail(message: string, changed: string[] = []): ApplyResult {
   return { ok: false, message, changed };
 }
 
-function exposedText(guard: Guard, root: string): string {
+export function exposedText(guard: Guard, root: string): string {
   const stopped = guard.state === "stopp-gescheitert" ? guardText(guard, root) : "Der Assistent hat Supabase darum wieder gestoppt (die Daten bleiben).";
   return `Supabase war nicht nur auf diesem Rechner erreichbar (Ports nicht an 127.0.0.1 gebunden oder aus dem Heimnetz erreichbar), und die lokalen Schlüssel sind allgemein bekannte Standardwerte. ${stopped} Die .env ist unverändert. Eigentlich bindet das Docker-Netz ${LOCAL_NETWORK}, das der Assistent anlegt, alle Ports an 127.0.0.1 (Netz-Option ${LOOPBACK_OPTION}; die Docker-Einstellung "ip" gilt nur für das Standard-Netz und hilft hier nicht). Nachsehen: docker network inspect ${LOCAL_NETWORK} muss bei Options 127.0.0.1 zeigen, docker ps --filter label=${PROJECT_LABEL} die Ports mit 127.0.0.1 davor. Fehlt die Option: Supabase anhalten (${stopHint(root)}), docker network rm ${LOCAL_NETWORK} („not found“ heißt: schon entfernt), dann die Einrichtung erneut starten (${BRAND.cli} setup datenbank). Hält sich die Docker-Umgebung nicht daran, Docker Desktop, OrbStack, Colima oder die Docker Engine nutzen.`;
 }
@@ -662,7 +714,74 @@ export async function runSupabaseLocal(values: SetupValues, ctx: SetupContext, r
   }
   const done = changed.length ? "Supabase läuft auf diesem Rechner und ist eingerichtet." : "Supabase läuft auf diesem Rechner, alles war schon eingerichtet.";
   if (!probe.ok) return { ok: false, message: `${done} Der Verbindungstest ist aber fehlgeschlagen: ${probe.message}`, changed };
-  return { ok: true, message: `${done} ${probe.message}`, changed };
+  // Einmal am Ende (Issue #165): startet Docker nach einem Neustart von selbst?
+  const login = await dockerLoginHint(ctx);
+  return { ok: true, message: `${done} ${probe.message} ${login}`, changed };
+}
+
+// ---------------------------------------------------------------------------
+// Docker beim Anmelden (Issue #165)
+// ---------------------------------------------------------------------------
+
+export type DockerKind = "desktop" | "orbstack" | "colima" | "engine" | "unbekannt";
+
+/** Welche Docker-Umgebung antwortet: Betriebssystem laut docker info, sonst der Kontext */
+export async function dockerKind(ctx: SetupContext): Promise<DockerKind> {
+  const info = await ctx.run(["docker", "info", "--format", "{{.OperatingSystem}}"], { timeoutMs: DOCKER_TIMEOUT_MS });
+  const os = info.code === 0 ? info.stdout : "";
+  if (/docker desktop/i.test(os)) return "desktop";
+  if (/orbstack/i.test(os)) return "orbstack";
+  const context = await ctx.run(["docker", "context", "show"], { timeoutMs: DOCKER_TIMEOUT_MS });
+  const name = context.code === 0 ? context.stdout.trim() : "";
+  if (name.startsWith("desktop")) return "desktop";
+  if (name === "orbstack") return "orbstack";
+  if (name.startsWith("colima")) return "colima";
+  if (ctx.platform === "linux") return "engine";
+  return "unbekannt";
+}
+
+/**
+ * Einstellung „Start Docker Desktop when you sign in“ aus
+ * ~/Library/Group Containers/group.com.docker/settings-store.json (neuere
+ * Versionen, Schlüssel AutoStart) bzw. settings.json (ältere, autoStart);
+ * null, wenn keine Datei den Schlüssel hat
+ */
+export function desktopAutoStart(home: string): boolean | null {
+  const dir = join(home, "Library", "Group Containers", "group.com.docker");
+  for (const [file, key] of [["settings-store.json", "AutoStart"], ["settings.json", "autoStart"]] as const) {
+    try {
+      const value = JSON.parse(readFileSync(join(dir, file), "utf8"))?.[key];
+      if (typeof value === "boolean") return value;
+    } catch {}
+  }
+  return null;
+}
+
+const AFTER_REBOOT = `Supabase selbst startet danach der Autostart (Schritt Autostart, Dienst ai.tybo.supabase bzw. tybo-supabase) oder von Hand ${BRAND.cli} datenbank start.`;
+
+/** Ein Absatz: startet Docker nach dem Anmelden von selbst, und wenn nicht, wie man es einschaltet */
+export async function dockerLoginHint(ctx: SetupContext): Promise<string> {
+  const kind = await dockerKind(ctx);
+  switch (kind) {
+    case "desktop": {
+      const on = ctx.platform === "darwin" ? desktopAutoStart(ctx.home) : null;
+      if (on === true) return `Docker Desktop startet beim Anmelden von selbst (Einstellung ist an). ${AFTER_REBOOT}`;
+      const how = "In Docker Desktop unter Settings, General „Start Docker Desktop when you sign in to your computer“ einschalten.";
+      if (on === false) return `Achtung: Docker Desktop startet beim Anmelden nicht von selbst, nach einem Neustart hätte ${BRAND.name} dann kein Gedächtnis. ${how} ${AFTER_REBOOT}`;
+      return `Ob Docker Desktop beim Anmelden startet, ließ sich nicht lesen. ${how} ${AFTER_REBOOT}`;
+    }
+    case "orbstack":
+      return `Damit nach einem Neustart alles wieder läuft: in OrbStack unter Settings „Start at login“ einschalten (${BRAND.name} prüft das nicht). ${AFTER_REBOOT}`;
+    case "colima":
+      return `Colima startet nicht von selbst. Damit es beim Anmelden startet, einmal im Terminal: brew services start colima (${BRAND.name} prüft das nicht). ${AFTER_REBOOT}`;
+    case "engine": {
+      const enabled = await ctx.run(["systemctl", "is-enabled", "docker"], { timeoutMs: DOCKER_TIMEOUT_MS });
+      if (enabled.code === 0 && enabled.stdout.trim() === "enabled") return `Docker startet mit dem Rechner (systemd). ${AFTER_REBOOT}`;
+      return `Docker startet womöglich nicht mit dem Rechner. Einschalten mit: sudo systemctl enable docker. ${AFTER_REBOOT}`;
+    }
+    default:
+      return `Damit ${BRAND.name} nach einem Neustart sein Gedächtnis hat, muss Docker beim Anmelden von selbst starten: Docker Desktop „Start Docker Desktop when you sign in“, OrbStack „Start at login“, Colima brew services start colima. ${AFTER_REBOOT}`;
+  }
 }
 
 /** Zustand eines Bilder-Ordners, ohne ihn anzulegen (keine Zeile: gibt es nicht) */
@@ -673,4 +792,523 @@ export function bucketStateSql(name: string): string {
 
 function publicBucketText(): string {
   return "Der Bilder-Ordner aus SUPABASE_ASSETS_BUCKET ist in der lokalen Supabase öffentlich. tybo braucht einen privaten und stellt ihn nicht still um: einen anderen Namen in SUPABASE_ASSETS_BUCKET eintragen, dann die Einrichtung erneut starten. Die .env ist unverändert.";
+}
+
+// ---------------------------------------------------------------------------
+// Dauerbetrieb: tybo datenbank start|stop|status|sichern (Issue #165)
+// ---------------------------------------------------------------------------
+
+/** Container der CLI heißen supabase_<dienst>_<project_id> */
+export const DB_CONTAINER = "supabase_db_tybo";
+export const STORAGE_CONTAINER = "supabase_storage_tybo";
+export const EDGE_CONTAINER = "supabase_edge_runtime_tybo";
+export const STUDIO_CONTAINER = "supabase_studio_tybo";
+/** Pfad der Bilddateien im Storage-Container (FILE_STORAGE_BACKEND_PATH, Mount des Volumes) */
+export const STORAGE_PATH = "/mnt";
+
+/** So lange wartet start auf Docker (etwa direkt nach dem Anmelden) */
+export const DOCKER_WAIT_MS = 5 * 60 * 1000;
+export const DOCKER_POLL_MS = 5_000;
+/** Ein Dump oder das Kopieren der Bilder */
+export const BACKUP_STEP_TIMEOUT_MS = 30 * 60 * 1000;
+/** Exit-Code nach Strg+C */
+export const EXIT_ABORTED = 130;
+
+/** Studio braucht postgres-meta für die Datenbankverwaltung; beide nur mit --studio */
+const STUDIO_SERVICES = ["studio", "postgres-meta"];
+
+/** Ausgelassene Dienste; mit Studio ohne studio und postgres-meta */
+export function excludedFor(studio: boolean): string {
+  return studio ? EXCLUDED_SERVICES.filter(s => !STUDIO_SERVICES.includes(s)).join(",") : AUSGELASSEN;
+}
+
+const DB_CLI = `${BRAND.cli} datenbank`;
+
+export type DatabaseArgs =
+  | { command: "help" }
+  | { command: "start"; studio: boolean }
+  | { command: "stop" }
+  | { command: "status" }
+  | { command: "sichern"; ziel?: string };
+
+/** Liest die Argumente nach „datenbank“; null bei allem Unbekannten */
+export function parseDatabaseArgs(args: string[]): DatabaseArgs | null {
+  const [command, ...rest] = args;
+  if (command === undefined || command === "help" || command === "--help" || command === "-h") return rest.length ? null : { command: "help" };
+  if (command === "start") {
+    if (rest.length === 0) return { command, studio: false };
+    return rest.length === 1 && rest[0] === "--studio" ? { command, studio: true } : null;
+  }
+  if (command === "stop" || command === "status") return rest.length ? null : { command };
+  if (command === "sichern") {
+    if (rest.length === 0) return { command };
+    if (rest.length === 2 && rest[0] === "--ziel" && rest[1].trim()) return { command, ziel: rest[1] };
+    if (rest.length === 1 && rest[0].startsWith("--ziel=") && rest[0].length > "--ziel=".length) return { command, ziel: rest[0].slice("--ziel=".length) };
+  }
+  return null;
+}
+
+export function databaseUsage(): string {
+  return [
+    `${DB_CLI}: Supabase auf diesem Rechner (nur wenn SUPABASE_URL auf ${LOCAL_SUPABASE_URL} zeigt)`,
+    "",
+    `  ${DB_CLI} start             starten; wartet bis zu 5 Minuten auf Docker`,
+    `  ${DB_CLI} start --studio    mit Studio, um die Daten im Browser anzusehen (${LOCAL_STUDIO_URL})`,
+    `  ${DB_CLI} stop              anhalten, die Daten bleiben`,
+    `  ${DB_CLI} status            läuft es, Adresse, Platz der Docker-Volumes`,
+    `  ${DB_CLI} sichern           Sicherung nach data/backups/supabase-<Datum>`,
+    `  ${DB_CLI} sichern --ziel <Ordner>   Sicherung nach <Ordner>/supabase-<Datum>`,
+  ].join("\n");
+}
+
+export interface DatabaseCommandOptions {
+  ctx: SetupContext;
+  /** Umgebung samt .env des Projekts (Werte aus der .env gehen vor) */
+  env: Record<string, string | undefined>;
+  out(line: string): void;
+  err(line: string): void;
+  /** Strg+C; bricht Warten, Start und Sicherung ab */
+  signal?: AbortSignal;
+  /** Bezug für ein relatives --ziel; Standard process.cwd() */
+  cwd?: string;
+  deps?: LocalSupabaseDeps;
+}
+
+/**
+ * Warum tybo datenbank hier nichts tut; null, wenn SUPABASE_URL genau auf
+ * das Supabase dieses Projekts zeigt
+ */
+export function notLocalText(url: string | undefined): string | null {
+  if (isLocalSupabaseUrl(url)) return null;
+  const setup = `${BRAND.cli} setup datenbank, Weg „Supabase auf diesem Rechner“`;
+  if (!url?.trim()) return `Diese Installation nutzt kein Supabase auf diesem Rechner (SUPABASE_URL fehlt in der .env). ${DB_CLI} gilt nur dafür; einrichten mit ${setup}.`;
+  let host = "";
+  try {
+    host = new URL(url.trim()).hostname;
+  } catch {}
+  if (isSupabaseCloudUrl(url) || !isLoopbackHost(host)) {
+    return `Diese Installation nutzt Supabase in der Cloud (SUPABASE_URL zeigt nicht auf diesen Rechner). ${DB_CLI} gilt nur für Supabase auf diesem Rechner (${setup}).`;
+  }
+  return `SUPABASE_URL zeigt auf ein anderes Supabase auf diesem Rechner, nicht auf das von ${BRAND.name} eingerichtete (${LOCAL_SUPABASE_URL}). ${DB_CLI} fasst es nicht an.`;
+}
+
+/** Namen der laufenden Container des Projekts; null, wenn docker ps scheitert */
+export async function runningContainers(ctx: SetupContext): Promise<Set<string> | null> {
+  const ps = await ctx.run(["docker", "ps", "--filter", `label=${PROJECT_LABEL}`, "--format", "{{.Names}}\t{{.Ports}}"], { timeoutMs: DOCKER_TIMEOUT_MS });
+  if (ps.code !== 0 || ps.timedOut) return null;
+  return new Set(
+    ps.stdout
+      .split("\n")
+      .map(l => l.split("\t")[0].trim())
+      .filter(Boolean),
+  );
+}
+
+/** Edge Runtime an laut supabase/config.toml (Standard der CLI: an) */
+export function edgeRuntimeEnabled(root: string): boolean {
+  try {
+    const config = Bun.TOML.parse(readFileSync(join(root, "supabase", "config.toml"), "utf8")) as any;
+    return config?.edge_runtime?.enabled !== false;
+  } catch {
+    return true;
+  }
+}
+
+type DockerWait = { ok: true } | { ok: false; message: string; aborted?: boolean };
+
+const DOCKER_NOT_THERE = `Docker fehlt (kein docker-Befehl im PATH). Supabase auf diesem Rechner läuft in Docker; ${BRAND.cli} installiert es nicht selbst. Siehe docs/einrichtung.md, „Supabase auf diesem Rechner“.`;
+const DOCKER_TIMEOUT_TEXT = `Docker läuft nach 5 Minuten noch nicht, Supabase wurde nicht gestartet. Docker Desktop bzw. OrbStack öffnen oder colima start, dann: ${DB_CLI} start. Damit Docker beim Anmelden von selbst startet: docs/einrichtung.md, „Supabase lokal im Alltag“.`;
+const DOCKER_PERMISSION_TEXT = "Docker läuft, aber dieser Benutzer darf es nicht verwenden (keine Berechtigung). Unter Linux: sudo usermod -aG docker $USER, dann ab- und wieder anmelden.";
+
+/**
+ * Wartet bis zu DOCKER_WAIT_MS auf Docker: docker info alle DOCKER_POLL_MS.
+ * Gemessen an der Uhr, nicht an der Zahl der Versuche: auch ein hängendes
+ * docker info zählt mit und wird am Ende der Frist abgebrochen.
+ */
+export async function waitForDocker(ctx: SetupContext, out: (line: string) => void, signal?: AbortSignal): Promise<DockerWait> {
+  const version = await ctx.run(["docker", "--version"], { timeoutMs: DOCKER_TIMEOUT_MS, signal });
+  if (version.aborted || signal?.aborted) return { ok: false, message: "", aborted: true };
+  if (version.code !== 0) return { ok: false, message: DOCKER_NOT_THERE };
+  const deadline = ctx.now().getTime() + DOCKER_WAIT_MS;
+  let announced = false;
+  for (;;) {
+    const left = deadline - ctx.now().getTime();
+    const info = await ctx.run(["docker", "info", "--format", "{{.ServerVersion}}"], { timeoutMs: Math.max(1_000, Math.min(DOCKER_TIMEOUT_MS, left)), signal });
+    if (info.aborted || signal?.aborted) return { ok: false, message: "", aborted: true };
+    if (info.code === 0) return { ok: true };
+    if (/permission denied/i.test(`${info.stderr} ${info.stdout}`)) return { ok: false, message: DOCKER_PERMISSION_TEXT };
+    const rest = deadline - ctx.now().getTime();
+    if (rest <= 0) return { ok: false, message: DOCKER_TIMEOUT_TEXT };
+    if (!announced) {
+      out("Warte auf Docker (bis zu 5 Minuten) …");
+      announced = true;
+    }
+    await ctx.sleep(Math.min(DOCKER_POLL_MS, rest), signal);
+    if (signal?.aborted) return { ok: false, message: "", aborted: true };
+  }
+}
+
+/** Läuft Docker jetzt? (ohne Warten, für stop, status, sichern) */
+async function dockerRunning(ctx: SetupContext): Promise<boolean> {
+  const info = await ctx.run(["docker", "info", "--format", "{{.ServerVersion}}"], { timeoutMs: DOCKER_TIMEOUT_MS });
+  return info.code === 0;
+}
+
+function stopCommandText(root: string): string {
+  return `Von Hand anhalten: im Projektordner ${stopHint(root)}; zeigt docker ps --filter label=${PROJECT_LABEL} danach noch Container, diese mit docker stop <name> anhalten.`;
+}
+
+async function databaseStart(o: DatabaseCommandOptions, studio: boolean): Promise<number> {
+  const { ctx, out, err, signal } = o;
+  const deps = o.deps ?? localDeps(ctx);
+  const root = ctx.root;
+  const retry = `${DB_CLI} start${studio ? " --studio" : ""}`;
+
+  const docker = await waitForDocker(ctx, out, signal);
+  if (!docker.ok) {
+    err(docker.aborted ? "Abgebrochen, Supabase wurde nicht gestartet." : docker.message);
+    return docker.aborted ? EXIT_ABORTED : 1;
+  }
+
+  // Läuft die Datenbank schon, kehrt supabase start sofort zurück und holt
+  // keine fehlenden Dienste nach: Edge Runtime hat keine Neustart-Regel und
+  // fehlt nach einem Neustart des Rechners, Studio lässt sich nicht zuschalten.
+  // Dann einmal anhalten (die Daten bleiben) und neu starten.
+  const running = await runningContainers(ctx);
+  if (running?.has(DB_CONTAINER)) {
+    const missing: string[] = [];
+    if (edgeRuntimeEnabled(root) && !running.has(EDGE_CONTAINER)) missing.push("Edge Runtime");
+    if (studio && !running.has(STUDIO_CONTAINER)) missing.push("Studio");
+    if (missing.length) {
+      out(`Supabase läuft ohne ${missing.join(" und ")}. ${BRAND.name} hält es kurz an und startet es neu, die Daten bleiben.`);
+      const stop = await ctx.run(supabaseCli(["stop", "--workdir", root]), { timeoutMs: STATUS_TIMEOUT_MS, cwd: root, env: cliEnv() });
+      if (stop.code !== 0 || stop.timedOut) {
+        // Womöglich halb angehalten oder in einem offenen Netz: was noch läuft,
+        // muss nur auf diesem Rechner erreichbar sein, sonst Schutz-Stopp
+        const guard = await checkExposure(ctx, deps);
+        const state =
+          guard.state === "sicher"
+            ? "Es läuft weiter, nur auf diesem Rechner erreichbar."
+            : guard.state === "keine"
+              ? "Es läuft jetzt gar nicht mehr."
+              : guardText(guard, root);
+        err(`Supabase ließ sich für den Neustart nicht anhalten. ${state} Docker neu starten, dann: ${retry}.`);
+        return 1;
+      }
+    }
+  }
+  if (signal?.aborted) {
+    err("Abgebrochen, Supabase wurde nicht gestartet.");
+    return EXIT_ABORTED;
+  }
+
+  const network = await ensureLoopbackNetwork(ctx, signal ?? new AbortController().signal);
+  if (!network.ok) {
+    if (network.aborted) {
+      err("Abgebrochen, Supabase wurde nicht gestartet.");
+      return EXIT_ABORTED;
+    }
+    // Laufen schon Container in einem offenen Netz, sind sie erreichbar: anhalten
+    const guard = network.open ? await checkExposure(ctx, deps) : null;
+    err([network.message, guard ? guardText(guard, root) : ""].filter(Boolean).join(" "));
+    return 1;
+  }
+
+  out(studio ? "Starte Supabase mit Studio (beim ersten Mal lädt Docker einige GB) …" : "Starte Supabase (beim ersten Mal lädt Docker einige GB) …");
+  // Ausgabe der CLI geht nie weiter: start nennt Schlüssel und DB_URL
+  const start = await ctx.run(supabaseCli(["start", "--workdir", root, "-x", excludedFor(studio)]), { timeoutMs: START_TIMEOUT_MS, signal, cwd: root, env: cliEnv() });
+  if (start.code !== 0 || signal?.aborted) {
+    const guard = await checkExposure(ctx, deps);
+    const problem = signal?.aborted || start.aborted ? "abgebrochen" : startProblem(start);
+    err([startProblemText(problem, root, retry), guardText(guard, root)].filter(Boolean).join(" "));
+    return problem === "abgebrochen" ? EXIT_ABORTED : 1;
+  }
+
+  // Nur auf diesem Rechner erreichbar? (Bindungen, dann Heimnetz, Studio eingeschlossen)
+  const guard = await checkExposure(ctx, deps);
+  if (guard.state !== "sicher") {
+    err(exposedText(guard, root));
+    return 1;
+  }
+  out(`Supabase läuft auf diesem Rechner: ${LOCAL_SUPABASE_URL}`);
+  const after = await runningContainers(ctx);
+  if (studio) {
+    out(`Studio (Daten im Browser ansehen): ${LOCAL_STUDIO_URL}. Ohne Anmeldung, nur auf diesem Rechner erreichbar. Ausschalten: ${DB_CLI} stop, dann ${DB_CLI} start.`);
+  } else if (after?.has(STUDIO_CONTAINER)) {
+    out(`Studio läuft noch (${LOCAL_STUDIO_URL}). Ausschalten: ${DB_CLI} stop, dann ${DB_CLI} start.`);
+  }
+  return 0;
+}
+
+async function databaseStop(o: DatabaseCommandOptions): Promise<number> {
+  const { ctx, out, err } = o;
+  const root = ctx.root;
+  if (!(await dockerRunning(ctx))) {
+    out("Docker läuft nicht, also läuft auch Supabase nicht. Nichts zu tun.");
+    return 0;
+  }
+  // Nie --no-backup (löscht die Daten), nie --all (träfe andere Projekte); ohne Signal, damit es zu Ende läuft
+  const stop = await ctx.run(supabaseCli(["stop", "--workdir", root]), { timeoutMs: STATUS_TIMEOUT_MS, cwd: root, env: cliEnv() });
+  const after = await containerBindings(ctx);
+  if (stop.code === 0 && !stop.timedOut && after === "keine") {
+    out("Supabase ist angehalten. Die Daten bleiben in den Docker-Volumes supabase_<dienst>_tybo.");
+    out(`Wieder starten: ${DB_CLI} start`);
+    return 0;
+  }
+  err(`Supabase ließ sich nicht vollständig anhalten. ${stopCommandText(root)}`);
+  return 1;
+}
+
+// Größen aus docker system df (go-units, Basis 1000: B, kB, MB, GB, TB)
+const SIZE_UNITS: Record<string, number> = { b: 1, kb: 1e3, mb: 1e6, gb: 1e9, tb: 1e12, pb: 1e15 };
+
+export function parseDockerSize(text: string): number | null {
+  const m = /^(\d+(?:\.\d+)?)\s*([kmgtp]?b)$/i.exec(text.trim());
+  if (!m) return null;
+  return Math.round(Number(m[1]) * SIZE_UNITS[m[2].toLowerCase()]);
+}
+
+/** 1234567 → „1,2 MB“ (Basis 1000 wie Docker) */
+export function formatBytes(bytes: number): string {
+  const units = ["B", "kB", "MB", "GB", "TB"];
+  let value = bytes;
+  let i = 0;
+  while (value >= 1000 && i < units.length - 1) {
+    value /= 1000;
+    i++;
+  }
+  const shown = i === 0 ? String(Math.round(value)) : value.toFixed(1).replace(".", ",");
+  return `${shown} ${units[i]}`;
+}
+
+/**
+ * Volumes von tybo aus `docker system df -v` (Abschnitt „Local Volumes space
+ * usage“, Name endet auf _tybo). Nur Name und Größe, nichts sonst.
+ */
+export function tyboVolumes(dfOutput: string): Array<{ name: string; size: string; bytes: number | null }> {
+  const out: Array<{ name: string; size: string; bytes: number | null }> = [];
+  let inVolumes = false;
+  for (const line of dfOutput.split("\n")) {
+    if (/^local volumes space usage/i.test(line.trim())) {
+      inVolumes = true;
+      continue;
+    }
+    if (!inVolumes) continue;
+    if (/space usage:?$|usage:$/i.test(line.trim())) break;
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 2 || !parts[0].endsWith("_tybo")) continue;
+    const size = parts[parts.length - 1];
+    out.push({ name: parts[0], size, bytes: parseDockerSize(size) });
+  }
+  return out;
+}
+
+async function databaseStatus(o: DatabaseCommandOptions): Promise<number> {
+  const { ctx, out } = o;
+  if (!(await dockerRunning(ctx))) {
+    out("Supabase auf diesem Rechner: läuft nicht (Docker läuft nicht).");
+    out(`Starten: ${DB_CLI} start`);
+    return 1;
+  }
+  // Nur docker ps und docker system df: supabase status nennt Schlüssel und wird hier nicht gebraucht
+  const running = await runningContainers(ctx);
+  if (running === null) {
+    out("Supabase auf diesem Rechner: unbekannt (docker ps antwortet nicht).");
+    return 1;
+  }
+  const up = running.has(DB_CONTAINER);
+  out(`Supabase auf diesem Rechner: ${up ? "läuft" : "läuft nicht"}`);
+  out(`Adresse: ${LOCAL_SUPABASE_URL}`);
+  if (up) {
+    out(`Dienste: ${running.size} Container laufen`);
+    if (running.has(STUDIO_CONTAINER)) out(`Studio: ${LOCAL_STUDIO_URL}`);
+    if (edgeRuntimeEnabled(ctx.root) && !running.has(EDGE_CONTAINER)) out(`Edge Runtime fehlt (nach einem Neustart des Rechners üblich); ${DB_CLI} start holt sie zurück.`);
+    const bindings = await containerBindings(ctx);
+    if (bindings === "offen") out(`Achtung: Ports sind nicht nur an 127.0.0.1 gebunden, Supabase ist womöglich aus dem Heimnetz erreichbar. ${DB_CLI} stop, dann ${DB_CLI} start (prüft das Netz).`);
+  } else {
+    out(`Starten: ${DB_CLI} start`);
+  }
+  const df = await ctx.run(["docker", "system", "df", "-v"], { timeoutMs: 2 * 60 * 1000 });
+  const volumes = df.code === 0 ? tyboVolumes(df.stdout) : null;
+  if (volumes === null) {
+    out("Platz der Docker-Volumes: nicht lesbar (docker system df -v).");
+  } else if (!volumes.length) {
+    out("Docker-Volumes von tybo: keine (noch nie gestartet?)");
+  } else {
+    out("Docker-Volumes (Daten von tybo):");
+    for (const v of volumes) out(`  ${v.name.padEnd(28)} ${v.size}`);
+    const total = volumes.reduce((sum, v) => sum + (v.bytes ?? 0), 0);
+    out(`  ${"zusammen".padEnd(28)} ${formatBytes(total)}`);
+  }
+  return up ? 0 : 1;
+}
+
+/** JJJJMMTT-HHMM in Ortszeit */
+export function backupStamp(date: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}${p(date.getMonth() + 1)}${p(date.getDate())}-${p(date.getHours())}${p(date.getMinutes())}`;
+}
+
+/**
+ * Legt den Ordner der Sicherung exklusiv an (0700): supabase-<stamp>, ist der
+ * Name belegt, supabase-<stamp>-2, -3 … Eine vorhandene Sicherung wird nie
+ * überschrieben, auch nicht bei zwei Läufen in derselben Minute.
+ */
+export async function claimBackupDir(parent: string, stamp: string): Promise<string> {
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  for (let i = 1; i <= 99; i++) {
+    const dir = join(parent, i === 1 ? `supabase-${stamp}` : `supabase-${stamp}-${i}`);
+    try {
+      await mkdir(dir, { mode: 0o700 });
+      await chmod(dir, 0o700);
+      return dir;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code !== "EEXIST") throw e;
+    }
+  }
+  throw Object.assign(new Error("Zu viele Sicherungen in dieser Minute"), { code: "EEXIST" });
+}
+
+/** Teile der Sicherung in der Reihenfolge, in der sie entstehen */
+export const BACKUP_PARTS = ["schema.sql", "daten.sql", "storage.sql", "bilder.tar.gz"] as const;
+export const BACKUP_MANIFEST = "sicherung.txt";
+
+const PART_TEXT: Record<(typeof BACKUP_PARTS)[number], string> = {
+  "schema.sql": "Tabellen, Funktionen und Rechte von tybo (ohne auth, storage und die anderen Supabase-Schemas)",
+  "daten.sql": "Inhalte der Tabellen von tybo im Schema public: Gespräche, Gedächtnis, Ziele (ohne auth und storage)",
+  "storage.sql": "Einträge der Bilder (storage.buckets, storage.objects; ohne storage.migrations)",
+  "bilder.tar.gz": `die Bilddateien selbst (Volume supabase_storage_tybo, ${STORAGE_PATH} im Storage-Container)`,
+};
+
+async function databaseBackup(o: DatabaseCommandOptions, ziel: string | undefined): Promise<number> {
+  const { ctx, out, err, signal } = o;
+  const root = ctx.root;
+  const parent = ziel ? resolve(o.cwd ?? process.cwd(), ziel) : join(root, "data", "backups");
+
+  if (!(await dockerRunning(ctx))) {
+    err(`Docker läuft nicht, so lässt sich nichts sichern. Docker starten, dann ${DB_CLI} start und erneut ${DB_CLI} sichern.`);
+    return 1;
+  }
+  const running = await runningContainers(ctx);
+  if (!running?.has(DB_CONTAINER) || !running.has(STORAGE_CONTAINER)) {
+    err(`Supabase läuft nicht (Datenbank oder Storage fehlt), so lässt sich nichts sichern. Erst ${DB_CLI} start, dann erneut ${DB_CLI} sichern.`);
+    return 1;
+  }
+
+  let dir: string;
+  try {
+    dir = await claimBackupDir(parent, backupStamp(ctx.now()));
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException)?.code;
+    err(`Der Ordner für die Sicherung ließ sich in ${parent} nicht anlegen${code ? ` (${code})` : ""}. Einen anderen Ort mit --ziel <Ordner> angeben.`);
+    return 1;
+  }
+  out(`Sichere nach ${dir} …`);
+
+  const cli = { cwd: root, env: cliEnv(), timeoutMs: BACKUP_STEP_TIMEOUT_MS, signal };
+  const file = (name: string) => join(dir, name);
+  // Reihenfolge verbindlich (Konsistenz bei laufendem Bot): erst die Tabellen
+  // von tybo, dann die Einträge der Bilder, zuletzt die Dateien. Ein Bild lädt
+  // tybo erst hoch und trägt es dann ein; so fehlt zu keinem gesicherten
+  // Eintrag die Datei, höchstens liegt eine neuere Datei ohne Eintrag bei.
+  const steps: Array<{ label: string; name: string; cmds: string[][] }> = [
+    { label: "Schema", name: "schema.sql", cmds: [supabaseCli(["db", "dump", "--local", "--workdir", root, "-f", file("schema.sql")])] },
+    // -s public: ohne -s nimmt die CLI 2.118.0 auch auth, storage und
+    // supabase_functions mit (im Handversuch gemessen); tybo hat nur public,
+    // storage steht getrennt in storage.sql
+    { label: "Daten", name: "daten.sql", cmds: [supabaseCli(["db", "dump", "--local", "--workdir", root, "--data-only", "-s", "public", "-f", file("daten.sql")])] },
+    { label: "Einträge der Bilder", name: "storage.sql", cmds: [supabaseCli(["db", "dump", "--local", "--workdir", root, "--data-only", "-s", "storage", "-f", file("storage.sql")])] },
+    {
+      label: "Bilddateien",
+      name: "bilder.tar.gz",
+      cmds: [
+        ["docker", "cp", `${STORAGE_CONTAINER}:${STORAGE_PATH}/.`, file(".bilder")],
+        // COPYFILE_DISABLE: kein ._-Beiwerk von macOS im Archiv
+        ["tar", "-czf", file("bilder.tar.gz"), "-C", file(".bilder"), "."],
+      ],
+    },
+  ];
+
+  const failed = async (text: string, aborted = false): Promise<number> => {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    err(aborted ? "Abgebrochen. Die unvollständige Sicherung ist gelöscht." : `${text} Die unvollständige Sicherung ist gelöscht; nichts Älteres wurde angefasst.`);
+    return aborted ? EXIT_ABORTED : 1;
+  };
+
+  for (const [i, step] of steps.entries()) {
+    out(`  ${i + 1}/${steps.length} ${step.label}`);
+    for (const cmd of step.cmds) {
+      const env = cmd[0] === "tar" ? { ...cliEnv(), COPYFILE_DISABLE: "1" } : cli.env;
+      const r = await ctx.run(cmd, { ...cli, env });
+      if (r.aborted || signal?.aborted) return failed("", true);
+      // Ausgabe von CLI und Docker geht nie weiter
+      if (r.code !== 0) {
+        const why = r.timedOut ? "hat nach 30 Minuten nicht geantwortet" : "ist fehlgeschlagen";
+        return failed(`Die Sicherung (${step.label}) ${why}. Läuft Supabase? ${DB_CLI} status zeigt es.`);
+      }
+    }
+    const size = await stat(file(step.name)).then(s => (s.isFile() ? s.size : 0), () => 0);
+    if (size <= 0) return failed(`Die Sicherung (${step.label}) hat keine Datei ${step.name} geschrieben.`);
+  }
+  await rm(file(".bilder"), { recursive: true, force: true }).catch(() => {});
+
+  // Inhaltsverzeichnis zuletzt: liegt es da, ist die Sicherung vollständig
+  let total = 0;
+  const lines = [
+    `${BRAND.name}: Sicherung von Supabase auf diesem Rechner`,
+    `Zeit: ${ctx.now().toISOString()}`,
+    `Supabase-CLI: ${SUPABASE_CLI_VERSION}`,
+    "Reihenfolge: schema.sql, daten.sql, storage.sql, bilder.tar.gz",
+    "",
+  ];
+  try {
+    for (const name of BACKUP_PARTS) {
+      const size = (await stat(file(name))).size;
+      total += size;
+      await chmod(file(name), 0o600);
+      lines.push(`${name.padEnd(14)} ${formatBytes(size).padStart(9)}  ${PART_TEXT[name]}`);
+    }
+    lines.push("", "Wiederherstellen: docs/einrichtung.md, Abschnitt „Supabase lokal im Alltag“.", "");
+    await writeFile(file(BACKUP_MANIFEST), lines.join("\n"), { mode: 0o600 });
+    const extra = (await readdir(dir)).filter(n => ![...BACKUP_PARTS, BACKUP_MANIFEST].includes(n as any));
+    if (extra.length) throw new Error("unerwartete Dateien");
+  } catch {
+    return failed("Die Sicherung ließ sich nicht abschließen (Dateien nicht lesbar).");
+  }
+  out(`Sicherung fertig: ${dir} (${formatBytes(total)})`);
+  out("Die Dateien enthalten alle Gespräche und das Gedächtnis: nur an einem sicheren Ort aufbewahren.");
+  return 0;
+}
+
+/**
+ * tybo datenbank … (Issue #165). Tut nur etwas, wenn SUPABASE_URL genau auf
+ * das Supabase dieses Projekts zeigt; sonst ein Hinweis und Exit 1. Gibt nie
+ * Ausgaben der CLI weiter (start und status nennen Schlüssel).
+ */
+export async function runDatabaseCommand(args: string[], o: DatabaseCommandOptions): Promise<number> {
+  const parsed = parseDatabaseArgs(args);
+  if (!parsed) {
+    o.err(`Unbekannter Aufruf: ${DB_CLI} ${args.join(" ")}`);
+    o.err(databaseUsage());
+    return 2;
+  }
+  if (parsed.command === "help") {
+    o.out(databaseUsage());
+    return 0;
+  }
+  const notLocal = notLocalText(o.env.SUPABASE_URL);
+  if (notLocal) {
+    o.err(notLocal);
+    return 1;
+  }
+  switch (parsed.command) {
+    case "start":
+      return databaseStart(o, parsed.studio);
+    case "stop":
+      return databaseStop(o);
+    case "status":
+      return databaseStatus(o);
+    case "sichern":
+      return databaseBackup(o, parsed.ziel);
+  }
 }

@@ -112,7 +112,7 @@ export function atBudget(goal: ActiveGoal | null | undefined, goalId: number): b
 
 export interface GoalChoicesDeps {
   getGoal(sessionKey: string): Promise<ActiveGoal | undefined>;
-  /** abortClaudeCalls aus src/lib/claude.ts (Beenden bricht laufende Aufrufe ab) */
+  /** abortEngineCalls aus src/lib/engines (Beenden bricht laufende Aufrufe ab) */
   abort(sessionKey: string): number;
   /** Frage in Telegram zeigen und festhalten (createTelegramChoices().sendChoice) */
   sendChoice(choice: Choice): Promise<{ sent: boolean }>;

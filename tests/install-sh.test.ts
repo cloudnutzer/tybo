@@ -81,7 +81,7 @@ exit 0`,
 };
 
 /** Echte Werkzeuge, die das Skript und die Attrappen brauchen; bash nur für den Attrappen-Installer */
-const REAL_TOOLS = ["sed", "tr", "ls", "mktemp", "rm", "mkdir", "cat", "cp", "basename", "bash"];
+const REAL_TOOLS = ["sed", "tr", "ls", "mktemp", "rm", "mkdir", "cat", "cp", "basename", "bash", "sleep"];
 
 let root: string;
 let mockDir: string;
@@ -210,6 +210,40 @@ function exportedBunInstall(text: string): string {
   return p.stdout.toString();
 }
 
+/** Ausführbare Attrappe, die nichts tut */
+async function executable(path: string): Promise<void> {
+  await writeFile(path, "#!/bin/sh\nexit 0\n");
+  await chmod(path, 0o755);
+}
+
+/** Verhalten von ~/.local/bin/claude bei „claude --version“ */
+const CLAUDE_BODIES = {
+  /** meldet eine Version wie die echte CLI */
+  ok: 'echo "2.1.300 (Claude Code)"',
+  /** startet, scheitert aber */
+  fails: 'echo "Error: cannot find module" >&2\nexit 1',
+  /** Exit 0, aber keine Version */
+  silent: "exit 0",
+  /** hängt */
+  hangs: "exec sleep 30",
+  /** hängt und ignoriert TERM (PR #223) */
+  hangsIgnoringTerm: "trap '' TERM\nsleep 30",
+  /** meldet eine Version, hängt dann und beendet sich bei TERM mit Exit 0 (PR #223) */
+  versionThenHang: 'echo "2.1.300 (Claude Code)"\ntrap "exit 0" TERM\nsleep 30 & wait',
+} as const;
+
+/** ~/.local/bin/claude anlegen: ausführbare Attrappe mit Verhalten oder (false) nicht ausführbar */
+const localClaude = (body: keyof typeof CLAUDE_BODIES | false) => async (home: string) => {
+  await mkdir(join(home, ".local", "bin"), { recursive: true });
+  const file = join(home, ".local", "bin", "claude");
+  if (body === false) {
+    await writeFile(file, "kein Programm");
+    return;
+  }
+  await writeFile(file, `#!/bin/sh\n${CLAUDE_BODIES[body]}\n`);
+  await chmod(file, 0o755);
+};
+
 const setupEnv = (r: RunResult) => r.calls.find(c => c[0] === "setup-env");
 
 /** Legt einen vorhandenen Klon an (für den zweiten Lauf) */
@@ -283,8 +317,10 @@ describe("install.sh: Gleichlauf", () => {
     expect(pkg.engines.bun).toBe(`>=${MIN_BUN_VERSION}`);
   });
 
-  test("Claude-CLI-Befehl wie im Schritt Voraussetzungen", () => {
+  test("Claude-CLI-Befehl wie im Schritt Voraussetzungen: der native Installer", () => {
     expect(SOURCE).toContain(`CLAUDE_INSTALL_CMD="${CLAUDE_INSTALL}"`);
+    expect(SOURCE).toContain('CLAUDE_INSTALL_CMD="curl -fsSL https://claude.ai/install.sh | bash"');
+    expect(SOURCE).not.toContain("npm install -g @anthropic-ai/claude-code");
   });
 });
 
@@ -695,11 +731,85 @@ for (const shell of SHELLS) {
       expect(named(r, "git")).toEqual([]);
     });
 
-    test("fehlende Node.js und Claude CLI stehen am Ende als Hinweis", async () => {
+    test("fehlende Claude CLI: nativer Installer; Node.js nur für PM2, Convex und npm", async () => {
       const r = await run({ shell, tty: "" });
-      expect(r.stdout).toContain("Node.js installieren");
-      expect(r.stdout).toContain("tybo setup prüft Node.js nicht");
-      expect(r.stdout).toContain(CLAUDE_INSTALL);
+      expect(r.stdout).toContain("tybo: Als Nächstes die Claude CLI installieren: curl -fsSL https://claude.ai/install.sh | bash (braucht weder Node.js noch sudo)");
+      expect(r.stdout).not.toContain("npm install -g @anthropic-ai/claude-code");
+      expect(r.stdout).not.toContain("Node.js installieren");
+      expect(r.stdout).toContain("Node.js ist für tybo selbst nicht nötig, nur für PM2, den Convex-Weg (npx) oder die Claude CLI per npm.");
+    });
+
+    test("Claude CLI und Node.js erreichbar: keine Hinweise dazu", async () => {
+      const r = await run({
+        shell,
+        tty: "",
+        prepare: async home => {
+          await mkdir(join(home, "werkzeuge"));
+          for (const name of ["claude", "node"]) await executable(join(home, "werkzeuge", name));
+        },
+        extraPath: home => [join(home, "werkzeuge")],
+      });
+      expect(r.exit).toBe(0);
+      expect(r.stdout).not.toContain("Claude CLI");
+      expect(r.stdout).not.toContain("Node.js");
+    });
+
+    test("~/.local/bin/claude vorhanden, nicht im PATH: PATH-Hinweis statt Installationsbefehl", async () => {
+      const r = await run({ shell, tty: "", prepare: localClaude("ok") });
+      expect(r.exit).toBe(0);
+      expect(r.stdout).toContain("tybo: Die Claude CLI liegt in ~/.local/bin, das ist noch nicht im PATH: neue Sitzung öffnen.");
+      expect(r.stdout).toContain('  export PATH="$HOME/.local/bin:$PATH"');
+      expect(r.stdout).not.toContain(CLAUDE_INSTALL);
+    });
+
+    // Befund Runde 1: -x allein belegt nicht, dass nur der PATH fehlt. Wie im
+    // Schritt Voraussetzungen zählt nur ein erfolgreiches claude --version.
+    for (const [name, body] of [
+      ["nicht ausführbar", false],
+      ["ausführbar, scheitert beim Start", "fails"],
+      ["ausführbar, Exit 0 ohne Version", "silent"],
+    ] as const) {
+      test(`~/.local/bin/claude ${name}: Reparaturhinweis mit Installationsbefehl, kein PATH-Hinweis`, async () => {
+        const r = await run({ shell, tty: "", prepare: localClaude(body) });
+        expect(r.exit).toBe(0);
+        expect(r.stdout).toContain(`tybo: Die Claude CLI liegt in ~/.local/bin, startet dort aber nicht (claude --version scheitert). Neu installieren: ${CLAUDE_INSTALL}`);
+        expect(r.stdout).not.toContain("noch nicht im PATH");
+        expect(r.stdout).not.toContain("$HOME/.local/bin:$PATH");
+      });
+    }
+
+    test("~/.local/bin/claude hängt: nach der Frist beendet, Reparaturhinweis", async () => {
+      // Kopie mit kurzer Frist, sonst dauerte der Test 15 s
+      const script = join(root, `install-kurze-frist-${++counter}.sh`);
+      expect(SOURCE).toContain('CLAUDE_VERSION_TIMEOUT="15"');
+      await writeFile(script, SOURCE.replace('CLAUDE_VERSION_TIMEOUT="15"', 'CLAUDE_VERSION_TIMEOUT="1"'));
+      const started = Date.now();
+      const r = await run({ shell, tty: "", script, prepare: localClaude("hangs") });
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(r.exit).toBe(0);
+      expect(r.stdout).toContain("startet dort aber nicht (claude --version scheitert)");
+      expect(r.stdout).not.toContain("noch nicht im PATH");
+    });
+
+    test("~/.local/bin/claude meldet Version, hängt, endet bei TERM mit 0: trotzdem Fehler (PR #223)", async () => {
+      const script = join(root, `install-kurze-frist-${++counter}.sh`);
+      await writeFile(script, SOURCE.replace('CLAUDE_VERSION_TIMEOUT="15"', 'CLAUDE_VERSION_TIMEOUT="1"'));
+      const started = Date.now();
+      const r = await run({ shell, tty: "", script, prepare: localClaude("versionThenHang") });
+      expect(Date.now() - started).toBeLessThan(15_000);
+      expect(r.exit).toBe(0);
+      expect(r.stdout).toContain("startet dort aber nicht (claude --version scheitert)");
+      expect(r.stdout).not.toContain("noch nicht im PATH: neue Sitzung");
+    });
+
+    test("~/.local/bin/claude hängt und ignoriert TERM: nach Frist und Schonfrist beendet (PR #223)", async () => {
+      const script = join(root, `install-kurze-frist-${++counter}.sh`);
+      await writeFile(script, SOURCE.replace('CLAUDE_VERSION_TIMEOUT="15"', 'CLAUDE_VERSION_TIMEOUT="1"'));
+      const started = Date.now();
+      const r = await run({ shell, tty: "", script, prepare: localClaude("hangsIgnoringTerm") });
+      expect(Date.now() - started).toBeLessThan(15_000);
+      expect(r.exit).toBe(0);
+      expect(r.stdout).toContain("startet dort aber nicht (claude --version scheitert)");
     });
 
     test("echter Pipe-Aufruf (wie curl … | sh -s --): neue Installation mit Setup", async () => {
@@ -708,6 +818,187 @@ for (const shell of SHELLS) {
       const dir = join(realpathSync(r.home), "per pipe");
       expect(has(r, "git", "clone", "--branch", "master", "https://github.com/cloudnutzer/tybo.git", dir)).toBe(true);
       expect(has(r, "bun", "--no-env-file", join(dir, "scripts/tybo.ts"), "setup")).toBe(true);
+    });
+  });
+}
+
+/** Die Zeilen, die der offizielle Bun-Installer in die Startdatei schreibt */
+const BUN_RC = '# bun\nexport BUN_INSTALL="$HOME/.bun"\nexport PATH="$BUN_INSTALL/bin:$PATH"\n';
+
+/** Legt Startdateien in HOME an (Name → Inhalt) */
+const rcFiles = (files: Record<string, string>) => async (home: string) => {
+  for (const [name, content] of Object.entries(files)) await writeFile(join(home, name), content);
+};
+
+const ZEILEN = "Diese zwei Zeilen in ~/.zshrc";
+
+for (const shell of SHELLS) {
+  describe(`install.sh unter ${shell}: Bun-PATH-Hinweis je Startdatei (Issue #212)`, () => {
+    const found = (r: RunResult, rc: string) => {
+      expect(r.exit).toBe(0);
+      expect(r.stdout).toContain(`In ${rc} steht schon ein Eintrag dafür: neues Terminal bzw. neue SSH-Sitzung öffnen oder source ${rc} ausführen.`);
+      expect(r.stdout).not.toContain("dann wird der Befehl tybo gefunden");
+      expect(r.stdout).not.toContain(ZEILEN);
+      // Rückfall, weil die Wirksamkeit der Startdatei ohne Ausführen offen bleibt (PR #223)
+      expect(r.stdout).toContain(`Fehlt tybo danach trotzdem, diese zwei Zeilen am Ende von ${rc} eintragen:`);
+      expect(r.stdout).toContain("export BUN_INSTALL=");
+    };
+    const missing = (r: RunResult) => {
+      expect(r.exit).toBe(0);
+      expect(r.stdout).toContain(ZEILEN);
+      expect(r.stdout).not.toContain("steht schon ein Eintrag dafür");
+    };
+
+    for (const [name, content] of [
+      ["danach PATH überschrieben", `${BUN_RC}export PATH=/usr/bin:/bin\n`],
+      ["in inaktivem if-Zweig", `if false; then\n${BUN_RC}fi\n`],
+      ["in nicht aufgerufener Funktion", `bun_an() {\n${BUN_RC}}\n`],
+    ] as const) {
+      test(`Bun-Zeilen ${name}: keine Erfolgsbehauptung, Rückfall-Zeilen erscheinen (PR #223)`, async () => {
+        const r = await run({ shell, tty: "", env: { SHELL: "/bin/bash" }, prepare: rcFiles({ ".bashrc": content }) });
+        expect(r.exit).toBe(0);
+        expect(r.stdout).toContain("export BUN_INSTALL=");
+        expect(r.stdout).not.toContain("dann wird der Befehl tybo gefunden");
+      });
+    }
+
+    for (const [login, file] of [
+      ["/bin/bash", ".bashrc"],
+      ["/usr/bin/bash", ".bash_profile"],
+      ["/bin/zsh", ".zshrc"],
+    ] as const) {
+      test(`${login}, Bun-Zeilen in ~/${file}: kein Zeilen-Hinweis`, async () => {
+        const r = await run({ shell, tty: "", env: { SHELL: login }, prepare: rcFiles({ [file]: `alias ll='ls -l'\n${BUN_RC}` }) });
+        found(r, `~/${file}`);
+      });
+    }
+
+    test("Bun installiert erst in diesem Lauf, Zeilen in ~/.bashrc: kein Zeilen-Hinweis", async () => {
+      const r = await run({ shell, args: ["--yes"], bunInPath: false, tty: "", env: { SHELL: "/bin/bash" }, prepare: rcFiles({ ".bashrc": BUN_RC }) });
+      found(r, "~/.bashrc");
+    });
+
+    test("keine Startdatei: die zwei Zeilen, kein Abbruch", async () => {
+      missing(await run({ shell, tty: "", env: { SHELL: "/bin/bash" } }));
+    });
+
+    test("Eintrag auskommentiert: die zwei Zeilen", async () => {
+      const commented = BUN_RC.split("\n").map(l => (l ? `# ${l}` : l)).join("\n");
+      missing(await run({ shell, tty: "", env: { SHELL: "/bin/bash" }, prepare: rcFiles({ ".bashrc": `  ${commented.replace(/\n/g, "\n  ")}` }) }));
+    });
+
+    test("nur Kommentar und BUN_INSTALL, keine PATH-Zeile: die zwei Zeilen", async () => {
+      missing(await run({ shell, tty: "", env: { SHELL: "/bin/bash" }, prepare: rcFiles({ ".bashrc": '# bun\nexport BUN_INSTALL="$HOME/.bun"\n' }) }));
+    });
+
+    test("Zeilen in ~/.zshrc, Login-Shell bash: zählt nicht", async () => {
+      missing(await run({ shell, tty: "", env: { SHELL: "/bin/bash" }, prepare: rcFiles({ ".zshrc": BUN_RC }) }));
+    });
+
+    test("unbekannte Login-Shell oder SHELL fehlt: die zwei Zeilen", async () => {
+      missing(await run({ shell, tty: "", env: { SHELL: "/usr/bin/fish" }, prepare: rcFiles({ ".bashrc": BUN_RC, ".zshrc": BUN_RC }) }));
+      missing(await run({ shell, tty: "", prepare: rcFiles({ ".bashrc": BUN_RC }) }));
+    });
+
+    for (const [name, line] of [
+      ["$HOME/.bun/bin", 'export PATH="$HOME/.bun/bin:$PATH"'],
+      ["${HOME}/.bun/bin", "export PATH=${HOME}/.bun/bin:$PATH"],
+      ["~/.bun/bin", "PATH=~/.bun/bin:$PATH"],
+      ["eingerückt, ${BUN_INSTALL}", '\t export BUN_INSTALL=~/.bun/\n  export PATH="${BUN_INSTALL}/bin:$PATH"'],
+    ] as const) {
+      test(`PATH-Zeile mit ${name}: erkannt`, async () => {
+        found(await run({ shell, tty: "", env: { SHELL: "/bin/bash" }, prepare: rcFiles({ ".bashrc": `${line}\n` }) }), "~/.bashrc");
+      });
+    }
+
+    test("voller Pfad des Bun-Ordners: erkannt", async () => {
+      let home = "";
+      const r = await run({
+        shell,
+        tty: "",
+        env: { SHELL: "/bin/zsh" },
+        prepare: async h => {
+          home = h;
+          await writeFile(join(h, ".zshrc"), `export PATH="${h}/.bun/bin:$PATH"\n`);
+        },
+      });
+      expect(home).not.toBe("");
+      found(r, "~/.zshrc");
+    });
+
+    test("eigenes BUN_INSTALL: Zeilen für ~/.bun zählen nicht, Zeilen für den eigenen Ordner schon", async () => {
+      const bunHome = join(root, `eigenes rc-bun ${counter}`);
+      const wrong = await run({ shell, args: ["--yes"], bunInPath: false, tty: "", env: { SHELL: "/bin/bash", BUN_INSTALL: bunHome }, prepare: rcFiles({ ".bashrc": BUN_RC }) });
+      missing(wrong);
+      expect(exportedBunInstall(wrong.stdout)).toBe(bunHome);
+      const right = await run({
+        shell,
+        args: ["--yes"],
+        bunInPath: false,
+        tty: "",
+        env: { SHELL: "/bin/bash", BUN_INSTALL: bunHome },
+        prepare: rcFiles({ ".bashrc": `export BUN_INSTALL="${bunHome}"\nexport PATH="$BUN_INSTALL/bin:$PATH"\n` }),
+      });
+      found(right, "~/.bashrc");
+    });
+
+    // Befund Runde 1: gezählt wird nur, was die Zuweisungen tatsächlich in den
+    // PATH bringen, Eintrag für Eintrag verglichen, nicht ein Teilstring der Zeile
+    for (const [name, rc] of [
+      ["MANPATH statt PATH", 'export MANPATH="$HOME/.bun/bin:$MANPATH"\n'],
+      ["anderer Ordner mit gleichem Anfang", 'export PATH="$HOME/.bun/bin-old:$PATH"\n'],
+      ["Bun-Pfad nur im Kommentar hinter der Zuweisung", 'export PATH="$PATH" # $HOME/.bun/bin\n'],
+      ["$HOME in einfachen Anführungszeichen", "export PATH='$HOME/.bun/bin':$PATH\n"],
+      ["~ in doppelten Anführungszeichen", 'export PATH="~/.bun/bin:$PATH"\n'],
+      ["Zuweisung nur für einen Befehl", "PATH=~/.bun/bin:$PATH bun --version\n"],
+      ["spätere Zuweisung ersetzt den PATH", `${BUN_RC}export PATH=/usr/bin:/bin\n`],
+      ["Befehlsersetzung", 'export PATH="$(printf %s "$HOME/.bun/bin"):$PATH"\n'],
+      ["unbekannte Variable statt $HOME", 'export PATH="$ANDERES/.bun/bin:$PATH"\n'],
+      ["${HOME:-…} mit Vorgabe", 'export PATH="${HOME:-/tmp}/.bun/bin:$PATH"\n'],
+    ] as const) {
+      test(`${name}: die zwei Zeilen`, async () => {
+        missing(await run({ shell, tty: "", env: { SHELL: "/bin/bash" }, prepare: rcFiles({ ".bashrc": rc }) }));
+      });
+    }
+
+    for (const [name, rc] of [
+      ["~ nach einem Doppelpunkt", "PATH=$PATH:~/.bun/bin\n"],
+      ["Kommentar hinter der Zuweisung", 'export PATH="$HOME/.bun/bin:$PATH" # bun\n'],
+      ["weiterer, unbekannter Eintrag in derselben Zeile", 'export PATH="$PNPM_HOME:$HOME/.bun/bin:$PATH"\n'],
+      ["spätere Zuweisung behält $PATH", `${BUN_RC}export PATH="$HOME/.local/bin:$PATH"\n`],
+      ["/ am Ende und doppelte /", 'export PATH="$HOME//.bun/bin/:$PATH"\n'],
+    ] as const) {
+      test(`${name}: erkannt`, async () => {
+        found(await run({ shell, tty: "", env: { SHELL: "/bin/bash" }, prepare: rcFiles({ ".bashrc": rc }) }), "~/.bashrc");
+      });
+    }
+
+    test("BUN_INSTALL zeigt woandershin, PATH über $BUN_INSTALL: zählt nicht", async () => {
+      missing(await run({ shell, tty: "", env: { SHELL: "/bin/bash" }, prepare: rcFiles({ ".bashrc": 'export BUN_INSTALL="$HOME/.anderes-bun"\nexport PATH="$BUN_INSTALL/bin:$PATH"\n' }) }));
+    });
+
+    test("Startdatei wird nur gelesen, nie ausgeführt; Startdateien bleiben unverändert", async () => {
+      const content = `mkdir "$HOME/ausgefuehrt"\n${BUN_RC}`;
+      const r = await run({ shell, tty: "", env: { SHELL: "/bin/bash" }, prepare: rcFiles({ ".bashrc": content }) });
+      found(r, "~/.bashrc");
+      expect(existsSync(join(r.home, "ausgefuehrt"))).toBe(false);
+      expect(await readFile(join(r.home, ".bashrc"), "utf8")).toBe(content);
+      expect(existsSync(join(r.home, ".bash_profile"))).toBe(false);
+      expect(existsSync(join(r.home, ".zshrc"))).toBe(false);
+    });
+
+    test("Startdatei nicht lesbar: kein Abbruch, die zwei Zeilen", async () => {
+      if (process.getuid?.() === 0) return;
+      const r = await run({
+        shell,
+        tty: "",
+        env: { SHELL: "/bin/bash" },
+        prepare: async home => {
+          await writeFile(join(home, ".bashrc"), BUN_RC);
+          await chmod(join(home, ".bashrc"), 0o000);
+        },
+      });
+      missing(r);
     });
   });
 }

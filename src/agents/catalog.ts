@@ -388,7 +388,7 @@ export function getCatalogAgentConfig(raw: string): AgentConfig | undefined {
   const agent = describe(data, name)!;
   if (agent.origin === "builtin") {
     const config = builtinConfig(name);
-    let systemPrompt = agent.systemPrompt;
+    let systemPrompt = withLongTaskRules(agent.systemPrompt);
     if (name === "general") systemPrompt += customInvokeHint(data);
     return systemPrompt === config.systemPrompt ? config : { ...config, systemPrompt };
   }
@@ -404,6 +404,29 @@ export function getCatalogAgentConfig(raw: string): AgentConfig | undefined {
     model: general.model,
     ...(general.effort ? { effort: general.effort } : {}),
   };
+}
+
+/**
+ * Ein gespeicherter Prompt (config/agents.json) ersetzt den Code-Prompt ganz,
+ * also auch BASE_CONTEXT. Fehlt ihm der Block LONG TASKS (Issue #180), wird er
+ * beim Aufruf angehaengt; die Datei bleibt unveraendert. Die Ueberschrift
+ * allein reicht nicht: eine aus dem Code uebernommene Fassung mit alten
+ * Minuten wird im Laufzeit-Prompt durch die aktuelle ersetzt, jede andere
+ * Fassung (unvollstaendig, umformuliert) bleibt stehen und die aktuelle
+ * kommt dahinter.
+ */
+function withLongTaskRules(prompt: string): string {
+  const { LONG_TASK_RULES } = require("./base") as typeof import("./base");
+  if (prompt.includes(LONG_TASK_RULES)) return prompt;
+  const stale = staleLongTaskRules(LONG_TASK_RULES);
+  if (stale.test(prompt)) return prompt.replace(stale, () => LONG_TASK_RULES);
+  return `${prompt}\n\n${LONG_TASK_RULES}\n`;
+}
+
+/** Erkennt den Block aus dem Code mit beliebigen Minutenwerten */
+function staleLongTaskRules(rules: string): RegExp {
+  const escaped = rules.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(escaped.replace(/\d+/g, "\\d+(?:\\.\\d+)?"));
 }
 
 /** Zusatz fuer General: eigene Agenten, die er fragen kann (leer ohne eigene Agenten) */

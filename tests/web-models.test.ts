@@ -12,6 +12,8 @@ import {
   createModelCatalog,
   MODELS_CACHE_MS,
   OLLAMA_TAGS_URL,
+  OPENCODE_MODELS_TEXT,
+  OPENCODE_MODELS_TIMEOUT_MS,
   OPENROUTER_MODELS_URL,
   type ModelCatalogOptions,
 } from "../src/web/models";
@@ -60,6 +62,7 @@ describe("Modell-Listen", () => {
       claude: { models: [...CLAUDE_MODELS], custom: true },
       openrouter: { models: [{ id: "vendor/a", name: "Modell A" }, { id: "vendor/b", name: "vendor/b" }] },
       ollama: { models: ["qwen3:8b", "llama9:latest"] },
+      opencode: { models: [], error: OPENCODE_MODELS_TEXT.unavailable },
     });
     expect(CLAUDE_MODELS).toEqual(["claude-opus-5-5", "claude-fable-5-1", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5-20251001"]);
   });
@@ -161,6 +164,83 @@ describe("Modell-Listen", () => {
   });
 });
 
+describe("OpenCode-Modelle (Issue #129)", () => {
+  const LINES = ["openai/gpt-5.5", "openrouter/anthropic/claude-opus-5.5", "openrouter/openai/gpt-5.5"];
+
+  test("Zeilen der Attrappe unverändert, auch mit mehreren Schrägstrichen", async () => {
+    const net = fakeNet();
+    const lists = await createModelCatalog({ fetch: net.fetch, opencode: async () => ({ ok: true, models: [...LINES] }) }).list();
+    expect(lists.opencode).toEqual({ models: LINES });
+  });
+
+  test("Zwischenspeicher 10 Minuten, gleichzeitige Abrufe teilen sich einen Aufruf", async () => {
+    const net = fakeNet();
+    let t = 5_000_000;
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>(r => (release = r));
+    const catalog = createModelCatalog({
+      fetch: net.fetch,
+      now: () => t,
+      opencode: async () => {
+        calls++;
+        await gate;
+        return { ok: true, models: [...LINES] };
+      },
+    });
+    const both = Promise.all([catalog.list(), catalog.list(), catalog.list()]);
+    release();
+    for (const l of await both) expect(l.opencode.models).toEqual(LINES);
+    expect(calls).toBe(1);
+    t += MODELS_CACHE_MS - 1;
+    await catalog.list();
+    expect(calls).toBe(1);
+    t += 2;
+    await catalog.list();
+    expect(calls).toBe(2);
+  });
+
+  test("Fehler: leere Liste mit festem Text, nicht zwischengespeichert, eine Log-Zeile ohne Rohausgabe", async () => {
+    const net = fakeNet();
+    const logs: string[] = [];
+    let mode: "fail" | "throw" | "odd" | "ok" = "fail";
+    let calls = 0;
+    const catalog = createModelCatalog({
+      fetch: net.fetch,
+      log: m => logs.push(m),
+      opencode: async () => {
+        calls++;
+        if (mode === "throw") throw new Error("/Users/geheim/.local/share/opencode: sk-or-v1-abc");
+        if (mode === "odd") return { ok: false, error: "Zeile 1\nsk-or-v1-abc" };
+        if (mode === "ok") return { ok: true, models: [...LINES] };
+        return { ok: false, error: "OpenCode ist nicht installiert" };
+      },
+    });
+    expect((await catalog.list()).opencode).toEqual({ models: [], error: "OpenCode ist nicht installiert" });
+    mode = "throw";
+    expect((await catalog.list()).opencode).toEqual({ models: [], error: OPENCODE_MODELS_TEXT.failed });
+    mode = "odd";
+    expect((await catalog.list()).opencode).toEqual({ models: [], error: OPENCODE_MODELS_TEXT.failed });
+    mode = "ok";
+    expect((await catalog.list()).opencode.models).toEqual(LINES);
+    expect(calls).toBe(4);
+    expect(logs.join("\n")).not.toContain("sk-or");
+    expect(logs.join("\n")).not.toContain("/Users/");
+    // OpenRouter und Ollama bleiben unberührt
+    expect((await catalog.list()).openrouter.models).toHaveLength(2);
+  });
+
+  test("hängender Port: nach dem Zeitlimit Hinweis, die übrigen Listen kommen trotzdem", async () => {
+    expect(OPENCODE_MODELS_TIMEOUT_MS).toBe(10_000);
+    const net = fakeNet();
+    // Der Port antwortet nie: ein Ergebnis gibt es nur über das eigene Zeitlimit.
+    // Keine Messung der Wanduhr, die bei ausgelasteter Maschine kippen kann.
+    const lists = await createModelCatalog({ fetch: net.fetch, opencode: () => new Promise(() => {}), opencodeTimeoutMs: 50 }).list();
+    expect(lists.opencode).toEqual({ models: [], error: OPENCODE_MODELS_TEXT.timeout });
+    expect(lists.ollama.models).toHaveLength(2);
+  });
+});
+
 const root = await mkdtemp(join(tmpdir(), "tybo-models-"));
 afterAll(() => rm(root, { recursive: true, force: true }));
 const servers: WebServer[] = [];
@@ -179,6 +259,7 @@ describe("GET /api/models", () => {
     expect(body.claude.custom).toBe(true);
     expect(body.openrouter.models).toHaveLength(2);
     expect(body.ollama).toEqual({ models: [], error: "Ollama ist nicht erreichbar" });
+    expect(body.opencode).toEqual({ models: [], error: OPENCODE_MODELS_TEXT.unavailable });
     expect((await fetch(`${ctx.origin}/api/models`)).status).toBe(401);
     expect((await ctx.api("/api/models", "POST", {})).status).toBe(405);
   });

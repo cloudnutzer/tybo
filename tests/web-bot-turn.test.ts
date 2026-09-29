@@ -6,7 +6,7 @@ import {
   ABORT_REPLY,
   FALLBACK_FAILED_REPLY,
   SHUTDOWN_ABORT_REPLY,
-  TIMEOUT_NOTICE_TEXT,
+  LONG_RUN_NOTICE_TEXT,
   type TurnOptions,
   type TurnSink,
 } from "../src/lib/chat-turn";
@@ -70,8 +70,8 @@ function setup(core: (o: TurnOptions) => Promise<string> = async () => "Antwort"
     processIntents: async t => {
       state.intents.push(t);
     },
-    // wie abortClaudeCalls in src/lib/claude.ts: bricht die Ausführungen unter dem Schlüssel ab
-    abortClaudeCalls: key => {
+    // wie abortEngineCalls in src/lib/engines: bricht die Ausführungen unter dem Schlüssel ab
+    abortEngineCalls: key => {
       state.aborts.push(key);
       return abortExecutions(key);
     },
@@ -247,8 +247,8 @@ describe("createWebSink", () => {
     await sink.notice("Hinweis");
     await sink.finish?.();
     await sink.progress({ kind: "tool", text: "zu spät" });
-    await sink.notice(TIMEOUT_NOTICE_TEXT);
-    expect(events).toEqual(["progress:tool:Read", "notice:Hinweis", `notice:${TIMEOUT_NOTICE_TEXT}`]);
+    await sink.notice(LONG_RUN_NOTICE_TEXT);
+    expect(events).toEqual(["progress:tool:Read", "notice:Hinweis", `notice:${LONG_RUN_NOTICE_TEXT}`]);
   });
 
   test("Fehler des Ziels erreichen den Turn nicht", async () => {
@@ -338,7 +338,7 @@ describe("mit Web-Server", () => {
       await o.sink.progress({ kind: "tool", text: "WebSearch" });
       await o.sink.progress({ kind: "snippet", text: "Ich schaue nach, was es Neues gibt" });
       await o.sink.finish?.();
-      await o.sink.notice(TIMEOUT_NOTICE_TEXT);
+      await o.sink.notice(LONG_RUN_NOTICE_TEXT);
       return "**fertig**";
     });
     const ctx = await startServer(chat);
@@ -351,7 +351,7 @@ describe("mit Web-Server", () => {
     const kinds = sse.events.map(e => e.event);
     expect(kinds).toEqual(["status", "status", "progress", "progress", "notice", "message", "status"]);
     expect(sse.events[2].data).toEqual({ kind: "tool", text: "WebSearch" });
-    expect(sse.events[4].data).toEqual({ text: TIMEOUT_NOTICE_TEXT });
+    expect(sse.events[4].data).toEqual({ text: LONG_RUN_NOTICE_TEXT });
     expect(sse.events[5].data.html).toContain("<strong>fertig</strong>");
   });
 

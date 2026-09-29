@@ -1,9 +1,15 @@
 import { rotateServiceLogs } from "./lib/log-retention";
-import { runExecution, runCancelable, activeExecutionCount } from "./lib/execution-context";
+import { checkEmbeddingAtStartup } from "./lib/embedding";
+import { drainEmbeddingQueue, DRAIN_INTERVAL_MS } from "./lib/embedding";
+import { runExecution, runCancelable, activeExecutionCount, logAgentCapacity, isAbortError, closeIntake, isRestartPendingError, RESTART_PENDING_REPLY, isExecutionActive, blockExecutions } from "./lib/execution-context";
+import { createRestartControl } from "./lib/restart-control";
+import { resumeMacTask, taskResumeRecord } from "./lib/task-resume";
+import { turnInfoCollector } from "./lib/turn-collector";
 import { readRestartRequest, clearRestartRequest, detectSupervisor } from "./lib/restart-request";
 import { atomicWriteFile } from "./lib/atomic-file";
 import { allowedChat } from "./lib/http-security";
 import { createProcessHandler } from "./lib/process-handler";
+import { processInBackground, type ProcessBackgroundDeps } from "./lib/process-background";
 import { createWebServer, type WebServer } from "./web/server";
 import { createApprovalTurns, createBotChat, createTelegramChat, webMediaDir } from "./web/bot-turn";
 import { createBotSessionReset } from "./web/bot-session-reset";
@@ -19,6 +25,7 @@ import { chooseStartMode } from "./setup/start-mode";
 import { createBotTopics } from "./web/bot-topics";
 import { botInstructions, botSettings } from "./web/bot-settings";
 import { createBotStatus } from "./web/bot-status";
+import { createBotEngines } from "./web/bot-engines";
 import { createBotKeys } from "./web/bot-keys";
 import { createBotFiles } from "./web/bot-files";
 import { UploadStore } from "./web/uploads";
@@ -59,9 +66,11 @@ import {
   sanitizeModelOutput,
 } from "./lib/telegram";
 import { createTelegramProgressSink } from "./lib/telegram-progress";
-import { cleanupMedia, finishMedia, prepareMedia } from "./lib/media-turn";
-import { ABORT_REPLY, SHUTDOWN_ABORT_REPLY, finalizeClaudeSession, runJsonTurn, runStreamingTurn, type TurnInfo, type TurnSink } from "./lib/chat-turn";
-import { callClaude as callClaudeSubprocess, isClaudeErrorResponse, abortClaudeCalls, abortAllClaudeCalls, activeClaudeCallCount } from "./lib/claude";
+import { cleanupMedia, finishMedia, prepareMedia, uploadName } from "./lib/media-turn";
+import { ABORT_REPLY, SHUTDOWN_ABORT_REPLY, runJsonTurn, runStreamingTurn, type SessionIdListener, type SessionMetaListener, type TurnInfo, type TurnSessionMeta, type TurnSink } from "./lib/chat-turn";
+import { isClaudeErrorResponse } from "./lib/claude";
+import { abortEngineCalls, abortAllEngineCalls, activeEngineCallCount, type EngineId } from "./lib/engines";
+import { listOpenCodeModels } from "./lib/engines/opencode";
 import {
   getMemoryContext,
   addFact,
@@ -76,10 +85,9 @@ import { uploadAssetQuick, updateAssetDescription, parseAssetDescTag, stripAsset
 import { sessionKeyFor } from "./lib/convex";
 import {
   isSessionModeEnabled,
-  getResumableSession,
-  getResumableSessionId,
   getSessionsForKey,
   resetSession,
+  sessionEpoch,
   type BotSession,
 } from "./lib/session-manager";
 import {
@@ -112,6 +120,8 @@ import {
   formatGoalStatus,
   isGoalLoopRunning,
   onGoalChange,
+  runningGoalLoopCount,
+  goalResumeOnStart,
 } from "./lib/goal-engine";
 import { createTelegramGoalStatus, GOAL_NOTICE_SOURCE, handleGoalCallback, runGoalAction } from "./lib/goal-actions";
 import { createGoalChoices, GOAL_NO_BUTTONS_HINT } from "./lib/goal-choices";
@@ -119,9 +129,9 @@ import { legacyToolApprovalMiddleware } from "./lib/telegram-tool-approval";
 import { createTelegramChoices, installTelegramChoices } from "./lib/telegram-choices";
 import { learnFromSource } from "./lib/learn";
 import { captureTopicName, getTopicNames, recordTopicName, recordTopicNameIfMissing } from "./lib/topic-names";
+import { createQueueNotifier } from "./lib/queue-notice";
 import {
-  shouldAskTopicMapping,
-  markTopicMappingAsked,
+  claimTopicMappingQuestion,
   onTopicMappingSet,
 } from "./lib/topic-setup";
 import { createTopicChoices, legacyButtonPages, TOPIC_MAP_TEXT } from "./lib/topic-choices";
@@ -159,7 +169,7 @@ import {
 } from "./lib/agent-session";
 
 // Model Router (UX-only on Mac — controls progress updates, not model selection)
-import { classifyComplexity, MODEL_IDS } from "./lib/model-router";
+import { classifyComplexity } from "./lib/model-router";
 import * as creditGuard from "./lib/credit-guard";
 
 // Multi-Bot Agent Identity
@@ -177,10 +187,11 @@ import {
 import { boardAgentNames, isActiveAgent, listAgentNames } from "./agents/catalog";
 import { gatherBoardData } from "./lib/board-data";
 import { createTelegramBoardOutput, requestBoardStop, runBoardMeeting as runBoardCore } from "./lib/board-meeting";
+import { engineCommandServices } from "./lib/engine-choice";
 import { commandRegistry } from "./lib/commands/builtin";
 import { recoverJobsUntilSettled } from "./lib/jobs/control";
 import { createJobDeps } from "./lib/jobs/default-deps";
-import { runTelegramCommand, type TelegramCommandInput } from "./lib/commands/telegram";
+import { createTelegramSessionReset, runTelegramCommand, type TelegramCommandInput } from "./lib/commands/telegram";
 import type { CommandMatch, CommandServices } from "./lib/commands/types";
 
 // ---------------------------------------------------------------------------
@@ -188,6 +199,8 @@ import type { CommandMatch, CommandServices } from "./lib/commands/types";
 // ---------------------------------------------------------------------------
 
 await loadEnv(join(process.cwd(), ".env"));
+// Grenze gleichzeitiger Aufträge erst nach .env bestimmen, einmal ins Log (Issue #208)
+logAgentCapacity();
 // Einmal beim Start: welche Geheimnisse Claude-Subprozesse nicht erben (nur Namen, Issue #54)
 logSubprocessEnvFilter();
 
@@ -277,7 +290,7 @@ const commandServices: CommandServices = {
   isSessionModeEnabled,
   getGoal,
   pauseGoal,
-  abortClaudeCalls,
+  abortEngineCalls,
   listAllOverrides: () => listAllOverrides(isActiveAgent),
   listAgentNames,
   resolveAgentName,
@@ -291,14 +304,17 @@ const commandServices: CommandServices = {
   learn: learnFromSource,
   formatPlan: creditGuard.formatPlan,
   sessionsForKey: getSessionsForKey,
-  createRoutine: (session, hint) => createRoutineFromSession(session as BotSession, hint),
+  sessionEpoch,
+  createRoutine: (session, hint, epoch) => createRoutineFromSession(session as BotSession, hint, {}, epoch),
   requestBoardStop,
+  // /motor (Issue #125): Motor pro Gespräch in config/settings.json
+  engines: engineCommandServices,
   // /goal (Issue #76): gleiche Aktionen wie die Knoepfe in Telegram und im Browser
   goals: {
     get: getGoal,
     set: setGoal,
     update: updateGoal,
-    action: (sessionKey, action) => runGoalAction(sessionKey, action, { abort: abortClaudeCalls }),
+    action: (sessionKey, action) => runGoalAction(sessionKey, action, { abort: abortEngineCalls }),
     start: (sessionKey) => void startGoalWork(sessionKey),
     formatStatus: formatGoalStatus,
   },
@@ -326,14 +342,16 @@ function telegramCommandInput(
       typing.start();
       return () => typing.stop();
     },
-    // Wie bisher ohne Sperre: endende Sessions destillieren, dann verwerfen
-    resetSession: async () => {
-      for (const s of await getSessionsForKey(sessionKey)) {
-        if (shouldDistill(s)) void distillSession(s);
-      }
-      const reset = await resetSession(sessionKey);
-      return { status: "done", reset, sessionMode: isSessionModeEnabled() };
-    },
+    // /new wie bisher ohne Sperre; /motor (whileBlocked) lehnt bei laufender Antwort ab und sperrt bis nach dem Schreiben
+    resetSession: createTelegramSessionReset(sessionKey, {
+      isActive: isExecutionActive,
+      block: blockExecutions,
+      sessionsForKey: getSessionsForKey,
+      shouldDistill,
+      distill: distillSession,
+      reset: key => resetSession(key),
+      sessionModeEnabled: isSessionModeEnabled,
+    }),
     // Antwort geht wie bisher selbst nach Telegram; kein Rueckgabewert (Issue #78)
     agentTurn: async (agent, prompt) => {
       await callClaudeAndReply(ctx, chatId, prompt, agent, topicId);
@@ -393,6 +411,8 @@ async function voiceReplyTelegram(ctx: Context, chatId: string, topicId: number 
 
 interface SessionState {
   sessionId: string | null;
+  /** Motor der letzten Session (Issue #122), nur Anzeige */
+  engine: EngineId | null;
   pendingFiles: string[];
 }
 
@@ -400,6 +420,7 @@ const SESSION_STATE_PATH = join(PROJECT_ROOT, "session-state.json");
 
 let sessionState: SessionState = {
   sessionId: null,
+  engine: null,
   pendingFiles: [],
 };
 
@@ -409,6 +430,7 @@ async function loadSessionState(): Promise<void> {
     const parsed = JSON.parse(raw);
     sessionState = {
       sessionId: parsed.sessionId || null,
+      engine: parsed.engine || (parsed.sessionId ? "claude" : null),
       pendingFiles: Array.isArray(parsed.pendingFiles) ? parsed.pendingFiles : [],
     };
   } catch {
@@ -503,7 +525,7 @@ async function shutdown(signal: string): Promise<void> {
 
   console.log(`\nReceived ${signal}. Shutting down gracefully...`);
 
-  abortAllClaudeCalls();
+  abortAllEngineCalls();
   clearInterval(heartbeatInterval);
   clearInterval(staleTaskInterval);
   clearInterval(restartCheckInterval);
@@ -556,48 +578,21 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 // and the bot exits once nothing is running; launchd/PM2 start it again.
 // ---------------------------------------------------------------------------
 
-let restartCheckRunning = false;
+// Entscheidung mit erneuter Prüfung und Annahmesperre: src/lib/restart-control.ts (Issue #190)
+const restartControl = createRestartControl({
+  readRequest: () => readRestartRequest(),
+  clearRequest: () => clearRestartRequest(),
+  // Aktive Ziel-Schleifen zählen auch zwischen ihren Turns (Issue #190)
+  busyCount: () => activeEngineCallCount() + activeExecutionCount() + runningGoalLoopCount(),
+  detectSupervisor: () => detectSupervisor(),
+  closeIntake,
+  send: (text, chatId, topicId) => sendStatusMessage(chatId || String(ALLOWED_USER_ID), text, topicId),
+  shutdown: reason => shutdown(reason),
+  isShuttingDown: () => isShuttingDown,
+});
 
 async function maybeRestart(trigger: string, chatId?: string, topicId?: number): Promise<void> {
-  if (isShuttingDown || restartCheckRunning) return;
-  restartCheckRunning = true;
-  try {
-    const note = await readRestartRequest();
-    if (note === null) return;
-
-    const busy = activeClaudeCallCount() + activeExecutionCount();
-    if (busy > 0) {
-      console.log(`[Restart] angefordert (${trigger}), warte: ${busy} Verarbeitung(en) aktiv`);
-      return;
-    }
-
-    const target = chatId || String(ALLOWED_USER_ID);
-    const supervisor = await detectSupervisor();
-    if (!supervisor) {
-      // Exiting without a supervisor would leave the bot dead — refuse.
-      await clearRestartRequest();
-      console.warn("[Restart] angefordert, aber kein launchd/PM2 erkannt: kein Exit, bitte manuell neu starten");
-      await sendStatusMessage(
-        target,
-        "🔄 Neustart angefordert, aber der Bot laeuft nicht unter launchd/PM2. Bitte manuell neu starten (docs/troubleshooting.md, Abschnitt Restart).",
-        topicId
-      ).catch(() => {});
-      return;
-    }
-
-    await clearRestartRequest();
-    console.log(`[Restart] Neustart via ${supervisor} (${trigger}${note ? `: ${note}` : ""})`);
-    await sendStatusMessage(
-      target,
-      `🔄 Neustart mit neuem Code${note ? ` (${note})` : ""}, bin in ein paar Sekunden wieder da.`,
-      topicId
-    ).catch(() => {});
-    await shutdown("restart-requested");
-  } catch (err) {
-    console.error("[Restart] check failed:", err);
-  } finally {
-    restartCheckRunning = false;
-  }
+  await restartControl.maybeRestart(trigger, chatId, topicId);
 }
 
 /** Check shortly after a reply, once the update's execution scope has closed. */
@@ -652,7 +647,7 @@ const postReviewToWeb: PostWeb = async (conversationId, post) =>
   webServer ? webServer.postToConversation(conversationId, post) : false;
 const reviewResults = createReviewResults({
   decideReview: (action, reviewId) => decideReview(action, reviewId),
-  createRoutine: (session, hint) => createRoutineFromSession(session, hint),
+  createRoutine: (session, hint, epoch) => createRoutineFromSession(session, hint, {}, epoch),
   sendAndRecord: (input) => sendAndRecord(input),
   sendTelegram: (chatId, text, topicId) => sendDirectMessage(chatId, text, topicId),
   saveMessage: (message) => saveMessage(message),
@@ -666,7 +661,7 @@ onChoiceDecided("review", reviewResults.handler);
 // eine offene Frage zuerst im Register, jede andere Änderung am Ziel lässt sie ablaufen
 const goalChoices = createGoalChoices({
   getGoal,
-  abort: abortClaudeCalls,
+  abort: abortEngineCalls,
   sendChoice: (choice) => telegramChoices.sendChoice(choice),
 });
 onChoiceDecided("goal", goalChoices.handler);
@@ -992,9 +987,8 @@ async function handleTextMessage(ctx: Context): Promise<void> {
   if (
     topicId !== undefined &&
     !getAgentByTopicId(topicId, chatId) &&
-    (await shouldAskTopicMapping(chatId, topicId))
+    (await claimTopicMappingQuestion(chatId, topicId))
   ) {
-    await markTopicMappingAsked(chatId, topicId);
     // Über das Rückfragen-Register (Issue #119), damit auch der Browser die
     // Frage zeigt; klappt das nicht, wie früher mit topicmap:-Knöpfen
     // (höchstens 100 je Nachricht, der Rest in Folge-Nachrichten)
@@ -1319,7 +1313,7 @@ async function handleVideoMessage(ctx: Context): Promise<void> {
 
     const ext = filePath.split(".").pop() || "mp4";
     const fileName = (ctx.message?.video as any)?.file_name || `video_${Date.now()}.${ext}`;
-    const localPath = join(uploadsDir, `video_${Date.now()}.${ext}`);
+    const localPath = join(uploadsDir, uploadName("video", Date.now(), crypto.randomUUID(), `.${ext}`));
     const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
     const response = await fetch(fileUrl);
     const buffer = Buffer.from(await response.arrayBuffer());
@@ -1432,7 +1426,7 @@ async function handleCallbackQuery(ctx: Context): Promise<void> {
 
   // ---- Goal: alte Weiter?-Buttons goalkb| von vor Issue #118 (neue laufen als "ch|" ueber das Register) ----
 
-  const goalReply = await handleGoalCallback(data, { abort: abortClaudeCalls });
+  const goalReply = await handleGoalCallback(data, { abort: abortEngineCalls });
   if (goalReply !== null) {
     if (goalReply) await ctx.editMessageText(goalReply).catch(() => {});
     return;
@@ -1494,13 +1488,15 @@ async function handleCallbackQuery(ctx: Context): Promise<void> {
       );
 
       if (response) {
-        await saveMessage({
-          chat_id: chatId,
-          role: "assistant",
-          content: response,
-          metadata: { type: "agent_sdk_resume", taskId: result.taskId },
+        // Mit dem Topic der Rueckfrage speichern (Issue #189)
+        const record = taskResumeRecord(task, chatId, {
+          taskId: result.taskId,
+          response,
+          kind: "agent_sdk_resume",
+          origin: "Telegram (Agent SDK)",
         });
-        await processTurnIntents(response, undefined, { chatId, origin: "Telegram (Agent SDK)" });
+        await saveMessage(record.message);
+        await processTurnIntents(response, undefined, record.intents);
         await sendResponse(ctx, response);
       }
 
@@ -1547,13 +1543,14 @@ async function handleCallbackQuery(ctx: Context): Promise<void> {
 
       // processWithAnthropic returns "" if another ask_user was triggered (new task created)
       if (response) {
-        await saveMessage({
-          chat_id: chatId,
-          role: "assistant",
-          content: response,
-          metadata: { type: "task_resume", taskId: result.taskId },
+        const record = taskResumeRecord(task, chatId, {
+          taskId: result.taskId,
+          response,
+          kind: "task_resume",
+          origin: "Telegram (Anthropic API)",
         });
-        await processTurnIntents(response, undefined, { chatId, origin: "Telegram (Anthropic API)" });
+        await saveMessage(record.message);
+        await processTurnIntents(response, undefined, record.intents);
         await sendResponse(ctx, response);
       }
 
@@ -1581,50 +1578,38 @@ async function handleCallbackQuery(ctx: Context): Promise<void> {
   // --- Mac mode resume: continue the Claude Code session ---
   // Session mode (docs/topic-sessions.md F-1): the question was asked inside the
   // topic's session, so the button answer resumes that session and counts as
-  // a turn (idle expiry, messageCount, distillation). task.session_id stays
-  // as fallback for session mode off or a topic session that was reset/expired
-  // since the question was asked — old buttons keep working either way.
-  const taskAgent = task.metadata?.agent_name || "general";
-  const taskSessionKey = sessionKeyFor(task.chat_id || chatId, task.thread_id ?? null);
-  const topicSession = isSessionModeEnabled()
-    ? await getResumableSession(taskSessionKey, taskAgent, MODEL_IDS.opus)
-    : undefined;
-  const resumeId = task.session_id || topicSession?.claudeSessionId;
-  if (resumeId) {
-    const typing = createTypingIndicator(ctx);
-    typing.start();
-
-    try {
-      const claudeResult = await callClaudeSubprocess({
-        prompt: `User responded: ${result.choice}`,
-        outputFormat: "json",
-        resumeSessionId: resumeId,
-        timeoutMs: 1_800_000,
-        cwd: PROJECT_ROOT,
-      });
-
-      // The answer continued the live topic session — record the turn so the
-      // session's bookkeeping stays current.
-      if (topicSession?.claudeSessionId === resumeId) {
-        await finalizeClaudeSession(taskSessionKey, taskAgent, claudeResult);
-      }
-
+  // a turn. Issue #189: runs under the same session lock, model, effort and
+  // tools as a normal turn (src/lib/task-resume.ts); /stop works while waiting.
+  const typing = createTypingIndicator(ctx);
+  typing.start();
+  try {
+    const outcome = await resumeMacTask(task, chatId, result.choice);
+    if (outcome.status === "aborted") {
+      await ctx.reply(isShuttingDown ? SHUTDOWN_ABORT_REPLY : ABORT_REPLY).catch(() => {});
+      await updateTask(result.taskId, { status: "failed", result: "Abgebrochen" });
+      return;
+    }
+    if (outcome.status === "done") {
+      const claudeResult = outcome.result;
       const response = claudeResult.text || "Task completed.";
-
-      await saveMessage({
-        chat_id: chatId,
-        role: "assistant",
-        content: response,
-        metadata: { type: "task_resume", taskId: result.taskId },
+      const record = taskResumeRecord(task, chatId, {
+        taskId: result.taskId,
+        response,
+        kind: "task_resume",
+        origin: "Telegram",
+        agent: outcome.agent,
       });
-      await processTurnIntents(response, claudeResult.tools, { chatId, topicId: task.thread_id ?? undefined, origin: "Telegram" });
+      await saveMessage(record.message);
+      await processTurnIntents(response, claudeResult.tools, record.intents);
 
       // Check if the resumed response also contains questions
       const parsed = parseClaudeResponse(response);
       if (parsed.needsInput && parsed.options.length > 0) {
         await updateTask(result.taskId, {
           status: "needs_input",
-          session_id: claudeResult.sessionId || resumeId,
+          session_id: claudeResult.sessionId || outcome.resumeId,
+          // Folgefrage bleibt beim Motor und Modell der Rueckfrage (Issue #122)
+          metadata: { ...(task.metadata ?? {}), engine: outcome.engine, model: outcome.model },
           pending_question: parsed.question || undefined,
           pending_options: parsed.options,
           current_step: parsed.text.substring(0, 500),
@@ -1640,14 +1625,15 @@ async function handleCallbackQuery(ctx: Context): Promise<void> {
         });
         await sendResponse(ctx, response);
       }
-    } catch (err) {
-      console.error("Mac resume error:", err);
-      await ctx.reply("Error resuming task. Please try again.");
-      await updateTask(result.taskId, { status: "failed", result: String(err) });
-    } finally {
-      typing.stop();
+      return;
     }
+  } catch (err) {
+    console.error("Mac resume error:", err);
+    await ctx.reply("Error resuming task. Please try again.");
+    await updateTask(result.taskId, { status: "failed", result: String(err) });
     return;
+  } finally {
+    typing.stop();
   }
 
   // --- No resume context: just acknowledge ---
@@ -1679,7 +1665,9 @@ async function callClaudeUnlocked(
   agentName: string = "general",
   topicId?: number,
   onInfo?: (info: TurnInfo) => void,
-  onTools?: (tools: TurnTools | undefined) => void
+  onTools?: (tools: TurnTools | undefined) => void,
+  onSessionId?: SessionIdListener,
+  onSessionMeta?: SessionMetaListener
 ): Promise<string> {
   return runJsonTurn({
     userMessage,
@@ -1687,38 +1675,29 @@ async function callClaudeUnlocked(
     agentName,
     topicId,
     sink: createTelegramNoticeSink(agentName, chatId, topicId),
-    onSessionId: rememberLastSessionId,
+    onSessionId: trackSessionId(onSessionId),
+    onSessionMeta,
     onInfo,
     onTools,
   });
 }
 
 /**
- * Sammelt Modell und Dauer eines Turns fuer die Metadaten der gespeicherten
- * Antwort; die WebUI zeigt sie unter der Antwort (Issue #22). Ohne Meldung
- * (Abbruch) bleiben die Metadaten wie bisher.
+ * Letzte Session irgendeines Turns samt Motor, nur noch fuer Status und
+ * Anzeige (Issues #189, #122); Rueckfragen merken sich Motor und Modell am Task
  */
-function turnInfoCollector() {
-  let info: TurnInfo | undefined;
-  // Werkzeuge des Turns fuer das Merk-Tag-Tor (Issue #53); ohne Meldung unbekannt
-  let tools: TurnTools | undefined;
-  return {
-    onInfo: (i: TurnInfo) => {
-      info = i;
-    },
-    onTools: (t: TurnTools | undefined) => {
-      tools = t;
-    },
-    tools: () => tools,
-    metadata: (): Record<string, unknown> =>
-      info ? { ...(info.model ? { model: info.model } : {}), durationMs: info.durationMs } : {},
-  };
+async function rememberLastSessionId(id: string, engine: EngineId): Promise<void> {
+  sessionState.sessionId = id;
+  sessionState.engine = engine;
+  await saveSessionState();
 }
 
-/** Track session ID for HITL task creation (if Claude asks a question with buttons). */
-async function rememberLastSessionId(id: string): Promise<void> {
-  sessionState.sessionId = id;
-  await saveSessionState();
+/** Meldet die Session-ID mit Motor und Modell dem Turn (Rueckfrage) und dem globalen Stand */
+function trackSessionId(onSessionId?: SessionIdListener) {
+  return async (id: string, meta: TurnSessionMeta) => {
+    onSessionId?.(id, meta);
+    await rememberLastSessionId(id, meta.engine);
+  };
 }
 
 /**
@@ -1743,10 +1722,10 @@ async function callClaudeAndReply(
 
     if (tier !== "haiku") {
       // Complex task → streaming subprocess with live progress
-      response = await callClaudeWithProgress(ctx, userMessage, chatId, agentName, topicId, turn.onInfo, turn.onTools);
+      response = await callClaudeWithProgress(ctx, userMessage, chatId, agentName, topicId, turn.onInfo, turn.onTools, turn.onSessionId, turn.onSessionMeta);
     } else {
       // Simple task → standard subprocess (fast, no progress needed)
-      response = await callClaude(userMessage, chatId, agentName, topicId, turn.onInfo, turn.onTools);
+      response = await callClaude(userMessage, chatId, agentName, topicId, turn.onInfo, turn.onTools, turn.onSessionId, turn.onSessionMeta);
     }
 
     // Vom User per /stop abgebrochen — nichts persistieren, kein Fallback.
@@ -1818,23 +1797,17 @@ async function callClaudeAndReply(
       // Create task for human-in-the-loop
       const task = await createTask(chatId, userMessage, topicId, "mac");
       if (task) {
-        // Session mode: the question lives in the topic's session — store that
-        // ID. The global sessionState.sessionId (last subprocess anywhere, can
-        // race across topics) is only the legacy fallback.
-        const topicSessionId = isSessionModeEnabled()
-          ? await getResumableSessionId(
-              sessionKeyFor(chatId, topicId ?? null),
-              agentName,
-              MODEL_IDS.opus
-            )
-          : undefined;
+        // Die Frage lebt in der Session genau dieses Turns (Issue #189): nie
+        // die globale letzte Session, die zu einem anderen Topic gehoeren kann
         await updateTask(task.id, {
           status: "needs_input",
-          session_id: topicSessionId || sessionState.sessionId || undefined,
+          session_id: turn.sessionId(),
           pending_question: parsed.question || undefined,
           pending_options: parsed.options,
           current_step: parsed.text.substring(0, 500),
-          metadata: { agent_name: agentName },
+          // Motor und Modell der Session (Issue #122): die Knopf-Antwort
+          // laeuft ueber genau diesen Motor, auch nach einem Motorwechsel
+          metadata: turn.taskMetadata(agentName),
         });
         const keyboard = buildTaskKeyboard(task.id, parsed.options);
         await botRegistry.sendWithKeyboardAsAgent(agentName, chatId, response, keyboard, { threadId: topicId });
@@ -1845,6 +1818,11 @@ async function callClaudeAndReply(
     // Normal response — send via agent's bot
     await botRegistry.sendAsAgent(agentName, chatId, response, { threadId: topicId });
   } catch (error) {
+    // Abbruch (/stop, Neustart), der erst hier ankommt: nie als Fehler melden (Issue #188)
+    if (isAbortError(error)) {
+      await ctx.reply(isShuttingDown ? SHUTDOWN_ABORT_REPLY : ABORT_REPLY).catch(() => {});
+      return;
+    }
     console.error("callClaudeAndReply error:", error);
     await ctx.reply("Something went wrong. Please try again.");
   } finally {
@@ -1865,7 +1843,9 @@ async function callClaudeWithProgressUnlocked(
   agentName: string,
   topicId?: number,
   onInfo?: (info: TurnInfo) => void,
-  onTools?: (tools: TurnTools | undefined) => void
+  onTools?: (tools: TurnTools | undefined) => void,
+  onSessionId?: SessionIdListener,
+  onSessionMeta?: SessionMetaListener
 ): Promise<string> {
   return runStreamingTurn({
     userMessage,
@@ -1875,7 +1855,8 @@ async function callClaudeWithProgressUnlocked(
     sink: createTelegramProgressSink(ctx, (text) =>
       botRegistry.sendAsAgent(agentName, chatId, text, { threadId: topicId })
     ),
-    onSessionId: rememberLastSessionId,
+    onSessionId: trackSessionId(onSessionId),
+    onSessionMeta,
     onInfo,
     onTools,
   });
@@ -1907,7 +1888,12 @@ async function runBoardMeeting(ctx: Context, chatId: string, topicId?: number, e
           info = i;
         });
         if (text === ABORT_REPLY) return { text: "", aborted: true };
-        return { text, ...(info?.model ? { model: info.model } : {}), ...(info ? { durationMs: info.durationMs } : {}) };
+        return {
+          text,
+          ...(info?.model ? { model: info.model } : {}),
+          ...(info?.engine ? { engine: info.engine } : {}),
+          ...(info ? { durationMs: info.durationMs } : {}),
+        };
       },
       save: (message) => saveMessage({ chat_id: chatId, ...message }),
       newMessageId: () => crypto.randomUUID(),
@@ -1976,102 +1962,49 @@ async function sendDirectMessage(
 }
 
 /**
- * Process a /process request in the background.
- * Sends typing indicator, calls Claude, and sends the response
- * directly to Telegram. Fire-and-forget from the HTTP handler.
+ * Process a /process request in the background: typing indicator, Claude,
+ * response straight to Telegram. Fire-and-forget from the HTTP handler.
+ * Ablauf und Neustart-Schutz: src/lib/process-background.ts (Issue #190).
  */
-async function processInBackground(
-  text: string | undefined,
-  chatId: string | undefined,
-  threadId: number | undefined,
-  photoFileId: string | undefined
-): Promise<void> {
-  const targetChatId = chatId || "";
-  if (!targetChatId) {
-    console.error("/process background: no chatId provided");
-    return;
-  }
+const processDeps: ProcessBackgroundDeps = {
+  sessionKey: (chatId, threadId) => sessionKeyFor(chatId, threadId ?? null),
+  send: (chatId, text, threadId) => sendDirectMessage(chatId, text, threadId),
+  typing: async chatId => { await bot.api.sendChatAction(chatId, "typing"); },
+  downloadPhoto: async photoFileId => {
+    // VPS forwarded a photo — download from Telegram
+    const file = await fetch(
+      `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${photoFileId}`
+    ).then((r) => r.json()) as any;
+    const filePath = file?.result?.file_path;
+    if (!filePath) return null;
 
-  // Send typing indicator
-  await bot.api.sendChatAction(targetChatId, "typing").catch(() => {});
-
-  // Keep typing indicator alive during processing
-  const typingInterval = setInterval(() => {
-    bot.api.sendChatAction(targetChatId, "typing").catch(() => {});
-  }, 4000);
-
-  try {
-    let response: string;
-
-    if (photoFileId) {
-      // VPS forwarded a photo — download from Telegram and process
-      const file = await fetch(
-        `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${photoFileId}`
-      ).then((r) => r.json()) as any;
-
-      const filePath = file?.result?.file_path;
-      if (!filePath) {
-        await sendDirectMessage(targetChatId, "Could not download the photo from Telegram.", threadId);
-        return;
-      }
-
-      const uploadsDir = join(PROJECT_ROOT, "uploads");
-      await mkdir(uploadsDir, { recursive: true });
-
-      const ext = filePath.split(".").pop() || "jpg";
-      const localPath = join(uploadsDir, `photo_${Date.now()}.${ext}`);
-      const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
-      const dlRes = await fetch(fileUrl);
-      const buffer = Buffer.from(await dlRes.arrayBuffer());
-      await writeFile(localPath, buffer);
-
-      // Upload to asset store
-      const asset = await uploadAssetQuick(localPath, {
-        userCaption: text || undefined,
-        channel: "telegram",
-        telegramFileId: photoFileId,
-      });
-
-      const caption = text || "User sent a photo. Describe and respond to it.";
-      const assetNote = asset ? `\n(asset: ${asset.id})` : "";
-
-      response = await callClaude(
-        `[Image attached: ${localPath}]${assetNote}\n\nUser says: ${caption}`,
-        targetChatId,
-        "general",
-        threadId
-      );
-
-      // Parse and update asset description
-      if (asset) {
-        const parsed = parseAssetDescTag(response);
-        if (parsed) {
-          updateAssetDescription(asset.id, parsed.description, parsed.tags).catch(() => {});
-        } else {
-          const sentences = response.match(/[^.!?]+[.!?]+/g);
-          if (sentences) {
-            updateAssetDescription(asset.id, sentences.slice(0, 2).join(" ").trim()).catch(() => {});
-          }
+    const uploadsDir = join(PROJECT_ROOT, "uploads");
+    await mkdir(uploadsDir, { recursive: true });
+    const ext = filePath.split(".").pop() || "jpg";
+    const localPath = join(uploadsDir, uploadName("photo", Date.now(), crypto.randomUUID(), `.${ext}`));
+    const dlRes = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`);
+    await writeFile(localPath, Buffer.from(await dlRes.arrayBuffer()));
+    return localPath;
+  },
+  uploadAsset: (localPath, caption, photoFileId) =>
+    uploadAssetQuick(localPath, { userCaption: caption, channel: "telegram", telegramFileId: photoFileId }),
+  callClaude: (prompt, chatId, threadId) => callClaude(prompt, chatId, "general", threadId),
+  finishAsset: (assetId, response) => {
+    // Parse and update asset description
+    if (assetId) {
+      const parsed = parseAssetDescTag(response);
+      if (parsed) {
+        updateAssetDescription(assetId, parsed.description, parsed.tags).catch(() => {});
+      } else {
+        const sentences = response.match(/[^.!?]+[.!?]+/g);
+        if (sentences) {
+          updateAssetDescription(assetId, sentences.slice(0, 2).join(" ").trim()).catch(() => {});
         }
       }
-
-      response = stripAssetDescTag(response);
-    } else {
-      // Text message
-      response = await callClaude(text || "", targetChatId, "general", threadId);
     }
-
-    // Send response directly to Telegram
-    await sendDirectMessage(targetChatId, response, threadId);
-    console.log(`/process completed for chat ${targetChatId} (${response.length} chars)`);
-  } catch (err) {
-    console.error("/process background processing error:", err);
-    const errorMsg = "Sorry, something went wrong processing your message on the local machine.";
-    await sendDirectMessage(targetChatId, errorMsg, threadId).catch(() => {});
-  } finally {
-    clearInterval(typingInterval);
-  }
-}
+    return stripAssetDescTag(response);
+  },
+};
 
 // ---------------------------------------------------------------------------
 // 10. Health Check HTTP Server
@@ -2079,7 +2012,7 @@ async function processInBackground(
 
 const handleProcessRequest = createProcessHandler({
   secret: () => GATEWAY_SECRET, allowChat: allowedChat,
-  process: ({ text, chatId, threadId, photoFileId }) => processInBackground(text, chatId, threadId, photoFileId),
+  process: ({ text, chatId, threadId, photoFileId }) => processInBackground({ text, chatId, threadId, photoFileId }, processDeps),
 });
 const healthServer = Bun.serve({
   hostname: process.env.HEALTH_HOST || "127.0.0.1",
@@ -2096,6 +2029,7 @@ const healthServer = Bun.serve({
           uptime: process.uptime(),
           pid: process.pid,
           sessionId: sessionState.sessionId,
+          sessionEngine: sessionState.engine,
           timestamp: new Date().toISOString(),
         }),
         {
@@ -2122,11 +2056,13 @@ const webTurnDeps = {
   runStreamingTurn,
   saveMessage,
   processIntents: (text: string, turn: IntentTurn) => processTurnIntents(text, turn.tools, turn),
-  abortClaudeCalls,
+  abortEngineCalls,
   isShuttingDown: () => isShuttingDown,
   // Ohne Chat-ID: maybeRestart schickt seine Meldung sonst an eine Telegram-ID
   scheduleRestartCheck: (trigger: string) => scheduleRestartCheck(trigger),
   allowedTools: (agent: string) => getAgentConfigOrGeneral(agent)?.allowedTools,
+  // Wartehinweis (Issue #188) nennt Topics beim Namen
+  topicNames: getTopicNames,
 };
 // Anhaenge aus dem Web-Chat (Issue #72): eine Ablage fuer Upload-Route, Telegram- und Web-Turn;
 // mediaDir: Arbeitskopien der Web-Gespraeche, beim Loeschen des Gespraechs mit weg (Issue #112)
@@ -2234,8 +2170,17 @@ webServer = await startWebUi({
   // Einstellungsseiten (Issue #36): config/settings.json und /agent-Anweisungen
   settings: botSettings,
   instructions: botInstructions,
+  // Modell-Liste von OpenCode (Issue #129): `opencode models`, 10 s, Liste 10 Minuten zwischengespeichert
+  opencodeModels: listOpenCodeModels,
   // Statusseite und "Jetzt neu starten" (Issue #37): Marker data/restart-requested, maybeRestart erledigt den Rest
   status: createBotStatus(process.env),
+  // Motor-Wahl in der WebUI (Issue #126): Standard, Codex-Einstellungen, abweichende Gespraeche,
+  // Verfuegbarkeit (Claude Code wird dabei wirklich geprueft), Motor-Pille in der Kopfzeile
+  engines: createBotEngines({
+    userId: process.env.TELEGRAM_USER_ID,
+    groupId: () => botGroupId(process.env),
+    agentForTopic: (topicId, chatId) => getAgentByTopicId(topicId, chatId),
+  }),
   // Schluessel-Seite (Issue #62): dieselbe .env, die oben geladen wurde; Aendern nur mit WEB_ALLOW_KEY_EDIT=true
   keys: createBotKeys(process.env),
   // Dateien aus Meldungen (Issue #47): nur mit festgehaltenem Eintrag, aus data/outbox
@@ -2249,7 +2194,7 @@ webServer = await startWebUi({
     agentForTopic: (topicId, chatId) => getAgentByTopicId(topicId, chatId),
     get: getGoal,
     isRunning: isGoalLoopRunning,
-    action: (sessionKey, action, goalId, onlyIf) => runGoalAction(sessionKey, action, { goalId, abort: abortClaudeCalls, onlyIf }),
+    action: (sessionKey, action, goalId, onlyIf) => runGoalAction(sessionKey, action, { goalId, abort: abortEngineCalls, onlyIf }),
     decideBudget: (sessionKey, goalId, action) => goalChoices.decideFromCard(sessionKey, goalId, action),
     onChange: onGoalChange,
   }),
@@ -2296,6 +2241,8 @@ initGoalEngine({
       tools: turn.tools(),
     };
   },
+  // Abbruch durch Neustart/SIGTERM pausiert kein Ziel (Issue #190)
+  isShuttingDown: () => isShuttingDown,
   sendAsAgent: (goalAgent, goalChatId, goalText, goalTopicId) =>
     botRegistry.sendAsAgent(goalAgent, goalChatId, goalText, { threadId: goalTopicId }),
   // Telegram wie bisher; Pause, Wartet, Fertig zusaetzlich als Meldung fuer die WebUI (Issue #76).
@@ -2352,6 +2299,22 @@ await sbLog("info", "bot", "Bot started", {
   timezone: TIMEZONE,
 });
 
+// Embedding-Anbieter gegen die Kennung der Datenbank prüfen (Issue #167):
+// Abweichung laut melden; geschrieben und gesucht wird dann ohne Vektoren
+void checkEmbeddingAtStartup().then(check => {
+  if (!check) return;
+  if (check.ok) console.log(`[embedding] ${check.message}`);
+  else console.warn(`[embedding] ACHTUNG: ${check.message}`);
+});
+
+// Einträge nachziehen, die die Datenbank nach einem Anbieterwechsel ohne
+// Vektor vorgemerkt hat (Issue #168, verspätete Schreiber mit altem Anbieter)
+const drainEmbeddings = () => drainEmbeddingQueue()
+  .then(r => { if (r?.state === "fertig" && (r.written || r.rejected)) console.log(`[embedding] ${r.written} vorgemerkte Einträge nachgezogen, ${r.rejected} abgelehnt`); })
+  .catch(() => {});
+void drainEmbeddings();
+setInterval(() => { void drainEmbeddings(); }, DRAIN_INTERVAL_MS).unref();
+
 void rotateServiceLogs().catch(error => console.error("Log rotation failed", error));
 setInterval(() => { void rotateServiceLogs().catch(() => {}); }, 3_600_000).unref();
 
@@ -2374,37 +2337,50 @@ const sweepChoices = () => telegramChoices.sweep()
 void sweepChoices();
 setInterval(() => { void sweepChoices(); }, 60_000).unref();
 
-// Start polling
+// Start polling. Aktive Ziele nach einem Neustart erst fortsetzen, wenn grammY
+// die Initialisierung abgeschlossen hat (onStart, Issue #190)
+const resumeGoalsOnStart = goalResumeOnStart();
 bot.start({
   onStart: (botInfo) => {
     console.log(`Bot online as @${botInfo.username}`);
+    void resumeGoalsOnStart();
   },
 });
 
-async function callClaude(userMessage: string, chatId: string, agentName = "general", topicId?: number, onInfo?: (info: TurnInfo) => void, onTools?: (tools: TurnTools | undefined) => void): Promise<string> {
+async function callClaude(userMessage: string, chatId: string, agentName = "general", topicId?: number, onInfo?: (info: TurnInfo) => void, onTools?: (tools: TurnTools | undefined) => void, onSessionId?: SessionIdListener, onSessionMeta?: SessionMetaListener): Promise<string> {
   try {
     return await runExecution(sessionKeyFor(chatId, topicId ?? null), agentName,
-      () => callClaudeUnlocked(userMessage, chatId, agentName, topicId, onInfo, onTools), getAgentConfigOrGeneral(agentName)?.allowedTools);
+      () => callClaudeUnlocked(userMessage, chatId, agentName, topicId, onInfo, onTools, onSessionId, onSessionMeta), getAgentConfigOrGeneral(agentName)?.allowedTools);
   } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") return ABORT_REPLY;
+    if (isAbortError(error)) return ABORT_REPLY;
     throw error;
   }
 }
 
-async function callClaudeWithProgress(ctx: Context, userMessage: string, chatId: string, agentName: string, topicId?: number, onInfo?: (info: TurnInfo) => void, onTools?: (tools: TurnTools | undefined) => void): Promise<string> {
+async function callClaudeWithProgress(ctx: Context, userMessage: string, chatId: string, agentName: string, topicId?: number, onInfo?: (info: TurnInfo) => void, onTools?: (tools: TurnTools | undefined) => void, onSessionId?: SessionIdListener, onSessionMeta?: SessionMetaListener): Promise<string> {
   try {
     return await runExecution(sessionKeyFor(chatId, topicId ?? null), agentName,
-      () => callClaudeWithProgressUnlocked(ctx, userMessage, chatId, agentName, topicId, onInfo, onTools), getAgentConfigOrGeneral(agentName)?.allowedTools);
+      () => callClaudeWithProgressUnlocked(ctx, userMessage, chatId, agentName, topicId, onInfo, onTools, onSessionId, onSessionMeta), getAgentConfigOrGeneral(agentName)?.allowedTools);
   } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") return ABORT_REPLY;
+    if (isAbortError(error)) return ABORT_REPLY;
     throw error;
   }
 }
 
 async function handleUpdateScope(ctx: Context, fn: () => Promise<void>): Promise<void> {
   const text = ctx.message?.text || "";
-  if (/^\/(stop|new|goal\s+(pause|stop))\b/i.test(text)) return fn();
+  // /motor und /engine (Issue #125) ohne Bereich: ihr Reset prüft, ob im Gespräch eine Antwort läuft, und träfe sonst sich selbst
+  if (/^\/(stop|new|motor|engine|goal\s+(pause|stop))\b/i.test(text)) return fn();
   const key = sessionKeyFor(String(ctx.chat?.id || ""), ctx.msg?.message_thread_id ?? null);
-  try { await runCancelable(key, fn); }
-  catch (error) { if (!(error instanceof Error && error.name === "AbortError")) throw error; }
+  // Wartet der Turn auf einen freien Platz (MAX_AGENT_PROCESSES), einmal Bescheid geben (Issue #188)
+  const onQueueWait = createQueueNotifier(text => ctx.reply(text), getTopicNames);
+  try { await runCancelable(key, fn, { onQueueWait }); }
+  catch (error) {
+    // Während des Neustarts (Issue #190): klare Meldung statt stillem Abbruch
+    if (isRestartPendingError(error)) {
+      await ctx.reply(RESTART_PENDING_REPLY, { message_thread_id: ctx.msg?.message_thread_id } as any).catch(() => {});
+      return;
+    }
+    if (!isAbortError(error)) throw error;
+  }
 }

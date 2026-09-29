@@ -451,6 +451,70 @@ function clockTime(value) {
   return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
 }
 
+const WEEKDAYS = ["Sonntag", "Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag"];
+const MONTHS = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"];
+
+/**
+ * Zeitstempel einer Nachricht (Issue #186) relativ zu now, in der Zeitzone
+ * des Browsers: short ist „21:08" (heute), „gestern 21:08", „26.09. 21:08"
+ * (dieses Jahr) oder „26.09.2025 21:08"; full das ausgeschriebene Datum für
+ * Tooltip und Screenreader, „Samstag, 26. September 2026, 21:08 Uhr".
+ * Verglichen werden Kalendertage, nicht 24 Stunden (Sommerzeit, Jahreswechsel).
+ * null bei fehlendem oder ungültigem Zeitpunkt.
+ */
+function messageTime(value, now) {
+  const clock = clockTime(value);
+  if (!clock) return null;
+  const date = new Date(parseTime(value));
+  const today = new Date(typeof now === "number" ? now : Date.now());
+  const startOfDay = offset => new Date(today.getFullYear(), today.getMonth(), today.getDate() + offset).getTime();
+  const time = date.getTime();
+  const two = n => String(n).padStart(2, "0");
+  const day = two(date.getDate()) + "." + two(date.getMonth() + 1) + ".";
+  let short;
+  if (time >= startOfDay(0) && time < startOfDay(1)) short = clock;
+  else if (time >= startOfDay(-1) && time < startOfDay(0)) short = "gestern " + clock;
+  else if (date.getFullYear() === today.getFullYear()) short = day + " " + clock;
+  else short = day + date.getFullYear() + " " + clock;
+  const full = WEEKDAYS[date.getDay()] + ", " + date.getDate() + ". " + MONTHS[date.getMonth()] + " " + date.getFullYear() + ", " + clock + " Uhr";
+  return { short, full };
+}
+
+/** Kalendertag in der Zeitzone des Browsers, z.B. "2026-8-26" (Monat ab 0) */
+function localDay(ms) {
+  const d = new Date(ms);
+  return d.getFullYear() + "-" + d.getMonth() + "-" + d.getDate();
+}
+
+/** Millisekunden bis kurz nach der nächsten lokalen Mitternacht */
+function msUntilNextDay(now) {
+  const d = new Date(now);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getTime() - now + 1000;
+}
+
+/**
+ * <time> für eine Nachricht: sichtbar die kurze Form (für Screenreader
+ * verborgen), dazu das volle Datum als title und als unsichtbarer Text, den
+ * Screenreader vorlesen. Nur über textContent. null ohne gültigen Zeitpunkt.
+ */
+function messageTimeElement(value, className, now) {
+  const label = messageTime(value, now);
+  if (!label) return null;
+  const at = document.createElement("time");
+  at.className = className;
+  at.setAttribute("datetime", String(value));
+  at.setAttribute("title", label.full);
+  const shown = document.createElement("span");
+  shown.setAttribute("aria-hidden", "true");
+  shown.textContent = label.short;
+  at.appendChild(shown);
+  const spoken = document.createElement("span");
+  spoken.className = "visually-hidden";
+  spoken.textContent = label.full;
+  at.appendChild(spoken);
+  return at;
+}
+
 /** Dateigröße kurz auf Deutsch: „850 Bytes", „12,3 KB", „4,2 MB". */
 function formatFileSize(bytes) {
   if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) return "";
@@ -1114,6 +1178,11 @@ function messageElement(message, agent, ui) {
     else body.textContent = String(message.text ?? "");
     item.appendChild(body);
   }
+  // Eigene Nachricht (Issue #186): leise Uhrzeit rechtsbündig unter Blase bzw. Anhängen
+  if (role === "user") {
+    const at = messageTimeElement(message.createdAt, "msg-time msg-user-time");
+    if (at) item.appendChild(at);
+  }
   // Rückfrage (Issue #115): Knöpfe bzw. Ergebnis unter der Antwort
   const choice = role === "assistant" ? choiceOrNull(message.choice) : null;
   if (choice) item.appendChild(choiceElement(choice, ui));
@@ -1137,7 +1206,7 @@ function messageElement(message, agent, ui) {
 }
 
 // ---------------------------------------------------------------------------
-// Fußzeile unter Antworten: Agent, Modell, Dauer, Kopieren (Issue #22)
+// Fußzeile unter Antworten: Uhrzeit, Agent, Modell, Dauer, Kopieren (Issue #22, #186)
 // ---------------------------------------------------------------------------
 
 /** So lange steht „Kopiert" bzw. die Fehlermeldung neben dem Knopf */
@@ -1157,13 +1226,35 @@ function formatDuration(ms) {
 }
 
 /**
- * Leise Zeile unter einer Antwort, z.B. „General · claude-opus-5-5 · 42 s".
+ * Motoren mit Anzeigenamen: unter der Antwort (Issue #125, seit #126 auch
+ * Claude Code) und in der Pille der Kopfzeile (Issue #126)
+ */
+const ENGINE_NAMES = { claude: "Claude Code", codex: "Codex", opencode: "OpenCode" };
+
+/**
+ * Pille der Kopfzeile (Issue #126): Motor des Gesprächs, wenn er vom
+ * Standard abweicht oder der Standard nicht Claude Code ist; sonst null.
+ * engine: eingestellter Motor des Gesprächs (nicht der der letzten Antwort),
+ * standard: Standard-Motor oder null, wenn der Server keinen nennt.
+ */
+function enginePillText(engine, standard) {
+  if (typeof engine !== "string" || !Object.hasOwn(ENGINE_NAMES, engine)) return null;
+  const base = typeof standard === "string" && standard ? standard : "claude";
+  if (engine === "claude" && base === "claude") return null;
+  return ENGINE_NAMES[engine];
+}
+
+/**
+ * Leise Zeile unter einer Antwort, z.B. „General · Claude Code · claude-opus-5-5 · 42 s"
+ * oder „General · Codex · gpt-5.6-sol · 42 s". Den Motor nennt nur eine
+ * Antwort, die ihn mitbringt: Fallback-Antworten und ältere haben keinen.
  * Nur, was die Nachricht selbst mitbringt: ältere Antworten ohne Angaben
  * zeigen weniger oder nichts, der Agent des Gesprächs wird nicht eingesetzt.
  */
 function replyMetaText(message) {
   const parts = [];
   if (typeof message.agent === "string" && message.agent) parts.push(agentLabel(message.agent));
+  if (typeof message.engine === "string" && Object.hasOwn(ENGINE_NAMES, message.engine)) parts.push(ENGINE_NAMES[message.engine]);
   if (typeof message.model === "string" && message.model.trim()) parts.push(message.model.trim());
   const duration = formatDuration(message.durationMs);
   if (duration) parts.push(duration);
@@ -1230,15 +1321,18 @@ async function copyToClipboard(text) {
 }
 
 /**
- * Fußzeile einer Antwort: Kopieren-Knopf, Metazeile und Kopierstatus. Alles
- * nur über textContent; kopiert wird copyText vom Server (Markdown ohne
- * Steuer-Tags). Ohne copyText gibt es keinen Knopf, ohne Angaben keine Zeile.
- * null, wenn beides fehlt.
+ * Fußzeile einer Antwort: Kopieren-Knopf, Uhrzeit (Issue #186), Metazeile
+ * und Kopierstatus. Alles nur über textContent; kopiert wird copyText vom
+ * Server (Markdown ohne Steuer-Tags). Ohne copyText gibt es keinen Knopf,
+ * ohne gültiges createdAt keine Uhrzeit, ohne Angaben keine Metazeile.
+ * null, wenn alles fehlt.
  */
 function replyFooter(message) {
   const meta = replyMetaText(message);
   const copyText = typeof message.copyText === "string" && message.copyText ? message.copyText : null;
-  if (!meta && !copyText) return null;
+  // Die Uhrzeit steht vorn: sie steht so bei jeder Antwort an derselben Stelle und nicht neben der Dauer
+  const at = messageTimeElement(message.createdAt, "msg-time");
+  if (!meta && !copyText && !at) return null;
   const foot = document.createElement("div");
   foot.className = "msg-foot";
   let status = null;
@@ -1270,6 +1364,7 @@ function replyFooter(message) {
     });
     foot.appendChild(button);
   }
+  if (at) foot.appendChild(at);
   if (meta) {
     const line = document.createElement("span");
     line.className = "msg-meta";
@@ -1371,6 +1466,7 @@ function init() {
     input: document.getElementById("input"),
     send: document.getElementById("send"),
     agent: document.getElementById("agent-name"),
+    engine: document.getElementById("engine-name"),
     newChat: document.getElementById("new-chat"),
     logout: document.getElementById("logout"),
     connection: document.getElementById("connection"),
@@ -1446,11 +1542,13 @@ function init() {
     conversations: [],
     /** Direktchat (oder null) und Topics aus GET /api/conversations */
     telegram: { dm: null, topics: [] },
+    /** Standard-Motor aus GET /api/conversations (Issue #126), null ohne Angabe */
+    engineDefault: null,
     /** „Ältere Topics" aufgeklappt (gilt nur ohne Filter) */
     olderOpen: false,
     /** Telegram-Gespräche mit neuer Nachricht seit dem letzten Öffnen (Neu-Punkt), gespeichert bis zum Öffnen */
     unread: loadUnread(),
-    /** Sammelstrom der Aktivität (nur mit Telegram-Gesprächen) */
+    /** Sammelstrom der Aktivität (auch ohne Telegram-Gespräche, für Motor-Änderungen) */
     activityEvents: null,
     activityTimer: null,
     activityDelay: 1000,
@@ -1466,6 +1564,9 @@ function init() {
     historyLoaded: false,
     /** IDs, die beim nächsten Zeichnen kurz einblenden */
     fresh: new Set(),
+    /** Kalendertag des letzten Zeichnens und Timer auf Mitternacht (Issue #186) */
+    renderedDay: "",
+    dayTimer: null,
     /** Nachrichten des aktuellen Gesprächs, nach createdAt sortiert */
     messages: [],
     running: false,
@@ -1639,6 +1740,33 @@ function init() {
     el.loadOlder.hidden = !(isTelegram() && state.hasMore);
     el.loadOlder.disabled = state.loadingOlder;
     el.loadOlder.textContent = state.loadingOlder ? "Lädt …" : "Ältere Nachrichten laden";
+    watchDayChange();
+  }
+
+  // --- Zeitstempel über Mitternacht (Issue #186) ------------------------------
+
+  /**
+   * Bleibt die Seite über Mitternacht offen, wird aus „21:08" am neuen Tag
+   * „gestern 21:08": einmal kurz nach Mitternacht neu zeichnen. Im
+   * Hintergrund pausieren Timer, deshalb prüft auch das Zurückkehren in den
+   * Tab (refreshDay). Kein Dauer-Polling.
+   */
+  function watchDayChange() {
+    const now = Date.now();
+    const today = localDay(now);
+    // Schon für heute gestellt: nicht bei jedem Zeichnen neu
+    if (state.dayTimer && state.renderedDay === today) return;
+    state.renderedDay = today;
+    if (state.dayTimer) clearTimeout(state.dayTimer);
+    state.dayTimer = setTimeout(() => {
+      state.dayTimer = null;
+      refreshDay();
+    }, msUntilNextDay(now));
+  }
+
+  /** Neuer Kalendertag seit dem letzten Zeichnen: Verlauf neu zeichnen */
+  function refreshDay() {
+    if (localDay(Date.now()) !== state.renderedDay) renderMessages();
   }
 
   // --- Rückfragen (Issue #115) ----------------------------------------------
@@ -2244,6 +2372,7 @@ function init() {
       // Chat-ID der Forum-Gruppe; fehlt sie, gilt kein Topic-Name als zugeordnet (Issue #51)
       chatId: typeof telegram.chatId === "string" && telegram.chatId ? telegram.chatId : null,
     };
+    state.engineDefault = data.engine && typeof data.engine.default === "string" ? data.engine.default : null;
   }
 
   /** Eintrag mit dieser ID aus allen drei Gruppen, sonst null */
@@ -2338,11 +2467,30 @@ function init() {
     }
   }
 
-  /** Agent-Chip der Kopfzeile aus dem offenen Gespräch */
+  /** Agent-Chip der Kopfzeile aus dem offenen Gespräch, daneben die Motor-Pille (Issue #126) */
   function renderAgentChip() {
     const conversation = state.conversation;
     el.agent.textContent = conversation ? agentLabel(conversation.agent) : "";
     el.agent.setAttribute("data-agent", String((conversation && conversation.agent) || "general"));
+    renderEnginePill();
+  }
+
+  /**
+   * Motor-Pille: eingestellter Motor des offenen Gesprächs aus der
+   * Gesprächsliste. /motor, Standard und „Auf Standard" kommen als
+   * SSE-Ereignis engine, danach ein Abgleich der Liste; ohne Angabe keine Pille.
+   */
+  function renderEnginePill() {
+    if (!el.engine) return;
+    const conversation = state.conversation;
+    const listed = conversation ? findConversation(conversation.id) : null;
+    const engine = listed && typeof listed.engine === "string" ? listed.engine : conversation && conversation.engine;
+    const text = conversation ? enginePillText(engine, state.engineDefault) : null;
+    el.engine.textContent = text || "";
+    el.engine.hidden = !text;
+    // Leeren statt entfernen: die Pille ist dann ohnehin ausgeblendet
+    el.engine.setAttribute("data-engine", text ? engine : "");
+    el.engine.setAttribute("title", text ? "Motor dieses Gesprächs: " + text + ". Wechseln mit /motor." : "");
   }
 
   /**
@@ -2667,6 +2815,7 @@ function init() {
     el.title.disabled = true;
     el.title.setAttribute("title", "");
     el.agent.textContent = "";
+    renderEnginePill();
     el.conversationMenu.hidden = true;
     el.input.value = "";
     closeCommandList();
@@ -3097,13 +3246,15 @@ function init() {
   }
 
   /**
-   * Ein Strom für alle Telegram-Gespräche, unabhängig vom offenen Gespräch.
+   * Ein Strom für alle Gespräche, unabhängig vom offenen Gespräch.
    * Er bringt nur ID und Zeitpunkt (activity) oder nur die ID (topic), nie
    * Nachrichteninhalt; den bekommt nur der Strom des offenen Gesprächs.
+   * Auch ohne Direktchat und Topics offen: Motor-Änderungen (engine) gelten
+   * für reine Web-Gespräche genauso (Issue #126).
    */
   function connectActivity() {
     closeActivity();
-    if (state.leaving || (!state.telegram.dm && state.telegram.topics.length === 0)) return;
+    if (state.leaving) return;
     const source = new EventSource(ACTIVITY_EVENTS_PATH);
     state.activityEvents = source;
     const current = () => state.activityEvents === source;
@@ -3137,6 +3288,13 @@ function init() {
       if (!current()) return;
       const data = parse(event);
       if (data && typeof data.id === "string" && isTelegramId(data.id)) void refreshConversations();
+    });
+    // Motor geändert (Issue #126): /motor aus Telegram, Browser oder Terminal,
+    // Standard oder „Auf Standard" auf der Einstellungsseite. Ohne Inhalt: Liste
+    // abgleichen, das setzt die Pille der Kopfzeile ohne Neuladen
+    source.addEventListener("engine", () => {
+      if (!current()) return;
+      void refreshConversations();
     });
     source.addEventListener("error", () => {
       if (!current()) return;
@@ -5092,7 +5250,10 @@ function init() {
   window.addEventListener("pageshow", () => renderAttachments());
   // Neue Version (Issue #111): beim Zurückkehren in den Tab prüfen
   if (typeof document.addEventListener === "function") {
-    document.addEventListener("visibilitychange", () => onVisible());
+    document.addEventListener("visibilitychange", () => {
+      onVisible();
+      if (document.visibilityState !== "hidden") refreshDay();
+    });
   }
 
   if (touchInput) el.input.setAttribute("enterkeyhint", "enter");

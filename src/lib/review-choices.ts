@@ -45,7 +45,7 @@ import {
 import type { ReviewDecision } from "./intent-gate";
 import type { SendAndRecordInput, SendAndRecordResult } from "./outbox";
 import { REVIEW_MAX_AGE_MS, type ReviewNotifier, type ReviewProposal } from "./session-distill";
-import type { BotSession } from "./session-manager";
+import { sessionEpochSnapshot, type BotSession } from "./session-manager";
 import { alreadyText, choiceStatusLine } from "./telegram-choices";
 
 export const REVIEW_APPLY = "ok";
@@ -181,8 +181,17 @@ export function createReviewNotifier(deps: ReviewNotifierDeps): ReviewNotifier {
 export interface ReviewResultsDeps {
   /** decideReview aus intent-gate.ts */
   decideReview(action: string, reviewId: string): Promise<ReviewDecision>;
-  /** createRoutineFromSession aus session-routine.ts */
-  createRoutine(session: BotSession, hint: string): Promise<{ isError?: boolean; text?: string }>;
+  /**
+   * createRoutineFromSession aus session-routine.ts; epoch ist die Epoche des
+   * Session-Schlüssels bei der Entscheidung (Issue #189): ein /new danach
+   * verhindert, dass die Routine die Session wieder anlegt
+   */
+  createRoutine(session: BotSession, hint: string, epoch: number): Promise<{ isError?: boolean; text?: string }>;
+  /**
+   * sessionEpochSnapshot aus session-manager.ts (Standard), austauschbar für
+   * Tests: Epochen vor decideReview, dessen Session erst danach bekannt ist
+   */
+  sessionEpochSnapshot?(): (sessionKey: string) => number;
   /** Meldung mit Festhalten (Telegram und Browser), sendAndRecord aus outbox.ts */
   sendAndRecord(input: SendAndRecordInput): Promise<SendAndRecordResult>;
   /** Telegram ohne Festhalten (Routine-Bericht, den saveMessage festhält), Markdown */
@@ -207,8 +216,12 @@ export interface ReviewResultsDeps {
 export interface ReviewResults {
   /** Handler der Art "review" (onChoiceDecided) */
   handler: ChoiceHandler;
-  /** Ergebnis einer Entscheidung im Gespräch melden (Routine: einfrieren und berichten); wirft nicht */
-  deliver(decision: ReviewDecision, conversation: ChoiceConversation | null): Promise<void>;
+  /**
+   * Ergebnis einer Entscheidung im Gespräch melden (Routine: einfrieren und
+   * berichten); wirft nicht. epochs: Schnappschuss von vor decideReview,
+   * ohne ihn gelten die Epochen von jetzt
+   */
+  deliver(decision: ReviewDecision, conversation: ChoiceConversation | null, epochs?: (sessionKey: string) => number): Promise<void>;
   /**
    * Alter Knopf "rev|<aktion>|<id>": Text für die geklickte Nachricht
    * (ersetzt sie samt Knöpfen); null: Nachricht unverändert lassen, damit ein
@@ -226,6 +239,7 @@ const LEGACY_LABELS: Record<Exclude<ReviewDecision["kind"], "expired">, string> 
 
 export function createReviewResults(deps: ReviewResultsDeps): ReviewResults {
   const log = deps.log ?? defaultLog;
+  const snapshot = deps.sessionEpochSnapshot ?? sessionEpochSnapshot;
   const list = deps.listChoices ?? listChoices;
   const decide = deps.decideChoice ?? ((id: string, key: string, via: "telegram") => decideChoice(id, key, via));
   const background =
@@ -296,7 +310,11 @@ export function createReviewResults(deps: ReviewResultsDeps): ReviewResults {
     }
   }
 
-  async function deliver(decision: ReviewDecision, conversation: ChoiceConversation | null): Promise<void> {
+  async function deliver(
+    decision: ReviewDecision,
+    conversation: ChoiceConversation | null,
+    epochs: (sessionKey: string) => number = snapshot()
+  ): Promise<void> {
     const target = conversation ?? (decision.kind === "expired" ? null : reviewConversation(decision.review.chatId, decision.review.topicId));
     const reviewId = decision.kind === "expired" ? "?" : decision.review.id;
     if (!target) {
@@ -315,10 +333,14 @@ export function createReviewResults(deps: ReviewResultsDeps): ReviewResults {
         return;
       case "routine": {
         const description = decision.review.routineDescription || "";
+        // Epoche von vor decideReview: ein /new während der Entscheidung
+        // oder der Startmeldung verwirft die Session der Routine
+        const session = decision.session;
+        const epoch = epochs(session.key.slice(0, -(session.agentName.length + 1)));
         await notice(target, routineStartText(description), `Routine-Start zu ${reviewId}`);
         let text: string;
         try {
-          const result = await deps.createRoutine(decision.session, description);
+          const result = await deps.createRoutine(session, description, epoch);
           text = result.isError || !result.text ? REVIEW_TEXT.routineFailed : result.text;
         } catch (e) {
           log(`[Review] Routine zu ${reviewId} nicht eingefroren (${errorName(e)})`);
@@ -331,16 +353,23 @@ export function createReviewResults(deps: ReviewResultsDeps): ReviewResults {
   }
 
   /** Ergebnis melden; eine Routine läuft im Hintergrund weiter */
-  async function settle(decision: ReviewDecision, conversation: ChoiceConversation | null): Promise<void> {
-    if (decision.kind === "routine") background(deliver(decision, conversation));
-    else await deliver(decision, conversation);
+  async function settle(
+    decision: ReviewDecision,
+    conversation: ChoiceConversation | null,
+    epochs: (sessionKey: string) => number
+  ): Promise<void> {
+    if (decision.kind === "routine") background(deliver(decision, conversation, epochs));
+    else await deliver(decision, conversation, epochs);
   }
 
   const handler: ChoiceHandler = async choice => {
     if (!choice.ref || !choice.result) throw new Error("Rückfrage ohne Vorschlag oder Ergebnis");
+    // Epochen vor decideReview (Issue #189): ein /new während der Auswahl
+    // der Session soll die Routine ebenso stoppen
+    const epochs = snapshot();
     // Genau einmal: decideReview nimmt den Vorschlag aus der Ablage, erst danach wird gemeldet
     const decision = await deps.decideReview(choice.result.key, choice.ref);
-    await settle(decision, choice.conversation);
+    await settle(decision, choice.conversation, epochs);
   };
 
   async function legacy(action: string, reviewId: string): Promise<{ text: string | null }> {
@@ -374,9 +403,10 @@ export function createReviewResults(deps: ReviewResultsDeps): ReviewResults {
       }
     }
     // Vorschlag von vor dem Update: ohne Register, nur die Ablage entscheidet genau einmal
+    const epochs = snapshot();
     const decision = await deps.decideReview(action, reviewId);
     if (decision.kind === "expired") return { text: REVIEW_TEXT.expired };
-    await settle(decision, null);
+    await settle(decision, null, epochs);
     return { text: `✓ ${LEGACY_LABELS[decision.kind]} (in Telegram)` };
   }
 

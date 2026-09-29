@@ -1,6 +1,6 @@
 {
   "name": "tybo",
-  "version": "2.12.0",
+  "version": "2.13.0",
   "description": "Always-on AI assistant on Telegram and in the browser, powered by Claude Code, with agents, persistent memory and background jobs",
   "homepage": "https://tybo.ai",
   "repository": {
@@ -38,7 +38,7 @@
     "whatsapp": "bun run src/whatsapp-gateway.ts",
     "test:tools": "bun run setup/test-builtin-tools.ts",
     "typecheck": "tsc --noEmit --pretty false && tsc --noEmit --pretty false -p convex/tsconfig.json",
-    "test": "bun test tests src/lib/voice-bridge",
+    "test": "bun test --preload ./tests/preload-env.ts tests src/lib/voice-bridge",
     "check": "bun run typecheck && bun run test",
     "voice": "bun run src/voice-bridge.ts",
     "web:dev": "bun run scripts/web-dev.ts",
@@ -55,7 +55,6 @@
     "marked": "^18.0.14",
     "pdfkit": "^0.17.2",
     "pptxgenjs": "^4.0.1",
-    "puppeteer": "^25.10.0",
     "telegram": "^2.26.22",
     "zod": "^3.25.76"
   },

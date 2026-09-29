@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import {
   BASE_CONTEXT,
+  LONG_TASK_RULES,
   canInvokeAgent,
   getAgentConfig,
   getAgentConfigOrGeneral,
@@ -34,6 +35,7 @@ import { createWebServer, type WebServer } from "../src/web/server";
 import { agentList } from "../src/web/agents";
 import { stripControlTags } from "../src/web/markdown";
 import { addAgentOverride, listAllOverrides, setAgentOverridesPath } from "../src/lib/agent-overrides";
+import { createClaudeEngine } from "../src/lib/engines";
 
 // Katalog, Einstellungen und Topics nur in temporären Dateien.
 
@@ -80,7 +82,8 @@ describe("getAgentConfig über den Katalog", () => {
     const code = getAgentConfig("research")!;
     await setPrompt("research", "Neuer Prompt für Research");
     const changed = getAgentConfig("researcher")!;
-    expect(changed.systemPrompt).toBe("Neuer Prompt für Research");
+    // Gespeicherter Text bleibt, der Block LONG TASKS kommt dazu (Issue #180)
+    expect(changed.systemPrompt).toBe(`Neuer Prompt für Research\n\n${LONG_TASK_RULES}\n`);
     expect(changed.model).toBe(code.model);
     expect(changed.name).toBe(code.name);
     await resetPrompt("research");
@@ -138,8 +141,7 @@ function fakeTurn() {
     return { text: "antwort", sessionId: `sid-${calls.length}`, isError: false };
   };
   const deps: Partial<ChatTurnDeps> = {
-    callClaude: fakeCall,
-    callClaudeStreaming: fakeCall,
+    getEngine: () => createClaudeEngine({ callClaude: fakeCall, callClaudeStreaming: fakeCall }),
     callFallbackLLMWithSource: async () => ({ text: "fallback", source: "none" }),
     buildPromptContext: async () => ({ fullPrompt: "voll", fallbackContext: "" }),
     buildResumePrompt: async () => "resume",

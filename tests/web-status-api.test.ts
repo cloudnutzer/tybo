@@ -9,6 +9,8 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readRestartRequest, requestRestart } from "../src/lib/restart-request";
+import type { EngineId, EngineStatus } from "../src/lib/engines";
+import { CLAUDE_LOGIN_UNKNOWN, CODEX_NOT_LOGGED_IN } from "../src/lib/engines/check";
 import { createBotStatus, type BotStatusDeps } from "../src/web/bot-status";
 import type { WebServer } from "../src/web/server";
 import { RESTART_NOTE, STATUS_TEXT, type Supervisor } from "../src/web/status";
@@ -42,6 +44,8 @@ async function setup(supervisor: Supervisor | null | "throws", overrides: Partia
       activeClaudeCalls: () => 1,
       restartMarker: marker,
       requestRestart: note => requestRestart(note, marker),
+      // Nie ein echtes claude oder codex (Issue #126): Prüf-Attrappe
+      inspectEngine: async (id: EngineId): Promise<EngineStatus> => ({ engine: id, checked: true, installed: true, loggedIn: true, version: "1.0.0" }),
       ...overrides,
     }
   );
@@ -60,7 +64,7 @@ describe("GET /api/status", () => {
     for (const [, v] of res.headers) expect(v).not.toContain(SECRET);
     const body = JSON.parse(raw);
     expect(Object.keys(body).sort()).toEqual(
-      ["keys", "restartRequested", "running", "sessions", "startedAt", "storage", "supervisor", "uptimeSeconds", "version"].sort()
+      ["engines", "keys", "restartRequested", "running", "semanticSearch", "sessions", "startedAt", "storage", "supervisor", "uptimeSeconds", "version"].sort()
     );
     expect(body.version).toEqual({ app: "2.12.0", commit: "0fe4c19" });
     expect(body.supervisor).toBe("launchd");
@@ -172,5 +176,50 @@ describe("POST /api/restart", () => {
       expect(res.headers.get("allow")).toBe("POST");
     }
     expect(await readRestartRequest(ctx.marker)).toBeNull();
+  });
+});
+
+describe("Motoren auf der Statusseite (Issue #126)", () => {
+  test("Akzeptanz: „nicht angemeldet\" aus der Prüf-Attrappe, je Motor installiert, angemeldet, Version", async () => {
+    const asked: EngineId[] = [];
+    const ctx = await setup("launchd", {
+      inspectEngine: async (id): Promise<EngineStatus> => {
+        asked.push(id);
+        if (id === "opencode") return { engine: "opencode", checked: true, installed: true, loggedIn: true, version: "1.18.33" };
+        return id === "codex"
+          ? { engine: "codex", checked: true, installed: true, loggedIn: false, version: "0.155.1", message: CODEX_NOT_LOGGED_IN }
+          : { engine: "claude", checked: true, installed: true, loggedIn: true, version: "2.1.281" };
+      },
+    });
+    const body = await (await ctx.api("/api/status")).json();
+    expect(asked.sort()).toEqual(["claude", "codex", "opencode"]);
+    expect(body.engines).toEqual([
+      { engine: "claude", label: "Claude Code", installed: true, loggedIn: true, version: "2.1.281" },
+      { engine: "codex", label: "Codex", installed: true, loggedIn: false, version: "0.155.1", message: CODEX_NOT_LOGGED_IN },
+      { engine: "opencode", label: "OpenCode", installed: true, loggedIn: true, version: "1.18.33" },
+    ]);
+  });
+
+  test("nicht feststellbare Anmeldung ist null, nie „angemeldet\"; nicht installiert ohne Version; Fehler je Motor", async () => {
+    const ctx = await setup("launchd", {
+      inspectEngine: async (id): Promise<EngineStatus> => {
+        if (id === "codex") throw new Error("kaputt");
+        if (id === "opencode") return { engine: "opencode", checked: true, installed: false, loggedIn: false, message: "OpenCode ist nicht installiert" };
+        return { engine: "claude", checked: true, installed: true, loggedIn: false, loginUnknown: true, version: "2.1.281", message: CLAUDE_LOGIN_UNKNOWN };
+      },
+    });
+    const body = await (await ctx.api("/api/status")).json();
+    expect(body.engines).toEqual([
+      { engine: "claude", label: "Claude Code", installed: true, loggedIn: null, version: "2.1.281", message: CLAUDE_LOGIN_UNKNOWN },
+      { engine: "codex", label: "Codex", installed: false, loggedIn: false, message: "Codex ließ sich nicht prüfen" },
+      { engine: "opencode", label: "OpenCode", installed: false, loggedIn: false, message: "OpenCode ist nicht installiert" },
+    ]);
+  });
+
+  test("Port ohne engines: null", async () => {
+    const status = createBotStatus({}, { gitHead: async () => "0fe4c19", readPackageJson: () => "{}", detectSupervisor: async () => null, listSessions: async () => [] });
+    const { engines: _engines, ...withoutEngines } = status;
+    const ctx = await topicServer(root, servers, null, { status: withoutEngines });
+    expect((await (await ctx.api("/api/status")).json()).engines).toBeNull();
   });
 });

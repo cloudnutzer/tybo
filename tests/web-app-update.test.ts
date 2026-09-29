@@ -461,7 +461,9 @@ describe("Vergleich der Version (Issue #111, Schritt 2)", () => {
     app.advance(1_000);
     await settle();
     expect(app.server.versionCalls).toBe(2);
-    expect(app.timers.size).toBe(0);
+    // Übrig bleibt nur der Timer auf kurz nach Mitternacht für die Zeitstempel (Issue #186)
+    const atMidnight = (at: number) => { const d = new Date(at - 1000); return d.getHours() + d.getMinutes() + d.getSeconds() + d.getMilliseconds() === 0; };
+    expect([...app.timers.values()].filter(t => !atMidnight(t.at))).toHaveLength(0);
   });
 
   test("gebremster Timer nach einer Prüfung beim Wiederverbinden: die Minute gilt ab dort neu", async () => {

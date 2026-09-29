@@ -1,7 +1,7 @@
 // Seitenleiste mit Direktchat, Topics und Web-Gesprächen sowie der
 // Telegram-Verlauf im Browser (Issue #18), ohne Browser: Attrappen für DOM,
 // fetch, EventSource, Timer und localStorage wie in web-app-sync.test.ts.
-import { describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, setSystemTime, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { TYBO_BRAND } from "./brand-fixture";
@@ -104,7 +104,9 @@ function setup(options: Options = {}) {
   };
   const timers = new Map<number, () => void>();
   let nextTimer = 1;
-  const setTimeout = (fn: () => void) => { const id = nextTimer++; timers.set(id, fn); return id; };
+  /** Verzögerung je Timer, für den Timer auf Mitternacht (Issue #186) */
+  const delays = new Map<number, number>();
+  const setTimeout = (fn: () => void, ms?: number) => { const id = nextTimer++; timers.set(id, fn); delays.set(id, ms ?? 0); return id; };
   const clearTimeout = (id: number) => { timers.delete(id); };
 
   const server = {
@@ -199,7 +201,7 @@ function setup(options: Options = {}) {
     elements["conversation-filter"].value = text;
     elements["conversation-filter"].dispatch("input");
   };
-  return { server, elements, store, titles, entry, shown, filter, timers };
+  return { server, elements, store, titles, entry, shown, filter, timers, delays };
 }
 
 async function settle() {
@@ -798,5 +800,81 @@ describe("Board-Sitzung: mehrere Sprecher in einem Gespräch", () => {
     expect(app.shown()).toEqual(["m1", "m2", "web-2", "web-3"]);
     expect(speaker(app, "web-3").agent).toBe("critic");
     expect(speaker(app, "web-3").name).toBe("Critic");
+  });
+});
+
+describe("Zeitstempel an Nachrichten (Issue #186)", () => {
+  let previousTz: string | undefined;
+  beforeAll(() => {
+    previousTz = process.env.TZ;
+    process.env.TZ = "Europe/Berlin";
+  });
+  afterAll(() => {
+    if (previousTz === undefined) delete process.env.TZ;
+    else process.env.TZ = previousTz;
+  });
+  afterEach(() => setSystemTime());
+  const ev = (data: unknown) => ({ data: JSON.stringify(data) });
+
+  /** Sichtbare Kurzform und datetime des Zeitstempels einer angezeigten Nachricht */
+  function stamp(app: ReturnType<typeof setup>, id: string) {
+    const item = app.elements["messages"].children.find(c => c.attributes["data-id"] === id);
+    if (!item) throw new Error(`Nachricht ${id} fehlt`);
+    const foot = item.children.find((c: Node) => c.className === "msg-foot");
+    const at = (foot ?? item).children.find((c: Node) => String(c.className).split(" ").includes("msg-time"));
+    return at ? { text: at.children[0].textContent as string, datetime: at.attributes["datetime"] } : null;
+  }
+
+  test("Web-Gespräch: geladen und live, Nutzer und Antwort; ohne createdAt keine Zeit", async () => {
+    setSystemTime(new Date("2026-09-26T20:00:00.000Z"));
+    const app = setup({
+      web: { c1: [
+        { id: "w1", role: "user", text: "Hallo", createdAt: "2026-09-23T10:00:00.000Z" },
+        { id: "w2", role: "assistant", text: "Hi", html: "<p>Hi</p>", createdAt: "2026-09-25T19:08:00.000Z" },
+      ] },
+    });
+    await settle();
+    expect(stamp(app, "w1")).toEqual({ text: "23.09. 12:00", datetime: "2026-09-23T10:00:00.000Z" });
+    expect(stamp(app, "w2")).toEqual({ text: "gestern 21:08", datetime: "2026-09-25T19:08:00.000Z" });
+    const stream = FakeEventSource.all.at(-1)!;
+    expect(stream.url).toBe("/api/conversations/c1/events");
+    stream.emit("open");
+    stream.emit("message", ev({ id: "w3", role: "user", text: "Neu", createdAt: "2026-09-26T19:59:00.000Z" }));
+    stream.emit("message", ev({ id: "w4", role: "assistant", text: "Ok", html: "<p>Ok</p>", createdAt: "2026-09-26T20:00:00.000Z", agent: "general" }));
+    stream.emit("message", ev({ id: "w5", role: "assistant", text: "Ohne", html: "<p>Ohne</p>" }));
+    await settle();
+    expect(stamp(app, "w3")!.text).toBe("21:59");
+    expect(stamp(app, "w4")!.text).toBe("22:00");
+    expect(stamp(app, "w5")).toBeNull();
+  });
+
+  test("Telegram-Gespräch: geladen, nachgeladen und live; über Mitternacht wird aus „21:08“ „gestern 21:08“", async () => {
+    setSystemTime(new Date("2026-09-26T19:30:00.000Z"));
+    const history = { "topic-443": Array.from({ length: 60 }, (_, i) => tg(i)), dm: [] as Message[] };
+    const app = setup({ telegram: { dm: DM, topics: TOPICS }, history, stored: "topic-443" });
+    await settle();
+    // Geladene Seite: m10 bis m59 (Mikrosekunden aus Postgres), 20.09. 12:00 in Berlin
+    expect(stamp(app, "m59")).toEqual({ text: "20.09. 12:00", datetime: "2026-09-20T10:00:59.123456Z" });
+    expect(stamp(app, "m58")!.text).toBe("20.09. 12:00");
+    // Nachgeladen
+    app.elements["load-older"].dispatch("click");
+    await settle();
+    expect(stamp(app, "m0")).toEqual({ text: "20.09. 12:00", datetime: "2026-09-20T10:00:00.123456Z" });
+    // Live aus Telegram
+    const stream = FakeEventSource.all.at(-1)!;
+    expect(stream.url).toBe("/api/conversations/topic-443/events");
+    stream.emit("open");
+    stream.emit("message", ev({ id: "live-1", role: "assistant", text: "Da", html: "<p>Da</p>", createdAt: "2026-09-26T19:08:00.000Z", agent: "research", model: "claude-opus-5-5", durationMs: 1_002_000 }));
+    await settle();
+    expect(stamp(app, "live-1")!.text).toBe("21:08");
+
+    // Timer auf kurz nach Mitternacht (Ortszeit): jetzt 21:30 Uhr, also 2,5 Stunden plus 1 s
+    const midnight = [...app.delays].filter(([id, ms]) => app.timers.has(id) && ms === 150 * 60 * 1000 + 1000);
+    expect(midnight).toHaveLength(1);
+    setSystemTime(new Date("2026-09-26T22:00:01.000Z"));
+    app.timers.get(midnight[0]![0])!();
+    expect(stamp(app, "live-1")!.text).toBe("gestern 21:08");
+    // Nächster Timer für die folgende Mitternacht
+    expect([...app.delays].some(([id, ms]) => app.timers.has(id) && ms === 24 * 60 * 60 * 1000)).toBe(true);
   });
 });

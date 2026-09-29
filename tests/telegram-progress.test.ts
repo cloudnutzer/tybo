@@ -13,6 +13,7 @@ import { runStreamingTurn, type ChatTurnDeps, type TurnProgress, type TurnSink }
 import { installTelegramOutputGuard } from "../src/lib/telegram";
 import { createTelegramProgressSink } from "../src/lib/telegram-progress";
 import { setMcpReaderForTests } from "../src/lib/subprocess-env";
+import { createClaudeEngine } from "../src/lib/engines";
 
 const SECRET = "https://a.b/geheim";
 /**
@@ -60,10 +61,13 @@ afterAll(() => {
 
 /** Alle Abhängigkeiten außer callClaudeStreaming sind Attrappen: kein Prompt-Bau, keine Datenbank */
 const DEPS: Partial<ChatTurnDeps> = {
-  callClaudeStreaming,
-  callClaude: async () => {
-    throw new Error("unerwartet");
-  },
+  getEngine: () =>
+    createClaudeEngine({
+      callClaudeStreaming,
+      callClaude: async () => {
+        throw new Error("unerwartet");
+      },
+    }),
   callFallbackLLMWithSource: async () => ({ text: "fallback", source: "none" }),
   buildPromptContext: async () => ({ fullPrompt: "prompt", fallbackContext: "" }),
   buildResumePrompt: async () => "resume",

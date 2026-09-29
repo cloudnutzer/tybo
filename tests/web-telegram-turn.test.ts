@@ -81,7 +81,7 @@ function setup(core: (o: TurnOptions) => Promise<string> = async () => "Antwort"
       state.steps.push("intents");
       state.intents.push(t);
     },
-    abortClaudeCalls: key => {
+    abortEngineCalls: key => {
       state.aborts.push(key);
       return abortExecutions(key);
     },

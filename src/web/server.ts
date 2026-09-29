@@ -49,9 +49,10 @@ import {
 } from "./telegram";
 import { normalizeTopicTitle, TEXT as TOPIC_TEXT, TOPIC_TITLE_MAX_CHARS, type TopicManager } from "./topics";
 import { createSettingsApi, SETTINGS_TEXT, type SettingsPort } from "./settings";
-import { createModelCatalog, type ModelCatalog } from "./models";
+import { createModelCatalog, type ModelCatalog, type OpenCodeModelsPort } from "./models";
 import { createInstructionsApi, INSTRUCTIONS_PATH, INSTRUCTIONS_TEXT, type InstructionsPort } from "./instructions";
 import { createStatusApi, STATUS_TEXT, type StatusPort } from "./status";
+import { conversationEngines, createEnginesApi, ENGINE_TEXT, type EngineConversation, type EnginePort } from "./engines";
 import { createKeysApi, KEYS_TEXT, type KeysPort } from "./keys";
 import { FILES_PATH, serveOutboxFile, type FilesDeps } from "./files";
 import { FILE_NAME_HEADER, MAX_ATTACHMENT_BYTES, parseAttachmentName, toApiAttachment, type ApiAttachment } from "./attachments";
@@ -240,11 +241,25 @@ export interface WebServerDeps {
    */
   models?: ModelCatalog;
   /**
+   * `opencode models` für die Standard-Modell-Liste (Issue #129); in bot.ts
+   * listOpenCodeModels aus src/lib/engines/opencode.ts. Fehlt: die Liste
+   * meldet OpenCode als nicht abrufbar, das Feld bleibt frei eingebbar.
+   */
+  opencodeModels?: OpenCodeModelsPort;
+  /**
    * Status und Neustart-Anforderung (Issue #37); in bot.ts createBotStatus
    * aus ./bot-status, in web:dev und Demo createDemoStatus (schreibt nie
    * den echten Marker). Ohne ihn antworten /api/status und /api/restart mit 503.
    */
   status?: StatusPort;
+  /**
+   * Motor-Wahl (Issue #126): GET /api/engines (Standard, Verfügbarkeit,
+   * abweichende Gespräche), POST /api/engines/reset („Auf Standard"), Motor
+   * je Gespräch in GET /api/conversations und das SSE-Ereignis engine im
+   * Sammelstrom. In bot.ts createBotEngines aus ./bot-engines, in Demo und
+   * Tests eine Attrappe. Ohne ihn antworten die Routen mit 503.
+   */
+  engines?: EnginePort;
   /**
    * Slash-Befehle (Issue #74): Beginnt eine Nachricht mit einem registrierten
    * Befehl, läuft er statt eines Turns; GET /api/commands liefert die Liste.
@@ -525,10 +540,31 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
   // Wie ein Set, aber bei jeder Abfrage aktuell
   const agentNames = { has: (name: string) => currentAgents().some(a => a.name === name) };
   const settingsApi = deps.settings ? createSettingsApi(deps.settings, log) : null;
-  const models = deps.models ?? createModelCatalog({ log });
+  const models = deps.models ?? createModelCatalog({ log, ...(deps.opencodeModels ? { opencode: deps.opencodeModels } : {}) });
   const agentsApi = catalog ? createAgentsApi({ port: catalog, settingsApi, settingsPort: deps.settings, log }) : null;
   const instructionsApi = deps.instructions ? createInstructionsApi(deps.instructions, agentNames, log) : null;
   const statusApi = deps.status ? createStatusApi(deps.status, log) : null;
+  // „Auf Standard" (Issue #126): bei Gesprächen der WebUI wie /motor standard unter der Sperre des Gesprächs
+  const enginesApi = deps.engines
+    ? createEnginesApi(
+        deps.engines,
+        {
+          conversations: () => engineConversations(),
+          resetConversation: deps.resetConversation
+            ? async (id, write) => {
+                const reset = deps.resetConversation!;
+                const result = await hubFor(id).exclusive(id, () => reset(id, write));
+                if (result.status !== "done") return result.status;
+                if (result.value.status === "busy") return "busy";
+                // Kein Session-Schlüssel ermittelbar: beweist nicht, dass keine Antwort läuft, nichts schreiben
+                if (result.value.status === "unavailable") return "unavailable";
+                return "done";
+              }
+            : undefined,
+        },
+        log
+      )
+    : null;
   // Nie mit unlocked: Sperren aufheben darf nur der Einrichtungsmodus (M8) intern
   const keysApi = deps.keys ? createKeysApi(deps.keys, log) : null;
   // Telegram-Gespräche: eigener Hub, Nachrichten speichert der Turn in Supabase
@@ -593,6 +629,15 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
       log(`Topic-Änderungen aus Telegram nicht verfügbar (${e instanceof Error ? e.name : typeof e})`);
     }
   }
+  // Motor-Einstellungen geändert (Issue #126), gleich aus welchem Kanal: an alle Seitenleisten ohne Inhalt
+  let stopEngineChanges: (() => void) | null = null;
+  if (deps.engines?.subscribe) {
+    try {
+      stopEngineChanges = deps.engines.subscribe(() => telegramHub.publishEngineChange(ACTIVITY_STREAM));
+    } catch (e) {
+      log(`Motor-Änderungen nicht verfügbar (${errorName(e)})`);
+    }
+  }
   // Automatische Titel neuer Topics aus der ersten Nutzernachricht (Issue #29), einmal pro Server
   let stopAutoTitle: (() => void) | null = null;
   if (deps.topics) {
@@ -619,6 +664,37 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     } catch (e) {
       log(`Telegram-Gespräche nicht lesbar (${errorName(e)})`);
       return { dm: null, topics: [] };
+    }
+  }
+
+  /** Alle Gespräche der WebUI mit Namen, für die Motor-Ausnahmen (Issue #126) */
+  async function engineConversations(): Promise<EngineConversation[]> {
+    const telegram = await listTelegram();
+    const out: EngineConversation[] = [];
+    if (telegram.dm) out.push({ id: telegram.dm.id, title: telegram.dm.title });
+    for (const t of telegram.topics) out.push({ id: t.id, title: t.title });
+    for (const c of await store.listConversations()) out.push({ id: c.id, title: c.title });
+    return out;
+  }
+
+  /** Motor je Gespräch und Standard für GET /api/conversations (Issue #126); ohne Port nichts */
+  function withEngines<T extends { id: string }>(list: T[]): (T & { engine?: string })[] {
+    if (!deps.engines) return list;
+    try {
+      const engines = conversationEngines(deps.engines, list.map(c => c.id));
+      return list.map(c => ({ ...c, engine: engines[c.id] }));
+    } catch (e) {
+      log(`Motor je Gespräch nicht ermittelbar (${errorName(e)})`);
+      return list;
+    }
+  }
+
+  function engineSummary(): { default: string } | undefined {
+    if (!deps.engines) return undefined;
+    try {
+      return { default: deps.engines.standard().engine };
+    } catch {
+      return undefined;
     }
   }
 
@@ -1236,6 +1312,18 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
       const result = method === "GET" ? await settingsApi.get() : await settingsApi.patch(body);
       return json(result.body, result.status);
     }
+    if (path === "/api/engines") {
+      if (method !== "GET") return methodNotAllowed("GET");
+      if (!enginesApi) return json({ error: ENGINE_TEXT.notConfigured }, 503);
+      const result = await enginesApi.get();
+      return json(result.body, result.status);
+    }
+    if (path === "/api/engines/reset") {
+      if (method !== "POST") return methodNotAllowed("POST");
+      if (!enginesApi) return json({ error: ENGINE_TEXT.notConfigured }, 503);
+      const result = await enginesApi.reset(body);
+      return json(result.body, result.status);
+    }
     if (path === "/api/status") {
       if (method !== "GET") return methodNotAllowed("GET");
       if (!statusApi) return json({ error: STATUS_TEXT.notConfigured }, 503);
@@ -1323,10 +1411,20 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     }
     if (path === "/api/conversations") {
       if (method === "GET") {
-        const telegram: TelegramConversationList & { chatId?: string } = await listTelegram();
+        const listed = await listTelegram();
+        // Motor je Gespräch (Issue #126): eingestellt, nicht der tatsächliche der letzten Antwort
+        const telegram: TelegramConversationList & { chatId?: string } = {
+          dm: listed.dm ? withEngines([listed.dm])[0] : null,
+          topics: withEngines(listed.topics),
+        };
         // Chat-ID der Forum-Gruppe, nur wenn bekannt: Topic-Namen in der Löschvorschau (Issue #51)
         const chatId = groupChatId();
-        return json({ conversations: await store.listConversations(), telegram: chatId ? { ...telegram, chatId } : telegram });
+        const engine = engineSummary();
+        return json({
+          conversations: withEngines(await store.listConversations()),
+          telegram: chatId ? { ...telegram, chatId } : telegram,
+          ...(engine ? { engine } : {}),
+        });
       }
       if (method !== "POST") return methodNotAllowed("GET, POST");
       let agent: unknown = DEFAULT_AGENT;
@@ -1623,6 +1721,8 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
       stopChoices = null;
       stopTopicChanges?.();
       stopTopicChanges = null;
+      stopEngineChanges?.();
+      stopEngineChanges = null;
       stopAutoTitle?.();
       stopAutoTitle = null;
       deps.uploads?.stop();

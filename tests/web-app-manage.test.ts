@@ -536,7 +536,7 @@ describe("Löschen", () => {
     expect(app.requests("DELETE")).toEqual([{ method: "DELETE", path: "/api/conversations/c2", body: undefined }]);
     expect(app.titles()).toEqual(["Betrieb"]);
     expect(app.elements["chat-title"].textContent).toBe("Betrieb");
-    expect(FakeEventSource.all.filter(s => !s.closed).map(s => s.url)).toEqual(["/api/conversations/c1/events"]);
+    expect(FakeEventSource.all.filter(s => !s.closed).map(s => s.url)).toEqual(["/api/telegram/events", "/api/conversations/c1/events"]);
   });
 
   test("offenes Gespräch über die Kopfzeile löschen: jüngstes anderes öffnet, Entwurf, Strom und Auswahl aufgeräumt", async () => {

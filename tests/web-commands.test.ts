@@ -141,6 +141,8 @@ interface Ctx {
   sendVoice: () => Promise<void>;
   /** Antworttexte, deren Merk-Tags verarbeitet wurden */
   intents: string[];
+  /** /motor (Issue #125): Ausnahmen je Session-Schlüssel */
+  engineTopics: Record<string, string>;
 }
 
 async function start(options: { realReset?: boolean; realWebChat?: boolean; gatedOverrides?: boolean } = {}): Promise<Ctx> {
@@ -177,6 +179,7 @@ async function start(options: { realReset?: boolean; realWebChat?: boolean; gate
   ctx.voiceSends = [];
   ctx.sendVoice = async () => {};
   ctx.intents = [];
+  ctx.engineTopics = {};
   let rowCounter = 0;
   // Wie onMessageSaved in src/lib/convex.ts: jede gespeicherte Zeile geht an den echten Feed
   let savedHook: MessageSavedListener | null = null;
@@ -211,7 +214,7 @@ async function start(options: { realReset?: boolean; realWebChat?: boolean; gate
     },
     saveMessage,
     processIntents: async (text: string) => void ctx.intents.push(text),
-    abortClaudeCalls: (key: string) => {
+    abortEngineCalls: (key: string) => {
       ctx.aborts.push(key);
       return abortExecutions(key);
     },
@@ -265,7 +268,7 @@ async function start(options: { realReset?: boolean; realWebChat?: boolean; gate
     isSessionModeEnabled: () => true,
     getGoal: async () => (ctx.goalActive ? { status: "active" } : undefined),
     pauseGoal: async key => void ctx.paused.push(key),
-    abortClaudeCalls: key => turnDeps.abortClaudeCalls(key),
+    abortEngineCalls: key => turnDeps.abortEngineCalls(key),
     listAllOverrides: () => ({}),
     listAgentNames: () => known,
     resolveAgentName: raw => (known.includes(raw.toLowerCase()) ? raw.toLowerCase() : undefined),
@@ -280,6 +283,19 @@ async function start(options: { realReset?: boolean; realWebChat?: boolean; gate
     formatPlan: async () => "Plan",
     sessionsForKey: async () => ctx.sessions,
     createRoutine: () => ctx.createRoutine(),
+    // /motor (Issue #125): Einstellungen im Speicher statt config/settings.json
+    engines: {
+      configured: key => (ctx.engineTopics[key] ? { engine: ctx.engineTopics[key], source: "topic" } : { engine: "claude", source: "code" }),
+      standard: () => ({ engine: "claude", source: "code" }),
+      available: async () => [
+        { engine: "claude", label: "Claude Code", ready: true },
+        { engine: "codex", label: "Codex", ready: true },
+      ],
+      setTopic: async (key, engine) => {
+        if (engine) ctx.engineTopics[key] = engine;
+        else delete ctx.engineTopics[key];
+      },
+    },
     ...gated,
   };
   if (options.realWebChat) ctx.botChat = createBotChat({ ...turnDeps, approvals: ctx.approvals });
@@ -578,6 +594,64 @@ describe("/new mit dem echten Reset-Baustein", () => {
   });
 });
 
+describe("/motor aus Browser und Terminal (Issue #125)", () => {
+  test("Browser im Topic: Ausnahme unter dem Topic-Schlüssel, neue Session, Antwort als Meldung", async () => {
+    const ctx = await start();
+    const sse = await listen(ctx, "topic-443");
+    expect((await post(ctx, "topic-443", "/motor codex")).status).toBe(202);
+    await sse.settled();
+    await sse.close();
+    expect(ctx.engineTopics).toEqual({ [`topic:${GROUP}:443`]: "codex" });
+    expect(ctx.resets).toEqual(["topic-443"]);
+    expect(ctx.claudeStarted).toBe(0);
+    expect(ctx.plain).toEqual([{ chatId: GROUP, text: "Du (Web): /motor codex", threadId: 443 }]);
+    expect(ctx.records.map(r => r.text)).toEqual(["Dieses Gespräch läuft jetzt mit Codex. Das beginnt eine neue Session, das Gedächtnis bleibt."]);
+  });
+
+  test("Terminal im Direktchat: /engine codex, dann /motor zeigt es, /motor standard nimmt es zurück", async () => {
+    const ctx = await start();
+    for (const text of ["/engine codex", "/motor", "/motor standard"]) {
+      const sse = await listen(ctx, "dm");
+      expect((await post(ctx, "dm", text, true)).status).toBe(202);
+      await sse.settled();
+      await sse.close();
+    }
+    expect(ctx.engineTopics).toEqual({});
+    expect(ctx.resets).toEqual(["dm", "dm"]);
+    expect(ctx.records.map(r => r.text.split("\n")[0])).toEqual([
+      "Dieses Gespräch läuft jetzt mit Codex. Das beginnt eine neue Session, das Gedächtnis bleibt.",
+      "Motor dieses Gesprächs: Codex (mit /motor für dieses Gespräch gesetzt)",
+      "Ausnahme entfernt: dieses Gespräch nimmt wieder den Standard, Claude Code. Das beginnt eine neue Session, das Gedächtnis bleibt.",
+    ]);
+    expect(ctx.plain.map(p => p.text)).toEqual(["Du (Terminal): /engine codex", "Du (Terminal): /motor", "Du (Terminal): /motor standard"]);
+  });
+
+  test("älteres Web-Gespräch: Schlüssel web:<id>", async () => {
+    const ctx = await start({ realReset: true });
+    const sse = await listen(ctx, ctx.webId);
+    expect((await post(ctx, ctx.webId, "/motor codex")).status).toBe(202);
+    await sse.settled();
+    await sse.close();
+    expect(ctx.engineTopics).toEqual({ [`web:${ctx.webId}`]: "codex" });
+    expect(ctx.resets).toEqual([`web:${ctx.webId}`]);
+  });
+
+  test("echter Reset während einer laufenden Antwort: Hinweis, Motor bleibt", async () => {
+    const ctx = await start({ realReset: true });
+    let release!: () => void;
+    ctx.core = () => new Promise(resolve => (release = () => resolve("fertig")));
+    await post(ctx, "topic-443", "Lange Frage");
+    await waitUntil(() => ctx.claudeStarted === 1);
+    const res = await post(ctx, "topic-443", "/motor codex");
+    // Wie /new: als belegt abgelehnt, nichts gespiegelt, nichts geändert
+    expect(res.status).toBe(409);
+    expect(ctx.plain.map(p => p.text)).toEqual(["Du (Web): Lange Frage"]);
+    expect(ctx.engineTopics).toEqual({});
+    expect(ctx.resets).toEqual([]);
+    release();
+  });
+});
+
 describe("/agent aus Browser und Terminal", () => {
   test("/agent research: kürzer fügt die Anweisung hinzu", async () => {
     const ctx = await start();
@@ -788,7 +862,7 @@ describe("Stopp wirkt auf den ganzen Befehlsablauf", () => {
   test("/routine: Strg+C im Terminal (Stopp mit lokalem Schlüssel) bricht die Destillation ab, keine Antwort danach", async () => {
     const ctx = await start();
     const keys: string[] = [];
-    ctx.sessions = [{ claudeSessionId: "sitzung-1", lastActivity: 1 }];
+    ctx.sessions = [{ engineSessionId: "sitzung-1", lastActivity: 1 }];
     ctx.createRoutine = untilStopped(keys, () => ({ text: "Routine fertig" }));
     const sse = await listen(ctx, "topic-443");
     await post(ctx, "topic-443", "/routine täglich", true);
@@ -1499,7 +1573,7 @@ describe("GET /api/commands", () => {
     const res = await api(ctx, "/api/commands");
     expect(res.status).toBe(200);
     const { commands } = await res.json();
-    expect(commands.map((c: any) => c.name)).toEqual(["help", "stop", "new", "topics", "agent", "goal", "goals", "learn", "plan", "critic", "board", "routine", "jobs", "voice"]);
+    expect(commands.map((c: any) => c.name)).toEqual(["help", "stop", "new", "topics", "motor", "agent", "goal", "goals", "learn", "plan", "critic", "board", "routine", "jobs", "voice"]);
     expect(commands.find((c: any) => c.name === "critic")).toEqual({
       name: "critic",
       aliases: [],

@@ -14,8 +14,23 @@ import { listAgentNames } from "../agents/catalog";
 import { addAgentOverride, AgentOverridesChanged, clearAgentOverrides, getAgentOverrides, removeLastAgentOverride } from "../lib/agent-overrides";
 import { describeAux } from "../lib/aux-model";
 import { defaultEffort } from "../lib/claude";
+import { defaultEngineSetting, engineLabel } from "../lib/engine-choice";
 import { describeFallback } from "../lib/fallback-llm";
-import { EFFORT_LEVELS, getSettings, getSettingsPath, settingsSchema, writeSettings, type Settings } from "../lib/settings";
+import {
+  CODEX_EFFORT_LEVELS,
+  CODEX_SANDBOX_LEVELS,
+  DEFAULT_CODEX_SANDBOX,
+  DEFAULT_OPENCODE_PERMISSION,
+  EFFORT_LEVELS,
+  getSettings,
+  getSettingsPath,
+  OPENCODE_PERMISSION_LEVELS,
+  SELECTABLE_ENGINES,
+  settingsSchema,
+  withSettingsLock,
+  writeSettings,
+  type Settings,
+} from "../lib/settings";
 import { InstructionsChanged, type InstructionsPort } from "./instructions";
 import {
   AUX_PURPOSES,
@@ -34,6 +49,8 @@ function issueMessage(issue: { code: string; message: string } & Record<string, 
       return `erlaubt: ${(issue.options as unknown[]).map(String).join(", ")}`;
     case "custom":
     case "too_small":
+    // Regex-Prüfung mit eigenem Text im Schema (Codex-Modellname), nie der Wert
+    case "invalid_string":
       return issue.message;
     case "invalid_type":
       return "falscher Typ";
@@ -76,7 +93,9 @@ export function effectiveSettings(settings: SettingsData): EffectiveSettings {
     const { target, source } = describeAux(purpose, s, true);
     aux[purpose] = { value: `${target.kind}:${target.model}`, source };
   }
-  return { agents, aux, fallback: describeFallback(s) };
+  // Standard-Motor wie bei der Motor-Wahl (Issue #126): Datei, TYBO_ENGINE, Claude Code
+  const engine = defaultEngineSetting({ getSettings: () => s });
+  return { agents, aux, fallback: describeFallback(s), engine: { default: { value: engine.engine, source: engine.source } } };
 }
 
 async function readForWrite(): Promise<SettingsData> {
@@ -108,7 +127,16 @@ export const botSettings: SettingsPort = {
   readForWrite,
   validate: validateSettings,
   write: value => writeSettings(value as Settings),
+  lock: withSettingsLock,
   effective: effectiveSettings,
+  engineOptions: {
+    engines: SELECTABLE_ENGINES.map(id => ({ id, label: engineLabel(id) })),
+    codexEffortLevels: CODEX_EFFORT_LEVELS,
+    codexSandboxLevels: CODEX_SANDBOX_LEVELS,
+    codexDefaultSandbox: DEFAULT_CODEX_SANDBOX,
+    opencodePermissionLevels: OPENCODE_PERMISSION_LEVELS,
+    opencodeDefaultPermission: DEFAULT_OPENCODE_PERMISSION,
+  },
 };
 
 /** AgentOverridesChanged aus src/lib wird zu InstructionsChanged der WebUI */

@@ -164,6 +164,14 @@ describe("Speichern: jeder Beitrag einzeln, kein Sammeltext", () => {
     ]);
   });
 
+  test("Motor des Beitrags wird mitgespeichert, wenn der Turn ihn meldet (Issue #125)", async () => {
+    const h = harness(["research"]);
+    h.answer = async agent => ({ text: agent, engine: "codex", model: "gpt-5.6-sol", durationMs: 900 });
+    await runBoardMeeting(h.deps, { sessionKey: KEY, topicId: 7 }, telegramOutput(h));
+    expect(h.saved.map(m => m.metadata.engine)).toEqual(["codex", "codex"]);
+    expect(h.saved[0].metadata).toMatchObject({ engine: "codex", model: "gpt-5.6-sol" });
+  });
+
   test("ohne Dauer vom Turn misst der Kern selbst; Direktchat mit topicId null", async () => {
     const h = harness(["research"]);
     let t = 1000;

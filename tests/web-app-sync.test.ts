@@ -1,6 +1,6 @@
 // Verlaufabgleich der Chat-Seite (app.js) ohne Browser: Attrappen für DOM,
 // fetch, EventSource und Timer, damit sich die Reihenfolge exakt steuern lässt.
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { TYBO_BRAND } from "./brand-fixture";
@@ -81,7 +81,11 @@ function setup(prepare?: (server: any) => void) {
   // Timer nur auf Abruf
   const timers = new Map<number, () => void>();
   let nextTimer = 1;
-  const setTimeout = (fn: () => void) => { const id = nextTimer++; timers.set(id, fn); return id; };
+  /** Verzögerung je Timer: der Timer auf Mitternacht (Issue #186) wartet Stunden */
+  const delays = new Map<number, number>();
+  const setTimeout = (fn: () => void, ms?: number) => { const id = nextTimer++; timers.set(id, fn); delays.set(id, ms ?? 0); return id; };
+  /** Offene Timer außer dem auf Mitternacht (nur mit Uhr um 12 Uhr eindeutig) */
+  const shortTimers = () => [...timers.keys()].filter(id => (delays.get(id) ?? 0) < 60 * 60_000).length;
   const clearTimeout = (id: number) => { timers.delete(id); };
   const runTimers = () => {
     const due = [...timers.entries()];
@@ -157,7 +161,7 @@ function setup(prepare?: (server: any) => void) {
     elements["composer"].dispatch("submit", { preventDefault() {} });
   };
   const sendEnabled = () => !elements["send"].disabled;
-  return { server, shown, connection, latestSource, runTimers, timers, sendText, sendEnabled, elements, root: document.documentElement, stored };
+  return { server, shown, connection, latestSource, runTimers, timers, shortTimers, sendText, sendEnabled, elements, root: document.documentElement, stored };
 }
 
 /** Lässt ausstehende Promises (fetch, json) durchlaufen. */
@@ -190,7 +194,13 @@ test("Antwort zwischen Verlaufabruf und SSE-Anmeldung erscheint genau einmal", a
   expect(app.shown()).toEqual(["u1", "a1"]);
 });
 
+afterEach(() => setSystemTime());
+
 test("Nachladen nach Reconnect wird wiederholt, bis es klappt; Hinweis bleibt bis dahin", async () => {
+  // Mittags: der Timer auf Mitternacht (Issue #186) ist klar von den Wiederholungen zu trennen
+  const noon = new Date();
+  noon.setHours(12, 0, 0, 0);
+  setSystemTime(noon);
   const app = setup();
   app.server.messages = [msg("u1", "user", 0)];
   await settle();
@@ -220,7 +230,7 @@ test("Nachladen nach Reconnect wird wiederholt, bis es klappt; Hinweis bleibt bi
   expect(app.server.historyCalls).toBe(before + 1);
   expect(app.shown()).toEqual(["u1"]);
   expect(app.connection()).not.toBe("");
-  expect(app.timers.size).toBe(1);
+  expect(app.shortTimers()).toBe(1);
 
   app.runTimers();
   await settle();
@@ -234,7 +244,7 @@ test("Nachladen nach Reconnect wird wiederholt, bis es klappt; Hinweis bleibt bi
   expect(app.server.historyCalls).toBe(before + 3);
   expect(app.shown()).toEqual(["u1", "a1"]);
   expect(app.connection()).toBe("");
-  expect(app.timers.size).toBe(0);
+  expect(app.shortTimers()).toBe(0);
 
   // Kein weiterer Abruf mehr geplant, nichts doppelt
   app.runTimers();

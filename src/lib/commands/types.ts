@@ -39,20 +39,31 @@ export interface ReplyOptions {
 
 export type SessionResetOutcome =
   | { status: "done"; reset: number; sessionMode: boolean }
-  /** Nur Browser und Terminal: im Gespräch läuft gerade eine Antwort */
+  /** Im Gespräch läuft gerade eine Antwort: Browser und Terminal immer, Telegram nur mit whileBlocked */
   | { status: "busy" }
   /** Kein Session-Schlüssel ermittelbar */
   | { status: "unavailable" };
 
-/** Laufende Session eines Gesprächs für /routine; Aufbau kennt nur der Dienst */
-export type RoutineSession = { readonly claudeSessionId?: string | null; readonly lastActivity: number };
+export interface SessionResetOptions {
+  /**
+   * Läuft nach dem Reset, solange neue Ausführungen des Gesprächs noch
+   * gesperrt sind (/motor schreibt hier die Einstellung, Issue #125): kein
+   * Turn kann zwischen Reset und Schreiben mit dem alten Motor beginnen.
+   * Mit dieser Angabe lehnt auch Telegram ab („busy"), solange im Gespräch
+   * eine Antwort läuft. Wirft sie, gibt resetSession den Fehler weiter.
+   */
+  whileBlocked?(): Promise<void>;
+}
+
+/** Laufende Session eines Gesprächs für /routine (gleich welcher Motor); Aufbau kennt nur der Dienst */
+export type RoutineSession = { readonly engineSessionId?: string | null; readonly lastActivity: number };
 
 export interface CommandServices {
   isSessionModeEnabled(): boolean;
   getGoal(sessionKey: string): Promise<{ status: string } | undefined>;
   pauseGoal(sessionKey: string, reason: string): Promise<unknown>;
   /** Bricht laufende Claude-Aufrufe unter dem Schlüssel ab, Anzahl zurück */
-  abortClaudeCalls(sessionKey: string): number;
+  abortEngineCalls(sessionKey: string): number;
   /** Anweisungen aller aktiven Agenten (gelöschte Agenten fehlen) */
   listAllOverrides(): Record<string, string[]>;
   listAgentNames(): string[];
@@ -70,7 +81,13 @@ export interface CommandServices {
   learn(input: string, onWriteStart?: () => void): Promise<{ message: string }>;
   formatPlan(): Promise<string>;
   sessionsForKey(sessionKey: string): Promise<RoutineSession[]>;
-  createRoutine(session: RoutineSession, hint: string): Promise<{ isError?: boolean; text?: string }>;
+  /**
+   * Epoche des Session-Schlüssels (Issue #189, session-manager.ts): /routine
+   * erfasst sie vor der Session-Auswahl und reicht sie an createRoutine durch,
+   * damit ein /new während der Startmeldung die Session nicht zurückbringt
+   */
+  sessionEpoch?(sessionKey: string): number;
+  createRoutine(session: RoutineSession, hint: string, epoch?: number): Promise<{ isError?: boolean; text?: string }>;
   /**
    * Stopp für eine laufende Board-Sitzung unter dem Schlüssel (Issue #75,
    * src/lib/board-meeting.ts requestBoardStop): "requested" endet nach dem
@@ -86,6 +103,32 @@ export interface CommandServices {
   jobsOverview?(): Promise<string>;
   /** /voice in Telegram: Antwort als Sprachnachricht; fehlt außerhalb von Telegram (dort ctx.voiceMessage) */
   voiceReply?(ctx: CommandContext, text: string): Promise<void>;
+  /** /motor (Issue #125): Motor-Wahl in config/settings.json; fehlt, meldet /motor das */
+  engines?: EngineCommandServices;
+}
+
+/** Woher der Motor eines Gesprächs kommt: /motor, Einstellungsdatei, .env oder eingebaut */
+export type EngineChoiceSource = "topic" | "settings" | "env" | "code";
+
+/** Ein wählbarer Motor mit Bereitschaft (src/lib/engine-choice.ts) */
+export interface EngineAvailability {
+  engine: string;
+  label: string;
+  ready: boolean;
+  /** Warum nicht bereit, verständlich */
+  message?: string;
+}
+
+/** src/lib/engine-choice.ts, für /motor in allen Kanälen */
+export interface EngineCommandServices {
+  /** Eingestellter Motor des Gesprächs, ohne Verfügbarkeitsprüfung */
+  configured(sessionKey: string): { engine: string; source: EngineChoiceSource };
+  /** Standard ohne Ausnahme */
+  standard(): { engine: string; source: Exclude<EngineChoiceSource, "topic"> };
+  /** Wählbare Motoren mit Bereitschaft */
+  available(): Promise<EngineAvailability[]>;
+  /** Ausnahme setzen (engine) oder entfernen (null); wirft SettingsFileInvalidError bei ungültiger Datei */
+  setTopic(sessionKey: string, engine: string | null): Promise<void>;
 }
 
 /** Ergebnis einer Sprachsynthese (Issue #78); Endung und MIME-Typ aus den Bytes (src/lib/audio-type.ts) */
@@ -158,8 +201,8 @@ export interface CommandContext {
   buttons(text: string, rows: CommandButton[][]): Promise<void>;
   /** Tippt-Anzeige für längere Arbeit; gibt die Stopp-Funktion zurück */
   working(): () => void;
-  /** /new: Session des Gesprächs zurücksetzen (endende Sessions vorher destilliert) */
-  resetSession(): Promise<SessionResetOutcome>;
+  /** /new, /motor: Session des Gesprächs zurücksetzen (endende Sessions vorher destilliert) */
+  resetSession(options?: SessionResetOptions): Promise<SessionResetOutcome>;
   /**
    * Modellgestützte Befehlsarbeit (z. B. /critic): Prompt an einen Agenten,
    * Antwort wie ein normaler Turn. Browser und Terminal geben die gespeicherte

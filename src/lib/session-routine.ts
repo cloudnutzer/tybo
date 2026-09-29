@@ -2,7 +2,8 @@ import { runExecution } from "./execution-context";
 /**
  * /routine — Session in eine wiederholbare Routine einfrieren ("Teach a Task").
  *
- * Resumes the current topic's Claude session once and asks Claude to
+ * Resumes the current topic's session once, über den Motor der Session
+ * (Issue #122, mit dem Modell der Session), and asks it to
  * crystallize the workflow just performed into a durable artifact:
  * either a Claude Code skill (.claude/skills/<name>/SKILL.md) for flows
  * that still need judgment, or a deterministic script (src/<name>.ts,
@@ -14,9 +15,9 @@ import { runExecution } from "./execution-context";
  * turn continues the session: the caller records the returned session ID.
  */
 
-import { callClaude } from "./claude";
 import { log as sbLog } from "./convex";
-import { recordSessionTurn, getSessionsForKey, type BotSession } from "./session-manager";
+import { getEngine } from "./engines";
+import { recordSessionTurn, getSessionsForKey, sessionEpoch, normalizeSession, type BotSession, type LegacyBotSession } from "./session-manager";
 
 const ROUTINE_TIMEOUT_MS = 900_000; // 15 min — Claude writes real files here
 
@@ -42,20 +43,24 @@ Antworte zum Schluss mit einem kurzen Bericht fuer Telegram: was erstellt wurde 
  */
 async function createRoutineUnlocked(
   session: BotSession,
-  hint: string
+  hint: string,
+  d: RoutineDeps
 ): Promise<{ text: string; sessionId?: string; isError: boolean }> {
   try {
-    const result = await callClaude({
+    // Eine fremde Session-ID geht nie an Claude: ohne verfügbaren Motor wirft getEngine
+    const engine = d.getEngine(session.engine);
+    const run = await engine.run({
       prompt: buildRoutinePrompt(hint),
-      resumeSessionId: session.claudeSessionId,
-      outputFormat: "json",
+      streaming: false,
+      ...(session.engineSessionId ? { resumeSessionId: session.engineSessionId } : {}),
       model: session.model,
       timeoutMs: ROUTINE_TIMEOUT_MS,
       cwd: process.cwd(),
     });
+    const result = { text: run.text, sessionId: run.sessionId, isError: run.isError || !!run.aborted || !!run.timedOut };
 
     if (!result.isError && result.text) {
-      await sbLog("info", "bot", "Session frozen into routine", {
+      await d.log("info", "bot", "Session frozen into routine", {
         sessionKey: session.key,
         hint: hint || undefined,
       });
@@ -67,13 +72,30 @@ async function createRoutineUnlocked(
   }
 }
 
-export async function createRoutineFromSession(session: BotSession, hint: string) {
+/** Austauschbar für Tests (Issue #189), sonst die echten Funktionen */
+export interface RoutineDeps {
+  getEngine: typeof getEngine;
+  log: typeof sbLog;
+}
+
+export async function createRoutineFromSession(
+  stored: BotSession | LegacyBotSession,
+  hint: string,
+  deps: Partial<RoutineDeps> = {},
+  // Epoche von der Session-Auswahl (/routine); fehlt sie, gilt die jetzige:
+  // ein /new ab hier verwirft die Session der Routine
+  epoch = sessionEpoch(stored.key.slice(0, -(stored.agentName.length + 1)))
+) {
+  // Snapshot aus pending-reviews.json kann noch das alte Format haben
+  const session = normalizeSession(stored);
+  const d: RoutineDeps = { getEngine, log: sbLog, ...deps };
   return runExecution(session.key.slice(0, -(session.agentName.length + 1)), session.agentName,
     async () => {
       const key = session.key.slice(0, -(session.agentName.length + 1));
       const current = (await getSessionsForKey(key)).find(s => s.agentName === session.agentName);
-      const result = await createRoutineUnlocked(session, hint);
-      if (result.sessionId && !result.isError && (!current || current.claudeSessionId === session.claudeSessionId)) await recordSessionTurn(key, session.agentName, session.model, result.sessionId, session.memoryWatermark);
+      const result = await createRoutineUnlocked(session, hint, d);
+      const sameSession = !current || (current.engine === session.engine && current.engineSessionId === session.engineSessionId);
+      if (result.sessionId && !result.isError && sameSession) await recordSessionTurn(key, session.agentName, session.model, session.engine, result.sessionId, session.memoryWatermark, epoch);
       return result;
     });
 }

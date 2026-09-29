@@ -30,6 +30,8 @@ const FULL_RUN = [
   FAKE.convexUrl,
   FAKE.convexToken,
   "j",
+  // Semantische Suche (optional, Issue #166)
+  "n",
   // Profil
   "Testperson",
   "Europe/Berlin",
@@ -78,8 +80,8 @@ describe("tybo setup: Durchlauf", () => {
     expect(r.out).toMatch(/1\. Voraussetzungen\s+erledigt/);
     expect(r.out).toMatch(/2\. Telegram\s+fehlt/);
     expect(r.out).toMatch(/3\. Forum-Gruppe \(optional\)\s+fehlt/);
-    expect(r.out).toContain("9. Gesamtprüfung");
-    expect(r.out.indexOf("9. Gesamtprüfung")).toBeLessThan(r.out.indexOf("Schritt 1 von"));
+    expect(r.out).toContain("10. Gesamtprüfung");
+    expect(r.out.indexOf("10. Gesamtprüfung")).toBeLessThan(r.out.indexOf("Schritt 1 von"));
 
     // Verbindungstests mit Ergebnis, Gesamtprüfung am Ende
     expect(r.out).toContain("Verbindungstest: bestanden. Verbunden mit @test_bot");
@@ -88,7 +90,7 @@ describe("tybo setup: Durchlauf", () => {
 
     // Ende: Zusammenfassung, nächster Schritt, tybo und WebUI-Adresse
     expect(r.out).toContain("Gespeichert: Telegram, Datenbank, Profil, WebUI, Autostart");
-    expect(r.out).toContain("Übersprungen: Forum-Gruppe, Modelle und Fallback");
+    expect(r.out).toContain("Übersprungen: Forum-Gruppe, Semantische Suche, Modelle und Fallback");
     expect(r.out).toContain("Alle Pflichtschritte sind erledigt.");
     expect(r.out).toContain("tybo läuft über den Autostart");
     expect(r.out).toContain("Chat im Terminal mit tybo");
@@ -107,7 +109,7 @@ describe("tybo setup: Durchlauf", () => {
     const before = await readFile(ctx.envPath, "utf8");
 
     // Nur noch die offenen optionalen Schritte werden angeboten
-    const prompter = scripted(["", "n", "n"]);
+    const prompter = scripted(["", "n", "n", "n"]);
     const r = await runWith({ mode: "all" }, ctx, prompter);
     expect(r.code).toBe(0);
     expect(prompter.left()).toBe(0);
@@ -115,9 +117,11 @@ describe("tybo setup: Durchlauf", () => {
       expect.stringContaining("Erledigte trotzdem bearbeiten?"),
       "Jetzt einrichten? [J/n] ",
       "Jetzt einrichten? [J/n] ",
+      "Jetzt einrichten? [J/n] ",
     ]);
-    expect(r.out).toContain("Schritt 1 von 2: Forum-Gruppe (optional)");
-    expect(r.out).toContain("Schritt 2 von 2: Modelle und Fallback (optional)");
+    expect(r.out).toContain("Schritt 1 von 3: Forum-Gruppe (optional)");
+    expect(r.out).toContain("Schritt 2 von 3: Semantische Suche (optional)");
+    expect(r.out).toContain("Schritt 3 von 3: Modelle und Fallback (optional)");
     expect(r.out).not.toContain("Bot-Token");
     expect(await readFile(ctx.envPath, "utf8")).toBe(before);
     // Gesamtprüfung läuft trotzdem mit den gespeicherten Werten
@@ -127,12 +131,12 @@ describe("tybo setup: Durchlauf", () => {
   test("erledigten Schritt auswählen: wird gezeigt, leere Eingaben behalten die Werte", async () => {
     const ctx = await linuxCtx({ env: FULL_ENV, profile: "# Testperson\n" });
     const before = await readFile(ctx.envPath, "utf8");
-    // Auswahl 2 = Telegram; Enter behält Token und Nutzer-ID; offen ist nur noch Autostart (abgelehnt)
-    const prompter = scripted(["2", "", "", "n"]);
+    // Auswahl 2 = Telegram; Enter behält Token und Nutzer-ID; offen sind noch Semantische Suche und Autostart (beide abgelehnt)
+    const prompter = scripted(["2", "", "", "n", "n"]);
     const r = await runWith({ mode: "all" }, ctx, prompter);
     expect(r.code).toBe(0);
     expect(prompter.left()).toBe(0);
-    expect(r.out).toContain("Schritt 1 von 2: Telegram");
+    expect(r.out).toContain("Schritt 1 von 3: Telegram");
     expect(r.out).toContain("Ist gesetzt. Enter behält den bisherigen Wert.");
     expect(r.out).toContain("Keine neuen Eingaben, alles bleibt, wie es ist.");
     // Gesetzte Werte werden nie angezeigt
@@ -182,8 +186,8 @@ describe("Gesamtprüfung schlägt fehl", () => {
 
   test("Durchlauf: gespeichertes Token ungültig, erneut eingeben, danach bestanden", async () => {
     const ctx = await staleTokenCtx();
-    // Auswahl Enter, Autostart ablehnen, dann Telegram erneut: neues Token, Nutzer-ID behalten, speichern
-    const prompter = scripted(["", "n", "e", NEW_TOKEN, "", ""]);
+    // Auswahl Enter, Semantische Suche und Autostart ablehnen, dann Telegram erneut: neues Token, Nutzer-ID behalten, speichern
+    const prompter = scripted(["", "n", "n", "e", NEW_TOKEN, "", ""]);
     const r = await runWith({ mode: "all" }, ctx, prompter);
     expect(r.code).toBe(0);
     expect(prompter.left()).toBe(0);
@@ -200,7 +204,7 @@ describe("Gesamtprüfung schlägt fehl", () => {
   test("Durchlauf: ungültiges Token übersprungen, Fehler steht in der Zusammenfassung", async () => {
     const ctx = await staleTokenCtx();
     const before = await readFile(ctx.envPath, "utf8");
-    const prompter = scripted(["", "n", "ü"]);
+    const prompter = scripted(["", "n", "n", "ü"]);
     const r = await runWith({ mode: "all" }, ctx, prompter);
     expect(r.code).toBe(0);
     expect(prompter.left()).toBe(0);
@@ -248,8 +252,9 @@ describe("Eingaben deuten", () => {
 
   test("Schrittauswahl: Nummern und Namen, Unbekanntes ist null", () => {
     expect(parseSelection("")).toEqual([]);
-    expect(parseSelection("2, 5 telegram")).toEqual(["telegram", "profil"]);
-    expect(parseSelection("9")).toBeNull();
+    expect(parseSelection("2, 6 telegram")).toEqual(["telegram", "profil"]);
+    expect(parseSelection("5 suche")).toEqual(["suche"]);
+    expect(parseSelection("10")).toBeNull();
     expect(parseSelection("quatsch")).toBeNull();
   });
 });

@@ -95,3 +95,58 @@ test("Attrappen einzeln: Einstellungen prüfen grob wie das Schema, geerbte Wert
   expect(await inst.clear("general")).toBe(1);
   expect(inst.list("general")).toEqual([]);
 });
+
+// --- Motor in der Demo (Issue #126) ------------------------------------------
+
+test("Demo-Motoren, Codex-Stufen und Rechte stimmen mit src/lib/settings.ts überein", async () => {
+  const { DEMO_ENGINE_OPTIONS } = await import("../src/web/demo");
+  const { botSettings } = await import("../src/web/bot-settings");
+  expect(JSON.parse(JSON.stringify(DEMO_ENGINE_OPTIONS))).toEqual(JSON.parse(JSON.stringify(botSettings.engineOptions)));
+});
+
+test("Demo mit OpenCode (Issue #129): verfügbar, Modell-Liste aus der Attrappe, Topic Finanzen mit OpenCode-Antwort", async () => {
+  const { DEMO_ENGINE_AVAILABILITY, DEMO_OPENCODE_MODELS, DEMO_OPENCODE_TOPIC, DEMO_SETTINGS, createDemoModels, createDemoTelegram, demoSessionKey } = await import("../src/web/demo");
+  expect(DEMO_ENGINE_AVAILABILITY.find(a => a.engine === "opencode")).toEqual({ engine: "opencode", label: "OpenCode", installed: true, loggedIn: true, version: "1.18.33" });
+  const lists = await createDemoModels().list();
+  expect(lists.opencode).toEqual({ models: [...DEMO_OPENCODE_MODELS] });
+  expect(DEMO_OPENCODE_MODELS.every(m => /^[A-Za-z0-9][\w.:/@-]*$/.test(m) && m.includes("/"))).toBe(true);
+  expect(DEMO_SETTINGS.engine?.topics?.[demoSessionKey(DEMO_OPENCODE_TOPIC)!]).toBe("opencode");
+  const history = await createDemoTelegram(Date.now()).history(DEMO_OPENCODE_TOPIC);
+  const reply = history!.messages.find((m: any) => m.role === "assistant") as any;
+  expect(reply).toMatchObject({ engine: "opencode", model: "openrouter/anthropic/claude-opus-5.5" });
+});
+
+test("Demo-Session-Schlüssel wie conversationSessionKey im Bot", async () => {
+  const { DEMO_DM_SESSION_KEY, DEMO_GROUP_ID, demoSessionKey } = await import("../src/web/demo");
+  const { conversationSessionKey } = await import("../src/web/bot-turn");
+  const deps = { userId: DEMO_DM_SESSION_KEY.slice("dm:".length), groupId: () => DEMO_GROUP_ID, agentForTopic: () => "general" };
+  for (const id of ["dm", "topic-1", "topic-443", "5f0c3a1e-demo-web"]) expect(demoSessionKey(id)).toBe(conversationSessionKey(id, deps));
+});
+
+test("Demo-Einstellungen prüfen den Motor grob wie das Schema, Demo-Motor entfernt genau einen Eintrag", async () => {
+  const { createDemoEngines, DEMO_SETTINGS } = await import("../src/web/demo");
+  const settings = createDemoSettings(DEMO_SETTINGS);
+  expect(settings.validate({ engine: { codex: { sandbox: "alles" } } })).toEqual({
+    ok: false,
+    issues: [{ path: "engine.codex.sandbox", message: "erlaubt: read-only, workspace-write, full" }],
+  });
+  expect(settings.validate({ engine: { default: "gemini" } }).ok).toBe(false);
+  expect(settings.validate({ engine: { default: "opencode", opencode: { model: "openrouter/anthropic/claude-opus-5.5", variant: "high", permission: "ask-deny" } } }).ok).toBe(true);
+  for (const variant of ["-x", "-", "--auto", "a", "a".repeat(20)]) {
+    expect(settings.validate({ engine: { opencode: { variant } } }).ok).toBe(true);
+  }
+  for (const opencode of [{ variant: "" }, { variant: "a_b" }, { variant: "a".repeat(21) }, { model: "a b" }, { permission: "full" }]) {
+    expect(settings.validate({ engine: { opencode } }).ok).toBe(false);
+  }
+  expect(settings.validate({ engine: { default: "codex", codex: { model: "gpt-5.6-sol", effort: "max", sandbox: "read-only" } } }).ok).toBe(true);
+  const engines = createDemoEngines(settings);
+  expect(engines.standard()).toEqual({ engine: "claude", source: "code" });
+  expect(Object.values(engines.overrides())).toEqual(["codex", "opencode"]);
+  const [key, opencodeKey] = Object.keys(engines.overrides());
+  expect(await engines.removeOverride(key)).toBe(true);
+  expect(await engines.removeOverride(key)).toBe(false);
+  expect(Object.values(engines.overrides())).toEqual(["opencode"]);
+  expect(await engines.removeOverride(opencodeKey)).toBe(true);
+  expect(settings.data().engine).toBeUndefined();
+  expect(settings.data().agents).toEqual(DEMO_SETTINGS.agents);
+});

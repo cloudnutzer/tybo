@@ -11,10 +11,11 @@
  *
  * Stopp (Knopf, /stop, Strg+C im Terminal): der laufende Beitrag wird fertig,
  * gespeichert und ausgegeben, danach startet kein Agent und keine
- * Zusammenfassung mehr. Ein zweites /stop bricht hart ab (abortClaudeCalls);
+ * Zusammenfassung mehr. Ein zweites /stop bricht hart ab (abortEngineCalls);
  * der Modellaufruf meldet das als aborted, dann endet die Sitzung sofort.
  */
 
+import type { EngineId } from "./engines/types";
 import { agentLabel } from "../web/agents";
 
 /** Was die Datenbeschaffung liefert (src/lib/board-data.ts gatherBoardData) */
@@ -30,6 +31,8 @@ export interface BoardCallResult {
   /** Abgebrochen (/stop zweimal, Beenden des Bots): kein Beitrag */
   aborted?: boolean;
   model?: string;
+  /** Motor der Antwort (Issue #125); fehlt bei Fallback-Antworten */
+  engine?: EngineId;
   /** Dauer des Turns; fehlt sie, misst der Kern selbst */
   durationMs?: number;
 }
@@ -41,6 +44,7 @@ export interface BoardContribution {
   text: string;
   durationMs: number;
   model?: string;
+  engine?: EngineId;
   /** metadata.msgId im Nachrichtenspeicher; Live-Anzeige nutzt dieselbe ID */
   msgId: string;
 }
@@ -180,6 +184,7 @@ export async function runBoardMeeting(deps: BoardDeps, input: BoardInput, output
       agent: c.agent,
       durationMs: c.durationMs,
       ...(c.model ? { model: c.model } : {}),
+      ...(c.engine ? { engine: c.engine } : {}),
       topicId: input.topicId ?? null,
       msgId,
     };
@@ -191,7 +196,7 @@ export async function runBoardMeeting(deps: BoardDeps, input: BoardInput, output
     return contribution;
   }
 
-  async function call(prompt: string, agent: string): Promise<{ text: string; durationMs: number; model?: string } | "aborted" | null> {
+  async function call(prompt: string, agent: string): Promise<{ text: string; durationMs: number; model?: string; engine?: EngineId } | "aborted" | null> {
     const started = now();
     let response: BoardCallResult;
     try {
@@ -206,6 +211,7 @@ export async function runBoardMeeting(deps: BoardDeps, input: BoardInput, output
       text: response.text,
       durationMs: typeof response.durationMs === "number" ? response.durationMs : now() - started,
       ...(response.model ? { model: response.model } : {}),
+      ...(response.engine ? { engine: response.engine } : {}),
     };
   }
 
@@ -255,7 +261,7 @@ Reference specific numbers and data from your LIVE DATA section above. Provide a
         continue;
       }
       agentResponses.push({ agent, response: cleanResponse });
-      const saved = await save({ kind: "agent", agent, text: cleanResponse, durationMs: answer.durationMs, ...(answer.model ? { model: answer.model } : {}) });
+      const saved = await save({ kind: "agent", agent, text: cleanResponse, durationMs: answer.durationMs, ...(answer.model ? { model: answer.model } : {}), ...(answer.engine ? { engine: answer.engine } : {}) });
       await output.contribution(saved);
       result.contributions++;
 
@@ -298,7 +304,7 @@ Synthesize the key themes, identify conflicts or alignments between agents, and 
       return result;
     }
     // Ein Stopp während der Zusammenfassung: sie ist der laufende Beitrag und wird fertig
-    const saved = await save({ kind: "synthesis", agent: "general", text: synthesis.text, durationMs: synthesis.durationMs, ...(synthesis.model ? { model: synthesis.model } : {}) });
+    const saved = await save({ kind: "synthesis", agent: "general", text: synthesis.text, durationMs: synthesis.durationMs, ...(synthesis.model ? { model: synthesis.model } : {}), ...(synthesis.engine ? { engine: synthesis.engine } : {}) });
     await output.contribution(saved);
     result.synthesis = true;
     await output.end(result, null);

@@ -381,7 +381,7 @@ describe("Gemeinsame Aktionen (Weiter-Semantik als Regressionstest)", () => {
   });
 
   test("Stopp, Nachfolger während des Speicherns der Löschung: der Abbruch trifft nur die alte Arbeit", async () => {
-    // Abbruch wie abortClaudeCalls: beendet den Agentenaufruf, der gerade läuft
+    // Abbruch wie abortEngineCalls: beendet den Agentenaufruf, der gerade läuft
     const liveAbort = (k: string) => {
       aborts.push(k);
       const running = pendingTurn;

@@ -41,21 +41,37 @@ export async function shouldAskTopicMapping(
   chatId: string,
   topicId: number
 ): Promise<boolean> {
-  const asked = await readJson(ASKED_FILE);
-  return !asked[`${chatId}:${topicId}`];
+  // In der Schreibkette: liest nie eine halb geschriebene Markierung (Issue #190)
+  return serializeTopics(async () => !(await readJson(ASKED_FILE))[`${chatId}:${topicId}`]);
 }
 
 export async function markTopicMappingAsked(
   chatId: string,
   topicId: number
 ): Promise<void> {
-  try {
+  await claimTopicMappingQuestion(chatId, topicId);
+}
+
+/**
+ * Lesen, Prüfen und Markieren von data/topics-asked.json am Stück in
+ * derselben Schreibkette wie config/topics.json (Issue #190): true nur für
+ * den ersten Aufrufer je Topic, also stellt genau einer die Frage „Welcher
+ * Agent?", auch bei gleichzeitigen Nachrichten. Scheitert das Schreiben,
+ * trotzdem true (wie bisher lieber einmal zu oft fragen als nie).
+ */
+export function claimTopicMappingQuestion(chatId: string, topicId: number): Promise<boolean> {
+  return serializeTopics(async () => {
     const asked = await readJson(ASKED_FILE);
-    asked[`${chatId}:${topicId}`] = Date.now();
-    await writeJson(ASKED_FILE, asked);
-  } catch (err) {
-    console.error("[TopicSetup] markAsked failed:", err);
-  }
+    const key = `${chatId}:${topicId}`;
+    if (asked[key]) return false;
+    asked[key] = Date.now();
+    try {
+      await writeJson(ASKED_FILE, asked);
+    } catch (err) {
+      console.error(`[TopicSetup] markAsked failed (${err instanceof Error ? err.name : "Fehler"})`);
+    }
+    return true;
+  });
 }
 
 /**

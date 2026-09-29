@@ -23,6 +23,8 @@ import { extname } from "node:path";
 import { readFile } from "fs/promises";
 import { basename } from "path";
 import { anyApi } from "convex/server";
+import { embeddingColumns, MISSING_COLUMN_CODES } from "../../supabase/functions/_shared/embedding";
+import type { ConfiguredEmbedding } from "./embedding";
 
 // ============================================================
 // TYPES
@@ -338,15 +340,22 @@ export async function updateAssetDescription(
       if (tags && tags.length > 0) updateData.tags = tags;
       if (relatedProject) updateData.related_project = relatedProject;
 
-      const embedding = await generateEmbedding(
+      const embedded = await generateEmbedding(
         `${description} ${(tags || []).join(" ")}`
       );
-      if (embedding) updateData.embedding = embedding;
+      const embedding = embedded?.vector ?? null;
+      // Mit Angabe embedding_model (Issue #168): die Datenbank verwirft einen Vektor eines anderen Anbieters
+      if (embedded) Object.assign(updateData, embeddingColumns(embedded.vector, embedded.config));
 
-      const { error } = await client
+      let { error } = await client
         .from("assets")
         .update(updateData)
         .eq("id", assetId);
+      if (error && embedded && MISSING_COLUMN_CODES.includes(String(error.code))) {
+        // Datenbank ohne Migration 20260928: ohne Angabe wie vorher
+        delete updateData.embedding_model;
+        ({ error } = await client.from("assets").update(updateData).eq("id", assetId));
+      }
 
       if (error) {
         console.error("updateAssetDescription error:", error.message);
@@ -362,62 +371,15 @@ export async function updateAssetDescription(
 }
 
 /**
- * Generate an embedding vector. Tries Gemini (free) first, then OpenAI.
- * Gracefully returns null if no API key is set.
+ * Embedding der Bildbeschreibung für assets.embedding: derselbe Anbieter wie
+ * für die übrige Supabase-Datenbank (EMBEDDING_PROVIDER, Issue #167), damit
+ * in einer Datenbank nie Vektoren verschiedener Modelle nebeneinander liegen.
+ * Vor #167 stand hier ein eigener Weg (Gemini text-embedding-004 zuerst,
+ * sonst OpenAI). Null ohne Schlüssel oder bei Fehler.
  */
-async function generateEmbedding(text: string): Promise<number[] | null> {
-  const geminiKey = process.env.GEMINI_API_KEY;
-  if (geminiKey) {
-    try {
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${geminiKey}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: "models/text-embedding-004",
-            content: { parts: [{ text }] },
-            outputDimensionality: 1536,
-          }),
-        }
-      );
-      if (response.ok) {
-        const data = await response.json();
-        return data.embedding?.values || null;
-      }
-    } catch {
-      // Fall through to OpenAI
-    }
-  }
-
-  const openaiKey = process.env.OPENAI_API_KEY;
-  if (!openaiKey) return null;
-
-  try {
-    const response = await fetch("https://api.openai.com/v1/embeddings", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${openaiKey}`,
-      },
-      body: JSON.stringify({
-        model: "text-embedding-3-small",
-        input: text,
-        dimensions: 1536,
-      }),
-    });
-
-    if (!response.ok) {
-      console.error("Embedding API error:", await response.text());
-      return null;
-    }
-
-    const result = await response.json();
-    return result.data?.[0]?.embedding || null;
-  } catch (err) {
-    console.error("generateEmbedding error:", err);
-    return null;
-  }
+async function generateEmbedding(text: string): Promise<ConfiguredEmbedding | null> {
+  const { embedWithConfig } = await import("./embedding");
+  return embedWithConfig(text);
 }
 
 // ============================================================

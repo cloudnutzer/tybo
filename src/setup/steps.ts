@@ -4,7 +4,7 @@
  * diese Liste; das Modell steht in src/setup/model.ts.
  *
  * Pflicht: voraussetzungen, telegram, datenbank, profil, autostart.
- * Optional (überspringbar): gruppe, modelle, webui. „pruefung“ fasst am Ende
+ * Optional (überspringbar): gruppe, suche, modelle, webui. „pruefung“ fasst am Ende
  * zusammen und schreibt nichts.
  */
 
@@ -15,6 +15,7 @@ import { databaseStep, setupPath } from "./steps/database";
 import { modelsStep } from "./steps/models";
 import { prerequisitesStep } from "./steps/prerequisites";
 import { profileStep } from "./steps/profile";
+import { searchPathValues, searchStep } from "./steps/search";
 import { groupStep, telegramStep } from "./steps/telegram";
 import { webuiStep } from "./steps/webui";
 
@@ -23,6 +24,7 @@ const STEPS_BEFORE_CHECK: SetupStep[] = [
   telegramStep,
   groupStep,
   databaseStep,
+  searchStep,
   profileStep,
   modelsStep,
   webuiStep,
@@ -65,12 +67,13 @@ export const checkStep: SetupStep = {
   },
 
   /** Testet jeden eingerichteten Schritt mit den gespeicherten Werten */
-  async test(_values, ctx) {
+  async test(_values, ctx, signal) {
     const { states, overall } = await allStates(ctx, []);
     const items: StatusItem[] = [];
     for (const step of STEPS_BEFORE_CHECK) {
       if (!step.test || states[step.id] !== "erledigt") continue;
-      const result = await step.test({}, ctx);
+      if (signal?.aborted) break;
+      const result = await step.test({}, ctx, signal);
       items.push({ label: step.title, ok: result.ok, detail: result.message });
     }
     const failed = items.filter(i => !i.ok);
@@ -93,7 +96,8 @@ export function getStep(id: string): SetupStep | undefined {
 /**
  * Vorhandene Werte der Felder eines Schritts (.env, dazu was der Schritt
  * woanders speichert; beim Datenbank-Schritt der vorgewählte Weg, siehe
- * setupPath: nicht die Laufzeit-Datenbank, sondern etwa supabase-cloud), nie
+ * setupPath: nicht die Laufzeit-Datenbank, sondern etwa supabase-cloud; beim
+ * Schritt Semantische Suche derselbe Weg, nur zum Anzeigen), nie
  * transiente. Terminal und Browser werten Sichtbarkeit, Standardwerte,
  * runWhen und plan auf diesen Werten plus den Eingaben aus (Issue #161).
  * Nur intern: geht nie an die Oberfläche.
@@ -111,6 +115,8 @@ export async function existingFieldValues(step: SetupStep, ctx: SetupContext): P
     const path = setupPath(out);
     if (path) out.DB_BACKEND = path;
   }
+  // Semantische Suche: Sichtbarkeit und Plan hängen am Weg der Datenbank (Issue #166)
+  if (step.id === "suche") Object.assign(out, await searchPathValues(ctx));
   return out;
 }
 

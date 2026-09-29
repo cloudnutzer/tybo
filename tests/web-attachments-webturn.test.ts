@@ -73,7 +73,7 @@ async function start() {
         processIntents: async (text, turn) => {
           rec.intents.push({ text, turn });
         },
-        abortClaudeCalls: key => abortExecutions(key),
+        abortEngineCalls: key => abortExecutions(key),
         isShuttingDown: () => false,
         scheduleRestartCheck: () => {},
         uploads,

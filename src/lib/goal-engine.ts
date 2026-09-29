@@ -1,4 +1,4 @@
-import { runExecution, checkAborted, currentExecution } from "./execution-context";
+import { runExecution, checkAborted, currentExecution, isIntakeClosed } from "./execution-context";
 import { terminateProcessTree } from "./process-tree";
 import { atomicWriteFile } from "./atomic-file";
 /**
@@ -73,9 +73,10 @@ export interface GoalButton {
 
 /**
  * Art einer Statusmeldung: "turn" ist der Zwischenstand vor jedem Arbeits-Turn
- * (die Karte im Browser zeigt ihn selbst), die anderen beenden oder pausieren.
+ * (die Karte im Browser zeigt ihn selbst), "resumed" die Fortsetzung nach einem
+ * Neustart (Issue #190), die anderen beenden oder pausieren.
  */
-export type GoalStatusKind = "turn" | "budget" | "waiting" | "judge-failed" | "no-reply" | "done";
+export type GoalStatusKind = "turn" | "budget" | "waiting" | "judge-failed" | "no-reply" | "done" | "resumed";
 
 export interface GoalStatusMessage {
   kind: GoalStatusKind;
@@ -119,6 +120,11 @@ export interface GoalEngineDeps {
   sendStatus: (target: GoalTarget, message: GoalStatusMessage) => Promise<void>;
   /** Antwort eines Ziel-Turns speichern; Standard saveMessage aus ./convex (Tests reichen eine Attrappe herein) */
   saveMessage?: typeof saveMessage;
+  /**
+   * Der Prozess fährt herunter (Neustart, SIGTERM). Ein Abbruch gilt dann
+   * nicht als /stop: das Ziel bleibt aktiv und läuft nach dem Start weiter (Issue #190).
+   */
+  isShuttingDown?: () => boolean;
 }
 
 /** Wie viele Turns der Weiter-Knopf nach dem Turn-Budget dazugibt (/goal weiter gibt keine) */
@@ -339,6 +345,11 @@ export function isGoalLoopRunning(sessionKey: string): boolean {
   return runningLoops.has(sessionKey);
 }
 
+/** Laufende Ziel-Schleifen, auch zwischen ihren Turns (Neustart-Prüfung, Issue #190) */
+export function runningGoalLoopCount(): number {
+  return runningLoops.size;
+}
+
 export function formatGoalStatus(g: ActiveGoal | undefined): string {
   if (!g) {
     return "Kein aktives Ziel in diesem Topic.\n\nSo geht's: `/goal <was erreicht werden soll>`: ich arbeite dann selbststaendig weiter, bis es erreicht ist (oder das Turn-Budget aufgebraucht ist und ich nachfrage).";
@@ -463,7 +474,8 @@ export async function onAgentTurnForGoal(
   const g = await getGoal(sessionKey);
   if (!g || g.status !== "active") return;
   if (g.agentName !== agentName) return;
-  if (runningLoops.has(sessionKey)) return;
+  // Neustart läuft (Issue #190): keine neue Schleife, das Ziel bleibt aktiv und geht danach weiter
+  if (runningLoops.has(sessionKey) || isIntakeClosed()) return;
 
   markLoop(sessionKey, true);
   let finished = false;
@@ -479,7 +491,8 @@ export async function onAgentTurnForGoal(
 /** Kick off work on a freshly set goal (first turn) — used by /goal <text>. */
 export async function startGoalWork(sessionKey: string): Promise<void> {
   if (!deps) return;
-  if (runningLoops.has(sessionKey)) return;
+  // Neustart läuft (Issue #190): nicht anfangen, resumeActiveGoalsAfterStart setzt fort
+  if (runningLoops.has(sessionKey) || isIntakeClosed() || deps.isShuttingDown?.()) return;
   markLoop(sessionKey, true);
   let finished = false;
   try {
@@ -500,7 +513,8 @@ export async function startGoalWork(sessionKey: string): Promise<void> {
 async function continueWhileActive(sessionKey: string): Promise<void> {
   for (;;) {
     const next = await getGoal(sessionKey);
-    if (!next || next.status !== "active") return;
+    // Beim Shutdown (Issue #190) keinen weiteren Turn anfangen, das Ziel bleibt aktiv
+    if (!next || next.status !== "active" || deps?.isShuttingDown?.()) return;
     await workLoop(sessionKey, next.createdAt);
   }
 }
@@ -513,6 +527,57 @@ async function continueWhileActive(sessionKey: string): Promise<void> {
 function endLoop(sessionKey: string, finished: boolean): void {
   markLoop(sessionKey, false);
   if (finished && cache?.[sessionKey]?.status === "active") void startGoalWork(sessionKey);
+}
+
+let resumedAfterStart = false;
+
+/** Meldung, mit der ein aktives Ziel nach dem Neustart weiterläuft */
+export function goalResumedText(g: ActiveGoal): string {
+  return `🔄 Nach dem Neustart arbeite ich am Ziel weiter (Turn ${g.turnsUsed}/${g.maxTurns}):\n"${g.goal}"`;
+}
+
+/**
+ * Nach dem Start (Issue #190): aktive Ziele aus data/goals.json fortsetzen,
+ * je mit einer Meldung im Gespräch des Ziels. Pausierte (auch am Turn-Budget)
+ * und erledigte bleiben stehen. Budget, turnsUsed und judgeFailures bleiben,
+ * wie sie gespeichert sind. Wirkt einmal pro Prozess; gibt die fortgesetzten
+ * Session-Schlüssel zurück.
+ */
+export async function resumeActiveGoalsAfterStart(): Promise<string[]> {
+  if (!deps || resumedAfterStart) return [];
+  resumedAfterStart = true;
+  const resumed: string[] = [];
+  for (const g of Object.values(await load())) {
+    if (g.status !== "active" || runningLoops.has(g.sessionKey)) continue;
+    try {
+      await deps.sendStatus(g, { kind: "resumed", text: goalResumedText(g) });
+    } catch (err) {
+      console.error("[GoalEngine] Fortsetzungs-Meldung nicht gesendet:", err instanceof Error ? err.name : typeof err);
+    }
+    // Während der Meldung gestoppt, pausiert oder ersetzt: nicht mehr fortsetzen
+    const current = cache?.[g.sessionKey];
+    if (!current || current.createdAt !== g.createdAt || current.status !== "active") continue;
+    resumed.push(g.sessionKey);
+    void startGoalWork(g.sessionKey);
+  }
+  return resumed;
+}
+
+/**
+ * onStart-Handler für bot.start (Issue #190): grammY ruft ihn erst nach der
+ * Initialisierung (getMe, deleteWebhook), vorher läuft kein Ziel weiter.
+ * Mehrfache Aufrufe setzen nichts doppelt fort (resumeActiveGoalsAfterStart).
+ */
+export function goalResumeOnStart(resume: () => Promise<string[]> = resumeActiveGoalsAfterStart): () => Promise<void> {
+  return () =>
+    resume()
+      .then(keys => { if (keys.length) console.log(`[GoalEngine] ${keys.length} aktive Ziele nach dem Start fortgesetzt`); })
+      .catch(e => console.error(`[GoalEngine] Fortsetzen nach dem Start gescheitert (${e instanceof Error ? e.name : "Fehler"})`));
+}
+
+/** Nur für Tests: resumeActiveGoalsAfterStart wieder erlauben */
+export function resetGoalResumeForTests(): void {
+  resumedAfterStart = false;
 }
 
 /**
@@ -556,10 +621,14 @@ async function afterChecks(sessionKey: string, goalId: number, g: ActiveGoal, la
 
   // 1. Quality Gates zuerst — deterministisch schlaegt LLM
   const gateFailure = await runGates(g);
+  // Shutdown-Abbruch (Issue #190): Gate oder Judge wurde abgebrochen, kein
+  // Befund. Nichts zaehlen oder pausieren, das Ziel laeuft nach dem Start weiter
+  if (deps.isShuttingDown?.()) return false;
   if (gateFailure) return !!(await updateGoal(sessionKey, { lastNote: gateFailure }, goalId));
 
   // 2. Judge
   const verdict = await judgeGoal(g, lastResponse);
+  if (deps.isShuttingDown?.()) return false;
   if (!verdict) {
     const failed = await updateGoal(sessionKey, { judgeFailures: g.judgeFailures + 1 }, goalId);
     if (!failed) return false;
@@ -601,6 +670,8 @@ async function workLoop(sessionKey: string, goalId: number): Promise<void> {
   if (!deps) return;
 
   while (true) {
+    // Beim Shutdown (Issue #190) keinen weiteren Turn, das Ziel bleibt aktiv
+    if (deps.isShuttingDown?.()) return;
     let g = await getGoal(sessionKey);
     if (!g || g.createdAt !== goalId || g.status !== "active") return;
 
@@ -623,6 +694,9 @@ async function workLoop(sessionKey: string, goalId: number): Promise<void> {
     // noch keinen Agentenaufruf, die alte Arbeit darf jetzt nicht starten
     const stillCurrent = await getGoal(sessionKey);
     if (!stillCurrent || stillCurrent.createdAt !== goalId || stillCurrent.status !== "active") return;
+    // Shutdown begann waehrend sendStatus: abortAllEngineCalls ist schon
+    // durchgelaufen und faende diesen Aufruf nicht mehr
+    if (deps.isShuttingDown?.()) return;
 
     const { text, aborted, tools } = await deps.callAgent(
       continuationPrompt(g),
@@ -632,6 +706,9 @@ async function workLoop(sessionKey: string, goalId: number): Promise<void> {
     );
 
     if (aborted) {
+      // Abbruch durch den Shutdown (Issue #190): nicht pausieren, der Zustand
+      // bleibt aktiv und resumeActiveGoalsAfterStart setzt nach dem Start fort
+      if (deps.isShuttingDown?.()) return;
       await pauseGoal(sessionKey, "Vom User gestoppt (/stop)", goalId);
       return;
     }

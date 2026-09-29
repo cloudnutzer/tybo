@@ -44,8 +44,8 @@ const ROWS: Record<KeyGroup, Row[]> = {
   "LLM-Anbieter": [
     ["ANTHROPIC_API_KEY", "Anthropic-API. Ist er gesetzt, nutzt auch Claude Code die API (Kosten pro Token) statt des Abos"],
     ["OPENROUTER_API_KEY", "OpenRouter, Cloud-Fallback, wenn Claude nicht antwortet"],
-    ["OPENAI_API_KEY", "OpenAI, Embeddings und Bildbeschreibungen, wenn kein Gemini-Schlüssel da ist"],
-    ["GEMINI_API_KEY", "Google Gemini: Spracherkennung, Sprachausgabe und Embeddings"],
+    ["OPENAI_API_KEY", "OpenAI: Embeddings der semantischen Suche (Standard-Anbieter) und Bildbeschreibungen, wenn kein Gemini-Schlüssel da ist"],
+    ["GEMINI_API_KEY", "Google Gemini: Spracherkennung, Sprachausgabe und Embeddings, wenn EMBEDDING_PROVIDER=gemini"],
     ["XAI_API_KEY", "xAI Grok, KI-Nachrichten im Morgenbriefing"],
   ],
   Werkzeuge: [

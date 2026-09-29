@@ -92,6 +92,9 @@ function durationText(ms: unknown): string {
   return seconds < 60 ? `${seconds.toFixed(1).replace(".", ",")} s` : `${Math.round(seconds / 60)} min`;
 }
 
+/** Motoren, die im Kopf einer Antwort genannt werden (Issue #125); Claude bleibt ungenannt */
+const ENGINE_NAMES: Record<string, string> = { codex: "Codex", opencode: "OpenCode" };
+
 /** Eine Nachricht als Textblock: Kopf (wer, wann) und Inhalt */
 export function formatMessage(m: Message, style: Style, fallbackAgent = ""): string {
   const time = timeOf(m.createdAt);
@@ -108,7 +111,9 @@ export function formatMessage(m: Message, style: Style, fallbackAgent = ""): str
     body = sanitizeTerminal(m.text);
   } else if (m.role === "assistant") {
     const agent = sanitizeLine(m.agent ?? fallbackAgent);
-    const meta = [time, sanitizeLine(m.model ?? ""), durationText(m.durationMs)].filter(Boolean).join(sep);
+    // Motor nur, wenn er nicht Claude ist (Issue #125), z. B. „Codex · gpt-5.6-sol"
+    const engine = typeof m.engine === "string" && Object.hasOwn(ENGINE_NAMES, m.engine) ? ENGINE_NAMES[m.engine] : "";
+    const meta = [time, engine, sanitizeLine(m.model ?? ""), durationText(m.durationMs)].filter(Boolean).join(sep);
     head = [style.cyan(style.bold(agent ? agentLabel(agent) : BRAND.name)), meta].filter(Boolean).join(sep);
     body = renderTerminalMarkdown(typeof m.copyText === "string" ? m.copyText : stripControlTags(m.text), style);
   } else {

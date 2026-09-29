@@ -2,7 +2,16 @@ import { test, expect, describe, beforeEach, afterEach, spyOn } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, statSync, chmodSync, utimesSync, readdirSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { getSettings, writeSettings, setSettingsPath, parseAuxSpec, type Settings } from "../src/lib/settings";
+import {
+  getSettings,
+  writeSettings,
+  setSettingsPath,
+  parseAuxSpec,
+  updateSettings,
+  withSettingsLock,
+  SettingsFileInvalidError,
+  type Settings,
+} from "../src/lib/settings";
 
 // Jede Probe arbeitet in einem eigenen temporären Ordner, nie in config/.
 
@@ -57,6 +66,107 @@ describe("Laden", () => {
     put(JSON.stringify(full));
     expect(getSettings()).toEqual(full);
     expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  test("engine.codex.sandbox: drei Stufen gültig, andere Werte abgelehnt (Issue #124)", () => {
+    for (const sandbox of ["read-only", "workspace-write", "full"] as const) {
+      put(JSON.stringify({ engine: { codex: { sandbox } } }));
+      expect(getSettings()).toEqual({ engine: { codex: { sandbox } } });
+    }
+    put(JSON.stringify({ engine: {} }));
+    expect(getSettings()).toEqual({ engine: {} });
+    for (const sandbox of ["danger-full-access", "", "FULL", 1]) {
+      put(JSON.stringify({ engine: { codex: { sandbox } } }));
+      expect(getSettings()).toEqual({ engine: {} });
+    }
+    expect(errorSpy).toHaveBeenCalledTimes(4);
+  });
+
+  test("engine: Standard, Gesprächs-Ausnahmen und Codex-Modell/Effort (Issue #125)", () => {
+    const full: Settings = {
+      engine: {
+        default: "codex",
+        topics: { "topic:-1001:7": "claude", "group:-1001": "codex", "dm:42": "codex", "web:0b3c6a2e-1f00-4c1a-9d0e-2a4b6c8d0e1f": "claude" },
+        codex: { model: "gpt-5.6-sol", effort: "max", sandbox: "workspace-write" },
+      },
+    };
+    put(JSON.stringify(full));
+    expect(getSettings()).toEqual(full);
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  test("engine: ungültige Werte werden abgelehnt, die letzte gültige Fassung bleibt (Issue #125)", () => {
+    const valid = { engine: { default: "codex" } };
+    put(JSON.stringify(valid));
+    expect(getSettings()).toEqual(valid);
+    const invalid = [
+      { engine: { default: "opencode2" } },
+      { engine: { default: "gpt" } },
+      { engine: { topics: { "topic:-1001:7": "gemini" } } },
+      { engine: { topics: { "irgendwas": "codex" } } },
+      { engine: { topics: { "topic:1:2:../x": "codex" } } },
+      { engine: { codex: { effort: "ultra" } } },
+      { engine: { codex: { model: "" } } },
+      { engine: { codex: { model: "-c evil" } } },
+    ];
+    for (const content of invalid) {
+      put(JSON.stringify(content));
+      expect(getSettings()).toEqual(valid);
+    }
+    expect(errorSpy).toHaveBeenCalledTimes(invalid.length);
+    // Wie im Issue [a-z0-9-]{1,20}: Bindestrich vorn und beide Längengrenzen sind gültig
+    for (const variant of ["-x", "-", "--auto", "a", "a".repeat(20)]) {
+      put(JSON.stringify({ engine: { opencode: { variant } } }));
+      expect(getSettings()).toEqual({ engine: { opencode: { variant } } });
+    }
+  });
+
+  test("engine.opencode: Standard, Ausnahme, Modell, Variante und Rechte (Issue #129)", () => {
+    const full: Settings = {
+      engine: {
+        default: "opencode",
+        topics: { "topic:-1001:7": "opencode", "dm:42": "claude" },
+        opencode: { model: "openrouter/anthropic/claude-opus-5.5", variant: "high", permission: "ask-deny" },
+      },
+    };
+    put(JSON.stringify(full));
+    expect(getSettings()).toEqual(full);
+    for (const variant of ["x", "max", "thinking-8k", "a".repeat(20), "0"]) {
+      put(JSON.stringify({ engine: { opencode: { variant } } }));
+      expect(getSettings()).toEqual({ engine: { opencode: { variant } } });
+    }
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  test("engine.opencode: ungültige Modelle und Varianten werden abgelehnt (Issue #129)", () => {
+    const valid = { engine: { opencode: { variant: "low" } } };
+    put(JSON.stringify(valid));
+    expect(getSettings()).toEqual(valid);
+    const invalid = [
+      { engine: { opencode: { variant: "" } } },
+      { engine: { opencode: { variant: "High" } } },
+      { engine: { opencode: { variant: "a".repeat(21) } } },
+      { engine: { opencode: { variant: "a b" } } },
+      { engine: { opencode: { variant: "a_b" } } },
+      { engine: { opencode: { model: "" } } },
+      { engine: { opencode: { model: "--model x" } } },
+      { engine: { opencode: { model: "-x/y" } } },
+      { engine: { opencode: { model: "a b/c" } } },
+      { engine: { opencode: { permission: "full" } } },
+    ];
+    for (const content of invalid) {
+      put(JSON.stringify(content));
+      expect(getSettings()).toEqual(valid);
+    }
+    expect(errorSpy).toHaveBeenCalledTimes(invalid.length);
+  });
+
+  test("max gilt nur für Codex, nicht für Claude-Agenten (Issue #125)", () => {
+    put(JSON.stringify({ engine: { codex: { effort: "max" } } }));
+    expect(getSettings()).toEqual({ engine: { codex: { effort: "max" } } });
+    put(JSON.stringify({ agents: { research: { effort: "max" } } }));
+    expect(getSettings()).toEqual({ engine: { codex: { effort: "max" } } });
+    expect(errorSpy).toHaveBeenCalledTimes(1);
   });
 
   test("liest bei unveränderter Datei nicht neu", () => {
@@ -171,6 +281,50 @@ describe("Schreiben", () => {
     }
     expect(readFileSync(file, "utf-8")).toBe(before);
     expect(getSettings().defaults?.model).toBe("alt");
+  });
+});
+
+describe("updateSettings (Issue #125)", () => {
+  test("erhält bestehende Werte und liest frisch aus der Datei", async () => {
+    put(JSON.stringify({ defaults: { model: "m" }, engine: { codex: { sandbox: "read-only" } } }));
+    await updateSettings((s) => ({ ...s, engine: { ...s.engine, default: "codex" } }));
+    expect(JSON.parse(readFileSync(file, "utf-8"))).toEqual({
+      defaults: { model: "m" },
+      engine: { default: "codex", codex: { sandbox: "read-only" } },
+    });
+  });
+
+  test("parallele Änderungen überschreiben sich nicht", async () => {
+    await Promise.all(
+      Array.from({ length: 6 }, (_, i) =>
+        updateSettings((s) => ({ ...s, engine: { ...s.engine, topics: { ...s.engine?.topics, [`dm:${i}`]: "codex" as const } } }))
+      )
+    );
+    expect(Object.keys(getSettings().engine?.topics ?? {}).sort()).toEqual(["dm:0", "dm:1", "dm:2", "dm:3", "dm:4", "dm:5"]);
+  });
+
+  test("eine ungültige Datei wird nicht überschrieben", async () => {
+    put("{ kaputt");
+    await expect(updateSettings((s) => ({ ...s, engine: { default: "codex" } }))).rejects.toBeInstanceOf(SettingsFileInvalidError);
+    expect(readFileSync(file, "utf-8")).toBe("{ kaputt");
+  });
+
+  test("teilt die Schreibkette mit withSettingsLock", async () => {
+    const order: string[] = [];
+    let release!: () => void;
+    const held = withSettingsLock(async () => {
+      order.push("lock");
+      await new Promise<void>((r) => (release = r));
+      order.push("lock-ende");
+    });
+    const update = updateSettings((s) => {
+      order.push("update");
+      return s;
+    });
+    await Bun.sleep(5);
+    release();
+    await Promise.all([held, update]);
+    expect(order).toEqual(["lock", "lock-ende", "update"]);
   });
 });
 

@@ -642,6 +642,26 @@ body.app {
   background: var(--agent, var(--muted));
 }
 
+/*
+ * Motor (Issue #126): Zustand als Pille mit Haarlinie wie die Stopp-Notiz,
+ * ohne Punkt und ohne Fläche, damit sie sich vom Agent-Chip abhebt.
+ * In der Kopfzeile nur bei abweichendem oder Nicht-Claude-Motor.
+ */
+.engine-pill {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 0.1rem 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.engine-pill[hidden] { display: none; }
+
 .connection {
   margin: 0;
   padding: 0.4rem 1rem;
@@ -727,7 +747,8 @@ body.app {
 
 .bubble { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
 
-.msg-user { justify-content: flex-end; }
+/* Spalte statt Zeile: die Uhrzeit (Issue #186) steht rechtsbündig unter der Blase */
+.msg-user { flex-direction: column; align-items: flex-end; }
 
 .msg-user .bubble {
   max-width: min(85%, 36rem);
@@ -760,8 +781,9 @@ body.app {
  */
 .msg-foot {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
+  /* Keine zweite Zeile: nur die Metazeile schrumpft und bricht in sich um (Issue #186) */
+  flex-wrap: nowrap;
+  align-items: flex-start;
   gap: 0 0.25rem;
   margin: 0.25rem 0 0 -0.7rem;
   color: var(--muted);
@@ -770,9 +792,45 @@ body.app {
 
 .copy-button svg { width: 1.1rem; height: 1.1rem; }
 .msg-meta { min-width: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+
+/*
+ * Zeitstempel (Issue #186): vorn in der Metazeile der Antwort, bei eigenen
+ * Nachrichten leise und rechtsbündig unter der Blase. Der Punkt als
+ * Trenner kommt aus CSS und wird nicht vorgelesen.
+ */
+.msg-time { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.msg-time + .msg-meta::before { content: "·"; content: "·" / ""; margin-right: 0.25rem; }
+.msg-foot > .copy-button, .msg-time, .copy-status { flex: none; }
+/*
+ * Mit Kopieren-Knopf: die Texte der Fußzeile stehen oben, ihre erste Zeile
+ * mittig zum Knopf (.msg-foot richtet oben aus). So bleiben Knopf und
+ * Uhrzeit neben der ersten Zeile, auch wenn die Metazeile umbricht.
+ */
+.copy-button ~ .msg-time,
+.copy-button ~ .msg-meta,
+.copy-button ~ .copy-status {
+  line-height: 1.125rem;
+  margin-top: calc((2.5rem - 1.125rem) / 2);
+}
+.msg-user-time { margin-top: 0.25rem; color: var(--muted); font-size: 0.75rem; }
+/* Mit Anhängen steht schon der Spaltenabstand von 0.4rem davor */
+.msg-with-attachments .msg-user-time { margin-top: -0.15rem; }
 .copy-status:empty { display: none; }
 .copy-status { margin-left: 0.5rem; color: var(--ink); }
 .msg-foot[data-copy="failed"] .copy-status { color: var(--error); }
+
+/* Nur für Screenreader, etwa das volle Datum eines Zeitstempels */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
 
 /* Ersatzweg fürs Kopieren ohne Clipboard-API: unsichtbar, 16 px gegen das Zoomen in iOS Safari */
 .copy-buffer {
@@ -1426,6 +1484,28 @@ body.app {
 .settings-key-name { min-width: 0; overflow-wrap: anywhere; font-family: var(--mono); font-size: 0.8125rem; }
 .settings-key-state { flex-shrink: 0; }
 .settings-keys li[data-set="false"] .settings-key-state { color: var(--muted); }
+/* Motor (Issue #126): Verfügbarkeit wie die Schlüsselliste, Name in normaler Schrift */
+.settings-engines .settings-key-name { font-family: inherit; font-size: 0.9375rem; }
+.settings-engines .settings-key-state { flex-shrink: 1; text-align: right; overflow-wrap: anywhere; }
+.settings-engines li[data-set="false"] .settings-key-state { color: var(--muted); }
+/* Abweichende Gespräche: Name und Motor links, „Auf Standard" rechts; am Handy umbrechend */
+.settings-engine-overrides { list-style: none; margin: 0; padding: 0; display: grid; gap: 1px; font-size: 0.9375rem; }
+.settings-engine-overrides li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.25rem 0.75rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--line);
+}
+.settings-engine-conversation { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; min-width: 0; }
+.settings-engine-title { min-width: 0; overflow-wrap: anywhere; }
+/* Leiser Knopf nur so breit wie sein Text, rechts neben dem Namen */
+.settings-engine-overrides .quiet-button { width: auto; flex-shrink: 0; }
+.settings-engine-overrides .actions-hint,
+.settings-engine-overrides .actions-error { flex-basis: 100%; margin: 0; }
+.settings-engine-scope { margin: 0; }
 .settings-section > .settings-actions { margin-top: 0.25rem; }
 
 /* Reiter „Schlüssel" (Issue #63): Name und Zustand oben, darunter Beschreibung und Knöpfe */
@@ -1608,6 +1688,7 @@ body.setup { min-height: 100vh; min-height: 100dvh; display: flex; }
 
 .setup-check { display: flex; align-items: center; gap: 0.6rem; margin: 0 0 0.75rem; font-size: 0.9375rem; }
 .setup-check input { width: 1.1rem; height: 1.1rem; accent-color: var(--accent); }
+.setup-manager { margin: 0 0 0.75rem; }
 
 .setup-command {
   margin: 0 0 1rem;
@@ -1659,6 +1740,9 @@ body.setup { min-height: 100vh; min-height: 100dvh; display: flex; }
   /* Kopieren unter Antworten (Issue #22): 44 px Tippfläche */
   .copy-button { width: 2.75rem; height: 2.75rem; }
   .msg-foot { margin-left: -0.825rem; }
+  .copy-button ~ .msg-time,
+  .copy-button ~ .msg-meta,
+  .copy-button ~ .copy-status { margin-top: calc((2.75rem - 1.125rem) / 2); }
   /* Ziel-Karte (Issue #76): Knöpfe als Daumen-Ziele */
   .goal-button { min-height: 2.75rem; }
   /* Rückfrage-Knöpfe (M10): Daumen-Ziele */

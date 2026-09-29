@@ -18,7 +18,8 @@ import {
   type TurnSink,
 } from "../lib/chat-turn";
 import { acceptedCreatedAt, sessionKeyFor } from "../lib/convex";
-import { currentExecution, runCancelable, runExecution } from "../lib/execution-context";
+import { currentExecution, isAbortError, isRestartPendingError, RESTART_PENDING_REPLY, runCancelable, runExecution } from "../lib/execution-context";
+import { createQueueNotifier } from "../lib/queue-notice";
 import { chunkForTelegram } from "../lib/telegram";
 import type { TurnTools } from "../lib/turn-tools";
 import { decideChoice } from "../lib/choices";
@@ -64,7 +65,7 @@ export interface BotChatDeps {
    * Inhalten nur als Vorschlag mit Telegram-Knöpfen, nie direkt.
    */
   processIntents(text: string, turn: IntentTurn): Promise<unknown>;
-  abortClaudeCalls(sessionKey: string): number;
+  abortEngineCalls(sessionKey: string): number;
   /** true, sobald shutdown() in src/bot.ts läuft */
   isShuttingDown(): boolean;
   /** Angeforderten Neustart prüfen, sobald nichts mehr läuft; ohne Chat-ID (die ist Telegram vorbehalten) */
@@ -87,6 +88,21 @@ export interface BotChatDeps {
   approvals?: ApprovalTurns;
   /** Nie Nachrichtentexte oder Zugangsdaten übergeben */
   log?(message: string): void;
+  /** Topic-Namen für den Wartehinweis (Issue #188); ohne sie „Topic <id>" */
+  topicNames?(): Promise<Record<string, string>>;
+  /** Wartezeit bis zum Hinweis, Standard QUEUE_NOTICE_DELAY_MS; anders nur in Tests */
+  queueNoticeMs?: number;
+}
+
+/**
+ * Optionen für runCancelable eines Web-Turns: der Wartehinweis geht als
+ * notice an den Browser (nur Anzeige, nie in den Speicher, nie nach Telegram).
+ */
+function queueWaitOptions(deps: BotChatDeps, sink: TurnSink) {
+  return {
+    onQueueWait: createQueueNotifier(text => sink.notice(text), deps.topicNames),
+    ...(deps.queueNoticeMs !== undefined ? { queueNoticeMs: deps.queueNoticeMs } : {}),
+  };
 }
 
 /** Angaben zu einem Turn für das Merk-Tag-Tor (src/lib/intent-gate.ts) */
@@ -226,10 +242,6 @@ export function replyInfoFrom(agent: string, info: TurnInfo | undefined): ReplyI
   return pickReplyInfo(info ? { ...info, agent: info.agent || agent } : { agent });
 }
 
-function isAbortError(e: unknown): boolean {
-  return e instanceof Error && e.name === "AbortError";
-}
-
 function errorName(e: unknown): string {
   return e instanceof Error ? e.name : typeof e;
 }
@@ -282,6 +294,7 @@ export function createBotChat(deps: BotChatDeps): BotChat {
     open.set(conversationId, entry);
     const unregister = registerApprovals(conversationId, { ask, endAsk, title });
     const prepared: PreparedMedia[] = [];
+    const webSink = createWebSink(sink);
     try {
       return await runCancelable(sessionKey, async () => {
         const signal = currentExecution()?.controller.signal;
@@ -355,7 +368,7 @@ export function createBotChat(deps: BotChatDeps): BotChat {
                 userMessage: prepared.length ? buildMediaPrompt(prepared, text) : text,
                 chatId,
                 agentName: agent,
-                sink: createWebSink(sink),
+                sink: webSink,
                 onInfo: i => {
                   turnInfo = i;
                 },
@@ -394,9 +407,11 @@ export function createBotChat(deps: BotChatDeps): BotChat {
           log(`Merk-Tags aus Gespräch ${conversationId} nicht verarbeitet (${errorName(e)})`);
         }
         return { text: response, info };
-      });
+      }, queueWaitOptions(deps, webSink));
     } catch (e) {
       if (isAbortError(e)) return aborted();
+      // Neustart läuft (Issue #190): nicht angenommen, klare Meldung
+      if (isRestartPendingError(e)) return { text: RESTART_PENDING_REPLY, failed: true };
       throw e;
     } finally {
       if (open.get(conversationId) === entry) open.delete(conversationId);
@@ -422,7 +437,7 @@ export function createBotChat(deps: BotChatDeps): BotChat {
     /** false, wenn die Antwort schon gespeichert wird: dann gibt es nichts mehr abzubrechen */
     stop(conversationId: string) {
       if (open.get(conversationId)?.committed) return false;
-      deps.abortClaudeCalls(sessionKeyFor(webChatId(conversationId)));
+      deps.abortEngineCalls(sessionKeyFor(webChatId(conversationId)));
       return true;
     },
     /** Nur für die offene Frage mit dieser Register-ID; eine verspätete Antwort bewirkt nichts */
@@ -502,9 +517,9 @@ function attachmentLine(a: MessageAttachment, p: PreparedMedia): string {
 
 /**
  * Unterordner der Arbeitsdateien aus dem Web-Chat unter dem uploads/ des
- * Medien-Kerns: Telegram legt photo_<Zeit> und voice_<Zeit> direkt in
- * uploads/ ab und nutzt eine eigene Uhr, gleiche Namen dürfen sich dort nicht
- * treffen.
+ * Medien-Kerns: Telegram legt photo_<Zeit>_<UUID> und voice_<Zeit>_<UUID>
+ * direkt in uploads/ ab. Seit Issue #190 sind die Namen schon durch die UUID
+ * eindeutig; der eigene Ordner trennt Web und Telegram zusätzlich.
  */
 export const WEB_MEDIA_SUBDIR = "web";
 
@@ -821,6 +836,7 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
     // channel bleibt "web" (über die HTTP-Schnittstelle, Filter in bot-telegram.ts);
     // Terminal-Nachrichten tragen zusätzlich via: "terminal" (Issue #59)
     const metaBase = { topicId: topicId ?? null, channel: WEB_CHANNEL, ...(source === "terminal" ? { via: "terminal" } : {}) };
+    const webSink = createWebSink(sink);
     try {
       return await runCancelable(sessionKey, async () => {
         const signal = currentExecution()?.controller.signal;
@@ -942,7 +958,7 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
                 chatId,
                 agentName: agent,
                 topicId,
-                sink: createWebSink(sink),
+                sink: webSink,
                 onInfo: i => {
                   turnInfo = i;
                 },
@@ -1007,12 +1023,14 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
             ? {
                 followUp: (output: FollowUpOutput) => {
                   // Stopp-Knopf während der Rückfragen: wie /stop über den Telegram-Schlüssel
-                  const stop = () => deps.abortClaudeCalls(sessionKey);
+                  const stop = () => deps.abortEngineCalls(sessionKey);
                   output.signal.addEventListener("abort", stop, { once: true });
                   return runCancelable(sessionKey, () =>
                     runWebInvocations(response, { sourceAgent: agent, chatId, topicId, sessionKey, conversationId, metadata: metaBase }, budget!, deps, output)
                   )
-                    .catch(e => {
+                    .catch(async e => {
+                      // Neustart dazwischen (Issue #190): Rückfragen entfallen, sichtbar gemeldet
+                      if (isRestartPendingError(e)) return output.notice(RESTART_PENDING_REPLY).catch(() => {});
                       if (!isAbortError(e)) throw e;
                     })
                     .finally(() => output.signal.removeEventListener("abort", stop));
@@ -1020,9 +1038,11 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
               }
             : {}),
         };
-      });
+      }, queueWaitOptions(deps, webSink));
     } catch (e) {
       if (isAbortError(e)) return aborted();
+      // Neustart läuft (Issue #190): nicht angenommen, klare Meldung
+      if (isRestartPendingError(e)) return { text: RESTART_PENDING_REPLY, failed: true };
       throw e;
     } finally {
       if (open.get(conversationId) === entry) open.delete(conversationId);
@@ -1046,7 +1066,7 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
       const entry = open.get(conversationId);
       // Ohne offenen Turn (schon fertig) gibt es nichts mehr abzubrechen
       if (!entry || entry.committed) return false;
-      deps.abortClaudeCalls(entry.sessionKey);
+      deps.abortEngineCalls(entry.sessionKey);
       return true;
     },
     answer: (conversationId, text, approvalId, source = "web") => approvals.answer(conversationId, text, approvalId, source),

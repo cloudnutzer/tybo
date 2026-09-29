@@ -1,4 +1,4 @@
-import { test, expect, afterAll } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -108,4 +108,55 @@ test("detectSupervisor: pm_id set → pm2; other platforms never ask launchctl",
   };
   expect(await detectSupervisor(1, { env: { pm_id: "0" }, platform: "darwin", launchctlList: never })).toBe("pm2");
   expect(await detectSupervisor(1, { env: {}, platform: "linux", launchctlList: never })).toBeNull();
+});
+
+// Issue #207: systemd-Benutzerdienst. Nie das echte systemctl
+describe("detectSupervisor unter systemd", () => {
+  const UNIT_ENV = { INVOCATION_ID: "0123abcd", TYBO_SYSTEMD_UNIT: "tybo-telegram-relay.service" };
+  const never = async () => {
+    throw new Error("launchctl must not be called");
+  };
+  function fakeSystemctl(out: string | Error) {
+    const asked: string[] = [];
+    return {
+      asked,
+      systemctlShow: async (unit: string) => {
+        asked.push(unit);
+        if (out instanceof Error) throw out;
+        return out;
+      },
+    };
+  }
+
+  test("eigener Dienst, eigene PID, Restart=always → systemd", async () => {
+    const f = fakeSystemctl("MainPID=4242\nRestart=always\n");
+    expect(await detectSupervisor(4242, { env: UNIT_ENV, platform: "linux", launchctlList: never, systemctlShow: f.systemctlShow })).toBe("systemd");
+    expect(f.asked).toEqual(["tybo-telegram-relay.service"]);
+  });
+
+  test("fremde PID, Restart=on-failure oder systemctl scheitert → null", async () => {
+    for (const out of ["MainPID=1111\nRestart=always", "MainPID=4242\nRestart=on-failure", new Error("Failed to connect to bus")]) {
+      const f = fakeSystemctl(out);
+      expect(await detectSupervisor(4242, { env: UNIT_ENV, platform: "linux", launchctlList: never, systemctlShow: f.systemctlShow })).toBeNull();
+    }
+  });
+
+  test("ohne INVOCATION_ID, ohne Dienstnamen oder mit seltsamem Namen: systemctl wird nicht gefragt", async () => {
+    for (const env of [
+      { TYBO_SYSTEMD_UNIT: "tybo-telegram-relay.service" },
+      { INVOCATION_ID: "x" },
+      { INVOCATION_ID: "x", TYBO_SYSTEMD_UNIT: "--user; rm" },
+    ]) {
+      const f = fakeSystemctl("MainPID=4242\nRestart=always");
+      expect(await detectSupervisor(4242, { env, platform: "linux", launchctlList: never, systemctlShow: f.systemctlShow })).toBeNull();
+      expect(f.asked).toEqual([]);
+    }
+  });
+
+  test("nur unter Linux; PM2 hat Vorrang", async () => {
+    const f = fakeSystemctl("MainPID=4242\nRestart=always");
+    expect(await detectSupervisor(4242, { env: UNIT_ENV, platform: "darwin", launchctlList: async () => { throw new Error("nicht geladen"); }, systemctlShow: f.systemctlShow })).toBeNull();
+    expect(await detectSupervisor(4242, { env: { ...UNIT_ENV, pm_id: "0" }, platform: "linux", launchctlList: never, systemctlShow: f.systemctlShow })).toBe("pm2");
+    expect(f.asked).toEqual([]);
+  });
 });

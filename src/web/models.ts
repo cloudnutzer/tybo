@@ -5,6 +5,12 @@
  * - openrouter: öffentliche Liste ohne Schlüssel, nur id und name, erfolgreiche
  *   Antworten 10 Minuten zwischengespeichert
  * - ollama: lokal installierte Modelle, nur Namen, jedes Mal frisch
+ * - opencode (Issue #129): Zeilen von `opencode models` (<anbieter>/<modell>)
+ *   über einen Port, den src/bot.ts mit listOpenCodeModels aus
+ *   src/lib/engines/opencode.ts füllt; Zeitlimit 10 s, erfolgreiche Listen
+ *   10 Minuten zwischengespeichert, gleichzeitige Abrufe teilen sich einen
+ *   Prozess. Ohne Port oder bei Fehler: leere Liste mit festem Text, das Feld
+ *   bleibt frei eingebbar.
  *
  * Beide Abfragen laufen parallel und mit begrenzter Wartezeit, damit ein
  * hängendes Ollama die Liste nicht blockiert. Fehler ergeben eine leere Liste
@@ -24,11 +30,24 @@ export const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models";
 export const OLLAMA_TAGS_URL = "http://localhost:11434/api/tags";
 export const MODELS_CACHE_MS = 10 * 60_000;
 export const MODELS_TIMEOUT_MS = 5_000;
+/** Wie OPENCODE_MODELS_TIMEOUT_MS in src/lib/engines/opencode.ts; der Port beendet den Prozess selbst */
+export const OPENCODE_MODELS_TIMEOUT_MS = 10_000;
+
+export const OPENCODE_MODELS_TEXT = {
+  unavailable: "Die Modell-Liste von OpenCode ist hier nicht abrufbar",
+  failed: "OpenCode liefert keine Modellliste",
+  timeout: "OpenCode antwortet nicht (Zeitüberschreitung)",
+} as const;
+
+/** Ergebnis von `opencode models` (OpenCodeModelsResult in src/lib/engines/opencode.ts); error nur mit festen Texten */
+export type OpenCodeModelsPort = () => Promise<{ ok: true; models: string[] } | { ok: false; error: string }>;
 
 export interface ModelLists {
   claude: { models: string[]; custom: true };
   openrouter: { models: { id: string; name: string }[]; error?: string };
   ollama: { models: string[]; error?: string };
+  /** Kennungen <anbieter>/<modell>, unverändert wie OpenCode sie nennt */
+  opencode: { models: string[]; error?: string };
 }
 
 export interface ModelCatalogOptions {
@@ -40,6 +59,10 @@ export interface ModelCatalogOptions {
   ollamaUrl?: string;
   /** Nur feste Texte übergeben */
   log?: (message: string) => void;
+  /** `opencode models` (Issue #129); fehlt: kein Abruf, Hinweis „nicht abrufbar" */
+  opencode?: OpenCodeModelsPort;
+  /** Zeitlimit für den OpenCode-Port, Standard OPENCODE_MODELS_TIMEOUT_MS */
+  opencodeTimeoutMs?: number;
 }
 
 export interface ModelCatalog {
@@ -158,10 +181,51 @@ export function createModelCatalog(options: ModelCatalogOptions = {}): ModelCata
     }
   }
 
+  const opencodePort = options.opencode;
+  const opencodeTimeoutMs = options.opencodeTimeoutMs ?? OPENCODE_MODELS_TIMEOUT_MS;
+  let opencodeCached: { at: number; models: string[] } | null = null;
+  let opencodeInflight: Promise<ModelLists["opencode"]> | null = null;
+
+  /** Fester Text aus dem Port, sonst ein eigener; nie mehr als eine kurze Zeile */
+  const portError = (raw: unknown): string =>
+    typeof raw === "string" && /^[^\n\r]{1,120}$/.test(raw) ? raw : OPENCODE_MODELS_TEXT.failed;
+
+  async function opencode(): Promise<ModelLists["opencode"]> {
+    if (!opencodePort) return { models: [], error: OPENCODE_MODELS_TEXT.unavailable };
+    if (opencodeCached && now() - opencodeCached.at < cacheMs) return { models: [...opencodeCached.models] };
+    opencodeInflight ??= (async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const call = opencodePort();
+        // Auch ein Port, der sein Zeitlimit nicht einhält, hält die Liste nicht auf
+        const timeout = new Promise<{ ok: false; error: string }>(resolve => {
+          timer = setTimeout(() => resolve({ ok: false, error: OPENCODE_MODELS_TEXT.timeout }), opencodeTimeoutMs);
+        });
+        call.catch(() => {});
+        const r = await Promise.race([call, timeout]);
+        if (r.ok && Array.isArray(r.models)) {
+          const models = r.models.filter(m => typeof m === "string" && m.length > 0 && m.length <= 200);
+          opencodeCached = { at: now(), models };
+          return { models: [...models] };
+        }
+        const error = portError(r.ok ? undefined : r.error);
+        log(`Modellliste: ${error}`);
+        return { models: [], error };
+      } catch {
+        log(`Modellliste: ${OPENCODE_MODELS_TEXT.failed}`);
+        return { models: [], error: OPENCODE_MODELS_TEXT.failed };
+      } finally {
+        clearTimeout(timer);
+        opencodeInflight = null;
+      }
+    })();
+    return opencodeInflight;
+  }
+
   return {
     async list() {
-      const [or, ol] = await Promise.all([openrouter(), ollama()]);
-      return { claude: { models: [...CLAUDE_MODELS], custom: true }, openrouter: or, ollama: ol };
+      const [or, ol, oc] = await Promise.all([openrouter(), ollama(), opencode()]);
+      return { claude: { models: [...CLAUDE_MODELS], custom: true }, openrouter: or, ollama: ol, opencode: oc };
     },
   };
 }

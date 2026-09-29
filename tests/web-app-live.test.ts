@@ -159,14 +159,14 @@ async function settle() {
 }
 
 describe("Sammelstrom der Seitenleiste", () => {
-  test("wird vor dem Strom des Gesprächs geöffnet, nur mit Telegram-Gesprächen", async () => {
+  test("wird vor dem Strom des Gesprächs geöffnet, auch ohne Telegram-Gespräche (Motor-Änderungen, Issue #126)", async () => {
     setup({ stored: "topic-8" });
     await settle();
     expect(FakeEventSource.all.map(s => s.url)).toEqual([ACTIVITY, "/api/conversations/topic-8/events"]);
 
     setup({ telegram: { dm: null, topics: [] } });
     await settle();
-    expect(FakeEventSource.all.map(s => s.url)).toEqual(["/api/conversations/c1/events"]);
+    expect(FakeEventSource.all.map(s => s.url)).toEqual([ACTIVITY, "/api/conversations/c1/events"]);
   });
 
   test("Topic 8 offen, Nachricht in 443: Aktivität live, Topic rückt nach oben, Neu-Punkt; Öffnen entfernt ihn", async () => {

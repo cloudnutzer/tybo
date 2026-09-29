@@ -153,10 +153,39 @@ describe("Anzeige", () => {
     const node = app.messageElement(REPLY, "general");
     expect(node.children.map(c => c.className)).toEqual(["bubble content", "msg-head", "msg-foot"]);
     const foot = footer(node)!;
+    // Reihenfolge: Knopf, Uhrzeit (Issue #186), Metazeile, Status
+    expect(foot.children.map(c => c.className)).toEqual(["icon-button copy-button", "msg-time", "msg-meta", "copy-status"]);
     expect(part(foot, "msg-meta")!.textContent).toBe("General · claude-opus-5-5 · 42 s");
     // Das HTML der Antwort wird wie bisher gesetzt; alles in der Fußzeile nur als Text
     expect(node.children[0]!.innerHTMLWrites).toEqual([REPLY.html]);
     for (const c of foot.children) expect(c.innerHTMLWrites).toEqual([]);
+  });
+
+  test("nennt den Motor der Antwort (Issues #125, #126), auch Claude Code", () => {
+    const { app } = load();
+    const codex = app.messageElement({ ...REPLY, engine: "codex", model: "gpt-5.6-sol" }, "general");
+    expect(part(footer(codex)!, "msg-meta")!.textContent).toBe("General · Codex · gpt-5.6-sol · 42 s");
+    const codexDefault = app.messageElement({ ...REPLY, engine: "codex", model: undefined }, "general");
+    expect(part(footer(codexDefault)!, "msg-meta")!.textContent).toBe("General · Codex · 42 s");
+    // Issue #129: OpenCode mit Modell <anbieter>/<modell>, ohne Modell nur der Motor
+    const opencode = app.messageElement({ ...REPLY, engine: "opencode", model: "openai/gpt-5.5" }, "general");
+    expect(part(footer(opencode)!, "msg-meta")!.textContent).toBe("General · OpenCode · openai/gpt-5.5 · 42 s");
+    const opencodeDefault = app.messageElement({ ...REPLY, engine: "opencode", model: undefined }, "general");
+    expect(part(footer(opencodeDefault)!, "msg-meta")!.textContent).toBe("General · OpenCode · 42 s");
+    // Issue #126: auch Claude Code, etwa wenn es für einen nicht bereiten Codex einspringt
+    const claude = app.messageElement({ ...REPLY, engine: "claude" }, "general");
+    expect(part(footer(claude)!, "msg-meta")!.textContent).toBe("General · Claude Code · claude-opus-5-5 · 42 s");
+    const unknown = app.messageElement({ ...REPLY, engine: "__proto__" }, "general");
+    expect(part(footer(unknown)!, "msg-meta")!.textContent).toBe("General · claude-opus-5-5 · 42 s");
+  });
+
+  test("Fallback-Antworten und ältere Antworten ohne engine nennen keinen Motor (Issue #126)", () => {
+    const { app } = load();
+    // Fallback: Modell kommt von OpenRouter, TurnInfo hat keinen Motor
+    const fallback = app.messageElement({ ...REPLY, model: "minimax/minimax-m2.7" }, "general");
+    expect(part(footer(fallback)!, "msg-meta")!.textContent).toBe("General · minimax/minimax-m2.7 · 42 s");
+    const old = app.messageElement({ ...REPLY, model: undefined, durationMs: undefined }, "general");
+    expect(part(footer(old)!, "msg-meta")!.textContent).toBe("General");
   });
 
   test("HTML-artige Modellnamen und Agenten landen als Text", () => {
@@ -171,14 +200,18 @@ describe("Anzeige", () => {
   test("alte Nachrichten zeigen nur, was da ist; nichts vom Gesprächs-Agenten erfunden", () => {
     const { app } = load();
     const old = { id: "a0", role: "assistant", text: "alt", html: "<p>alt</p>", createdAt: REPLY.createdAt };
-    // ganz ohne Angaben und ohne copyText: keine Fußzeile, der Kopf bleibt
-    const bare = app.messageElement(old, "research");
+    // ohne Angaben, ohne copyText und ohne gültiges createdAt: keine Fußzeile, der Kopf bleibt
+    const bare = app.messageElement({ ...old, createdAt: "kaputt" }, "research");
     expect(footer(bare)).toBeUndefined();
     expect(bare.children[1]!.className).toBe("msg-head");
+    // nur ein gültiger Zeitpunkt (Issue #186): Fußzeile allein mit der Uhrzeit
+    const timeOnly = footer(app.messageElement(old, "research"))!;
+    expect(timeOnly.children.map(c => c.className)).toEqual(["msg-time"]);
     // nur copyText: Knopf ohne Zeile
-    const copyOnly = footer(app.messageElement({ ...old, copyText: "alt" }, "research"))!;
+    const copyOnly = footer(app.messageElement({ ...old, createdAt: undefined, copyText: "alt" }, "research"))!;
     expect(part(copyOnly, "copy-button")).toBeDefined();
     expect(part(copyOnly, "msg-meta")).toBeUndefined();
+    expect(part(copyOnly, "msg-time")).toBeUndefined();
     // nur Agent und Dauer
     expect(app.replyMetaText({ agent: "research", durationMs: 1500 })).toBe("Research · 2 s");
     expect(app.replyMetaText({ model: "qwen3:8b" })).toBe("qwen3:8b");

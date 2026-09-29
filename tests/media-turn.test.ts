@@ -115,7 +115,7 @@ describe("Regressionserwartungen (Ist-Zustand): Bild", () => {
       { kind: "image", bytes: F.JPEG, ext: "jpg", chatId: "1", topicId: 7, caption: "Was ist das?", source: { channel: "telegram", telegramFileId: "tg-file" } },
       deps,
     );
-    const path = join(uploadsDir, `photo_${TS}.jpg`);
+    const path = join(uploadsDir, `photo_${TS}_0000-uuid.jpg`);
     expect(p.localPath).toBe(path);
     expect(p.assetId).toBe("a-42");
     expect(p.prompt).toBe(PHOTO.prompt(path, "Was ist das?", "a-42"));
@@ -125,7 +125,7 @@ describe("Regressionserwartungen (Ist-Zustand): Bild", () => {
     expect(p.userMetadata).toEqual(PHOTO.userMetadata(7, path, "a-42"));
     expect(p.replyMetadata).toEqual(PHOTO.replyMetadata(7, "a-42"));
     expect(p.foreignInput).toBe(PHOTO.foreignInput);
-    expect(calls.upload).toEqual([[path, PHOTO.upload("Was ist das?", "tg-file", `photo_${TS}.jpg`)]]);
+    expect(calls.upload).toEqual([[path, PHOTO.upload("Was ist das?", "tg-file", `photo_${TS}_0000-uuid.jpg`)]]);
     expect(Object.keys(calls.upload[0][1])).toEqual(["userCaption", "channel", "telegramFileId", "originalFilename"]);
     expect(await readFile(path)).toEqual(Buffer.from(F.JPEG));
   });
@@ -136,7 +136,7 @@ describe("Regressionserwartungen (Ist-Zustand): Bild", () => {
       { kind: "image", bytes: F.PNG, ext: "png", chatId: "1", caption: "", source: { channel: "telegram", telegramFileId: "tg" } },
       deps,
     );
-    const path = join(uploadsDir, `photo_${TS}.png`);
+    const path = join(uploadsDir, `photo_${TS}_0000-uuid.png`);
     expect("assetId" in p).toBe(false);
     expect(p.prompt).toBe(PHOTO.prompt(path, PHOTO.defaultCaption));
     expect(p.prompt).toBe(`[Image attached: ${path}]\n\nUser says: User sent a photo. Describe and respond to it.`);
@@ -146,13 +146,13 @@ describe("Regressionserwartungen (Ist-Zustand): Bild", () => {
     expect(p.replyMetadata).toEqual({ topicId: undefined, type: "photo_reply", assetId: undefined });
     expect(p.foreignInput).toBe(PHOTO.foreignInput);
     expect(p.foreignInput).toBe("Foto");
-    expect(calls.upload[0][1]).toEqual(PHOTO.upload(PHOTO.defaultCaption, "tg", `photo_${TS}.png`));
+    expect(calls.upload[0][1]).toEqual(PHOTO.upload(PHOTO.defaultCaption, "tg", `photo_${TS}_0000-uuid.png`));
   });
 
   test("unsichere Endung fällt auf jpg zurück", async () => {
     const { deps, uploadsDir } = fakeDeps();
     const p = await prepareMedia({ kind: "image", bytes: F.JPEG, ext: "photos/file_1", chatId: "1", source: { channel: "telegram" } }, deps);
-    expect(p.localPath).toBe(join(uploadsDir, `photo_${TS}.jpg`));
+    expect(p.localPath).toBe(join(uploadsDir, `photo_${TS}_0000-uuid.jpg`));
   });
 });
 
@@ -207,7 +207,7 @@ describe("Regressionserwartungen (Ist-Zustand): Sprache", () => {
   test("Telegram: Transkript, Prompt und Einstufung nach dem Prompt", async () => {
     const { deps, calls, uploadsDir } = fakeDeps({ transcript: "Erinnere mich morgen" });
     const p = await prepareMedia({ kind: "audio", bytes: F.OGG_OPUS, ext: "ogg", chatId: "1", topicId: 9, source: { channel: "telegram" } }, deps);
-    const path = join(uploadsDir, `voice_${TS}.ogg`);
+    const path = join(uploadsDir, `voice_${TS}_0000-uuid.ogg`);
     expect(p.localPath).toBe(path);
     expect(calls.transcribe).toEqual([path]);
     expect(p.transcript).toBe("Erinnere mich morgen");
@@ -227,7 +227,7 @@ describe("Regressionserwartungen (Ist-Zustand): Sprache", () => {
       { kind: "audio", bytes: F.ftyp("M4A ", "isom"), ext: "ogg", chatId: "1", topicId: 5, caption: "bitte kurz", fileName: "memo.ogg", source: { channel: "web" } },
       deps,
     );
-    const path = join(uploadsDir, `voice_${TS}.m4a`);
+    const path = join(uploadsDir, `voice_${TS}_0000-uuid.m4a`);
     expect(p.localPath).toBe(path);
     expect(calls.transcribe).toEqual([path]);
     expect(p.transcript).toBe("Hallo");
@@ -252,7 +252,7 @@ describe("Regressionserwartungen (Ist-Zustand): Sprache", () => {
     for (const [data, ext] of cases) {
       const { deps, calls } = fakeDeps();
       await prepareMedia({ kind: "audio", bytes: data, ext: "bin", chatId: "1", source: { channel: "web" } }, deps);
-      expect(calls.transcribe[0].endsWith(`voice_${TS}.${ext}`)).toBe(true);
+      expect(calls.transcribe[0].endsWith(`voice_${TS}_0000-uuid.${ext}`)).toBe(true);
       await rm(join(dir, "uploads"), { recursive: true, force: true });
     }
   });
@@ -265,7 +265,7 @@ describe("prepareMedia: Web-Pfad", () => {
       { kind: "image", bytes: F.PNG, ext: "jpg", chatId: "1", caption: "", fileName: "bild.jpg", source: { channel: "web" } },
       deps,
     );
-    const path = join(uploadsDir, `photo_${TS}.png`);
+    const path = join(uploadsDir, `photo_${TS}_0000-uuid.png`);
     expect(p.localPath).toBe(path);
     expect(calls.upload).toEqual([[path, {
       userCaption: PHOTO.defaultCaption, channel: "web", originalFilename: "bild.jpg", fileType: "image", mimeType: "image/png",
@@ -275,7 +275,7 @@ describe("prepareMedia: Web-Pfad", () => {
   test("Bild ohne Namen: originalFilename ist der Speichername", async () => {
     const { deps, calls } = fakeDeps();
     await prepareMedia({ kind: "image", bytes: F.WEBP, ext: "", chatId: "1", source: { channel: "web" } }, deps);
-    expect(calls.upload[0][1].originalFilename).toBe(`photo_${TS}.webp`);
+    expect(calls.upload[0][1].originalFilename).toBe(`photo_${TS}_0000-uuid.webp`);
   });
 
   test("fileName ../../etc/x.png landet nicht im Speicherpfad", async () => {

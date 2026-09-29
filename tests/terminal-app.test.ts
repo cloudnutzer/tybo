@@ -433,7 +433,9 @@ describe("Pipe: verspäteter Anfangsstatus", () => {
               new ReadableStream<Uint8Array>({
                 async start(c) {
                   init.signal?.addEventListener("abort", () => {
-                    void reader.cancel();
+                    // Der innere Stream hängt am selben Signal: ab Bun 1.4 ist er beim
+                    // Abbruch schon mit AbortError beendet, cancel() lehnt dann ab (Issue #210)
+                    reader.cancel().catch(() => {});
                     c.error(new Error("abgebrochen"));
                   });
                   await statusReleased;

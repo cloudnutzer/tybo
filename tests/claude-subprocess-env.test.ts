@@ -9,6 +9,8 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test
 import { callClaude, callClaudeStreaming, conversationEnv, runClaudeWithTimeout, setSpawnForTests } from "../src/lib/claude";
 import { runExecution } from "../src/lib/execution-context";
 import { CONVERSATION_VARS, setMcpReaderForTests } from "../src/lib/subprocess-env";
+import { runJsonTurn, runStreamingTurn, resolveStreamingLimits, type ChatTurnDeps } from "../src/lib/chat-turn";
+import type { BotSession } from "../src/lib/session-manager";
 
 type Env = Record<string, string | undefined>;
 const spawned: { cmd: string[]; env: Env }[] = [];
@@ -124,6 +126,76 @@ test("Argumente des Aufrufs bleiben unverändert", async () => {
   await runExecution("dm:4711", "general", () => callClaude({ prompt: "x", model: "claude-test", effort: "low" }));
   const cmd = spawned[0].cmd;
   expect(cmd.slice(cmd.indexOf("-p"))).toEqual(["-p", "--output-format", "text", "--model", "claude-test", "--effort", "low"]);
+});
+
+// Issue #121: der Chat-Kern geht über den Motor (getEngine, echter
+// Claude-Motor) bis zum Prozessstart; die Kommandozeile bleibt dieselbe.
+describe("Chat-Kern über den Motor bis zum Prozessstart", () => {
+  const savedEffort = process.env.CLAUDE_EFFORT;
+  beforeAll(() => {
+    delete process.env.CLAUDE_EFFORT;
+  });
+  afterAll(() => {
+    if (savedEffort !== undefined) process.env.CLAUDE_EFFORT = savedEffort;
+  });
+
+  /** Alles außer Motor und Prozessstart ist eine Attrappe; getEngine bleibt echt */
+  const deps = (resume: string | undefined): Partial<ChatTurnDeps> => ({
+    callFallbackLLMWithSource: async () => {
+      throw new Error("Fallback unerwartet");
+    },
+    buildPromptContext: async () => ({ fullPrompt: "voller-prompt", fallbackContext: "" }),
+    buildResumePrompt: async () => "resume-prompt",
+    isSessionModeEnabled: () => true,
+    getResumableSession: async () =>
+      resume ? ({ engine: "claude", engineSessionId: resume, startedAt: 1, messageCount: 1 } as BotSession) : undefined,
+    takeExpiredSession: async () => undefined,
+    recordSessionTurn: async () => true,
+    getSessionsForKey: async () => [],
+    sessionEpoch: () => 0,
+    resetSession: async () => 0,
+    shouldDistill: () => false,
+    distillSession: async () => {},
+    log: async () => {},
+    getAgentConfig: () =>
+      ({ model: "claude-test", effort: "low", allowedTools: ["WebSearch"] }) as ReturnType<ChatTurnDeps["getAgentConfig"]>,
+    getSettings: () => ({}),
+    resolveStreamingLimits: () => resolveStreamingLimits({}),
+    reportSecrets: () => [],
+  });
+  const sink = { progress() {}, notice() {} };
+  const argsAfterP = () => {
+    expect(spawned).toHaveLength(1);
+    const cmd = spawned[0].cmd;
+    return cmd.slice(cmd.indexOf("-p"));
+  };
+
+  test("JSON-Turn: dieselbe Kommandozeile wie vorher", async () => {
+    const reply = await runJsonTurn({ userMessage: "hallo", chatId: "4711", agentName: "general", sink, deps: deps(undefined) });
+    expect(reply).toBe("fertig");
+    expect(argsAfterP()).toEqual(["-p", "--output-format", "json", "--verbose", "--model", "claude-test", "--effort", "low", "--allowedTools", "WebSearch"]);
+  });
+
+  test("JSON-Turn mit Session: --resume wie vorher", async () => {
+    await runJsonTurn({ userMessage: "hallo", chatId: "4711", agentName: "general", sink, deps: deps("sid-alt") });
+    expect(argsAfterP()).toEqual([
+      "-p", "--output-format", "json", "--verbose", "--model", "claude-test", "--effort", "low",
+      "--allowedTools", "WebSearch", "--resume", "sid-alt",
+    ]);
+  });
+
+  test("Streaming-Turn mit Session: dieselbe Kommandozeile, Umgebung des Gesprächs", async () => {
+    const reply = await runExecution("dm:4711", "general", () =>
+      runStreamingTurn({ userMessage: "hallo", chatId: "4711", agentName: "general", sink, deps: deps("sid-alt") })
+    );
+    expect(reply).toBe("fertig");
+    expect(argsAfterP()).toEqual([
+      "-p", "--output-format", "stream-json", "--verbose", "--model", "claude-test", "--effort", "low",
+      "--allowedTools", "WebSearch", "--resume", "sid-alt",
+    ]);
+    expect(spawned[0].env.TYBO_CHAT_ID).toBe("4711");
+    expect(spawned[0].env.TYBO_SUBPROCESS).toBe("1");
+  });
 });
 
 describe("conversationEnv", () => {

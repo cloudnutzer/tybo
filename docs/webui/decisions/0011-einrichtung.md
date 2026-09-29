@@ -9,6 +9,8 @@ Datum: 24.09.2026. Entschieden von: Maintainer (Wunsch, wie `hermes setup`), Ums
   Nutzer-ID, Test), optional Forum-Gruppe, Datenbank (Supabase oder Convex,
   Test), Profil (Name, Zeitzone), Modelle und Fallback, WebUI (Passwort, Host),
   Autostart (launchd auf macOS, PM2 sonst), Gesamtprüfung.
+  Ergänzt 28.09.2026 (Issue #207): unter Linux mit systemd standardmäßig ein
+  systemd-Benutzerdienst, PM2 bleibt wählbar.
 - Terminal: `tybo setup` führt durch alles, `tybo setup <abschnitt>` durch
   einen Teil. Vorhandene Werte werden erkannt und nur als „gesetzt" gezeigt.
 - Browser: Fehlt beim Start eine Pflichtangabe (Telegram), startet der Bot im

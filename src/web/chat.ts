@@ -132,7 +132,7 @@ export type ApiMessageInput = StoredMessage & { kind?: "notice"; source?: unknow
  * Modell oder Dauer und keinen Kopiertext.
  */
 export function toApiMessage(m: ApiMessageInput): ApiMessage {
-  const { agent: _agent, model: _model, durationMs: _durationMs, kind: _kind, source: _source, file: _file, ...base } = m;
+  const { agent: _agent, model: _model, engine: _engine, durationMs: _durationMs, kind: _kind, source: _source, file: _file, ...base } = m;
   if (m.kind === "notice") {
     const source = typeof m.source === "string" && NOTICE_SOURCE_PATTERN.test(m.source) ? m.source : undefined;
     const file = pickNoticeFile(m.file);
@@ -711,6 +711,11 @@ export class ChatHub {
   /** Name eines Telegram-Topics geändert oder Topic neu (Issue #32): nur die ID, der Browser holt die Liste */
   publishTopicChange(streamId: string, id: string): void {
     this.publish(streamId, "topic", { id });
+  }
+
+  /** Motor-Einstellungen geändert (Issue #126): ohne Inhalt, der Browser holt die Gesprächsliste */
+  publishEngineChange(streamId: string): void {
+    this.publish(streamId, "engine", {});
   }
 
   /** Anzahl offener SSE-Verbindungen (für Tests). */

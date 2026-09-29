@@ -1,8 +1,8 @@
 // Arbeitsdateien aus Web und Telegram (Issue #72, Prüfung von PR #96): beide
-// legen Bilder als photo_<Zeit> und Sprache als voice_<Zeit> ab. Web nutzt
-// einen eigenen Unterordner, damit gleiche Zeitpunkte sich nicht treffen:
-// Pfade und Inhalte bleiben getrennt, das Löschen der Sprachdatei trifft nur
-// die eigene.
+// legen Bilder als photo_<Zeit>_<UUID> und Sprache als voice_<Zeit>_<UUID> ab
+// (UUID seit Issue #190). Web nutzt zusätzlich einen eigenen Unterordner:
+// bei gleichen Zeitpunkten bleiben Pfade und Inhalte getrennt, das Löschen
+// der Sprachdatei trifft nur die eigene.
 import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -19,9 +19,9 @@ afterAll(() => rm(root, { recursive: true, force: true }));
 const TG_PNG = bytes(PNG, "telegram-bild");
 const TG_OGG = bytes(OGG_OPUS, "telegram-sprache");
 
-/** Zeitpunkt aus photo_<Zeit>.<Endung> bzw. voice_<Zeit>.<Endung> */
+/** Zeitpunkt aus photo_<Zeit>_<UUID>.<Endung> bzw. voice_<Zeit>_<UUID>.<Endung> */
 function stamp(path: string): number {
-  return Number(/_(\d+)\./.exec(basename(path))![1]);
+  return Number(/^(?:photo|voice)_(\d+)_/.exec(basename(path))![1]);
 }
 
 describe("Web- und Telegram-Arbeitsdateien", () => {
@@ -62,8 +62,9 @@ describe("Web- und Telegram-Arbeitsdateien", () => {
             { ...common, now: () => stamp(webVoice), writeFile: async (p, d) => { tgWritten.push(p); await writeFile(p, d); } }
           ),
         ];
-        // Gleiche Namen, verschiedene Ordner
-        expect(tgWritten.map(p => basename(p))).toEqual(webWritten.map(p => basename(p)));
+        // Gleiche Zeitpunkte, trotzdem verschiedene Namen und Ordner
+        expect(tgWritten.map(stamp)).toEqual(webWritten.map(stamp));
+        for (const [i, p] of tgWritten.entries()) expect(basename(p)).not.toBe(basename(webWritten[i]));
         for (const p of tgWritten) expect(webWritten).not.toContain(p);
         expect(new Set(webWritten.map(p => dirname(p)))).toEqual(new Set([webMediaDir(mediaDir)]));
         expect(new Set(tgWritten.map(p => dirname(p)))).toEqual(new Set([mediaDir]));
@@ -76,7 +77,7 @@ describe("Web- und Telegram-Arbeitsdateien", () => {
       },
       saveMessage: async () => true,
       processIntents: async () => {},
-      abortClaudeCalls: () => 0,
+      abortEngineCalls: () => 0,
       isShuttingDown: () => false,
       scheduleRestartCheck: () => {},
       sendPlain: async () => {},

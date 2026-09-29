@@ -19,7 +19,9 @@ set -eu
 TYBO_DEFAULT_REPO_URL="https://github.com/cloudnutzer/tybo.git"
 TYBO_MIN_BUN_VERSION="1.3.10"
 BUN_INSTALLER_URL="https://bun.sh/install"
-CLAUDE_INSTALL_CMD="npm install -g @anthropic-ai/claude-code"
+CLAUDE_INSTALL_CMD="curl -fsSL https://claude.ai/install.sh | bash"
+# Frist für claude --version in Sekunden, wie claudeVersion in src/setup/providers.ts
+CLAUDE_VERSION_TIMEOUT="15"
 
 say() {
   printf 'tybo: %s\n' "$*"
@@ -342,24 +344,242 @@ finish() {
   fi
 }
 
+# Pfad vergleichbar machen: doppelte / zusammenfassen, / am Ende weg (außer bei /)
+norm_dir() {
+  v=$1
+  while :; do
+    case $v in
+      *//*) v=${v%%//*}/${v#*//} ;;
+      *) break ;;
+    esac
+  done
+  [ "$v" = "/" ] || v=${v%/}
+  printf '%s' "$v"
+}
+
+# Variable nach einem $ am Anfang von $rc_s: $NAME oder ${NAME}. Bekannt sind
+# HOME, PATH (Stand bis zu dieser Zeile, $rc_path) und BUN_INSTALL ($rc_bun).
+# Alles andere, auch ${NAME:-…}, wird zum Platzhalter. Kein Name oder keine
+# schließende Klammer: return 1.
+rc_var() {
+  case $rc_s in
+    "{"*)
+      rc_var_name=${rc_s#?}
+      case $rc_var_name in *"}"*) ;; *) return 1 ;; esac
+      rc_var_name=${rc_var_name%%\}*}
+      rc_s=${rc_s#*\}}
+      ;;
+    [A-Za-z_]*)
+      rc_var_name=${rc_s%%[!A-Za-z0-9_]*}
+      rc_s=${rc_s#"$rc_var_name"}
+      ;;
+    *) return 1 ;;
+  esac
+  case $rc_var_name in
+    HOME) rc_out=$rc_out$HOME ;;
+    PATH) rc_out=$rc_out$rc_path ;;
+    BUN_INSTALL) rc_out=$rc_out$rc_bun ;;
+    *) rc_out=$rc_out$rc_unknown ;;
+  esac
+}
+
+# Wert einer Zuweisung aus einer Startdatei so auswerten, wie die Shell es
+# täte, soweit das ohne Ausführen geht: einfache und doppelte
+# Anführungszeichen, ~ am Anfang und nach einem : (nur ohne
+# Anführungszeichen), Variablen über rc_var. Ergebnis in rc_out, der Rest der
+# Zeile hinter dem Wert in rc_rest. Befehlsersetzung, Backslash, ~benutzer
+# oder ein offenes Anführungszeichen: return 1.
+rc_expand() {
+  rc_s=$1
+  rc_out=""
+  rc_rest=""
+  rc_q=""
+  rc_start=1
+  while [ -n "$rc_s" ]; do
+    rc_c=${rc_s%"${rc_s#?}"}
+    rc_s=${rc_s#?}
+    if [ "$rc_q" = "'" ]; then
+      if [ "$rc_c" = "'" ]; then rc_q=""; else rc_out=$rc_out$rc_c; fi
+      continue
+    fi
+    case $rc_c in
+      '"')
+        if [ -n "$rc_q" ]; then rc_q=""; else rc_q='"'; fi
+        rc_start=0
+        ;;
+      "'")
+        if [ -n "$rc_q" ]; then rc_out=$rc_out$rc_c; else rc_q="'"; fi
+        rc_start=0
+        ;;
+      '$')
+        rc_var || return 1
+        rc_start=0
+        ;;
+      '`' | \\)
+        return 1
+        ;;
+      '~')
+        if [ -z "$rc_q" ] && [ "$rc_start" = 1 ]; then
+          case $rc_s in "" | /* | :*) rc_out=$rc_out$HOME ;; *) return 1 ;; esac
+        else
+          rc_out=$rc_out$rc_c
+        fi
+        rc_start=0
+        ;;
+      :)
+        rc_out=$rc_out$rc_c
+        if [ -z "$rc_q" ]; then rc_start=1; else rc_start=0; fi
+        ;;
+      [[:space:]] | ';' | '&' | '|' | '<' | '>' | '(' | ')')
+        if [ -z "$rc_q" ]; then
+          rc_rest=$rc_c$rc_s
+          return 0
+        fi
+        rc_out=$rc_out$rc_c
+        rc_start=0
+        ;;
+      *)
+        rc_out=$rc_out$rc_c
+        rc_start=0
+        ;;
+    esac
+  done
+  [ -z "$rc_q" ]
+}
+
+# true, wenn hinter dem Wert ($rc_rest) nichts steht, das die Zuweisung auf
+# einen einzelnen Befehl beschränkt (PATH=… befehl) oder in eine Unter-Shell
+# schiebt (… | befehl, … &)
+rc_assignment_ends() {
+  rc_rest=${rc_rest#"${rc_rest%%[![:space:]]*}"}
+  case $rc_rest in
+    "" | "#"* | ";"* | "&&"*) return 0 ;;
+  esac
+  return 1
+}
+
+# true, wenn eine neue Sitzung mit der Startdatei $1 den Bun-Ordner im PATH
+# hat. Liest die Datei nur, führt sie nie aus. Wertet jede nicht
+# auskommentierte Zuweisung an PATH und BUN_INSTALL der Reihe nach aus
+# (rc_expand; eine spätere Zuweisung ohne $PATH ersetzt also frühere) und
+# prüft am Ende, ob ein Eintrag des entstandenen PATH genau $bun_home/bin ist.
+# Was sich so nicht bestimmen lässt, zählt nie für Bun.
+rc_adds_bun() {
+  [ -f "$1" ] && [ -r "$1" ] || return 1
+  # Platzhalter für Werte, die sich ohne Ausführen nicht bestimmen lassen.
+  # Ein PATH-Eintrag, der ihn enthält, ist nie der Bun-Ordner.
+  rc_unknown='%unbekannt%'
+  rc_path=$rc_unknown
+  rc_bun=$rc_unknown
+  while IFS= read -r rc_line || [ -n "$rc_line" ]; do
+    rc_line=${rc_line#"${rc_line%%[![:space:]]*}"}
+    case $rc_line in
+      export[[:space:]]*)
+        rc_line=${rc_line#export}
+        rc_line=${rc_line#"${rc_line%%[![:space:]]*}"}
+        ;;
+    esac
+    case $rc_line in
+      PATH=* | BUN_INSTALL=*) ;;
+      *) continue ;;
+    esac
+    if rc_expand "${rc_line#*=}"; then
+      rc_assignment_ends || continue
+    else
+      rc_out=$rc_unknown
+    fi
+    case $rc_line in
+      PATH=*) rc_path=$rc_out ;;
+      *) rc_bun=$rc_out ;;
+    esac
+  done <"$1"
+  rc_want=$(norm_dir "$bun_home/bin")
+  rc_rest=$rc_path:
+  while [ -n "$rc_rest" ]; do
+    rc_dir=${rc_rest%%:*}
+    rc_rest=${rc_rest#*:}
+    if [ "$(norm_dir "$rc_dir")" = "$rc_want" ]; then return 0; fi
+  done
+  return 1
+}
+
+# Erste Startdatei der Login-Shell ($SHELL), die Bun schon in den PATH
+# bringt; ausgegeben als ~/<name>. Andere Shells: keine Suche.
+bun_rc_file() {
+  case ${SHELL:-} in
+    */zsh | zsh) rc_names=".zshrc" ;;
+    */bash | bash) rc_names=".bashrc .bash_profile" ;;
+    *) return 1 ;;
+  esac
+  for rc_name in $rc_names; do
+    if rc_adds_bun "$HOME/$rc_name"; then
+      # shellcheck disable=SC2088 # Anzeige für Menschen, nicht zum Erweitern
+      printf '~/%s' "$rc_name"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# true, wenn "$1" --version binnen $CLAUDE_VERSION_TIMEOUT Sekunden mit Exit 0
+# eine Ausgabe liefert (wie claudeVersion im Schritt Voraussetzungen). Nur so
+# ist ein fehlender PATH-Eintrag das einzige Problem; eine vorhandene, aber
+# defekte oder hängende CLI bleibt ein Fall für die Neuinstallation.
+reports_version() {
+  rv_out=$(mktemp "${TMPDIR:-/tmp}/tybo-version.XXXXXX") || return 1
+  "$1" --version >"$rv_out" 2>/dev/null </dev/null &
+  rv_pid=$!
+  # Nach der Frist TERM, nach 2 s Schonfrist KILL: auch eine CLI, die TERM ignoriert, hält nicht auf (PR #223)
+  # Fristablauf ausdrücklich merken: gilt als Fehler, egal mit welchem Exitcode
+  # die CLI danach endet (PR #223)
+  rv_expired="$rv_out.frist"
+  (sleep "$CLAUDE_VERSION_TIMEOUT" && : >"$rv_expired" && kill "$rv_pid" && sleep 2 && kill -9 "$rv_pid") >/dev/null 2>&1 &
+  rv_watch=$!
+  if wait "$rv_pid"; then rv_code=0; else rv_code=$?; fi
+  kill "$rv_watch" 2>/dev/null || true
+  rv_ok=1
+  [ "$rv_code" = 0 ] && [ -s "$rv_out" ] || rv_ok=0
+  [ -e "$rv_expired" ] && rv_ok=0
+  rm -f "$rv_out" "$rv_expired"
+  [ "$rv_ok" = 1 ]
+}
+
 # Schritt 8: was noch fehlt; Startdateien ändert dieses Skript nicht.
 # Maßgeblich ist der PATH vor dem Lauf, nicht der um Bun ergänzte.
 final_hints() {
   case ":$original_path:" in
     *":$bun_home/bin:"*) ;;
     *)
-      say "$bun_home/bin ist nicht im PATH, der Befehl tybo wird sonst nicht gefunden."
-      say "Diese zwei Zeilen in ~/.zshrc (zsh, macOS) bzw. ~/.bashrc (bash, Linux) eintragen und ein neues Terminal öffnen:"
-      printf '  export BUN_INSTALL=%s\n' "$(shell_quote "$bun_home")"
-      # shellcheck disable=SC2016 # die Zeile soll wörtlich so in der Startdatei stehen
-      printf '  export PATH="$BUN_INSTALL/bin:$PATH"\n'
+      if rc_file=$(bun_rc_file); then
+        say "$bun_home/bin ist in diesem Terminal noch nicht im PATH. In $rc_file steht schon ein Eintrag dafür: neues Terminal bzw. neue SSH-Sitzung öffnen oder source $rc_file ausführen."
+        # Die Startdatei wird nie ausgeführt; ob ihr Eintrag wirklich wirkt, bleibt offen (PR #223).
+        say "Fehlt tybo danach trotzdem, diese zwei Zeilen am Ende von $rc_file eintragen:"
+        printf '  export BUN_INSTALL=%s\n' "$(shell_quote "$bun_home")"
+        # shellcheck disable=SC2016 # die Zeile soll wörtlich so in der Startdatei stehen
+        printf '  export PATH="$BUN_INSTALL/bin:$PATH"\n'
+      else
+        say "$bun_home/bin ist nicht im PATH, der Befehl tybo wird sonst nicht gefunden."
+        say "Diese zwei Zeilen in ~/.zshrc (zsh, macOS) bzw. ~/.bashrc (bash, Linux) eintragen und ein neues Terminal öffnen:"
+        printf '  export BUN_INSTALL=%s\n' "$(shell_quote "$bun_home")"
+        # shellcheck disable=SC2016 # die Zeile soll wörtlich so in der Startdatei stehen
+        printf '  export PATH="$BUN_INSTALL/bin:$PATH"\n'
+      fi
       ;;
   esac
-  if ! command -v node >/dev/null 2>&1; then
-    say "Als Nächstes Node.js installieren (mit npm), Anleitung: $(manual_guide). tybo setup prüft Node.js nicht."
-  fi
   if ! command -v claude >/dev/null 2>&1; then
-    say "Dann die Claude CLI: $CLAUDE_INSTALL_CMD und einmal claude starten zum Anmelden. tybo setup prüft sie."
+    local_claude="$HOME/.local/bin/claude"
+    if [ -f "$local_claude" ] && reports_version "$local_claude"; then
+      say "Die Claude CLI liegt in ~/.local/bin, das ist noch nicht im PATH: neue Sitzung öffnen. Hilft das nicht, diese Zeile in ~/.zshrc bzw. ~/.bashrc eintragen:"
+      # shellcheck disable=SC2016 # die Zeile soll wörtlich so in der Startdatei stehen
+      printf '  export PATH="$HOME/.local/bin:$PATH"\n'
+    elif [ -e "$local_claude" ]; then
+      say "Die Claude CLI liegt in ~/.local/bin, startet dort aber nicht (claude --version scheitert). Neu installieren: $CLAUDE_INSTALL_CMD, danach einmal claude starten zum Anmelden."
+    else
+      say "Als Nächstes die Claude CLI installieren: $CLAUDE_INSTALL_CMD (braucht weder Node.js noch sudo), danach einmal claude starten zum Anmelden. tybo setup prüft sie."
+    fi
+  fi
+  if ! command -v node >/dev/null 2>&1; then
+    say "Node.js ist für tybo selbst nicht nötig, nur für PM2, den Convex-Weg (npx) oder die Claude CLI per npm. Anleitung: $(manual_guide)"
   fi
 }
 

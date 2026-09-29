@@ -8,7 +8,9 @@
  *   bun run setup/configure-launchd.ts --service telegram-relay
  *   bun run setup/configure-launchd.ts --service all
  *
- * Services: telegram-relay, smart-checkin, morning-briefing, watchdog, all
+ * Services: telegram-relay, smart-checkin, morning-briefing, watchdog, supabase, all
+ * („all“ nimmt supabase nur mit, wenn SUPABASE_URL in der .env auf das
+ * Supabase dieses Rechners zeigt, Issue #165)
  *
  * Importsicher: main() läuft nur als Skript (import.meta.main). Die
  * Einrichtung (src/setup/steps/autostart.ts) ruft configureService mit
@@ -26,7 +28,9 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join, dirname } from "path";
-import { labelInLaunchctlList, launchdLabel } from "../src/lib/service-names";
+import { readEnvFile } from "../src/lib/env-file";
+import { labelInLaunchctlList, launchdLabel, SUPABASE_SERVICE } from "../src/lib/service-names";
+import { isLocalSupabaseUrl, LAUNCHD_EXIT_TIMEOUT_S } from "../src/setup/local-supabase";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -35,15 +39,37 @@ import { labelInLaunchctlList, launchdLabel } from "../src/lib/service-names";
 const PROJECT_ROOT = dirname(import.meta.dir);
 const LAUNCH_AGENTS_DIR = join(process.env.HOME!, "Library", "LaunchAgents");
 
-export const SERVICES = ["telegram-relay", "smart-checkin", "morning-briefing", "watchdog", "whatsapp-gateway", "cloudflare-tunnel"] as const;
+export const SERVICES = ["telegram-relay", "smart-checkin", "morning-briefing", "watchdog", "whatsapp-gateway", "cloudflare-tunnel", "supabase"] as const;
 export type ServiceName = (typeof SERVICES)[number];
+
+/**
+ * Zeitgrenze für launchctl unload ai.tybo.supabase: launchd wartet bis zu
+ * ExitTimeOut (LAUNCHD_EXIT_TIMEOUT_S), bis ein laufender Start kontrolliert
+ * beendet ist; der Aufruf darf nicht vorher abbrechen
+ */
+export const SUPABASE_UNLOAD_TIMEOUT_MS = LAUNCHD_EXIT_TIMEOUT_S * 1000 + 60_000;
+
+/**
+ * Dienste zu --service: ein bekannter Name genau so, „all“ alle, den
+ * Supabase-Dienst aber nur, wenn SUPABASE_URL in der .env (envPath) auf das
+ * Supabase dieses Rechners zeigt (Issue #165); fehlt die .env oder die
+ * Adresse, ohne ihn. null bei unbekanntem Namen. Startet nichts.
+ */
+export async function selectServices(serviceArg: string, envPath: string): Promise<ServiceName[] | null> {
+  if (serviceArg === "all") {
+    const env = await readEnvFile(envPath).catch(() => ({}) as Record<string, string>);
+    return SERVICES.filter(s => s !== SUPABASE_SERVICE || isLocalSupabaseUrl(env.SUPABASE_URL));
+  }
+  return SERVICES.includes(serviceArg as ServiceName) ? [serviceArg as ServiceName] : null;
+}
 
 /** Alles, was nach außen greift; in Tests durch Attrappen ersetzbar */
 export interface LaunchdDeps {
   projectRoot: string;
   launchAgentsDir: string;
   home: string;
-  run(cmd: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }>;
+  /** timeoutMs: Zeitgrenze, wo der Aufruf länger dauern darf (launchctl unload ai.tybo.supabase) */
+  run(cmd: string[], options?: { timeoutMs?: number }): Promise<{ ok: boolean; stdout: string; stderr: string }>;
   exists(path: string): boolean;
   readFile(path: string): string;
   writeFile(path: string, content: string): void;
@@ -218,6 +244,7 @@ export async function configureService(service: ServiceName, deps: LaunchdDeps =
   content = content.replace(/\{\{PROJECT_ROOT\}\}/g, deps.projectRoot);
   content = content.replace(/\{\{BUN_DIR\}\}/g, bunDir);
   content = content.replace(/\{\{CLAUDE_DIR\}\}/g, claudeDir);
+  content = content.replace(/\{\{EXIT_TIMEOUT\}\}/g, String(LAUNCHD_EXIT_TIMEOUT_S));
 
   // Service-specific placeholders
   if (service === "cloudflare-tunnel") {
@@ -274,7 +301,8 @@ export async function configureService(service: ServiceName, deps: LaunchdDeps =
     // unklar, nichts überschreiben und nichts laden
     if (existed) {
       log(`    Unloading existing service...`);
-      const unload = await deps.run(["launchctl", "unload", plistPath]);
+      // Ein laufender Supabase-Start braucht zum Beenden bis zu ExitTimeOut
+      const unload = await deps.run(["launchctl", "unload", plistPath], service === SUPABASE_SERVICE ? { timeoutMs: SUPABASE_UNLOAD_TIMEOUT_MS } : undefined);
       if (!unload.ok && (await isLoaded(label, deps)) !== false) {
         log(`  ${FAIL} Existing unload failed: ${label} is still loaded, nothing changed`);
         return false;
@@ -344,12 +372,8 @@ async function main() {
   }
 
   // Determine which services to configure
-  let targets: ServiceName[];
-  if (serviceArg === "all") {
-    targets = [...SERVICES];
-  } else if (SERVICES.includes(serviceArg as ServiceName)) {
-    targets = [serviceArg as ServiceName];
-  } else {
+  const targets = await selectServices(serviceArg, join(PROJECT_ROOT, ".env"));
+  if (!targets) {
     console.log(`\n  ${red(`Unknown service: ${serviceArg}`)}`);
     console.log(`  Valid options: ${SERVICES.join(", ")}, all`);
     process.exit(1);

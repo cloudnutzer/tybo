@@ -41,7 +41,11 @@ web:{id}                    Web-Gespräch (WebUI)
 ```
 
 `src/lib/session-manager.ts` speichert die Sessions je Schlüssel und Agent
-(`{sessionKey}:{agentName}`) in `data/sessions.json`. Die Session-Dateien der
+(`{sessionKey}:{agentName}`) in `data/sessions.json`, jeweils mit Motor
+(`engine`, Entscheidung 0018) und Session-ID des Motors (`engineSessionId`).
+Einträge aus der Zeit davor (`claudeSessionId`, ohne `engine`) gelten als
+Claude-Sessions und werden beim nächsten Schreiben im neuen Format
+gespeichert. Die Session-Dateien der
 Claude CLI liegen nur auf diesem Rechner, deshalb ist der Zustand lokal. So
 übernimmt eine Rückfrage an einen anderen Agenten (`[INVOKE:]`) nicht die
 Session des Topics.
@@ -51,17 +55,30 @@ Eine neue Session beginnt, wenn
 - noch keine Session-ID gespeichert ist,
 - die letzte Aktivität länger als `SESSION_IDLE_HOURS` (Standard 18) zurückliegt (F-4),
 - der Nutzer `/new` schickt,
-- das eingestellte Modell nicht mehr dem Modell der Session entspricht.
+- das eingestellte Modell nicht mehr dem Modell der Session entspricht,
+- das Gespräch mit einem anderen Motor weiterläuft als die Session. Eine
+  Session gehört zu genau einem Motor und wird nie an einen anderen
+  übergeben; der nächste Turn baut den vollen Prompt, das Gedächtnis bleibt.
+
+Destillat (F-4), `/routine` und Knopf-Antworten setzen eine Session immer
+über ihren eigenen Motor fort: bei Claude das Destillat auf dem Aux-Modell
+`distill` und `/routine` mit dem Modell der Session, bei anderen Motoren
+beides mit dem Modell der Session. Ist der Motor nicht verfügbar, fällt der
+Schritt aus; die Session-ID geht nie an einen anderen Motor. `/new` setzt die
+Sessions aller Agenten und Motoren des Gesprächs zurück.
 
 Schlägt `--resume` fehl (Session-Datei weg, CLI-Update), startet tybo
 still eine neue Session. Fehler im Session-Manager blockieren nie eine
 Nachricht.
 
-Rückfragen mit Knöpfen (Human-in-the-loop) laufen über die Topic-Session:
-Eine Knopf-Antwort setzt die am Schlüssel gespeicherte Session fort und zählt
-als Turn. Die Session-ID an der Aufgabe (`async_tasks.session_id`) dient nur
-noch als Rückfall, wenn die Topic-Session seit der Frage zurückgesetzt wurde
-oder abgelaufen ist; alte Knöpfe funktionieren dann weiter.
+Rückfragen mit Knöpfen (Human-in-the-loop, `src/lib/task-resume.ts`): Eine
+Knopf-Antwort setzt die Session fort, in der die Frage gestellt wurde
+(`async_tasks.session_id`), über deren Motor mit deren Modell
+(`metadata.engine`, `metadata.model` an der Aufgabe; ältere Aufgaben ohne
+Angabe gelten als Claude mit dem jetzigen Modell des Agenten). Fehlt die ID,
+nimmt sie die Topic-Session desselben Motors und Modells. Als Turn der
+Topic-Session zählt die Antwort nur, wenn genau diese Session fortgesetzt
+wurde.
 
 Für Convex gibt es die Tabelle `sessions` (`convex/sessions.ts`).
 
@@ -100,7 +117,14 @@ Memory-Änderungen seit Session-Start.
   abgelaufen. Geprüft wird beim nächsten Eingang, ohne zeitgesteuerten Dienst.
 - Wer abends aufhört und morgens weiterschreibt, beginnt frisch; ein
   Gespräch mitten in der Nacht wird nicht abgeschnitten.
-- `/new` setzt die Session des aktuellen Topics sofort zurück.
+- `/new` setzt die Session des aktuellen Topics sofort zurück, für alle
+  Agenten des Topics. Ein Turn, der dabei noch läuft, antwortet zu Ende,
+  speichert seine Session aber nicht mehr (Epoche je Session-Schlüssel,
+  `sessionEpoch` in `src/lib/session-manager.ts`); die nächste Nachricht
+  beginnt frisch.
+- Knopf-Antworten auf Rückfragen setzen die Session fort, in der die Frage
+  gestellt wurde, mit Sperre, Modell und Werkzeugen des Agenten wie ein
+  normaler Turn, und landen im Topic der Rückfrage (`src/lib/task-resume.ts`).
 - **Session-Review:** Endet eine Session mit genug Inhalt
   (`SESSION_DISTILL_MIN_TURNS`, Standard 6), setzt tybo sie ein letztes Mal
   auf dem Nebenmodell fort und fragt nach Merk-Einträgen und erkannten

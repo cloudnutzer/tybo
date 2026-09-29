@@ -603,7 +603,7 @@ export async function searchMessages(
         query,
         limit,
       });
-      const vector = await (await import("./supabase")).generateEmbedding(query);
+      const vector = await (await import("./supabase")).generateOpenAiEmbedding(query);
       if (vector) {
         const hits = await client.action(anyApi.messages.semanticSearch, { vector, chatId, limit }).catch(() => []);
         for (const hit of hits) {

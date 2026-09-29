@@ -11,6 +11,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { authorizeServer } from "../supabase/functions/_shared/auth";
 import { adminKey, secretKeys, type EnvReader } from "../supabase/functions/_shared/admin-key";
+import { clearRegistryCache } from "../supabase/functions/_shared/embedding";
 
 // Erfundene Werte in der Form der echten Schlüssel
 const SECRET = "sb_secret_attrappe123";
@@ -167,14 +168,25 @@ describe("Functions", () => {
   });
 });
 
-// createClient-Attrappe statt esm.sh: merkt sich URL und Schlüssel, jede Abfrage liefert leere Daten
+// createClient-Attrappe statt esm.sh: merkt sich URL und Schlüssel, jede Abfrage liefert leere Daten.
+// queries: jeder Aufruf mit Argumenten (insert, update, rpc …), um Vektoren in Schreib- und Suchaufrufen zu finden
 const clients: { url: string; key: string }[] = [];
+const queries: Array<{ method: string; args: unknown[] }> = [];
 function fakeQuery(): unknown {
   const query: unknown = new Proxy(() => {}, {
-    get: (_, prop) => (prop === "then" ? (resolve: (v: unknown) => void) => resolve({ data: [], error: null }) : () => query),
+    get: (_, prop) =>
+      prop === "then"
+        ? (resolve: (v: unknown) => void) => resolve({ data: [], error: null })
+        : (...args: unknown[]) => {
+            queries.push({ method: String(prop), args });
+            return query;
+          },
   });
   return query;
 }
+/** Enthält ein Aufruf an die Datenbank einen Vektor (embedding bzw. query_embedding mit Werten)? */
+const vectorQueries = () =>
+  queries.filter(q => q.args.some(a => a !== null && typeof a === "object" && ["embedding", "query_embedding"].some(k => Array.isArray((a as Record<string, unknown>)[k]))));
 mock.module("https://esm.sh/@supabase/supabase-js@2.116.0", () => ({
   createClient: (url: string, key: string) => {
     clients.push({ url, key });
@@ -206,10 +218,17 @@ describe("Function-Handler", () => {
 
   beforeEach(() => {
     clients.length = 0;
+    clearRegistryCache();
     outbound = [];
-    // Nur OpenAI ist als Ziel denkbar; beantwortet von der Attrappe, jeder Aufruf gezählt
-    fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
+    // Nur OpenAI ist als Ziel denkbar; beantwortet von der Attrappe, jeder Aufruf gezählt.
+    // Die Anbieterkennung der Datenbank ist leer (Issue #167)
+    fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
       outbound.push(String(input));
+      if (String(input).endsWith("/rpc/claim_embedding_provider")) {
+        const body = JSON.parse(String(init?.body));
+        return new Response(JSON.stringify({ state: "festgehalten", provider: body.p_provider, model: body.p_model }), { status: 200 });
+      }
+      if (String(input).includes("/rest/v1/rpc/")) return new Response(JSON.stringify({ state: "leer", vectors: false }), { status: 200 });
       return new Response(JSON.stringify({ data: [{ embedding: [0.1, 0.2] }] }), { status: 200 });
     }) as typeof fetch);
   });
@@ -241,7 +260,8 @@ describe("Function-Handler", () => {
         const res = await call(name, { apikey: SECRET });
         expect(res.status).toBe(200);
         expect(clients).toEqual([{ url: "https://attrappe.supabase.co", key: SECRET }]);
-        expect(outbound.every(u => u.startsWith("https://api.openai.com/"))).toBe(true);
+        // Außer der Anbieterkennung der eigenen Datenbank (#167) nur OpenAI
+        expect(outbound.filter(u => !u.startsWith("https://attrappe.supabase.co/")).every(u => u.startsWith("https://api.openai.com/"))).toBe(true);
       });
 
       test("nur alter Schlüssel: der geht an createClient", async () => {
@@ -272,6 +292,332 @@ describe("Function-Handler", () => {
       });
     });
   }
+});
+
+// Issue #167: die Functions holen ihr Embedding über _shared/embedding.ts
+describe("Embeddings in den Functions (#167)", () => {
+  interface Outbound {
+    url: string;
+    headers: Record<string, string>;
+    body: any;
+  }
+  let sent: Outbound[];
+  let fetchSpy: ReturnType<typeof spyOn>;
+  let vector: number[];
+
+  /** Anbieterkennung der Datenbank: null = leer (das erste Embedding hält fest) */
+  let stored: null | { provider: string; model: string };
+
+  beforeEach(() => {
+    clients.length = 0;
+    queries.length = 0;
+    clearRegistryCache();
+    stored = null;
+    sent = [];
+    vector = Array.from({ length: 1536 }, (_, i) => (i + 1) / 1536);
+    fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      sent.push({ url, headers: { ...(init?.headers as Record<string, string>) }, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (url === "https://attrappe.supabase.co/rest/v1/rpc/embedding_provider_status") {
+        return new Response(JSON.stringify(stored ? { state: "festgehalten", ...stored } : { state: "leer", vectors: false }), { status: 200 });
+      }
+      if (url === "https://attrappe.supabase.co/rest/v1/rpc/claim_embedding_provider") {
+        const body = JSON.parse(String(init?.body));
+        stored ??= { provider: body.p_provider, model: body.p_model };
+        return new Response(JSON.stringify({ state: "festgehalten", ...stored }), { status: 200 });
+      }
+      if (url.startsWith("https://api.openai.com/")) return new Response(JSON.stringify({ data: [{ embedding: vector }] }), { status: 200 });
+      if (url.startsWith("https://generativelanguage.googleapis.com/")) return new Response(JSON.stringify({ embedding: { values: vector } }), { status: 200 });
+      if (url.includes("/api/embed")) return new Response(JSON.stringify({ embeddings: [vector.slice(0, 768)] }), { status: 200 });
+      return new Response("unerwartet", { status: 500 });
+    }) as typeof fetch);
+  });
+
+  afterEach(() => fetchSpy.mockRestore());
+
+  const base = { SUPABASE_URL: "https://attrappe.supabase.co", SUPABASE_SECRET_KEYS: JSON.stringify({ default: SECRET }) };
+  const INPUT: Record<string, string> = { "embed-knowledge": "Notiz", "search-memory": "Notiz", "store-telegram-message": "Hallo" };
+  const run = async (name: string) =>
+    (await handler(name))(
+      new Request(`http://edge.test/functions/v1/${name}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", apikey: SECRET },
+        body: JSON.stringify(HANDLER_BODIES[name]),
+      }),
+    );
+  const external = () => sent.filter(s => !s.url.startsWith("https://attrappe.supabase.co/"));
+
+  for (const name of Object.keys(HANDLER_BODIES)) {
+    describe(name, () => {
+      test("ohne EMBEDDING_PROVIDER genau der OpenAI-Aufruf von vorher", async () => {
+        env = { ...base, OPENAI_API_KEY: "sk-attrappe-openai" };
+        expect((await run(name)).status).toBe(200);
+        expect(external()).toEqual([
+          {
+            url: "https://api.openai.com/v1/embeddings",
+            headers: { Authorization: "Bearer sk-attrappe-openai", "Content-Type": "application/json" },
+            body: { model: "text-embedding-3-small", input: INPUT[name] },
+          },
+        ]);
+      });
+
+      test("ohne Schlüssel kein externer Aufruf (wie vorher)", async () => {
+        env = { ...base };
+        expect((await run(name)).status).toBe(200);
+        expect(external()).toEqual([]);
+      });
+
+      test("EMBEDDING_PROVIDER=gemini: Google mit 1536 Werten, kein OpenAI", async () => {
+        env = { ...base, EMBEDDING_PROVIDER: "gemini", GEMINI_API_KEY: "AIza-attrappe", OPENAI_API_KEY: "sk-attrappe-openai" };
+        expect((await run(name)).status).toBe(200);
+        expect(external().map(s => s.url)).toEqual(["https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:embedContent"]);
+        expect(external()[0].body.outputDimensionality).toBe(1536);
+      });
+
+      test("EMBEDDING_PROVIDER=ollama: OLLAMA_URL aus der Umgebung der Function", async () => {
+        env = { ...base, EMBEDDING_PROVIDER: "ollama", OLLAMA_URL: "http://host.docker.internal:11434" };
+        expect((await run(name)).status).toBe(200);
+        expect(external().map(s => s.url)).toEqual(["http://host.docker.internal:11434/api/embed"]);
+      });
+    });
+  }
+
+  test("Kennung: erst lesen, nach dem gelungenen Embedding festhalten, an der eigenen Datenbank mit dem Server-Schlüssel", async () => {
+    env = { ...base, EMBEDDING_PROVIDER: "gemini", GEMINI_API_KEY: "AIza-attrappe" };
+    await run("store-telegram-message");
+    expect(sent.map(s => s.url)).toEqual([
+      "https://attrappe.supabase.co/rest/v1/rpc/embedding_provider_status",
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:embedContent",
+      "https://attrappe.supabase.co/rest/v1/rpc/claim_embedding_provider",
+    ]);
+    const claim = sent[2];
+    expect(claim.headers.apikey).toBe(SECRET);
+    expect(claim.body).toEqual({ p_provider: "gemini", p_model: "gemini-embedding-2" });
+    expect(stored).toEqual({ provider: "gemini", model: "gemini-embedding-2" });
+  });
+
+  test("Embedding scheitert (Ollama nicht erreichbar): nichts festgehalten, ein anderer Anbieter bleibt möglich", async () => {
+    fetchSpy.mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      sent.push({ url, headers: {}, body: undefined });
+      if (url.endsWith("/rpc/embedding_provider_status")) return new Response(JSON.stringify({ state: "leer", vectors: false }));
+      throw new TypeError("Unable to connect");
+    }) as typeof fetch);
+    env = { ...base, EMBEDDING_PROVIDER: "ollama", OLLAMA_URL: "http://host.docker.internal:11434" };
+    expect(await (await run("store-telegram-message")).json()).toMatchObject({ ok: true, embedded: false, embedding_status: "nicht-erreichbar" });
+    expect(sent.some(s => s.url.endsWith("/rpc/claim_embedding_provider"))).toBe(false);
+    expect(stored).toBeNull();
+  });
+
+  for (const name of Object.keys(HANDLER_BODIES)) {
+    test(`${name}: Anbieter passt nicht zur Datenbank, kein Embedding, kein Aufruf beim Anbieter, einmal gewarnt`, async () => {
+      const warn = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        stored = { provider: "gemini", model: "gemini-embedding-2" };
+        env = { ...base, OPENAI_API_KEY: "sk-attrappe-openai" };
+        const res = await run(name);
+        expect(res.status).toBe(200);
+        expect(external()).toEqual([]);
+        await run(name);
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn.mock.calls.flat().join(" ")).not.toContain("sk-attrappe-openai");
+      } finally {
+        warn.mockRestore();
+      }
+    });
+  }
+
+  // Anbieterkennung nicht lesbar bzw. Festhalten gescheitert: auch OpenAI (Verhalten vor #167) bekommt keinen Vektor
+  const registryDown = (status: number | "netz", only?: "claim") =>
+    fetchSpy.mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      sent.push({ url, headers: { ...(init?.headers as Record<string, string>) }, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      const hit = only === "claim" ? url.endsWith("/rpc/claim_embedding_provider") : url.includes("/rest/v1/rpc/");
+      if (hit) {
+        if (status === "netz") throw new TypeError("Unable to connect");
+        return new Response("boom", { status });
+      }
+      if (url.endsWith("/rpc/embedding_provider_status")) return new Response(JSON.stringify({ state: "leer", vectors: false }));
+      if (url.startsWith("https://api.openai.com/")) return new Response(JSON.stringify({ data: [{ embedding: vector }] }));
+      return new Response("unerwartet", { status: 500 });
+    }) as typeof fetch);
+
+  for (const name of Object.keys(HANDLER_BODIES)) {
+    for (const status of [503, 401, "netz"] as const) {
+      test(`${name}: Kennung nicht lesbar (${status}): kein Vektor geschrieben oder gesucht, OpenAI nicht gefragt`, async () => {
+        const warn = spyOn(console, "warn").mockImplementation(() => {});
+        try {
+          registryDown(status);
+          env = { ...base, OPENAI_API_KEY: "sk-attrappe-openai" };
+          const res = await run(name);
+          expect(res.status).toBe(200);
+          expect(external()).toEqual([]);
+          expect(vectorQueries()).toEqual([]);
+          if (name === "store-telegram-message") expect(await res.json()).toMatchObject({ ok: true, embedded: false, embedding_status: "gesperrt" });
+        } finally {
+          warn.mockRestore();
+        }
+      });
+    }
+
+    test(`${name}: Festhalten scheitert (503): der Vektor wird verworfen, nichts geschrieben oder gesucht`, async () => {
+      const warn = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        registryDown(503, "claim");
+        env = { ...base, OPENAI_API_KEY: "sk-attrappe-openai" };
+        const res = await run(name);
+        expect(res.status).toBe(200);
+        // Das Embedding wurde gerechnet, aber nicht verwendet
+        expect(external().map(s => s.url)).toEqual(["https://api.openai.com/v1/embeddings"]);
+        expect(vectorQueries()).toEqual([]);
+        if (name === "store-telegram-message") expect(await res.json()).toMatchObject({ ok: true, embedded: false, embedding_status: "gesperrt" });
+      } finally {
+        warn.mockRestore();
+      }
+    });
+  }
+
+  // Festhalten antwortet nicht mit einer bestätigten Festlegung: der Vektor wird verworfen
+  const claimAnswers: Array<[string, () => Response]> = [
+    ["Funktion unbekannt (404 PGRST202)", () => new Response(JSON.stringify({ code: "PGRST202" }), { status: 404 })],
+    ["leer", () => new Response(JSON.stringify({ state: "leer", vectors: false }))],
+    ["leer ohne vectors", () => new Response(JSON.stringify({ state: "leer" }))],
+  ];
+  for (const name of Object.keys(HANDLER_BODIES)) {
+    for (const [label, answer] of claimAnswers) {
+      test(`${name}: Festhalten ${label}: nichts geschrieben oder gesucht`, async () => {
+        const warn = spyOn(console, "warn").mockImplementation(() => {});
+        try {
+          fetchSpy.mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            sent.push({ url, headers: {}, body: undefined });
+            if (url.endsWith("/rpc/claim_embedding_provider")) return answer();
+            if (url.endsWith("/rpc/embedding_provider_status")) return new Response(JSON.stringify({ state: "leer", vectors: false }));
+            if (url.startsWith("https://api.openai.com/")) return new Response(JSON.stringify({ data: [{ embedding: vector }] }));
+            return new Response("unerwartet", { status: 500 });
+          }) as typeof fetch);
+          env = { ...base, OPENAI_API_KEY: "sk-attrappe-openai" };
+          const res = await run(name);
+          expect(res.status).toBe(200);
+          expect(vectorQueries()).toEqual([]);
+          if (name === "store-telegram-message") expect(await res.json()).toMatchObject({ ok: true, embedded: false, embedding_status: "gesperrt" });
+          // Auch der nächste Aufruf bekommt keinen Vektor
+          await run(name);
+          expect(vectorQueries()).toEqual([]);
+        } finally {
+          warn.mockRestore();
+        }
+      });
+    }
+  }
+
+  test("Migration fehlt, danach eingespielt und auf Gemini festgelegt: keine OpenAI-Vektoren mehr beim Schreiben und Suchen", async () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      let missing = true;
+      const registry = fetchSpy.getMockImplementation()!;
+      fetchSpy.mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (missing && String(input).includes("/rest/v1/rpc/")) {
+          sent.push({ url: String(input), headers: {}, body: undefined });
+          return new Response(JSON.stringify({ code: "PGRST202" }), { status: 404 });
+        }
+        return registry(input, init);
+      }) as typeof fetch);
+      env = { ...base, OPENAI_API_KEY: "sk-attrappe-openai" };
+      // Suche ohne Migration: altes Verhalten, Suchvektor von OpenAI
+      await run("search-memory");
+      expect(vectorQueries()).toHaveLength(1);
+      expect(external()).toHaveLength(1);
+      missing = false;
+      stored = { provider: "gemini", model: "gemini-embedding-2" };
+      queries.length = 0;
+      for (const name of Object.keys(HANDLER_BODIES)) await run(name);
+      expect(vectorQueries()).toEqual([]);
+      expect(external()).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  for (const name of Object.keys(HANDLER_BODIES)) {
+    test(`${name}: laufende OpenAI-Anfrage, währenddessen Migration eingespielt und Gemini festgelegt: kein OpenAI-Vektor in insert, update oder match_messages`, async () => {
+      const warn = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        let missing = true;
+        const registry = fetchSpy.getMockImplementation()!;
+        fetchSpy.mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input);
+          if (missing && url.includes("/rest/v1/rpc/")) {
+            sent.push({ url, headers: {}, body: undefined });
+            return new Response(JSON.stringify({ code: "PGRST202" }), { status: 404 });
+          }
+          if (url.startsWith("https://api.openai.com/")) {
+            // Die Anbieterantwort gezielt verzögern; inzwischen Migration und Gemini-Festlegung
+            await new Promise(r => setTimeout(r, 5));
+            missing = false;
+            stored = { provider: "gemini", model: "gemini-embedding-2" };
+          }
+          return registry(input, init);
+        }) as typeof fetch);
+        env = { ...base, OPENAI_API_KEY: "sk-attrappe-openai" };
+        const res = await run(name);
+        expect(res.status).toBe(200);
+        expect(external().map(s => s.url)).toEqual(["https://api.openai.com/v1/embeddings"]);
+        expect(vectorQueries()).toEqual([]);
+        expect(stored).toEqual({ provider: "gemini", model: "gemini-embedding-2" });
+        if (name === "store-telegram-message") expect(await res.json()).toMatchObject({ ok: true, embedded: false, embedding_status: "gesperrt" });
+      } finally {
+        warn.mockRestore();
+      }
+    });
+  }
+
+  test("Gegenprobe: mit lesbarer Kennung landet der Vektor im Schreib- bzw. Suchaufruf", async () => {
+    env = { ...base, OPENAI_API_KEY: "sk-attrappe-openai" };
+    for (const name of Object.keys(HANDLER_BODIES)) {
+      queries.length = 0;
+      await run(name);
+      expect(vectorQueries().length).toBe(1);
+    }
+  });
+
+  test("store-telegram-message meldet Anbieter und Modell des Vektors, ohne Vektor keine", async () => {
+    env = { ...base, EMBEDDING_PROVIDER: "gemini", GEMINI_API_KEY: "AIza-attrappe" };
+    expect(await (await run("store-telegram-message")).json()).toMatchObject({ embedded: true, embedding_provider: "gemini", embedding_model: "gemini-embedding-2" });
+    env = { ...base };
+    const none = await (await run("store-telegram-message")).json();
+    expect(none.embedding_provider).toBeUndefined();
+    expect(none.embedding_model).toBeUndefined();
+  });
+
+  test("store-telegram-message: gesperrt wird als Kurzgrund gemeldet", async () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    stored = { provider: "ollama", model: "bge-m3" };
+    env = { ...base, OPENAI_API_KEY: "sk-attrappe-openai" };
+    expect(await (await run("store-telegram-message")).json()).toMatchObject({ ok: true, embedded: false, embedding_status: "gesperrt" });
+    warn.mockRestore();
+  });
+
+  test("store-telegram-message meldet embedded und einen festen Kurzgrund, ohne Schlüssel", async () => {
+    env = { ...base, OPENAI_API_KEY: "sk-attrappe-openai" };
+    expect(await (await run("store-telegram-message")).json()).toMatchObject({ ok: true, embedded: true, embedding_status: "ok" });
+    env = { ...base };
+    expect(await (await run("store-telegram-message")).json()).toMatchObject({ ok: true, embedded: false, embedding_status: "kein-zugang" });
+  });
+
+  test("embed-knowledge: Anbieter lehnt ab, die Antwort nennt weder Schlüssel noch Antworttext", async () => {
+    const registry = fetchSpy.getMockImplementation()!;
+    fetchSpy.mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) =>
+      String(input).startsWith("https://api.openai.com/")
+        ? new Response(JSON.stringify({ error: { message: "Incorrect API key provided: sk-attrappe-openai" } }), { status: 401 })
+        : registry(input, init)) as typeof fetch);
+    env = { ...base, OPENAI_API_KEY: "sk-attrappe-openai" };
+    const res = await run("embed-knowledge");
+    expect(res.status).toBe(502);
+    const text = await res.text();
+    expect(text).not.toContain("sk-attrappe-openai");
+    expect(text).not.toContain("Incorrect");
+  });
 });
 
 describe("Doku", () => {

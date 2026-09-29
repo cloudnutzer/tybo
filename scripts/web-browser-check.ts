@@ -531,7 +531,7 @@ async function telegramChecks() {
     await js(`(() => { const i = document.getElementById("input"); i.value = "Frage aus dem Browser"; i.dispatchEvent(new Event("input")); })()`);
     await js(`document.getElementById("send").click()`);
     check(`${label}: Topic: eigene Nachricht sofort, Stopp statt Senden`,
-      (await waitFor(`document.querySelectorAll(".msg").length === ${topicBefore + 1} && [...document.querySelectorAll(".msg-user")].at(-1).textContent === "Frage aus dem Browser"`)) &&
+      (await waitFor(`document.querySelectorAll(".msg").length === ${topicBefore + 1} && [...document.querySelectorAll(".msg-user .bubble")].at(-1).textContent === "Frage aus dem Browser"`)) &&
       (await waitFor(`${shown("stop")} && !${shown("send")}`, 2000)));
     check(`${label}: Topic: Antwort kommt live, Stopp wieder weg, keine Doppelungen`,
       (await waitFor(`document.querySelectorAll(".msg").length === ${topicBefore + 2} && document.getElementById("activity").hidden`, 8000)) &&
@@ -1369,6 +1369,53 @@ async function footerChecks() {
         check(`${label}: Fußzeile unter dem Inhalt, Kopf darüber`,
           await js<boolean>(`(() => { const m = document.querySelector(".msg-assistant"); const b = m.querySelector(".bubble").getBoundingClientRect();
             return m.querySelector(".msg-foot").getBoundingClientRect().top >= b.bottom - 1 && m.querySelector(".msg-head").getBoundingClientRect().bottom <= b.top + 1; })()`));
+        // Zeitstempel (Issue #186): vorn in der Fußzeile, unter eigenen Nachrichten rechtsbündig
+        const stamp = await js<{ text: string; datetime: string; title: string; spoken: string; order: string[]; valid: boolean; day: boolean }>(`(() => {
+          const f = ${foot(0)}; const t = f.querySelector("time.msg-time"); const dt = t.getAttribute("datetime");
+          return { text: t.querySelector("[aria-hidden=true]").textContent, datetime: dt, title: t.title,
+            spoken: t.querySelector(".visually-hidden").textContent, order: [...f.children].map(c => c.className),
+            valid: !Number.isNaN(Date.parse(dt)), day: new Date(dt).toDateString() === new Date().toDateString() }; })()`);
+        check(`${label}: Antwort zeigt „HH:MM" vor „General · …", datetime gültig, volles Datum als title und Screenreader-Text`,
+          /^\d\d:\d\d$/.test(stamp.text) && stamp.valid && stamp.day && stamp.order.join(" ") === "icon-button copy-button msg-time msg-meta copy-status"
+            && / 20\d\d, \d\d:\d\d Uhr$/.test(stamp.title) && stamp.spoken === stamp.title && !stamp.title.includes("Invalid"), JSON.stringify(stamp));
+        check(`${label}: Trenner „·" zwischen Uhrzeit und Metazeile, Zeit leise wie die Metazeile`,
+          await js<boolean>(`(() => { const f = ${foot(0)}; const m = f.querySelector(".msg-meta"); const t = f.querySelector(".msg-time");
+            return getComputedStyle(m, "::before").content.includes("·") && getComputedStyle(t).color === getComputedStyle(m).color
+              && getComputedStyle(t).fontSize === getComputedStyle(m).fontSize; })()`));
+        const user = await js<{ n: number; right: number; bubbleRight: number; below: boolean; text: string; color: string; muted: string; bubbleW: number; colW: number }>(`(() => {
+          const m = [...document.querySelectorAll(".msg-user")].find(x => x.querySelector(".bubble")); const b = m.querySelector(".bubble").getBoundingClientRect();
+          const t = m.querySelector("time.msg-user-time"); const r = t.getBoundingClientRect();
+          return { n: document.querySelectorAll(".msg-user time.msg-user-time").length, right: r.right, bubbleRight: b.right, below: r.top >= b.bottom - 1,
+            text: t.querySelector("[aria-hidden=true]").textContent, color: getComputedStyle(t).color,
+            muted: getComputedStyle(document.querySelector(".msg-assistant .msg-foot")).color, bubbleW: b.width, colW: m.getBoundingClientRect().width }; })()`);
+        check(`${label}: eigene Nachricht mit Uhrzeit rechtsbündig unter der Blase, leise`,
+          user.n === (await count(".msg-user")) && Math.abs(user.right - user.bubbleRight) <= 1 && user.below && /^\d\d:\d\d$/.test(user.text) && user.color === user.muted,
+          JSON.stringify(user));
+        check(`${label}: Blase so breit wie ihr Text, nicht gestreckt`, user.bubbleW < user.colW * 0.86, `${user.bubbleW} von ${user.colW}`);
+        // Langer Modellname: die Zeile bricht um, die Uhrzeit bleibt eine Zeile, nichts läuft über
+        const wrap = await js<{ lines: number; timeH: number; lineH: number; scroll: boolean; beside: boolean; inside: boolean; original: string }>(`(() => {
+          const f = ${foot(0)}; const m = f.querySelector(".msg-meta"); const original = m.textContent;
+          m.textContent = "General · openrouter/anthropic/claude-opus-5-5-mit-einem-sehr-langen-modellnamen-20260926-preview · 16 min 42 s";
+          const t = f.querySelector(".msg-time"); const lh = parseFloat(getComputedStyle(m).lineHeight) || 18;
+          const mr = m.getBoundingClientRect(); const tr = t.getBoundingClientRect(); const b = f.parentElement.querySelector(".bubble").getBoundingClientRect();
+          const out = { lines: Math.round(mr.height / lh), timeH: tr.height, lineH: lh,
+            scroll: document.documentElement.scrollWidth <= ${size.width},
+            beside: Math.abs(mr.top - tr.top) <= 2 && mr.left >= tr.right
+              && Math.abs((tr.top + tr.height / 2) - (f.querySelector(".copy-button").getBoundingClientRect().top + f.querySelector(".copy-button").getBoundingClientRect().height / 2)) <= 2, inside: mr.right <= b.right + 1, original };
+          m.textContent = original; return out; })()`);
+        check(`${label}: langer Modellname bricht neben der Uhrzeit um, Uhrzeit einzeilig, kein horizontales Scrollen`,
+          (size.mobile ? wrap.lines >= 2 : wrap.lines >= 1) && wrap.timeH <= wrap.lineH * 1.5 && wrap.scroll && wrap.beside && wrap.inside, JSON.stringify(wrap));
+        if (schemes.length > 1 && size.mobile) {
+          await js(`(() => { const f = ${foot(0)}; f.querySelector(".msg-meta").textContent = "General · openrouter/anthropic/claude-opus-5-5-mit-einem-sehr-langen-modellnamen-20260926-preview · 16 min 42 s";
+            f.scrollIntoView({ block: "center" }); })()`);
+          await Bun.sleep(300);
+          const { data } = await cdp("Page.captureScreenshot", { format: "png" });
+          const name = `zeitstempel-langer-name-${size.width}${scheme === "dark" ? "-dunkel" : ""}`;
+          await Bun.write(join(out, `${name}.png`), Buffer.from(data, "base64"));
+          console.log(`Bild ${name}.png`);
+          await js(`${foot(0)}.querySelector(".msg-meta").textContent = ${JSON.stringify("General · claude-opus-5-5 · 42 s")}`);
+        }
+
         const box = await js<{ w: number; h: number; name: string }>(`(() => { const b = ${foot(0)}.querySelector(".copy-button"); const r = b.getBoundingClientRect();
           return { w: r.width, h: r.height, name: b.getAttribute("aria-label") }; })()`);
         check(`${label}: Kopieren-Knopf ${size.mobile ? "mindestens 44 × 44 px" : "40 × 40 px"}, Name „Antwort kopieren"`,
@@ -1379,6 +1426,9 @@ async function footerChecks() {
         await js(`${foot(0)}.querySelector(".copy-button").click()`);
         check(`${label}: Clipboard-API bekommt Markdown ohne Steuer-Tags, „Kopiert" erscheint`,
           (await waitFor(`${status} === "Kopiert"`, 2000)) && (await js<string[]>(`window.__copied`))[0] === expected && !expected.includes("[REMEMBER"));
+        check(`${label}: „Kopiert" steht direkt hinter der Metazeile`,
+          await js<boolean>(`(() => { const f = ${foot(0)}; const m = f.querySelector(".msg-meta").getBoundingClientRect(); const s = f.querySelector(".copy-status").getBoundingClientRect();
+            return s.left - m.right >= 0 && s.left - m.right <= 16; })()`));
         if (schemes.length > 1) {
           await js(`(() => { const l = document.getElementById("chat-log"); const f = ${foot(0)};
             l.scrollTop = f.getBoundingClientRect().top - l.getBoundingClientRect().top + l.scrollTop - l.clientHeight / 2; })()`);
@@ -1922,6 +1972,188 @@ async function agentsManageChecks() {
  * starten" nur im Speicher einen neuen Prozessstart vortäuscht. Es entsteht
  * nie ein echter Neustart-Marker.
  */
+/**
+ * Motor in der WebUI (Issue #126): Abschnitt „Motor" oben im Reiter Agenten
+ * (Verfügbarkeit, Standard, Codex, abweichende Gespräche), Motor-Pille in der
+ * Kopfzeile, Motor in der Antwort-Angabe, Live-Wechsel über das SSE-Ereignis
+ * engine und die Motoren im Status. Seit Issue #129 auch OpenCode: Gruppe
+ * „OpenCode" mit Modell-Liste der Attrappe, Variante und Rechten, Topic
+ * „Finanzen" mit OpenCode-Pille. Alles gegen die Demo-Attrappen: nie ein
+ * echtes claude, codex oder opencode. 390/1280 px, hell und dunkel.
+ */
+async function engineChecks() {
+  const out = join(import.meta.dir, "..", "docs", "webui", "screenshots");
+  const shots = process.argv.includes("--screenshots");
+  const schemes = shots ? ["light", "dark"] : ["light"];
+  async function shoot(name: string) {
+    if (!shots) return;
+    await Bun.sleep(300);
+    const { data } = await cdp("Page.captureScreenshot", { format: "png" });
+    await Bun.write(join(out, `${name}.png`), Buffer.from(data, "base64"));
+    console.log(`Bild ${name}.png`);
+  }
+  const pillText = `(() => { const p = document.getElementById("engine-name"); return p && !p.hidden && p.getClientRects().length ? p.textContent : ""; })()`;
+  const patchSettings = (body: unknown) =>
+    js<number>(`fetch("/api/settings", { method: "PATCH", headers: { "content-type": "application/json" }, body: ${JSON.stringify(JSON.stringify(body))} }).then(r => r.status)`);
+  for (const scheme of schemes) {
+    await cdp("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: scheme }] });
+    const suffix = scheme === "dark" ? "-dunkel" : "";
+    for (const size of [{ width: 1280, height: 900, mobile: false }, { width: 390, height: 844, mobile: true }]) {
+      const label = `Motor ${size.width} px ${scheme === "dark" ? "dunkel" : "hell"}`;
+      await cdp("Emulation.setDeviceMetricsOverride", { ...size, deviceScaleFactor: 2 });
+      const d = await startDemoServer(
+        { host: "127.0.0.1", port: 0, password: PASSWORD, allowedHosts: [] },
+        { chat: createFakeChat({ delayMs: 300, stepMs: 100 }), telegramChat: createFakeChat({ delayMs: 300, stepMs: 100 }), log: () => {} }
+      );
+      try {
+        const url = `${d.server.url}/`;
+        // --- Einstellungen: Abschnitt „Motor" ---
+        await goto(`${url}#/einstellungen/agenten`);
+        await waitFor(`!!document.getElementById("settings-g-engine-default") && document.querySelectorAll(".settings-engine-overrides li").length === 2 && document.querySelectorAll("#settings-panel .settings-engines li").length === 3 && !!document.getElementById("settings-g-engine-opencodeModel")`);
+        check(`${label}: Abschnitt „Motor" ganz oben, vor der Agentenliste`,
+          await js<boolean>(`(() => { const h = document.querySelector("#settings-panel h3"); const list = document.querySelector(".settings-agents");
+            return h && h.textContent === "Motor" && !!list && (h.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING) > 0; })()`));
+        check(`${label}: Verfügbarkeit je Motor aus der Attrappe`,
+          JSON.stringify(await js<string[]>(`[...document.querySelectorAll("#settings-panel .settings-engines .settings-key-state")].map(e => e.textContent)`)) ===
+            JSON.stringify(["angemeldet, Version 2.1.281", "angemeldet, Version 0.155.1", "angemeldet, Version 1.18.33"]));
+        check(`${label}: Standard-Motor, Codex-Modell mit Platzhalter, Rechte „Voller Zugriff (Standard)"`,
+          (await js<string>(`document.getElementById("settings-g-engine-default").options[0].textContent`)) === "Standard (Claude Code, Voreinstellung)" &&
+            (await js<string>(`document.getElementById("settings-g-engine-codexModel").placeholder`)) === "Standard aus der Codex-Konfiguration" &&
+            (await js<string>(`document.getElementById("settings-g-engine-codexSandbox").selectedOptions[0].textContent`)) === "Voller Zugriff (Standard)");
+        check(`${label}: abweichendes Gespräch „Recherche" mit Pille „Codex" und leisem „Auf Standard"`,
+          await js<boolean>(`(() => { const li = [...document.querySelectorAll(".settings-engine-overrides li")].find(l => l.querySelector(".settings-engine-title").textContent === "Recherche");
+            const b = li.querySelector("button"); return li.querySelector(".settings-engine-title").textContent === "Recherche" &&
+              li.querySelector(".engine-pill").textContent === "Codex" && b.textContent === "Auf Standard" && b.className === "quiet-button"; })()`));
+        check(`${label}: abweichendes Gespräch „Finanzen" mit Pille „OpenCode"`,
+          await js<boolean>(`(() => { const li = [...document.querySelectorAll(".settings-engine-overrides li")].find(l => l.querySelector(".settings-engine-title").textContent === "Finanzen");
+            return !!li && li.querySelector(".engine-pill").textContent === "OpenCode"; })()`));
+        // --- Gruppe „OpenCode" (Issue #129) ---
+        check(`${label}: OpenCode im Standard-Motor wählbar`,
+          JSON.stringify(await js<string[]>(`[...document.getElementById("settings-g-engine-default").options].slice(1).map(o => o.textContent)`)) ===
+            JSON.stringify(["Claude Code", "Codex", "OpenCode"]));
+        check(`${label}: OpenCode-Modell aus der Attrappe, OpenRouter zuerst, Standard bleibt gewählt`,
+          JSON.stringify(await js<string[]>(`[...document.getElementById("settings-g-engine-opencodeModel").options].map(o => o.textContent)`)) ===
+            JSON.stringify(["Standard aus der OpenCode-Konfiguration", "openrouter/anthropic/claude-opus-5.5", "openrouter/moonshotai/kimi-k2", "openrouter/openai/gpt-5.5", "openai/gpt-5.5", "Eigenes Modell …"]) &&
+            (await js<number>(`document.getElementById("settings-g-engine-opencodeModel").selectedIndex`)) === 0);
+        check(`${label}: OpenCode-Variante frei, Rechte „Automatisch freigeben (Standard)", Verfügbarkeit angemeldet`,
+          (await js<string>(`document.getElementById("settings-g-engine-opencodeVariant").placeholder`)) === "Standard von OpenCode" &&
+            (await js<string>(`document.getElementById("settings-g-engine-opencodePermission").selectedOptions[0].textContent`)) === "Automatisch freigeben (Standard)" &&
+            (await js<string>(`document.querySelector('.settings-engine-state[data-engine="opencode"]').textContent`)) === "OpenCode: angemeldet, Version 1.18.33" &&
+            (await noHorizontalScroll(size.width)));
+        check(`${label}: Agenten-Modell „gilt für Claude Code" nach dem Aufklappen, kein seitliches Scrollen`,
+          (await js(`document.querySelector('[data-focus-key="agent:research"]').click()`), await waitFor(`!!document.querySelector(".settings-engine-scope")`)) &&
+            (await js<string>(`document.querySelector(".settings-engine-scope").textContent`)) === "gilt für Claude Code" && (await noHorizontalScroll(size.width)));
+        await js(`document.querySelector('[data-focus-key="agent:research"]').click()`);
+        await js(`window.scrollTo(0, 0); document.getElementById("settings-panel").scrollIntoView()`);
+        await shoot(`einstellungen-motor-${size.width}${suffix}`);
+        await js(`document.querySelector('[aria-labelledby="settings-g-engine-opencode"]').scrollIntoView({ block: "start" })`);
+        await shoot(`einstellungen-opencode-${size.width}${suffix}`);
+
+        // --- Gespräch mit Codex-Pille und Antwort-Angabe ---
+        await goto(url);
+        await waitFor(`!!document.querySelector('.conversation[data-id="topic-443"]')`);
+        await clickEntry("topic-443");
+        await waitFor(`document.getElementById("agent-name").textContent === "Research" && document.querySelectorAll(".msg-assistant .msg-meta").length === 2`);
+        check(`${label}: Kopfzeile mit Pille „Codex" neben dem Agent-Chip`, await waitFor(`${pillText} === "Codex"`) &&
+          (await js<boolean>(`(() => { const a = document.getElementById("agent-name").getBoundingClientRect(); const p = document.getElementById("engine-name").getBoundingClientRect();
+            return p.left >= a.right && Math.abs((p.top + p.bottom) / 2 - (a.top + a.bottom) / 2) <= 2; })()`)));
+        check(`${label}: Antwort-Angaben nennen den Motor (Claude Code, Codex)`,
+          JSON.stringify(await js<string[]>(`[...document.querySelectorAll(".msg-assistant .msg-meta")].map(m => m.textContent)`)) ===
+            JSON.stringify(["Research · Claude Code · claude-opus-5-5 · 8 s", "Research · Codex · gpt-5.6-sol · 13 s"]));
+        check(`${label}: Pille mit Haarlinie ohne Fläche, Kopfzeile ohne seitliches Scrollen`,
+          (await js<boolean>(`(() => { const s = getComputedStyle(document.getElementById("engine-name")); return s.borderTopWidth === "1px" && s.backgroundColor === "rgba(0, 0, 0, 0)" && s.borderTopLeftRadius !== "0px"; })()`)) &&
+            (await noHorizontalScroll(size.width)));
+        await shoot(`gespraech-codex-${size.width}${suffix}`);
+
+        // --- Gespräch mit OpenCode-Pille und Antwort-Angabe (Issue #129) ---
+        await clickEntry("topic-12");
+        await waitFor(`document.getElementById("agent-name").textContent === "Finance" && document.querySelectorAll(".msg-assistant .msg-meta").length === 1`);
+        check(`${label}: Kopfzeile mit Pille „OpenCode" im Topic Finanzen`, await waitFor(`${pillText} === "OpenCode"`) &&
+          (await js<string>(`document.getElementById("engine-name").dataset.engine`)) === "opencode");
+        check(`${label}: Antwort-Angabe nennt OpenCode und das OpenRouter-Modell`,
+          (await js<string>(`document.querySelector(".msg-assistant .msg-meta").textContent`)) === "Finance · OpenCode · openrouter/anthropic/claude-opus-5.5 · 8 s" &&
+            (await noHorizontalScroll(size.width)));
+        await shoot(`gespraech-opencode-${size.width}${suffix}`);
+
+        // Direktchat: Standard Claude Code, keine Pille
+        await clickEntry("dm");
+        await waitFor(`document.getElementById("agent-name").textContent === "General"`);
+        check(`${label}: Direktchat mit Standard Claude Code ohne Pille`, (await js<string>(pillText)) === "");
+
+        if (size.width === 1280 && scheme === "light") {
+          // Live: Standard auf Codex (Einstellungsseite), SSE engine, Pille ohne Neuladen
+          await js(`window.__engineMarker = 1`);
+          check(`${label}: PATCH Standard Codex`, (await patchSettings({ engine: { default: "codex" } })) === 200);
+          check(`${label}: Standard Codex erscheint im offenen Direktchat ohne Neuladen`,
+            (await waitFor(`${pillText} === "Codex"`, 6000)) && (await js<number>(`window.__engineMarker`)) === 1);
+          // „Auf Standard" für „Recherche" und Standard zurück: Pille verschwindet
+          const key = await js<string>(`fetch("/api/engines").then(r => r.json()).then(b => b.overrides[0].key)`);
+          const reset = await js<number>(`fetch("/api/engines/reset", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: ${JSON.stringify(key)} }) }).then(r => r.status)`);
+          check(`${label}: „Auf Standard" über die API`, reset === 200);
+          await patchSettings({ engine: { default: null } });
+          check(`${label}: Standard zurück auf Claude Code: Pille weg, ohne Neuladen`,
+            (await waitFor(`${pillText} === ""`, 6000)) && (await js<number>(`window.__engineMarker`)) === 1);
+          // Status: Motoren
+          await goto(`${url}#/einstellungen/status`);
+          await waitFor(`!!document.querySelector('#settings-panel [aria-labelledby="settings-g-title-engines"] li')`);
+          check(`${label}: Status zeigt die Motoren mit Version`,
+            JSON.stringify(await js<string[]>(`[...document.querySelectorAll('[aria-labelledby="settings-g-title-engines"] .settings-key-state')].map(e => e.textContent)`)) ===
+              JSON.stringify(["angemeldet, Version 2.1.281", "angemeldet, Version 0.155.1", "angemeldet, Version 1.18.33"]));
+        }
+      } finally {
+        await d.stop();
+      }
+    }
+  }
+  // Klick auf „Auf Standard" im Browser, einmal (hell, 1280)
+  await cdp("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "light" }] });
+  await cdp("Emulation.setDeviceMetricsOverride", { width: 1280, height: 900, deviceScaleFactor: 2, mobile: false });
+  const d = await startDemoServer({ host: "127.0.0.1", port: 0, password: PASSWORD, allowedHosts: [] }, { chat: createFakeChat(), telegramChat: createFakeChat(), log: () => {} });
+  try {
+    await goto(`${d.server.url}/#/einstellungen/agenten`);
+    await waitFor(`document.querySelectorAll(".settings-engine-overrides li").length === 2`);
+    await js(`document.querySelector(".settings-engine-overrides li button").click()`);
+    check("Motor: Klick auf „Auf Standard\" entfernt genau eine Zeile und meldet es",
+      await waitFor(`document.querySelectorAll(".settings-engine-overrides li").length === 1 && [...document.querySelectorAll("#settings-panel .settings-status")].some(e => e.textContent === "Auf Standard gestellt.")`));
+    await js(`document.querySelector(".settings-engine-overrides li button").click()`);
+    check("Motor: zweiter Klick leert die Liste",
+      await waitFor(`document.querySelectorAll(".settings-engine-overrides li").length === 0`));
+    check("Motor: danach „Keine. Alle Gespräche nehmen den Standard.\"",
+      await js<boolean>(`[...document.querySelectorAll("#settings-panel .settings-empty")].some(e => e.textContent === "Keine. Alle Gespräche nehmen den Standard.")`));
+    // Standard Codex über das Formular speichern
+    await js(`(() => { const s = document.getElementById("settings-g-engine-default"); s.value = "codex"; s.dispatchEvent(new Event("change")); })()`);
+    await js(`document.querySelector('[data-focus-key="save:section-engine"]').click()`);
+    check("Motor: Standard „Codex\" über das Formular gespeichert",
+      await waitFor(`[...document.querySelectorAll("#settings-panel .settings-status")].some(e => e.textContent === "Gespeichert.")`) &&
+        (await js<string>(`fetch("/api/settings").then(r => r.json()).then(b => b.settings.engine && b.settings.engine.default)`)) === "codex");
+    // OpenCode (Issue #129): Standard, Modell aus der Liste, Variante, Rechte über das Formular
+    await waitFor(`!document.querySelector('[data-focus-key="save:section-engine"]').textContent.includes("…")`);
+    await js(`(() => {
+      const set = (id, v) => { const s = document.getElementById(id); s.value = v; s.dispatchEvent(new Event("change")); };
+      set("settings-g-engine-default", "opencode");
+      set("settings-g-engine-opencodeModel", "openrouter/anthropic/claude-opus-5.5");
+      const v = document.getElementById("settings-g-engine-opencodeVariant"); v.value = "high"; v.dispatchEvent(new Event("input"));
+      set("settings-g-engine-opencodePermission", "ask-deny");
+      document.querySelector('[data-focus-key="save:section-engine"]').click();
+    })()`);
+    const savedEngine = () => js<string>(`fetch("/api/settings").then(r => r.json()).then(b => JSON.stringify(b.settings.engine))`);
+    const wantEngine = JSON.stringify({ default: "opencode", opencode: { model: "openrouter/anthropic/claude-opus-5.5", variant: "high", permission: "ask-deny" } });
+    let engineSaved = false;
+    for (let i = 0; i < 60 && !engineSaved; i++) {
+      engineSaved = (await savedEngine()) === wantEngine;
+      if (!engineSaved) await Bun.sleep(100);
+    }
+    check("Motor: OpenCode als Standard mit Modell, Variante und Rechten über das Formular gespeichert", engineSaved);
+    // Ungültige Variante: Meldung im Browser, nichts gesendet
+    await js(`(() => { const v = document.getElementById("settings-g-engine-opencodeVariant"); v.value = "High"; v.dispatchEvent(new Event("input")); document.querySelector('[data-focus-key="save:section-engine"]').click(); })()`);
+    check("Motor: ungültige OpenCode-Variante zeigt eine Meldung, gespeichert bleibt high",
+      (await waitFor(`[...document.querySelectorAll("#settings-panel .actions-error")].some(e => e.textContent.startsWith("Die Variante besteht aus 1 bis 20 Zeichen"))`)) &&
+        (await js<string>(`fetch("/api/settings").then(r => r.json()).then(b => b.settings.engine.opencode.variant)`)) === "high");
+  } finally {
+    await d.stop();
+  }
+}
+
 async function modelsStatusChecks() {
   const out = join(import.meta.dir, "..", "docs", "webui", "screenshots");
   const shots = process.argv.includes("--screenshots");
@@ -1969,7 +2201,7 @@ async function modelsStatusChecks() {
             telegramChat: createFakeChat({ delayMs: 300, stepMs: 100 }),
             settings,
             status,
-            models: { list: async () => ({ claude: { models: [...CLAUDE_MODELS], custom: true }, openrouter: { models: openrouter }, ollama: { models: ["qwen3:8b", "llama4:1b"] } }) },
+            models: { list: async () => ({ claude: { models: [...CLAUDE_MODELS], custom: true }, openrouter: { models: openrouter }, ollama: { models: ["qwen3:8b", "llama4:1b"] }, opencode: { models: ["openrouter/anthropic/claude-opus-5.5"] } }) },
             log: () => {},
           }
         );
@@ -2031,8 +2263,9 @@ async function modelsStatusChecks() {
           await waitFor(`!!document.querySelector("#settings-panel .settings-facts")`);
           check(`${label}: Status mit Version, Supervisor und Schlüsseln nur als gesetzt/fehlt`,
             (await js<string>(`location.hash`)) === "#/einstellungen/status" &&
-              (await js<boolean>(`[...document.querySelectorAll(".settings-keys li")].every(li => ["gesetzt", "fehlt"].includes(li.querySelector(".settings-key-state").textContent) && li.children.length === 2)`)) &&
-              (await count(".settings-keys li")) > 10 && (await noHorizontalScroll(size.width)));
+              (await js<boolean>(`[...document.querySelectorAll(".settings-keys:not(.settings-engines) li")].every(li => ["gesetzt", "fehlt"].includes(li.querySelector(".settings-key-state").textContent) && li.children.length === 2)`)) &&
+              // Motoren (Issue #126) stehen in derselben Listenform, aber mit eigenem Zustand
+              (await count(".settings-keys:not(.settings-engines) li")) > 10 && (await noHorizontalScroll(size.width)));
           await shoot(`einstellungen-status-${size.width}${suffix}`);
           await click('[data-focus-key="status-restart"]');
           await waitFor(`!!document.querySelector('[data-focus-key="status-restart-no"]')`);
@@ -2839,7 +3072,7 @@ async function toolApprovalChecks() {
           },
           saveMessage: async () => true,
           processIntents: async () => {},
-          abortClaudeCalls: key => abortExecutions(key),
+          abortEngineCalls: key => abortExecutions(key),
           isShuttingDown: () => false,
           scheduleRestartCheck: () => {},
           approvals,
@@ -2977,7 +3210,7 @@ async function reviewChecks() {
           },
           saveMessage: async () => true,
           processIntents: (text, turn) => processTurnIntents(text, turn.tools, turn, { projectRoot: dir, dmChatId: () => "4711", log: () => {} }),
-          abortClaudeCalls: key => abortExecutions(key),
+          abortEngineCalls: key => abortExecutions(key),
           isShuttingDown: () => false,
           scheduleRestartCheck: () => {},
           log: () => {},
@@ -3458,6 +3691,7 @@ try {
   await settingsChecks();
   await agentsManageChecks();
   await modelsStatusChecks();
+  await engineChecks();
   await keysChecks();
   await updateChecks();
 

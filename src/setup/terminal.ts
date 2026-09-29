@@ -27,7 +27,7 @@
  * (bzw. Prüfung) oder ausdrückliches Überspringen an. Was danach noch
  * fehlschlägt, steht in der Zusammenfassung.
  *
- * Autostart startet den Bot sofort über launchd oder PM2. Deshalb fragt
+ * Autostart startet den Bot sofort über launchd, systemd oder PM2. Deshalb fragt
  * dieser Schritt ausdrücklich nach, Standard ist Nein.
  *
  * Abläufe (Issue #161): Trifft runWhen eines Schritts zu, ersetzt der Ablauf
@@ -67,6 +67,8 @@ import {
 } from "./model";
 import { SetupAbort, type Prompter } from "./prompt";
 import { checkStep, existingFieldValues, getStep, SETUP_STEPS, setupOverview } from "./steps";
+import { probeCleanupWarning, probeMark, probeRunning, waitForProbes } from "./semantic-search";
+import { autostartPlan, MANAGER_LABEL, type AutostartManager } from "./steps/autostart";
 import { pendingSafetyWarnings, waitForEnvWrites, waitForSafetyWork } from "./steps/common";
 
 export { SetupAbort } from "./prompt";
@@ -280,6 +282,30 @@ class SetupRun {
     }
   }
 
+  /**
+   * Weg des Autostarts (Issue #207): nur fragen, wenn es mehr als einen gibt
+   * oder keinen Standard. null: nichts einrichten (blockiert oder abgelehnt).
+   */
+  async chooseAutostartManager(): Promise<AutostartManager | null> {
+    const plan = await this.interrupt.guard(autostartPlan(this.ctx));
+    if (plan.blocked) {
+      this.out.line(`  ${plan.blocked}`);
+      return null;
+    }
+    if (plan.note) this.out.line(`  ${plan.note}`);
+    if (plan.managers.length === 1 && plan.default) return plan.default;
+    this.out.line("  Wie soll der Autostart laufen?");
+    plan.managers.forEach((m, i) => this.out.line(`    ${i + 1}) ${MANAGER_LABEL[m]}${m === plan.default ? " (Vorschlag)" : ""}`));
+    if (!plan.default) this.out.line("    Enter: nichts einrichten");
+    for (;;) {
+      const answer = (await this.ask(`  Auswahl${plan.default ? ` [${plan.managers.indexOf(plan.default) + 1}]` : ""}: `)).trim();
+      if (answer === "") return plan.default;
+      const n = Number(answer);
+      if (Number.isInteger(n) && n >= 1 && n <= plan.managers.length) return plan.managers[n - 1];
+      this.out.line(`  Bitte eine Zahl von 1 bis ${plan.managers.length} eingeben.`);
+    }
+  }
+
   /** Geheimnisse aus der .env vorab kennen, damit sie nie in der Ausgabe landen */
   async learnSecrets() {
     const env = await readSetupEnv(this.ctx).catch(() => ({}) as Record<string, string>);
@@ -442,11 +468,16 @@ class SetupRun {
   printSummary(step: SetupStep, values: SetupValues) {
     this.out.line();
     if (step.id === "autostart") {
-      const how = this.ctx.platform === "darwin" ? "launchd" : "PM2";
+      const how = MANAGER_LABEL[(values.manager as AutostartManager | undefined) ?? (this.ctx.platform === "darwin" ? "launchd" : "pm2")] ?? "PM2";
       this.out.line(`  Autostart einrichten (${how}): ${BRAND.name} startet dann sofort im Hintergrund`);
       this.out.line("  und künftig mit dem Rechner und nach Abstürzen von selbst.");
       this.out.line(`  Läuft ${BRAND.name} gerade schon in einem anderen Fenster (bun run start), dort erst beenden,`);
       this.out.line("  sonst holen sich zwei Bots dieselben Telegram-Nachrichten.");
+      if (values.manager === "systemd") {
+        this.out.line("  Damit er nach einem Neustart auch ohne Anmeldung startet, schaltet der Assistent");
+        this.out.line("  Linger ein (loginctl enable-linger, ohne sudo); braucht das Administratorrechte,");
+        this.out.line("  steht danach der eine Befehl dafür da.");
+      }
       return;
     }
     const entered = enteredValues(values);
@@ -458,12 +489,43 @@ class SetupRun {
     if (kept.length && names.length) this.out.line(`  Bleibt, wie es ist: ${kept.map(f => f.label).join(", ")}`);
   }
 
+  /**
+   * Verbindungstest mit Abbruch: Strg+C löst dessen signal aus und beendet das
+   * Warten sofort. Ein angefangener Nachweis der semantischen Suche räumt
+   * seine Probe vorher noch auf (sonst bliebe sie nach dem Prozessende stehen).
+   */
+  private async runTest(step: SetupStep, values: SetupValues): Promise<TestResult> {
+    const controller = new AbortController();
+    const off = this.interrupt.onTrigger(() => controller.abort());
+    const mark = probeMark();
+    try {
+      return await this.interrupt.guard(step.test!(values, this.ctx, controller.signal));
+    } catch (e) {
+      if (e instanceof SetupAbort) await this.waitForProbeCleanup(mark);
+      throw e;
+    } finally {
+      off();
+    }
+  }
+
+  /**
+   * Nach Strg+C: angefangene Nachweise samt Aufräumen abwarten und ausgeben,
+   * wenn eine Probe (ab mark) stehen geblieben ist; das Ergebnis des Tests
+   * bzw. Ablaufs erscheint dann nicht mehr.
+   */
+  private async waitForProbeCleanup(mark: number) {
+    if (probeRunning()) this.out.line("  Breche ab, räume vorher die Probe der semantischen Suche auf …");
+    const { uncleaned } = await waitForProbes(mark);
+    const warning = probeCleanupWarning(uncleaned);
+    if (warning) this.out.line(`  ${warning}`);
+  }
+
   /** Voraussetzungen und andere Schritte ohne Eingaben und ohne Schreiben: nur prüfen */
   async checkOnly(step: SetupStep): Promise<Outcome> {
     if (!step.test) return "unverändert";
     for (;;) {
       this.out.line("  Prüfe …");
-      const result = await this.interrupt.guard(step.test({}, this.ctx));
+      const result = await this.runTest(step, {});
       this.printTest(result);
       if (result.ok) return "geprüft";
       if (!(await this.askRetry("Nochmal prüfen"))) return "übersprungen";
@@ -495,6 +557,12 @@ class SetupRun {
       const values = await this.collect(step, status, existing, previous);
       if (values === null) return "übersprungen";
       previous = values;
+      // Autostart (Issue #207): Weg wählen, bevor getestet und eingerichtet wird
+      if (step.id === "autostart" && status.state !== "erledigt") {
+        const manager = await this.chooseAutostartManager();
+        if (manager === null) return "übersprungen";
+        values.manager = manager;
+      }
       const entered = enteredValues(values);
 
       const merged = { ...existing, ...entered };
@@ -507,7 +575,7 @@ class SetupRun {
       if (step.test) {
         this.out.line();
         this.out.line("  Teste …");
-        const result = await this.interrupt.guard(step.test(values, this.ctx));
+        const result = await this.runTest(step, values);
         this.printTest(result);
         if (!result.ok) {
           if (await this.askRetry(step.fields.length ? "Erneut eingeben" : "Nochmal prüfen")) continue;
@@ -571,6 +639,7 @@ class SetupRun {
   /** Führt run() aus; Strg+C löst signal aus und wartet höchstens RUN_GRACE_MS */
   private async executeRun(step: SetupStep, values: SetupValues): Promise<ApplyResult> {
     const controller = new AbortController();
+    const mark = probeMark();
     let lastAt = -1;
     let lastWaited = Number.NEGATIVE_INFINITY;
     const report = (e: RunEvent) => {
@@ -614,6 +683,7 @@ class SetupRun {
     }
     this.out.line("  Die Einrichtung endet trotzdem; ein angefangenes Schreiben der .env läuft vorher zu Ende.");
     await waitForEnvWrites();
+    await this.waitForProbeCleanup(mark);
     throw new AbortAfterRun(false);
   }
 
@@ -641,7 +711,7 @@ class SetupRun {
     const declined = new Set<StepId>();
     for (;;) {
       this.out.line("  Prüfe alle eingerichteten Schritte mit den gespeicherten Werten …");
-      const result = await this.interrupt.guard(checkStep.test!({}, this.ctx));
+      const result = await this.runTest(checkStep, {});
       printItems(this.out, result.items);
       this.out.line(`  ${result.message}`);
       const failedTitles = new Set((result.items ?? []).filter(i => !i.ok).map(i => i.label));

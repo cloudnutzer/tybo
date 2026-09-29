@@ -7,10 +7,14 @@
  * Usage: bun run setup/verify.ts
  */
 
+import { existsSync, readFileSync } from "fs";
+import { userInfo } from "os";
 import { join, dirname } from "path";
 import { loadEnv } from "../src/lib/env";
 import { supabaseHeaders } from "../src/lib/supabase-keys";
-import { findLaunchctlLine, pm2Name } from "../src/lib/service-names";
+import { findLaunchctlLine, pm2Name, SUPABASE_SERVICE, SUPABASE_START_STATE } from "../src/lib/service-names";
+import { DB_CONTAINER, isLocalSupabaseUrl, PROJECT_LABEL } from "../src/setup/local-supabase";
+import { lingerCheckCommand, lingerCommand, parseShow, SYSTEMD_UNIT, SYSTEMD_UNIT_FILE, SYSTEMD_USER_DIR } from "./configure-systemd";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -218,8 +222,82 @@ async function checkServices() {
   } else {
     console.log(`\n${cyan("  [4/6] Background Services")}`);
 
-    await checkPm2Services(services);
+    // Bot als systemd-Benutzerdienst (Issue #207): die übrigen Dienste nur
+    // über ein installiertes PM2, nie über npx
+    if (process.platform === "linux" && (await checkSystemdService())) {
+      const rest = services.filter(s => s !== "telegram-relay");
+      if ((await runCommand(["pm2", "--version"])).ok) await checkPm2Services(rest, runCommand, record, undefined, ["pm2"]);
+      else for (const service of rest) record(service, "skip", "Not installed (PM2 not installed)");
+    } else {
+      await checkPm2Services(services);
+    }
   }
+  await checkSupabaseService(process.platform, process.env);
+}
+
+/**
+ * Supabase auf diesem Rechner (Issue #165), nur wenn SUPABASE_URL darauf
+ * zeigt. Zwei Zeilen: der Dienst ai.tybo.supabase ist ein Einmalaufruf (Ende
+ * mit Exit 0 ist Erfolg, kein Absturz), tybo-supabase unter PM2 bleibt über
+ * die Hülle run-once-and-stay „online“ (gestoppt startet PM2 es beim
+ * Hochfahren nicht, siehe setup/configure-services.ts), die Datenbank
+ * selbst läuft in Docker (Container supabase_db_tybo). Weil die Hülle auch
+ * nach einem gescheiterten Start „online“ bleibt, zählt unter PM2 zusätzlich
+ * ihre Zustandsdatei (SUPABASE_START_STATE): nur wenn sie zur PID der Hülle
+ * gehört und der Start mit Exit 0 endete (oder noch läuft), ist das Erfolg.
+ * `run`, `rec` und `readState` sind in Tests Attrappen.
+ */
+export async function checkSupabaseService(
+  platform: NodeJS.Platform,
+  env: Record<string, string | undefined>,
+  run: typeof runCommand = runCommand,
+  rec: typeof record = record,
+  readState: () => string | null = () => {
+    try {
+      return readFileSync(join(PROJECT_ROOT, SUPABASE_START_STATE), "utf-8");
+    } catch {
+      return null;
+    }
+  }
+): Promise<void> {
+  if (!isLocalSupabaseUrl(env.SUPABASE_URL)) return;
+  const name = "supabase (Autostart)";
+  if (platform === "darwin") {
+    const list = await run(["launchctl", "list"]);
+    const line = list.ok ? findLaunchctlLine(list.stdout, SUPABASE_SERVICE) : null;
+    if (!list.ok) rec(name, "fail", "launchctl list schlug fehl");
+    else if (!line) rec(name, "warn", "Nicht eingerichtet: nach einem Neustart fehlt Supabase (tybo setup autostart)");
+    else {
+      const [pid, exitCode] = line.trim().split(/\s+/);
+      if (pid !== "-") rec(name, "pass", `Startet gerade (PID: ${pid})`);
+      else if (exitCode === "0") rec(name, "pass", "Eingerichtet, letzter Aufruf erfolgreich (Exit 0)");
+      else rec(name, "warn", `Letzter Aufruf fehlgeschlagen (Exit ${exitCode}), siehe logs/supabase.log`);
+    }
+  } else {
+    const jlist = await run(["npx", "pm2", "jlist"]);
+    let procs: Array<{ name?: string; pid?: number; pm2_env?: { status?: string } }> | null = null;
+    try {
+      procs = jlist.ok ? JSON.parse(jlist.stdout) : null;
+    } catch {}
+    const proc = Array.isArray(procs) ? procs.find(p => p?.name === pm2Name(SUPABASE_SERVICE)) : undefined;
+    if (!Array.isArray(procs)) rec(name, "skip", "PM2-Liste nicht lesbar");
+    else if (!proc) rec(name, "warn", "Nicht in PM2 eingetragen: nach einem Neustart fehlt Supabase (tybo setup autostart)");
+    else if (proc.pm2_env?.status === "online") {
+      let state: { pid?: unknown; state?: unknown; exitCode?: unknown } | null = null;
+      try {
+        state = JSON.parse(readState() ?? "null");
+      } catch {}
+      if (!state || state.pid !== proc.pid) rec(name, "warn", "Eingerichtet, aber das Ergebnis des letzten Starts ist unbekannt (keine passende Zustandsdatei). Neu eintragen mit tybo setup autostart");
+      else if (state.state === "läuft") rec(name, "pass", "Eingerichtet, Supabase startet gerade (Protokoll logs/supabase.log)");
+      else if (state.exitCode === 0) rec(name, "pass", "Eingerichtet, letzter Start erfolgreich (Exit 0), startet Supabase bei jedem Hochfahren einmal (Protokoll logs/supabase.log)");
+      else rec(name, "warn", `Letzter Start fehlgeschlagen (Exit ${String(state.exitCode)}): Ursache in logs/supabase.log, danach von Hand tybo datenbank start`);
+    }
+    else rec(name, "warn", `PM2-Status ${proc.pm2_env?.status ?? "unbekannt"}: so startet PM2 Supabase nach einem Neustart nicht. Neu eintragen mit tybo setup autostart`);
+  }
+  const ps = await run(["docker", "ps", "--filter", `label=${PROJECT_LABEL}`, "--format", "{{.Names}}"]);
+  if (!ps.ok) rec("supabase (Datenbank)", "warn", "Docker antwortet nicht");
+  else if (ps.stdout.split("\n").some(l => l.trim() === DB_CONTAINER)) rec("supabase (Datenbank)", "pass", `Container ${DB_CONTAINER} läuft`);
+  else rec("supabase (Datenbank)", "fail", "Datenbank-Container läuft nicht: tybo datenbank start");
 }
 
 /**
@@ -229,7 +307,14 @@ async function checkServices() {
 export async function checkLaunchdServices(
   services: string[],
   run: typeof runCommand = runCommand,
-  rec: typeof record = record
+  rec: typeof record = record,
+  readState: () => string | null = () => {
+    try {
+      return readFileSync(join(PROJECT_ROOT, SUPABASE_START_STATE), "utf-8");
+    } catch {
+      return null;
+    }
+  }
 ): Promise<void> {
   const result = await run(["launchctl", "list"]);
   if (!result.ok) {
@@ -259,15 +344,62 @@ export async function checkLaunchdServices(
 }
 
 /**
+ * Bot als systemd-Benutzerdienst (Issue #207). false: keine Dienstdatei da,
+ * dann prüft der Aufrufer wie bisher PM2. Geprüft werden Lauf, Aktivierung
+ * und Linger (Start nach einem Neustart ohne Anmeldung). `run`, `rec` und
+ * `exists` sind in Tests Attrappen.
+ */
+export async function checkSystemdService(
+  unitDir: string = SYSTEMD_USER_DIR,
+  run: typeof runCommand = runCommand,
+  rec: typeof record = record,
+  user: string = (() => {
+    try {
+      return userInfo().username;
+    } catch {
+      return process.env.USER ?? "";
+    }
+  })(),
+  exists: (path: string) => boolean = existsSync
+): Promise<boolean> {
+  if (!exists(join(unitDir, SYSTEMD_UNIT_FILE))) return false;
+  const name = "telegram-relay";
+  const show = await run(["systemctl", "--user", "show", SYSTEMD_UNIT_FILE, "--property=ActiveState,SubState,UnitFileState,MainPID"]);
+  if (!show.ok) {
+    rec(name, "fail", "systemd-Benutzerdienst antwortet nicht (systemctl --user); als normaler Benutzer prüfen, nicht über sudo");
+    return true;
+  }
+  const p = parseShow(show.stdout);
+  if (p.ActiveState === "active") rec(name, "pass", `Läuft als systemd-Benutzerdienst ${SYSTEMD_UNIT} (PID: ${p.MainPID ?? "?"})`);
+  else if (p.ActiveState === "activating") rec(name, "warn", `systemd startet ${SYSTEMD_UNIT} gerade (neu), siehe logs/telegram-relay.error.log`);
+  else rec(name, "fail", `systemd-Status ${p.ActiveState ?? "unbekannt"}: systemctl --user start ${SYSTEMD_UNIT}, Ursache in logs/telegram-relay.error.log`);
+  if (p.UnitFileState !== "enabled") rec(`${name} (Autostart)`, "warn", `Nicht aktiviert, startet nicht mit dem Rechner: systemctl --user enable ${SYSTEMD_UNIT}`);
+  const linger = await run(["loginctl", "show-user", user, "--property=Linger", "--value"]);
+  if (linger.ok && linger.stdout.trim() === "yes") rec(`${name} (Linger)`, "pass", "Startet nach einem Neustart auch ohne Anmeldung");
+  else if (linger.ok && linger.stdout.trim() === "no") rec(`${name} (Linger)`, "warn", `Startet nach einem Neustart erst mit der Anmeldung: ${lingerCommand(user)}`);
+  // loginctl scheiterte: sudo hilft nicht zwingend, erst prüfen
+  else rec(`${name} (Linger)`, "warn", `Ob er nach einem Neustart ohne Anmeldung startet, ließ sich nicht prüfen. Prüfen mit: ${lingerCheckCommand(user)} und systemctl status systemd-logind`);
+  return true;
+}
+
+/**
  * PM2-Dienste unter tybo-<dienst> (Issue #101). Prozesse anderer Namen zählen
  * nicht (Issue #142). `run` und `rec` sind in Tests Attrappen.
  */
 export async function checkPm2Services(
   services: string[],
   run: typeof runCommand = runCommand,
-  rec: typeof record = record
+  rec: typeof record = record,
+  readState: () => string | null = () => {
+    try {
+      return readFileSync(join(PROJECT_ROOT, SUPABASE_START_STATE), "utf-8");
+    } catch {
+      return null;
+    }
+  },
+  pm2: string[] = ["npx", "pm2"]
 ): Promise<void> {
-  const pm2Result = await run(["npx", "pm2", "jlist"]);
+  const pm2Result = await run([...pm2, "jlist"]);
   if (!pm2Result.ok) {
     rec("PM2", "skip", "PM2 not installed (npm install -g pm2)");
     for (const service of services) {

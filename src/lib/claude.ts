@@ -1,4 +1,13 @@
-import { abortExecutions, abortAllExecutions, checkAborted, currentExecution } from "./execution-context";
+import { checkAborted, currentExecution } from "./execution-context";
+import {
+  abortEngineCalls,
+  abortAllEngineCalls,
+  activeEngineCallCount,
+  registerEngineCall,
+  unregisterEngineCall as unregisterAbortable,
+  type EngineCallEntry,
+  type EngineProc,
+} from "./engines/calls";
 import { terminateProcessTree } from "./process-tree";
 /**
  * Go - Claude Code Subprocess Spawner
@@ -53,6 +62,39 @@ export function setSpawnForTests(fn: typeof spawn | null): void {
   spawnProcess = fn ?? spawn;
 }
 
+/**
+ * Uhr, Timer und Prozessbeendigung der Claude-Aufrufe (Issue #178). Nur Tests
+ * ersetzen sie (setRuntimeForTests): eine Attrappe mit pid 0 darf nie echt
+ * beendet werden, process.kill(-0) träfe die eigene Prozessgruppe.
+ */
+interface ClaudeRuntime {
+  now: () => number;
+  setTimeout: (fn: () => void, ms: number) => unknown;
+  clearTimeout: (handle: unknown) => void;
+  setInterval: (fn: () => void, ms: number) => unknown;
+  clearInterval: (handle: unknown) => void;
+  terminate: typeof terminateProcessTree;
+}
+
+const defaultRuntime: ClaudeRuntime = {
+  now: () => Date.now(),
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+  setInterval: (fn, ms) => setInterval(fn, ms),
+  clearInterval: (h) => clearInterval(h as ReturnType<typeof setInterval>),
+  terminate: terminateProcessTree,
+};
+
+let runtime: ClaudeRuntime = defaultRuntime;
+
+/** Nur für Tests: Uhr, Timer und Prozessbeendigung ersetzen, null stellt zurück. */
+export function setRuntimeForTests(r: Partial<ClaudeRuntime> | null): void {
+  runtime = r ? { ...defaultRuntime, ...r } : defaultRuntime;
+}
+
+/** Wie oft callClaudeStreaming prüft, ob die Leerlauf-Grenze überschritten ist */
+export const IDLE_CHECK_INTERVAL_MS = 15_000;
+
 export interface ClaudeOptions {
   prompt: string;
   outputFormat?: "json" | "text";
@@ -80,6 +122,12 @@ export interface ClaudeStreamOptions extends ClaudeOptions {
    * fullText is the untruncated text block the snippet was cut from.
    */
   onFirstText?: (snippet: string, fullText: string) => void;
+  /**
+   * Leerlauf-Grenze (Issue #178): kommt so lange keine vollständige
+   * stream-json-Zeile, wird der Prozessbaum beendet (timeoutKind "idle").
+   * Ohne Angabe gilt nur timeoutMs, andere Aufrufer erben keine neue Grenze.
+   */
+  idleTimeoutMs?: number;
 }
 
 export interface ClaudeResult {
@@ -96,81 +144,77 @@ export interface ClaudeResult {
    * which would just burn another full timeout window. */
   timedOut?: boolean;
   /**
+   * Nur callClaudeStreaming (Issue #178): warum das Zeitlimit griff. "idle":
+   * länger als idleTimeoutMs keine stream-json-Zeile, "total": timeoutMs als
+   * Obergrenze der Gesamtzeit.
+   */
+  timeoutKind?: "idle" | "total";
+  /**
    * Werkzeuge dieses Aufrufs (Issue #53), aus stream-json bzw. json mit
    * --verbose. Fehlt, wenn die CLI keine Angaben lieferte (Textformat, altes
    * json-Format): dann sind sie unbekannt, nicht leer.
    */
   tools?: TurnTools;
+  /**
+   * Nur callClaudeStreaming bei timedOut (Issue #179): die letzten
+   * Werkzeugschritte in Reihenfolge, höchstens MAX_RUN_STEPS. Die Eingabe
+   * steht ungekürzt drin, damit Geheimnisse vor jeder Kürzung maskiert
+   * werden können; gekürzt wird erst im Bericht.
+   */
+  steps?: RunStep[];
+  /** Nur bei timedOut (Streaming): der letzte Textblock von Claude, ungekürzt */
+  lastText?: string;
+  /** Nur bei timedOut (Streaming): Laufzeit bis zum Abbruch */
+  stoppedAfterMs?: number;
+  /** Nur bei timedOut (Streaming): Zeit seit der letzten stream-json-Zeile beim Abbruch */
+  idleForMs?: number;
+}
+
+/** Ein beobachteter Werkzeugaufruf: Name und wichtigste Eingabe (Befehl, Pfad, Adresse) */
+export interface RunStep {
+  name: string;
+  input?: string;
+}
+
+/** So viele Schritte behält callClaudeStreaming für den Timeout-Bericht */
+export const MAX_RUN_STEPS = 8;
+
+/** Werkzeugaufruf als Schritt; null ohne Namen. Die Eingabe bleibt ungekürzt. */
+export function runStepFromBlock(block: any): RunStep | null {
+  if (!block || block.type !== "tool_use" || typeof block.name !== "string" || !block.name) return null;
+  const input = block.input && typeof block.input === "object" ? block.input : {};
+  const value = [
+    input.command,
+    input.file_path,
+    input.notebook_path,
+    input.path,
+    input.url,
+    input.query,
+    input.pattern,
+    input.description,
+  ].find((v) => typeof v === "string" && v.trim() !== "");
+  return value ? { name: block.name, input: value } : { name: block.name };
 }
 
 // ---------------------------------------------------------------------------
-// Abort registry (/stop) — running subprocesses registered under an abortKey
+// Abort registry (/stop): seit Issue #121 allgemein für alle Motoren in
+// src/lib/engines/calls.ts. Die Claude-Namen bleiben als dünne Aliase, bis
+// alle Aufrufer umgestellt sind.
 // ---------------------------------------------------------------------------
 
-interface AbortableProc {
-  proc: { pid: number; kill: () => void };
-  aborted: boolean;
-  removeListener?: () => void;
+/** Prozessbaum beenden über die (in Tests ersetzbare) Laufzeit dieses Moduls */
+const terminateViaRuntime = (proc: EngineProc) => runtime.terminate(proc);
+
+function registerAbortable(key: string | undefined, proc: EngineProc): EngineCallEntry {
+  return registerEngineCall(key, proc, terminateViaRuntime);
 }
 
-const activeProcs = new Map<string, Set<AbortableProc>>();
-
-function registerAbortable(key: string | undefined, proc: AbortableProc["proc"]): AbortableProc | undefined {
-  key ||= currentExecution()?.key || "background";
-  if (!key) return undefined;
-  checkAborted();
-  const entry: AbortableProc = { proc, aborted: false };
-  let set = activeProcs.get(key);
-  if (!set) {
-    set = new Set();
-    activeProcs.set(key, set);
-  }
-  set.add(entry);
-  const signal = currentExecution()?.controller.signal;
-  const abort = () => { entry.aborted = true; terminateProcessTree(proc); };
-  signal?.addEventListener("abort", abort, { once: true });
-  entry.removeListener = () => signal?.removeEventListener("abort", abort);
-  return entry;
-}
-
-function unregisterAbortable(key: string | undefined, entry: AbortableProc | undefined): void {
-  key ||= currentExecution()?.key || "background";
-  entry?.removeListener?.();
-  if (!key || !entry) return;
-  const set = activeProcs.get(key);
-  if (!set) return;
-  set.delete(entry);
-  if (set.size === 0) activeProcs.delete(key);
-}
-
-/**
- * Kill all running Claude subprocesses registered under a key (/stop).
- * Kills the process tree: the spawned wrapper (caffeinate) plus its children.
- * Returns how many subprocesses were killed.
- */
-export function abortClaudeCalls(key: string): number {
-  const tasks = abortExecutions(key);
-  const set = activeProcs.get(key);
-  let killed = 0;
-  for (const entry of set || []) {
-    entry.aborted = true;
-    terminateProcessTree(entry.proc);
-    killed++;
-  }
-  return Math.max(tasks, killed);
-}
-
-export function abortAllClaudeCalls(): void {
-  abortAllExecutions();
-  for (const key of activeProcs.keys()) abortClaudeCalls(key);
-}
-
-/** Number of Claude subprocesses currently running (deferred restart waits for 0). */
-export function activeClaudeCallCount(): number {
-  let n = 0;
-  for (const set of activeProcs.values()) n += set.size;
-  return n;
-}
+/** Alias von abortEngineCalls (src/lib/engines/calls.ts) */
+export const abortClaudeCalls = abortEngineCalls;
+/** Alias von abortAllEngineCalls (src/lib/engines/calls.ts) */
+export const abortAllClaudeCalls = abortAllEngineCalls;
+/** Alias von activeEngineCallCount (src/lib/engines/calls.ts) */
+export const activeClaudeCallCount = activeEngineCallCount;
 
 /**
  * Known error patterns in Claude output that indicate auth/API failures.
@@ -351,7 +395,7 @@ export async function callClaude(options: ClaudeOptions): Promise<ClaudeResult> 
   const timeoutId = setTimeout(() => {
     timedOut = true;
     try {
-      terminateProcessTree(proc);
+      runtime.terminate(proc);
     } catch {}
   }, timeoutMs);
 
@@ -462,7 +506,7 @@ export async function runClaudeWithTimeout(
   const timer = setTimeout(() => {
     killed = true;
     try {
-      terminateProcessTree(proc);
+      runtime.terminate(proc);
     } catch {}
   }, timeoutMs);
 
@@ -495,7 +539,8 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   AskUserQuestion: "Asking a question",
 };
 
-function friendlyToolName(toolName: string): string {
+/** Anzeigename eines Werkzeugs (Claude-Name) für die Fortschrittsanzeige; auch der Codex-Motor nutzt ihn */
+export function friendlyToolName(toolName: string): string {
   // Direct match
   if (TOOL_DISPLAY_NAMES[toolName]) return TOOL_DISPLAY_NAMES[toolName];
   // MCP tool: mcp__server__action → "Using server"
@@ -594,12 +639,58 @@ export async function callClaudeStreaming(options: ClaudeStreamOptions): Promise
 
   const abortEntry = registerAbortable(abortKey, proc);
 
-  // Timeout with proper process kill
+  // Zwei Grenzen (Issue #178): timeoutMs für die Gesamtzeit, idleTimeoutMs für
+  // die Zeit seit der letzten vollständigen stream-json-Zeile. Die CLI schickt
+  // auch während eines langen Werkzeugs oder Hilfs-Agenten alle 30 s eine
+  // tool_progress-Zeile, ein arbeitender Lauf ist also nie still.
+  // Der Grund wird nur einmal gesetzt, nach /stop gar nicht mehr.
+  const startedAt = runtime.now();
+  let lastActivityAt = startedAt;
   let timedOut = false;
-  const timeoutId = setTimeout(() => {
+  let timeoutKind: "idle" | "total" | undefined;
+  let stoppedAfterMs = 0;
+  let idleForMs = 0;
+  const stopFor = (kind: "idle" | "total") => {
+    if (timedOut || abortEntry?.aborted) return;
+    const now = runtime.now();
     timedOut = true;
-    try { terminateProcessTree(proc); } catch {}
-  }, timeoutMs);
+    timeoutKind = kind;
+    stoppedAfterMs = now - startedAt;
+    idleForMs = now - lastActivityAt;
+    try { runtime.terminate(proc); } catch {}
+  };
+  const timeoutId = runtime.setTimeout(() => stopFor("total"), timeoutMs);
+  const idleTimeoutMs = options.idleTimeoutMs;
+  const idleCheckId =
+    idleTimeoutMs && idleTimeoutMs > 0
+      ? runtime.setInterval(() => {
+          if (runtime.now() - lastActivityAt >= idleTimeoutMs) stopFor("idle");
+        }, Math.min(IDLE_CHECK_INTERVAL_MS, idleTimeoutMs))
+      : undefined;
+  const clearTimers = () => {
+    runtime.clearTimeout(timeoutId);
+    if (idleCheckId !== undefined) runtime.clearInterval(idleCheckId);
+  };
+  const timeoutResult = async (): Promise<ClaudeResult> => {
+    const stderr = await stderrPromise;
+    console.error(
+      `[Claude streaming] timeout (${timeoutKind}) after ${Math.round(stoppedAfterMs / 1000)}s, ` +
+        `last activity ${Math.round(idleForMs / 1000)}s ago (model ${model}), sessionId=${sessionId || "none"}, process tree killed`
+    );
+    if (stderr) console.error("[Claude streaming] stderr (timeout):", stderr.substring(0, 500));
+    return {
+      text: "",
+      sessionId,
+      isError: true,
+      timedOut: true,
+      timeoutKind,
+      tools: tools(),
+      steps: [...steps],
+      ...(textAccumulator ? { lastText: textAccumulator } : {}),
+      stoppedAfterMs,
+      idleForMs,
+    };
+  };
 
   // Throttle tool progress (max 1 per 5s)
   let lastToolProgressAt = 0;
@@ -625,6 +716,9 @@ export async function callClaudeStreaming(options: ClaudeStreamOptions): Promise
   // Alle Werkzeugaufrufe, ungedrosselt und unabhängig von onToolStart (Issue #53)
   const toolUses: TurnTools["uses"] = [];
   const tools = (): TurnTools => ({ uses: toolUses, cwd: cwd || process.cwd() });
+  // Getrennt davon die letzten Schritte für den Timeout-Bericht (Issue #179):
+  // ungekürzte Eingabe, nur die letzten MAX_RUN_STEPS
+  const steps: RunStep[] = [];
 
   const handleLine = (line: string) => {
     if (!line.trim()) return;
@@ -635,6 +729,10 @@ export async function callClaudeStreaming(options: ClaudeStreamOptions): Promise
     } catch {
       return; // skip malformed lines
     }
+    // Aktivität (Issue #178): jede vollständige, gültige Zeile, auch system-,
+    // tool_progress-, tool_result- und Subagenten-Ereignisse. Leere und
+    // kaputte Zeilen zählen nicht, unabhängig von gedrosseltem Fortschritt.
+    lastActivityAt = runtime.now();
 
     // Capture session_id from init event
     if (event.type === "system" && event.subtype === "init" && event.session_id) {
@@ -663,7 +761,14 @@ export async function callClaudeStreaming(options: ClaudeStreamOptions): Promise
     if (event.type === "assistant" && event.message?.content) {
       const msgId: string = event.message.id || `turn-${turnText.size}`;
       for (const block of event.message.content) {
-        if (block.type === "tool_use") turnHasToolUse.add(msgId);
+        if (block.type === "tool_use") {
+          turnHasToolUse.add(msgId);
+          const step = runStepFromBlock(block);
+          if (step) {
+            steps.push(step);
+            if (steps.length > MAX_RUN_STEPS) steps.shift();
+          }
+        }
 
         // Tool use → fire onToolStart
         if (block.type === "tool_use" && block.name && onToolStart) {
@@ -702,19 +807,14 @@ export async function callClaudeStreaming(options: ClaudeStreamOptions): Promise
     // Letzte Zeile ohne abschließenden Zeilenumbruch
     if (!timedOut) handleLine(buffer + decoder.decode());
 
-    clearTimeout(timeoutId);
+    clearTimers();
     unregisterAbortable(abortKey, abortEntry);
 
     if (abortEntry?.aborted) {
       return { text: "", isError: true, aborted: true };
     }
 
-    if (timedOut) {
-      const stderr = await stderrPromise;
-      console.error(`[Claude streaming] timeout after ${Math.round(timeoutMs / 1000)}s (model ${model}), sessionId=${sessionId || "none"}, process tree killed`);
-      if (stderr) console.error("[Claude streaming] stderr (timeout):", stderr.substring(0, 500));
-      return { text: "", sessionId, isError: true, timedOut: true, tools: tools() };
-    }
+    if (timedOut) return await timeoutResult();
 
     // If no result event (shouldn't happen), use accumulated text
     if (!resultText && textAccumulator) {
@@ -756,11 +856,14 @@ export async function callClaudeStreaming(options: ClaudeStreamOptions): Promise
 
     return { text: resultText, sessionId, isError: isErr, costUsd, tools: tools() };
   } catch (err) {
-    clearTimeout(timeoutId);
+    clearTimers();
     unregisterAbortable(abortKey, abortEntry);
     if (abortEntry?.aborted) {
       return { text: "", isError: true, aborted: true };
     }
+    // Ein Stream-Fehler nach dem Zeitlimit bleibt ein Zeitlimit: sonst
+    // startete chat-turn einen frischen Resume-Versuch mit neuem Zeitfenster
+    if (timedOut) return await timeoutResult();
     const stderr2 = await stderrPromise;
     console.error("[Claude streaming] exception:", err);
     if (stderr2) console.error("[Claude streaming] stderr:", stderr2.substring(0, 500));

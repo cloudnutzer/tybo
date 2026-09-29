@@ -12,11 +12,13 @@ import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { resolveAgentModel } from "../agents/base";
-import { activeClaudeCallCount } from "../lib/claude";
+import { activeEngineCallCount, inspectEngine, type EngineId, type EngineStatus } from "../lib/engines";
+import { configuredEngine, defaultEngineSetting, engineLabel, engineModelAndEffort, SELECTABLE_ENGINES, sessionModel } from "../lib/engine-choice";
+import { toAvailability } from "./bot-engines";
 import { activeExecutionCount } from "../lib/execution-context";
 import { detectSupervisor, RESTART_MARKER, requestRestart } from "../lib/restart-request";
 import { isSessionModeEnabled, listStoredSessions, SESSION_IDLE_MS } from "../lib/session-manager";
+import { searchDisplayState } from "../setup/search-record";
 import {
   countResumableSessions,
   keyStatus,
@@ -24,6 +26,7 @@ import {
   type SessionCounts,
   type StatusPort,
   type StoredSession,
+  type SemanticSearchState,
   type Supervisor,
 } from "./status";
 
@@ -83,12 +86,18 @@ export interface BotStatusDeps {
   listSessions(): Promise<StoredSession[]>;
   sessionMode(): boolean;
   idleMs: number;
-  modelFor(agentName: string): string;
+  modelFor(agentName: string, engine: string): string;
+  /** Motor des nächsten Turns eines Agenten in diesem Gespräch (Issues #122, #125) */
+  engineFor(agentName: string, sessionKey?: string): string;
   activeExecutions(): number;
   activeClaudeCalls(): number;
   /** Pfad des Neustart-Markers, Standard RESTART_MARKER */
   restartMarker: string;
   requestRestart(note: string): Promise<void>;
+  /** Semantische Suche aus data/semantic-search.json (Issue #166) */
+  semanticSearch(): Promise<SemanticSearchState | null>;
+  /** Verfügbarkeit eines Motors (Issue #126), Standard inspectEngine; Tests reichen eine Attrappe herein */
+  inspectEngine(id: EngineId): Promise<EngineStatus>;
   now(): number;
 }
 
@@ -105,11 +114,16 @@ export function createBotStatus(env: Env = process.env, overrides: Partial<BotSt
     listSessions: listStoredSessions,
     sessionMode: isSessionModeEnabled,
     idleMs: SESSION_IDLE_MS,
-    modelFor: agentName => resolveAgentModel(agentName),
+    modelFor: (agentName, engine) => sessionModel(engineModelAndEffort(engine as EngineId, agentName).model),
+    // Wie chat-turn.ts ohne TurnOptions.engine: Motor des Gesprächs laut Einstellungen
+    // (ohne Verfügbarkeitsprüfung: die Anzeige startet keinen codex-Prozess)
+    engineFor: (_agentName, sessionKey) => (sessionKey ? configuredEngine(sessionKey).engine : defaultEngineSetting().engine),
     activeExecutions: activeExecutionCount,
-    activeClaudeCalls: activeClaudeCallCount,
+    activeClaudeCalls: activeEngineCallCount,
     restartMarker: RESTART_MARKER,
     requestRestart: note => requestRestart(note),
+    semanticSearch: () => searchDisplayState(root, env),
+    inspectEngine,
     now: Date.now,
     ...overrides,
   };
@@ -140,6 +154,7 @@ export function createBotStatus(env: Env = process.env, overrides: Partial<BotSt
           sessionMode,
           idleMs: d.idleMs,
           modelFor: d.modelFor,
+          engineFor: d.engineFor,
           now: d.now(),
         }),
       };
@@ -149,6 +164,17 @@ export function createBotStatus(env: Env = process.env, overrides: Partial<BotSt
     restartRequested: () => restartMarkerPresent(d.restartMarker),
     requestRestart: note => d.requestRestart(note),
     keys: () => keyStatus(d.env),
+    semanticSearch: () => d.semanticSearch(),
+    engines: () =>
+      Promise.all(
+        SELECTABLE_ENGINES.map(async id => {
+          try {
+            return toAvailability(await d.inspectEngine(id));
+          } catch {
+            return { engine: id, label: engineLabel(id), installed: false, loggedIn: false, message: `${engineLabel(id)} ließ sich nicht prüfen` };
+          }
+        })
+      ),
     now: () => d.now(),
   };
 }

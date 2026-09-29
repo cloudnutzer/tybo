@@ -23,12 +23,17 @@ browser, with Claude Code doing the actual work on your own machine.
 - macOS, Linux or Windows
 - [Git](https://git-scm.com)
 - [Bun](https://bun.sh) 1.3.10 or newer
-- [Node.js](https://nodejs.org) 20 or newer with `npm`
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI,
-  installed and logged in (`npm install -g @anthropic-ai/claude-code`, then
-  `claude` and `/login`)
-- Linux and Windows only: [PM2](https://pm2.keymetrics.io) for autostart
-  (`npm install -g pm2`)
+  installed and logged in. On macOS, Linux and WSL use the native installer,
+  which needs neither Node.js nor `sudo`:
+  `curl -fsSL https://claude.ai/install.sh | bash`, then `claude` and
+  `/login`. On Windows (without WSL) the npm way still works:
+  `npm install -g @anthropic-ai/claude-code` (needs Node.js 22 or newer)
+- [Node.js](https://nodejs.org) 20 or newer with `npm`, only for PM2, the
+  optional Convex setup (`npx`) or installing the Claude CLI via npm
+- Autostart: nothing extra on macOS and on Linux with systemd (such as
+  Raspberry Pi OS); Windows and Linux without systemd need
+  [PM2](https://pm2.keymetrics.io) (`npm install -g pm2`)
 - A Telegram account
 
 ## Installation
@@ -41,8 +46,9 @@ curl -fsSL https://tybo.ai/install | sh
 
 It checks for Git and Bun (offering the official Bun installer if needed),
 clones tybo into `~/tybo`, installs the packages, creates the `tybo`
-command and starts `tybo setup`. It never uses `sudo` and does not install
-Node.js, the Claude CLI or PM2. Run the same command again to update.
+command and starts `tybo setup`. It never uses `sudo`, does not touch your
+shell startup files and does not install Node.js, the Claude CLI or PM2; at
+the end it lists what is still missing. Run the same command again to update.
 Options such as `--dir` and `--no-setup` are described in the
 [setup guide](docs/einrichtung.md#schnellweg-ein-befehl).
 
@@ -61,7 +67,12 @@ timezone, tests every entry right away and only writes `.env` after you
 confirm. For the database the default is Supabase in the cloud: you only
 create a free account and a personal access token, and the assistant sets
 up the project, tables, storage and keys (the token is used once and stored
-nowhere). Prefer the browser? Run `tybo setup --web` instead. Without
+nowhere). Right after the database, an optional step sets up semantic search
+(finding messages by meaning, not just by words): with an OpenAI key it
+deploys the Supabase Edge Functions, stores the key where they read it and
+proves it works with a test message; skip it and tybo uses plain text search,
+catch up later with `tybo setup suche`. Prefer the browser? Run
+`tybo setup --web` instead. Without
 `bun link`, use `bun run setup` in the project folder.
 
 The full walkthrough, including what the assistant does not cover, is in
@@ -71,10 +82,14 @@ The full walkthrough, including what the assistant does not cover, is in
 
 **Autostart.** `tybo setup autostart` registers tybo as a service that
 starts with your computer and restarts after crashes: launchd on macOS
-(`ai.tybo.telegram-relay`), PM2 on Linux and Windows (`tybo-telegram-relay`).
-On Linux, run `pm2 startup` once and execute the line it prints so PM2
-itself survives a reboot. Without autostart, `bun run start` runs tybo in
-the current terminal.
+(`ai.tybo.telegram-relay`), a systemd user service on Linux with systemd
+(`tybo-telegram-relay`), PM2 on Windows and Linux without systemd
+(`tybo-telegram-relay`). With PM2 on Linux, run `pm2 startup` once and
+execute the line it prints so PM2 itself survives a reboot. Without
+autostart, `bun run start` runs tybo in the current terminal.
+
+**Raspberry Pi.** To run tybo around the clock at home on a Raspberry Pi 5,
+follow the [Raspberry Pi guide](docs/raspberry-pi.md) (German).
 
 **Logs.** Output goes to `logs/telegram-relay.log`, errors to
 `logs/telegram-relay.error.log` in the project folder.
@@ -84,7 +99,9 @@ the current terminal.
 ```bash
 # macOS
 launchctl kickstart -k gui/$(id -u)/ai.tybo.telegram-relay
-# Linux and Windows
+# Linux with systemd
+systemctl --user restart tybo-telegram-relay
+# PM2 (Windows, Linux without systemd)
 pm2 restart tybo-telegram-relay
 ```
 
@@ -99,6 +116,7 @@ per token instead and the subscription limit no longer applies.
 ## Further reading
 
 - [Setup guide](docs/einrichtung.md) (German)
+- [Raspberry Pi 5 around the clock](docs/raspberry-pi.md) (German)
 - [User guide](docs/user-guide.md) (German): commands, agents, topics, goals
 - [Architecture](docs/architecture.md)
 - [Troubleshooting](docs/troubleshooting.md)

@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  Supabase auf diesem Rechner (Issue #165): startet beim Anmelden einmal
+  "tybo datenbank start" (wartet bis zu 5 Minuten auf Docker, holt fehlende
+  Dienste wie Edge Runtime nach). launchd startet ihn nicht neu: der Aufruf endet, die
+  Container laufen in Docker weiter. PATH mit Docker-Orten (Homebrew,
+  /usr/local/bin für Docker Desktop, OrbStack). ExitTimeOut (Sekunden,
+  LAUNCHD_EXIT_TIMEOUT_S): Entladen mitten im Start lässt dem Abbruch Zeit für
+  Bereinigung, Schutz-Stopp und Nachprüfung, bevor launchd SIGKILL schickt.
+-->
+<dict>
+    <key>Label</key>
+    <string>ai.tybo.supabase</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{BUN_PATH}}</string>
+        <string>--no-env-file</string>
+        <string>{{PROJECT_ROOT}}/scripts/tybo.ts</string>
+        <string>datenbank</string>
+        <string>start</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{{PROJECT_ROOT}}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{HOME}}/.local/bin:{{HOME}}/.bun/bin:{{BUN_DIR}}:/opt/homebrew/bin:/usr/local/bin:{{HOME}}/.orbstack/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ExitTimeOut</key>
+    <integer>{{EXIT_TIMEOUT}}</integer>
+
+    <key>StandardOutPath</key>
+    <string>{{PROJECT_ROOT}}/logs/supabase.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{PROJECT_ROOT}}/logs/supabase.log</string>
+</dict>
+</plist>

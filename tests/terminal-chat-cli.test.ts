@@ -135,6 +135,23 @@ describe("Senden aus einer Pipe (ohne TTY)", () => {
     expect(r.stdout).not.toContain("\u001b");
   });
 
+  test("Beenden nach EOF schließt die Live-Verbindung ohne AbortError: Exit 0, Antwort genau einmal (Issue #210)", async () => {
+    const s = await server();
+    const { proc, output } = spawn(["--topic", "dm"], s.dir, await newHome());
+    await waitFor(() => s.server.eventStreamCount() >= 1, 5000, "Live-Verbindung von tybo");
+    proc.stdin.write("Frage vor dem Ende\n");
+    proc.stdin.end();
+    await s.telegramChat.turn("dm");
+    // EOF ist schon da, die Antwort kommt erst danach über die offene Live-Verbindung
+    await new Promise(r => setTimeout(r, 200));
+    s.telegramChat.finish("dm", "Antwort nach dem Ende der Eingabe");
+    const r = await output;
+    expect(r.stderr).toBe("");
+    expect(r.code).toBe(0);
+    expect(r.stdout.split("Antwort nach dem Ende der Eingabe").length - 1).toBe(1);
+    await waitFor(() => s.server.eventStreamCount() === 0, 3000, "Live-Verbindung am Server geschlossen");
+  });
+
   test("mehrzeilig mit \\ am Zeilenende", async () => {
     const s = await server();
     const { proc, output } = spawn(["--topic", "dm"], s.dir, await newHome());

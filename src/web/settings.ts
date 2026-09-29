@@ -17,6 +17,13 @@
  * - Lesen, Zusammenführen und Schreiben laufen am Stück, gleichzeitige
  *   Änderungen verlieren keine Einträge.
  *
+ * Motor (Issues #126/#129): engine.default, engine.codex (model, effort,
+ * sandbox) und engine.opencode (model, variant, permission) lassen sich
+ * ändern, leer oder null entfernt den Wert. engine
+ * selbst ist nie null, und engine.topics (Ausnahmen mit /motor) ändert PATCH
+ * nie: die stehen unverändert weiter in der Datei, entfernt werden sie
+ * einzeln über POST /api/engines/reset (./engines.ts).
+ *
  * Beide Antworten enthalten neben effective auch inherited: je Agent Modell
  * und Effort samt Quelle, die gälten, wenn nur dieses Feld auf „Standard"
  * gesetzt würde (Issue #38), und inheritedModels mit denselben Angaben für
@@ -43,6 +50,13 @@ export interface SettingsData {
   agents?: Record<string, ModelAndEffort>;
   aux?: { judge?: string; distill?: string; review?: string };
   fallback?: { openrouterModel?: string; ollamaModel?: string; offlineOnly?: boolean };
+  /** Motor (Entscheidungen 0018/0019): Standard, Ausnahmen je Session-Schlüssel, Codex- und OpenCode-Einstellungen */
+  engine?: {
+    default?: string;
+    topics?: Record<string, string>;
+    codex?: { model?: string; effort?: string; sandbox?: string };
+    opencode?: { model?: string; variant?: string; permission?: string };
+  };
 }
 
 export const AUX_PURPOSES = ["judge", "distill", "review"] as const;
@@ -55,6 +69,8 @@ export interface EffectiveSettings {
   /** Format <claude|openrouter|ollama>:<modell> */
   aux: Record<AuxPurpose, Sourced<string>>;
   fallback: { openrouterModel: Sourced<string>; ollamaModel: Sourced<string>; offlineOnly: Sourced<boolean> };
+  /** Standard-Motor wie defaultEngineSetting (Issue #126); fehlt bei Ports ohne Motor-Wahl */
+  engine?: { default: Sourced<string> };
 }
 
 export interface SettingsIssue {
@@ -73,6 +89,17 @@ export class SettingsFileInvalid extends Error {
   }
 }
 
+/** Auswahl für den Abschnitt Motor der Einstellungsseite */
+export interface EngineOptions {
+  engines: readonly { id: string; label: string }[];
+  codexEffortLevels: readonly string[];
+  codexSandboxLevels: readonly string[];
+  codexDefaultSandbox: string;
+  /** Rechte von OpenCode (auto, ask-deny) und ihr Standard */
+  opencodePermissionLevels: readonly string[];
+  opencodeDefaultPermission: string;
+}
+
 export interface SettingsPort {
   /** Kanonische Agentennamen, für die Einstellungen erlaubt sind */
   agents: readonly string[];
@@ -84,8 +111,12 @@ export interface SettingsPort {
   /** Dasselbe Schema wie beim Laden; Meldungen ohne Werte */
   validate(value: unknown): ValidateResult;
   write(value: SettingsData): Promise<void>;
+  /** Gemeinsame Schreibkette mit anderen Schreibern der Datei (withSettingsLock); fehlt: nur innerhalb dieser API */
+  lock?<T>(fn: () => Promise<T>): Promise<T>;
   /** Wirksame Werte für genau diesen Stand */
   effective(settings: SettingsData): EffectiveSettings;
+  /** Motor (Issues #126/#129): wählbare Motoren, Stufen und Rechte von Codex und OpenCode */
+  engineOptions?: EngineOptions;
 }
 
 export interface ApiResult {
@@ -164,7 +195,7 @@ export function applySettingsPatch(
   const MODEL_EFFORT = { model: "string", effort: "string" } as const;
   try {
     for (const key of Object.keys(patch)) {
-      if (!["defaults", "agents", "aux", "fallback"].includes(key)) throw new PatchError(`Unbekanntes Feld: ${safeName(key)}`);
+      if (!["defaults", "agents", "aux", "fallback", "engine"].includes(key)) throw new PatchError(`Unbekanntes Feld: ${safeName(key)}`);
     }
     section("defaults", patch.defaults, MODEL_EFFORT, next, "defaults");
     section("aux", patch.aux, { judge: "string", distill: "string", review: "string" }, next, "aux");
@@ -183,6 +214,22 @@ export function applySettingsPatch(
       for (const name of Object.keys(agents)) section(name, agents[name], MODEL_EFFORT, target, `agents.${name}`);
       next.agents = target;
     }
+    // Motor (Issues #126/#129): nie als Ganzes entfernen, topics bleiben unberührt
+    const engine = patch.engine;
+    if (engine !== undefined) {
+      if (!isPlainObject(engine)) throw new PatchError("Falscher Typ: engine");
+      for (const key of Object.keys(engine)) {
+        if (key !== "default" && key !== "codex" && key !== "opencode") throw new PatchError(`Unbekanntes Feld: engine.${safeName(key)}`);
+      }
+      const target: Record<string, any> = isPlainObject(next.engine) ? next.engine : {};
+      leaf(target, "default", engine.default, "string", "engine.default");
+      section("codex", engine.codex, { model: "string", effort: "string", sandbox: "string" }, target, "engine.codex");
+      section("opencode", engine.opencode, { model: "string", variant: "string", permission: "string" }, target, "engine.opencode");
+      for (const name of ["codex", "opencode"]) {
+        if (isPlainObject(target[name]) && Object.keys(target[name]).length === 0) delete target[name];
+      }
+      next.engine = target;
+    }
   } catch (e) {
     if (e instanceof PatchError) return { ok: false, error: e.message };
     throw e;
@@ -194,7 +241,7 @@ export function applySettingsPatch(
       if (isPlainObject(entry) && Object.keys(entry).length === 0) delete next.agents[name];
     }
   }
-  for (const key of ["defaults", "agents", "aux", "fallback"]) {
+  for (const key of ["defaults", "agents", "aux", "fallback", "engine"]) {
     if (isPlainObject(next[key]) && Object.keys(next[key]).length === 0) delete next[key];
   }
   return { ok: true, value: next as SettingsData, changed };
@@ -241,6 +288,8 @@ export interface InheritedGlobalValues {
   defaults: { model: Sourced<string> | null; effort: Sourced<string | null> | null };
   aux: Record<AuxPurpose, Sourced<string>>;
   fallback: EffectiveSettings["fallback"];
+  /** Standard-Motor ohne eigenen Wert in der Datei (TYBO_ENGINE oder Claude Code), Issue #126 */
+  engine?: { default: Sourced<string> };
 }
 
 /** Ein Wert, wenn alle gleich sind (gleicher Wert und gleiche Quelle), sonst null */
@@ -285,7 +334,10 @@ export function inheritedGlobalValues(
     const eff = after({ fallback: { [key]: null } }, settings.fallback?.[key]);
     (fallback as Record<string, unknown>)[key] = (eff ?? effective).fallback[key];
   }
-  return { defaults: { model: defaultsFor("model"), effort: defaultsFor("effort") }, aux, fallback };
+  const out: InheritedGlobalValues = { defaults: { model: defaultsFor("model"), effort: defaultsFor("effort") }, aux, fallback };
+  const engineDefault = (after({ engine: { default: null } }, settings.engine?.default) ?? effective).engine?.default;
+  if (engineDefault) out.engine = { default: engineDefault };
+  return out;
 }
 
 export interface SettingsApi {
@@ -303,6 +355,8 @@ export function createSettingsApi(
   // und die Versionen in der Reihenfolge der Stände vergeben werden.
   let chain: Promise<unknown> = Promise.resolve();
   function serialize<T>(fn: () => Promise<T>): Promise<T> {
+    // Mit port.lock dieselbe Schreibkette wie /motor (Issue #125)
+    if (port.lock) return port.lock(fn);
     const run = chain.catch(() => {}).then(fn);
     chain = run;
     return run;
@@ -323,6 +377,7 @@ export function createSettingsApi(
       inheritedModels: inheritedGlobalValues(port, settings, effective),
       agents: port.agents,
       effortLevels: port.effortLevels,
+      ...(port.engineOptions ? { engineOptions: port.engineOptions } : {}),
       fileInvalid,
       revision: clock.stamp("settings", { settings, fileInvalid }),
       ...extra,

@@ -685,8 +685,9 @@ describe("Namen und Erkennung", () => {
     expect(launchdLabel("watchdog")).toBe("ai.tybo.watchdog");
     expect(pm2Name("watchdog")).toBe("tybo-watchdog");
     expect(Object.keys(serviceNames).sort()).toEqual(
-      ["BOT_SERVICE", "LAUNCHD_PREFIX", "PM2_PREFIX", "findLaunchctlLine", "hasServiceLabels", "isServicePlist", "labelInLaunchctlList", "launchdLabel", "pm2Name"].sort()
+      ["BOT_SERVICE", "SUPABASE_SERVICE", "SUPABASE_START_STATE", "LAUNCHD_PREFIX", "PM2_PREFIX", "findLaunchctlLine", "hasServiceLabels", "isServicePlist", "labelInLaunchctlList", "launchdLabel", "pm2Name", "systemdUnit", "systemdUnitFile"].sort()
     );
+    expect(serviceNames.systemdUnitFile("telegram-relay")).toBe("tybo-telegram-relay.service");
   });
 
   test("verify erkennt nur ai.tybo.*, exakt", () => {
@@ -701,7 +702,7 @@ describe("Namen und Erkennung", () => {
     expect(["ai.tybo.watchdog.plist", `${oldLaunchdLabel("watchdog")}.plist`, "com.apple.x.plist", "ai.tybo.x.txt"].filter(isServicePlist)).toEqual([
       "ai.tybo.watchdog.plist",
     ]);
-    expect(uninstallNames()).toEqual(["tybo-telegram-relay", "tybo-smart-checkin", "tybo-morning-briefing", "tybo-watchdog"]);
+    expect(uninstallNames()).toEqual(["tybo-telegram-relay", "tybo-smart-checkin", "tybo-morning-briefing", "tybo-watchdog", "tybo-supabase"]);
     expect(hasServiceLabels(`1\t0\t${NEW}`)).toBe(true);
     expect(hasServiceLabels(`1\t0\t${OLD}`)).toBe(false);
     expect(hasServiceLabels("1\t0\tcom.apple.x")).toBe(false);
@@ -742,6 +743,7 @@ describe("Namen und Erkennung", () => {
     expect(templates).toEqual([
       "ai.tybo.morning-briefing.plist.template",
       "ai.tybo.smart-checkin.plist.template",
+      "ai.tybo.supabase.plist.template",
       "ai.tybo.telegram-relay.plist.template",
       "ai.tybo.watchdog.plist.template",
     ]);

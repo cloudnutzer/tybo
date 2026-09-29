@@ -20,6 +20,15 @@ export interface ProbeResult {
   message: string;
 }
 
+export interface ClaudeVersionResult extends ProbeResult {
+  /**
+   * Nur gesetzt, wenn der Befehl in keinem PATH-Ordner liegt (spawnError
+   * „ENOENT“). Startet er, meldet aber keine Version, fehlt das Feld: dann ist
+   * die CLI da, aber defekt, kein bloßes PATH-Problem.
+   */
+  notFound?: boolean;
+}
+
 export interface TelegramBotInfo extends ProbeResult {
   username?: string;
 }
@@ -34,7 +43,7 @@ export interface Providers {
   telegramCheckGroup(token: string, chatId: string): Promise<ProbeResult>;
   supabaseQuery(url: string, key: string): Promise<ProbeResult>;
   convexQuery(url: string, token: string): Promise<ProbeResult>;
-  claudeVersion(claudePath: string): Promise<ProbeResult>;
+  claudeVersion(claudePath: string): Promise<ClaudeVersionResult>;
   claudeProbe(claudePath: string): Promise<ProbeResult>;
   openrouterKey(key: string): Promise<ProbeResult>;
   ollamaTags(): Promise<OllamaResult>;
@@ -209,7 +218,8 @@ export function createProviders(deps: ProviderDeps): Providers {
         const version = versionOnly(res.stdout);
         return { ok: true, message: version ? `Claude CLI ${version}` : "Claude CLI gefunden." };
       }
-      return { ok: false, message: "Claude CLI nicht gefunden." };
+      if (res.code === -1 && res.spawnError === "ENOENT") return { ok: false, message: "Claude CLI nicht gefunden.", notFound: true };
+      return { ok: false, message: "Die Claude CLI ist da, startet aber nicht richtig („claude --version“ scheitert). Neu installieren." };
     },
 
     async claudeProbe(claudePath) {

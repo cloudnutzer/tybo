@@ -288,7 +288,7 @@ describe("Convex: Nur-Anzeige-Einträge kommen gar nicht erst in den Speicher", 
   });
 
   test("searchMessages ohne Embedding: 60 passende Meldungen über der Textsuch-Grenze 50 verdrängen den echten Treffer nicht", async () => {
-    const embedding = spyOn(supabaseModule, "generateEmbedding").mockResolvedValue(null);
+    const embedding = spyOn(supabaseModule, "generateOpenAiEmbedding").mockResolvedValue(null);
     cleanups.push(() => embedding.mockRestore());
     convexStore();
     await facade.saveMessage({ chat_id: USER, role: "user", content: "Alte Frage zu Issue 45" });

@@ -194,7 +194,7 @@ export function fakeTelegramChat(mediaDir: string, extra: Partial<Parameters<typ
       processIntents: async (text, turn) => {
         rec.intents.push({ text, turn });
       },
-      abortClaudeCalls: key => abortExecutions(key),
+      abortEngineCalls: key => abortExecutions(key),
       isShuttingDown: () => false,
       scheduleRestartCheck: () => {},
       sendPlain: async (chatId, text, threadId) => {

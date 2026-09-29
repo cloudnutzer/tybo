@@ -14,8 +14,9 @@ import type { TelegramLiveFeed, TelegramSource } from "./telegram";
 import type { TopicManager } from "./topics";
 import type { SettingsPort } from "./settings";
 import type { InstructionsPort } from "./instructions";
-import type { ModelCatalog } from "./models";
+import type { ModelCatalog, OpenCodeModelsPort } from "./models";
 import type { StatusPort } from "./status";
+import type { EnginePort } from "./engines";
 import type { FilesDeps } from "./files";
 import type { UploadStore } from "./uploads";
 import { defaultCliTokenFile } from "./cli-token";
@@ -52,8 +53,12 @@ export interface StartWebUiOptions {
   instructions?: InstructionsPort;
   /** Modell-Listen (Issue #36); ohne Angabe die Standard-Abfrage im Server */
   models?: ModelCatalog;
+  /** `opencode models` für die Modell-Liste (Issue #129); in bot.ts listOpenCodeModels */
+  opencodeModels?: OpenCodeModelsPort;
   /** Status und Neustart-Anforderung (Issue #37); in bot.ts createBotStatus */
   status?: StatusPort;
+  /** Motor-Wahl (Issue #126); in bot.ts createBotEngines */
+  engines?: EnginePort;
   /** Dateien aus Meldungen herunterladen (Issue #47); in bot.ts createBotFiles */
   files?: FilesDeps;
   /** Anhänge aus dem Web-Chat (Issue #72); in bot.ts eine UploadStore auf data/uploads */
@@ -128,7 +133,9 @@ export async function startWebUi(options: StartWebUiOptions): Promise<WebServer 
       settings: options.settings,
       instructions: options.instructions,
       models: options.models,
+      opencodeModels: options.opencodeModels,
       status: options.status,
+      engines: options.engines,
       files: options.files,
       uploads: options.uploads,
       commands: options.commands,

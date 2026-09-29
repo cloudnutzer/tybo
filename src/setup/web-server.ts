@@ -59,7 +59,7 @@ import { randomBytes } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { BRAND } from "../brand";
-import type { Supervisor } from "../lib/restart-request";
+import { supervisorName, type Supervisor } from "../lib/restart-request";
 import { hashToken, hasTunnelHeaders, isSameOrigin, LoginLimiter, parseHostHeader, passwordMatches } from "../web/auth";
 import { MAX_ENV_VALUE_LENGTH } from "../web/env-rules";
 import { SECURITY_HEADERS } from "../web/server";
@@ -87,7 +87,7 @@ import {
 import type { Providers } from "./providers";
 import { existingFieldValues, SETUP_STEPS } from "./steps";
 import { waitForEnvWrites } from "./steps/common";
-import { autostartStep } from "./steps/autostart";
+import { AUTOSTART_MANAGERS, autostartPlan, autostartStep, MANAGER_LABEL, type AutostartManager } from "./steps/autostart";
 import { CLAUDE_LOGIN_NOT_CHECKED } from "./steps/prerequisites";
 
 export const SETUP_COOKIE = "tybo_setup";
@@ -147,7 +147,7 @@ export function noModelProviders(providers: Providers): Providers {
 /** Was nach „Fertig“ passiert */
 export type FinishPlan =
   | { kind: "restart"; supervisor: Supervisor; message: string }
-  | { kind: "autostart"; message: string }
+  | { kind: "autostart"; message: string; manager?: AutostartManager }
   | { kind: "manual"; command: string; message: string };
 
 export interface SetupServerOptions {
@@ -156,7 +156,7 @@ export interface SetupServerOptions {
   code: string;
   /** Standard 3100 aus WEB_PORT; 0 in Tests (freier Port) */
   port: number;
-  /** Läuft dieser Prozess unter launchd oder PM2? (bot.ts: detectSupervisor, tybo: nie) */
+  /** Läuft dieser Prozess unter launchd, PM2 oder systemd? (bot.ts: detectSupervisor, tybo: nie) */
   supervisor(): Promise<Supervisor | null>;
   /** Startbefehl ohne Supervisor */
   startCommand: string;
@@ -550,7 +550,23 @@ export async function createSetupServer(options: SetupServerOptions): Promise<Se
     return rel && !rel.startsWith("..") ? rel : p;
   }
 
+  /**
+   * Weg des Autostarts für „Fertig“ (Issue #207), solange er fehlt: wählbare
+   * Wege mit Standard (null: nur ausdrücklich), dazu ein Hinweis, warum
+   * systemd fehlt oder nichts geht. null, wenn es nichts zu wählen gibt.
+   */
+  async function autostartChoice(state: string | undefined) {
+    if (state === "erledigt") return null;
+    const plan = await autostartPlan(ctx);
+    return {
+      choices: plan.managers.map(m => ({ value: m, label: MANAGER_LABEL[m] })),
+      default: plan.default,
+      note: plan.blocked ?? plan.note ?? null,
+    };
+  }
+
   async function overview() {
+    const supervisor = await options.supervisor();
     const steps = [];
     const states: Partial<Record<StepId, string>> = {};
     for (const step of catalog) {
@@ -573,7 +589,8 @@ export async function createSetupServer(options: SetupServerOptions): Promise<Se
       ready: missing.length === 0,
       missing: missing.map(s => s.title),
       autostart: states.autostart ?? "fehlt",
-      supervisor: await options.supervisor(),
+      autostartChoice: supervisor ? null : await autostartChoice(states.autostart),
+      supervisor,
       startCommand: options.startCommand,
       running: activeRun ? { runId: activeRun.id, step: activeRun.stepId } : null,
     };
@@ -887,11 +904,15 @@ export async function createSetupServer(options: SetupServerOptions): Promise<Se
 
   async function finish(body: string): Promise<Response> {
     let wantAutostart = false;
+    let manager: AutostartManager | undefined;
     try {
       const parsed = body ? JSON.parse(body) : {};
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
       if (parsed.autostart !== undefined && typeof parsed.autostart !== "boolean") throw new Error();
+      // Weg des Autostarts (Issue #207); fehlt er, gilt der Standard
+      if (parsed.manager !== undefined && !AUTOSTART_MANAGERS.includes(parsed.manager)) throw new Error();
       wantAutostart = parsed.autostart === true;
+      manager = parsed.manager;
     } catch {
       return json({ error: "Ungültige Anfrage" }, 400);
     }
@@ -911,14 +932,16 @@ export async function createSetupServer(options: SetupServerOptions): Promise<Se
         plan = {
           kind: "restart",
           supervisor,
-          message: `${BRAND.name} startet jetzt neu (${supervisor === "launchd" ? "launchd" : "PM2"}) und ist in wenigen Sekunden in Telegram erreichbar.`,
+          message: `${BRAND.name} startet jetzt neu (${supervisorName(supervisor)}) und ist in wenigen Sekunden in Telegram erreichbar.`,
         };
       } else if (wantAutostart && (await autostartStep.status(ctx)).state !== "erledigt") {
-        const check = await autostartStep.test!({}, ctx);
+        const check = await autostartStep.test!(manager ? { manager } : {}, ctx);
         if (!check.ok) return json({ error: `Autostart lässt sich nicht einrichten: ${check.message}` }, 409);
+        const how = manager && manager !== "launchd" ? ` (${MANAGER_LABEL[manager]})` : "";
         plan = {
           kind: "autostart",
-          message: `Die Einrichtung schließt jetzt, dann richtet ${BRAND.name} den Autostart ein und startet. Ob es geklappt hat, steht im Terminal; danach meldet sich der Bot in Telegram.`,
+          message: `Die Einrichtung schließt jetzt, dann richtet ${BRAND.name} den Autostart${how} ein und startet. Ob es geklappt hat, steht im Terminal; danach meldet sich der Bot in Telegram.`,
+          ...(manager ? { manager } : {}),
         };
       } else {
         plan = {

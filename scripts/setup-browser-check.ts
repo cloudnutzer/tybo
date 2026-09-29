@@ -19,9 +19,28 @@
  * Issue #163: Die Management-API von Supabase ist die Attrappe aus
  * tests/supabase-api-fixture.ts; der Datenbank-Schritt zeigt den Standard
  * „Supabase in der Cloud“ und lädt die (einzige) Organisation.
+ *
+ * Issue #167: Schritt „Semantische Suche“ mit den Attrappen aus
+ * tests/search-fixture.ts (Supabase, Gemini, Ollama) und
+ * tests/local-supabase-fixture.ts (Supabase auf diesem Rechner):
+ * Anbieterwechsel und sichtbare Felder, Gemini-Schlüssel bis zum Nachweis,
+ * Ollama-Download abgelehnt und bestätigt.
+ *
+ * Issue #168: Rückfrage „Neuberechnung beim Anbieterwechsel“ (SEARCH_REINDEX)
+ * mit geladener Auswahl: kein Wechsel, Anbieterwechsel, Modellwechsel,
+ * Ablehnen, Zustimmen (Lauf reserviert, Neuberechnung im Hintergrund als
+ * Attrappe, es startet nichts) und Fehler beim Laden der Schätzung.
+ *
+ * Issue #207: Linux mit systemd, Kontext und Befehle (systemctl --user,
+ * loginctl, which, PM2) aus tests/systemd-fixture.ts. Auswahl „Art des
+ * Autostarts“ unter „Fertig“: Vorschlag systemd, erst mit Häkchen bedienbar,
+ * PM2 gewählt bis zum Abschluss; dazu ein Rechner, dessen Benutzer-Manager
+ * nicht antwortet (kein Vorschlag, Hinweis, „Fertig“ ohne Wahl abgelehnt).
+ * „Fertig“ schließt hier nur den Server: eingerichtet wird nichts, es startet
+ * kein Dienst.
  */
 
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BRAND } from "../src/brand";
@@ -33,6 +52,13 @@ import { checkStep, SETUP_STEPS } from "../src/setup/steps";
 import { writeEnv } from "../src/setup/steps/common";
 import { ABORTED_MESSAGE, FLOW, FLOW_ID, makeFlowStep } from "../tests/setup-flow-fixture";
 import { fakeSupabaseApi, SB } from "../tests/supabase-api-fixture";
+import { EDGE_FUNCTIONS, functionsEnvPath } from "../src/setup/semantic-search";
+import { GEMINI, localRuntime, OPENAI, searchFake, type FakeProjectState, type SearchFake } from "../tests/search-fixture";
+import { REINDEX_FIELD, REINDEX_NO, REINDEX_NONE, REINDEX_YES } from "../src/setup/semantic-search";
+import { fakeLocal, LOCAL, SAFE_CONTAINERS } from "../tests/local-supabase-fixture";
+import { cleanup as cleanupFixture, FULL_ENV } from "../tests/setup-fixture";
+import { PROFILE } from "../tests/setup-web-fixture";
+import { linuxCtx, started, type World } from "../tests/systemd-fixture";
 
 const CHROME = process.env.CHROME_PATH || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const SHOTS = process.argv.includes("--screenshots");
@@ -89,6 +115,8 @@ const server = await createSetupServer({
 });
 const base = server.url;
 let flowServer: SetupServer | null = null;
+const searchServers: SetupServer[] = [];
+const linuxServers: SetupServer[] = [];
 
 const debugPort = 9800 + Math.floor(Math.random() * 150);
 const chrome = Bun.spawn(
@@ -195,6 +223,89 @@ async function openStep(id: string) {
   await click(`.setup-step[data-step="${id}"]`);
   await waitFor(`document.querySelector('.setup-step[data-step="${id}"]').getAttribute("aria-current") === "step"`);
 }
+const choose = (id: string, value: string) =>
+  js(`(() => { const s = document.getElementById(${JSON.stringify(id)}); s.value = ${JSON.stringify(value)}; s.dispatchEvent(new Event("change")); })()`);
+/** Sind genau diese Felder im offenen Schritt sichtbar (in dieser Reihenfolge)? */
+async function fieldsAre(expected: string[]): Promise<boolean> {
+  const want = JSON.stringify(expected);
+  return waitFor(`JSON.stringify([...document.querySelectorAll("[data-field]")].filter(w => !w.hidden).map(w => w.dataset.field)) === ${JSON.stringify(want)}`);
+}
+
+/**
+ * Einrichtungs-Server für den Suchschritt (Issue #167): eigenes Projekt mit
+ * Kopie von supabase/, Attrappen statt Netz. project: Zustand der Datenbank
+ * (Issue #168: Anbieterkennung, Umfang); launches: Starts im Hintergrund
+ * (Attrappe, es startet nichts)
+ */
+async function searchServer(envText: string, local?: ReturnType<typeof fakeLocal>, project: Partial<FakeProjectState> = {}) {
+  const root = await mkdtemp(join(tmpdir(), "tybo-setup-suche-"));
+  await mkdir(join(root, "config"), { recursive: true });
+  await writeFile(join(root, ".env"), envText, { mode: 0o600 });
+  await writeFile(join(root, "config", "profile.md"), "# Profil\n");
+  const repo = join(import.meta.dir, "..");
+  await cp(join(repo, "supabase", "functions"), join(root, "supabase", "functions"), { recursive: true });
+  await cp(join(repo, "supabase", "config.toml"), join(root, "supabase", "config.toml"));
+  const fake: SearchFake = searchFake({ project: { serviceKeys: [local ? LOCAL.secret : SB.secret], deployed: local ? new Set(EDGE_FUNCTIONS) : new Set(), ...project }, ollama: { models: [] } });
+  const launches: string[][] = [];
+  if (local) {
+    local.containers = [...SAFE_CONTAINERS, "supabase_edge_runtime_tybo\t"];
+    const runtime = localRuntime(functionsEnvPath(root));
+    fake.project.runtimeKey = runtime.key;
+    fake.project.runtimeEnv = runtime.env;
+    await runtime.start();
+    local.answers["supabase start"] = async () => {
+      await runtime.start();
+      return { stdout: "Started" };
+    };
+  }
+  const c = createSetupContext({
+    root,
+    home: join(root, "home"),
+    platform: "darwin",
+    launchAgentsDir: join(root, "home", "Library", "LaunchAgents"),
+    pm2DumpPath: join(root, "home", ".pm2", "dump.pm2"),
+    run: local ? (local.run as CommandRunner) : run,
+    providers,
+    fetch: fake.fetch,
+    startBackground: async cmd => {
+      launches.push(cmd);
+      return true;
+    },
+    ...(local ? { localSupabase: local.deps } : {}),
+  });
+  const searchCode = generateSetupCode();
+  const s = await createSetupServer({ ctx: c, code: searchCode, port: 0, supervisor: async () => null, startCommand: "cd ~/tybo && bun run start", log: () => {} });
+  searchServers.push(s);
+  await goto(`${s.url}/`);
+  await waitFor(`document.getElementById("code-form")`);
+  await typeInto("code", formatSetupCode(searchCode));
+  await click("#code-button");
+  await waitFor(`document.querySelectorAll(".setup-step").length === ${SETUP_STEPS.length}`);
+  await openStep("suche");
+  return { fake, root, launches };
+}
+
+/** Auswahl der Rückfrage laden; die geladenen Optionen (Wert und Text) */
+async function loadReindex(): Promise<Array<{ value: string; label: string }>> {
+  await click(`button[data-action="load-${REINDEX_FIELD}"]`);
+  await waitFor(`!document.getElementById("field-${REINDEX_FIELD}").disabled`);
+  return js(`[...document.getElementById("field-${REINDEX_FIELD}").options].filter(o => o.value).map(o => ({ value: o.value, label: o.textContent }))`);
+}
+
+/** Rückfrage samt Hilfe ins Bild holen (für Screenshots) */
+const showReindex = () => js(`document.querySelector('[data-field="${REINDEX_FIELD}"]')?.scrollIntoView({ block: "center" })`);
+
+/** Ergebnis des Ablaufs ins Bild holen (für Screenshots) */
+const showResult = () => js(`document.querySelector(".setup-result")?.scrollIntoView({ block: "center" })`);
+
+/** Einrichten, Plan bestätigen, auf das Ergebnis warten; Text des Ergebnisses */
+async function runSearch(): Promise<string> {
+  await click('button[data-action="run"]');
+  await waitFor(`document.querySelector('button[data-action="run-confirm"]')`);
+  await click('button[data-action="run-confirm"]');
+  await waitFor(`document.querySelector(".setup-result-ok, .setup-result .actions-error")`, 15000);
+  return js<string>(`(document.querySelector(".setup-result-ok, .setup-result .actions-error")?.textContent) ?? ""`);
+}
 
 try {
   await cdp("Page.enable");
@@ -217,7 +328,7 @@ try {
   check("falscher Code: Meldung", await waitFor(`document.getElementById("code-error").textContent === "Falscher Code."`));
   await typeInto("code", formatSetupCode(code).toLowerCase());
   await click("#code-button");
-  check("richtiger Code (klein, mit Bindestrich): Assistent öffnet", await waitFor(`location.pathname === "/" && document.querySelectorAll(".setup-step").length === 9`));
+  check("richtiger Code (klein, mit Bindestrich): Assistent öffnet", await waitFor(`location.pathname === "/" && document.querySelectorAll(".setup-step").length === ${SETUP_STEPS.length}`));
   check(`Assistent: Titel und Wortmarke ${BRAND.name}`, await js<boolean>(`document.title === ${JSON.stringify(`${BRAND.name} Einrichtung`)} && document.querySelector(".wordmark").textContent === ${JSON.stringify(BRAND.name)}`));
   const cookie = await cdp("Network.getCookies", { urls: [base] }).catch(() => null);
   if (cookie) {
@@ -322,7 +433,9 @@ try {
   await waitFor(`document.getElementById("code-form")`);
   await typeInto("code", formatSetupCode(flowCode));
   await click("#code-button");
-  check("Test-Schritt: Assistent mit 10 Schritten", await waitFor(`document.querySelectorAll(".setup-step").length === 10`));
+  // Alle Schritte ohne Gesamtprüfung, dazu Test-Schritt und Gesamtprüfung
+  const flowSteps = SETUP_STEPS.length + 1;
+  check(`Test-Schritt: Assistent mit ${flowSteps} Schritten`, await waitFor(`document.querySelectorAll(".setup-step").length === ${flowSteps}`));
   await openStep(FLOW_ID);
   check("Standard vorausgefüllt, Auswahl erst nach Laden, Knopf Einrichten", await waitFor(
     `document.getElementById("field-FLOW_NAME").value === "tybo" && document.getElementById("field-FLOW_ORG").disabled && document.querySelector('button[data-action="run"]')?.textContent === "Einrichten" && !document.querySelector('button[data-action="apply"]')`,
@@ -363,6 +476,188 @@ try {
   check("Abbrechen: Meldung des Ablaufs", await waitFor(`document.querySelector(".setup-result .actions-error")?.textContent === ${JSON.stringify(ABORTED_MESSAGE)}`, 8000));
   await shootAll("einrichtung-ablauf-abgebrochen");
 
+  // --- Semantische Suche: Anbieterwahl (Issue #167) -----------------------------
+  const BASE_ENV = `TELEGRAM_BOT_TOKEN=${TOKEN}\nTELEGRAM_USER_ID=${USER_ID}\nUSER_NAME=Beispiel\nUSER_TIMEZONE=Europe/Berlin\n`;
+  const cloud = await searchServer(`${BASE_ENV}SUPABASE_URL=https://${SB.ref}.supabase.co\nSUPABASE_SERVICE_ROLE_KEY=${SB.secret}\n`);
+  check("Suche (Cloud): Standard OpenAI, Felder Schlüssel und Token", await waitFor(`document.getElementById("field-EMBEDDING_PROVIDER")?.value === "openai"`) && await fieldsAre(["EMBEDDING_PROVIDER", "SEARCH_OPENAI_KEY", "SUPABASE_SETUP_TOKEN", REINDEX_FIELD]));
+  check("Suche: drei Anbieter mit je einem Satz", await js<boolean>(`[...document.getElementById("field-EMBEDDING_PROVIDER").options].filter(o => o.value).map(o => o.value).join() === "openai,gemini,ollama"`));
+  await shootAll("einrichtung-suche-openai");
+  await choose("field-EMBEDDING_PROVIDER", "ollama");
+  check("Suche (Cloud): Ollama blendet Adresse und Rückfrage ein, Token aus", await fieldsAre(["EMBEDDING_PROVIDER", "OLLAMA_URL", "SEARCH_OLLAMA_PULL"]));
+  await click('button[data-action="run"]');
+  check("Suche (Cloud): Plan erklärt, warum Ollama dort nicht geht", await waitFor(`document.querySelector(".setup-plan")?.textContent.includes("erreichen es nicht")`));
+  await click('button[data-action="run-back"]');
+  await choose("field-EMBEDDING_PROVIDER", "gemini");
+  check("Suche (Cloud): Gemini blendet Gemini-Schlüssel und Token ein", await fieldsAre(["EMBEDDING_PROVIDER", "SEARCH_GEMINI_KEY", "SUPABASE_SETUP_TOKEN", REINDEX_FIELD]));
+  check("Gemini-Schlüssel: verdecktes Feld, leer, nicht vom Browser gemerkt", await js<boolean>(`(() => { const i = document.getElementById("field-SEARCH_GEMINI_KEY"); return i.type === "password" && i.value === "" && i.autocomplete === "new-password"; })()`));
+  await typeInto("field-SEARCH_GEMINI_KEY", GEMINI.good);
+  await typeInto("field-SUPABASE_SETUP_TOKEN", SB.token);
+  await shootAll("einrichtung-suche-gemini");
+  const geminiResult = await runSearch();
+  check("Gemini: Einrichtung bis zum Nachweis", geminiResult.includes("Semantische Suche: aktiv (Google Gemini (gemini-embedding-2))"), geminiResult);
+  check("Gemini: Geheimnisse bei Supabase samt Anbieter", cloud.fake.secrets[SB.ref]?.EMBEDDING_PROVIDER === "gemini" && cloud.fake.secrets[SB.ref]?.GEMINI_API_KEY === GEMINI.good);
+  check("Gemini: Schlüssel nie in der Adresse", cloud.fake.sent.every(s => !s.url.includes(GEMINI.good)));
+  check("Gemini: Schritt erledigt", await waitFor(`document.querySelector('.setup-step[data-step="suche"]').dataset.state === "erledigt"`));
+  const afterGemini = await js<string>(`document.documentElement.outerHTML`);
+  check("Gemini-Schlüssel und Token nirgends im Dokument", !afterGemini.includes(GEMINI.good) && !afterGemini.includes(SB.token));
+  await shootAll("einrichtung-suche-gemini-fertig", showResult);
+
+  const local = fakeLocal();
+  const onMac = await searchServer(`${BASE_ENV}SUPABASE_URL=${LOCAL.apiUrl}\nSUPABASE_SERVICE_ROLE_KEY=${LOCAL.secret}\n`, local);
+  check("Suche (lokal): Standard OpenAI, kein Token-Feld", await fieldsAre(["EMBEDDING_PROVIDER", "SEARCH_OPENAI_KEY", REINDEX_FIELD]));
+  await choose("field-EMBEDDING_PROVIDER", "ollama");
+  check("Suche (lokal): Ollama mit Adresse (Vorschlag) und Ja/Nein-Rückfrage", await fieldsAre(["EMBEDDING_PROVIDER", "OLLAMA_URL", "SEARCH_OLLAMA_PULL", REINDEX_FIELD]) && await js<boolean>(`document.getElementById("field-OLLAMA_URL").value === "http://localhost:11434" && [...document.getElementById("field-SEARCH_OLLAMA_PULL").options].map(o => o.value).join() === ",true,false"`));
+  await choose("field-SEARCH_OLLAMA_PULL", "false");
+  await shootAll("einrichtung-suche-ollama");
+  const declined = await runSearch();
+  check("Ollama, Download abgelehnt: Abbruch mit Befehl, kein Download", declined.includes("ollama pull bge-m3") && onMac.fake.ollama.pulls.length === 0, declined);
+  check("Ollama, abgelehnt: nichts eingetragen", !(await Bun.file(functionsEnvPath(onMac.root)).exists()));
+  await shootAll("einrichtung-suche-ollama-abgelehnt", showResult);
+  await choose("field-EMBEDDING_PROVIDER", "ollama");
+  await choose("field-SEARCH_OLLAMA_PULL", "true");
+  const accepted = await runSearch();
+  check("Ollama, Download bestätigt: ollama pull, dann Nachweis", accepted.includes("Semantische Suche: aktiv (Ollama (bge-m3))") && onMac.fake.ollama.pulls.join() === "bge-m3", accepted);
+  check("Ollama: Functions mit Docker-Adresse, Supabase neu gestartet", (await Bun.file(functionsEnvPath(onMac.root)).text()).includes("OLLAMA_URL=http://host.docker.internal:11434") && local.trail().includes("supabase start"));
+  await shootAll("einrichtung-suche-ollama-fertig", showResult);
+  await viewport(390);
+  check("Suche, 390 px: kein waagrechtes Scrollen", await noHorizontalScroll(390));
+  await viewport(1280);
+
+  // --- Semantische Suche: Rückfrage beim Anbieterwechsel (Issue #168) -------------
+  const OPENAI_DB = { registry: { provider: "openai", model: "text-embedding-3-small" }, counts: { messages: { rows: 1200, chars: 480_000 }, memory: { rows: 40, chars: 4_000 }, knowledge: { rows: 10, chars: 16_000 } } } as const;
+  const CLOUD_ENV = `${BASE_ENV}SUPABASE_URL=https://${SB.ref}.supabase.co\nSUPABASE_SERVICE_ROLE_KEY=${SB.secret}\n`;
+  const noStart = (fake: SearchFake) => fake.sent.every(c => !c.url.endsWith("/rpc/embedding_reindex_start"));
+  const changes = (fake: SearchFake) => fake.sent.filter(c => c.method === "POST" && /\/v1\/projects\/[a-z]+\/(functions\/deploy|secrets)/.test(c.url)).length;
+
+  // Kein Wechsel: die Datenbank hält OpenAI fest, gewählt ist OpenAI
+  const same = await searchServer(CLOUD_ENV, undefined, { ...OPENAI_DB });
+  await typeInto("field-SEARCH_OPENAI_KEY", OPENAI.good);
+  await typeInto("field-SUPABASE_SETUP_TOKEN", SB.token);
+  check("Rückfrage: vor dem Laden gesperrt, Knopf Auswahl laden", await js<boolean>(`document.getElementById("field-${REINDEX_FIELD}").disabled && !!document.querySelector('button[data-action="load-${REINDEX_FIELD}"]')`));
+  const sameChoices = await loadReindex();
+  check("Kein Wechsel: nur „Weiter“, passt zur Datenbank", sameChoices.length === 1 && sameChoices[0].value === REINDEX_NONE && sameChoices[0].label.includes("passt zur Datenbank"), JSON.stringify(sameChoices));
+  check("Kein Wechsel: keine Schätzung abgefragt", same.fake.sent.every(c => !c.url.endsWith("/rpc/embedding_reindex_estimate")));
+  await choose(`field-${REINDEX_FIELD}`, REINDEX_NONE);
+  await shootAll("einrichtung-suche-wechsel-keiner", showReindex);
+
+  // Anbieterwechsel OpenAI → Gemini: Auswahl mit Umfang, Dauer und Kosten
+  const change = await searchServer(CLOUD_ENV, undefined, { ...OPENAI_DB });
+  await choose("field-EMBEDDING_PROVIDER", "gemini");
+  // Erst die neue Sichtbarkeit abwarten: sonst verwirft die Seite eine Auswahl, die davor geladen wurde
+  await fieldsAre(["EMBEDDING_PROVIDER", "SEARCH_GEMINI_KEY", "SUPABASE_SETUP_TOKEN", REINDEX_FIELD]);
+  await typeInto("field-SEARCH_GEMINI_KEY", GEMINI.good);
+  await typeInto("field-SUPABASE_SETUP_TOKEN", SB.token);
+  const changeChoices = await loadReindex();
+  const yes = changeChoices.find(c => c.value === REINDEX_YES)?.label ?? "";
+  check("Anbieterwechsel: erst Abbrechen, dann Alles neu berechnen", changeChoices.map(c => c.value).join() === `${REINDEX_NO},${REINDEX_YES}`, JSON.stringify(changeChoices));
+  check("Anbieterwechsel: Abbrechen nennt, was bleibt", changeChoices[0]?.label.includes("es bleibt bei OpenAI (text-embedding-3-small)"));
+  check("Anbieterwechsel: Umfang, Dauer und Kosten", yes.includes("Alles neu berechnen mit Google Gemini (gemini-embedding-2) statt OpenAI (text-embedding-3-small)") && yes.includes("ca. 1.250 Einträge") && yes.includes("Dauer etwa") && yes.includes("Kosten"), yes);
+  check("Anbieterwechsel: noch nichts geändert", noStart(change.fake) && changes(change.fake) === 0);
+  await choose(`field-${REINDEX_FIELD}`, REINDEX_YES);
+  await shootAll("einrichtung-suche-wechsel-anbieter", showReindex);
+
+  // Ablehnen: nichts geändert
+  await choose(`field-${REINDEX_FIELD}`, REINDEX_NO);
+  const declinedSwitch = await runSearch();
+  check("Ablehnen: Abbruch, nichts geändert", declinedSwitch.includes("Abgebrochen, wie gewählt") && declinedSwitch.includes("Nichts wurde geändert"), declinedSwitch);
+  check("Ablehnen: keine Functions, keine Geheimnisse, kein Beginn, kein Hintergrund", changes(change.fake) === 0 && noStart(change.fake) && change.launches.length === 0 && !change.fake.project.reindex);
+  check("Ablehnen: .env unverändert", (await Bun.file(join(change.root, ".env")).text()) === CLOUD_ENV);
+  await shootAll("einrichtung-suche-wechsel-abgelehnt", showResult);
+
+  // Zustimmen: Lauf reserviert, eingerichtet, Neuberechnung im Hintergrund (Attrappe)
+  await choose("field-EMBEDDING_PROVIDER", "gemini");
+  await fieldsAre(["EMBEDDING_PROVIDER", "SEARCH_GEMINI_KEY", "SUPABASE_SETUP_TOKEN", REINDEX_FIELD]);
+  await typeInto("field-SEARCH_GEMINI_KEY", GEMINI.good);
+  await typeInto("field-SUPABASE_SETUP_TOKEN", SB.token);
+  await loadReindex();
+  await choose(`field-${REINDEX_FIELD}`, REINDEX_YES);
+  const acceptedSwitch = await runSearch();
+  check("Zustimmen: Neuberechnung begonnen, Hinweis auf Textsuche, Meldung und Neustart (ungekürzt)", acceptedSwitch.includes("Neuberechnung auf Google Gemini (gemini-embedding-2) begonnen (ca. 1.250 Einträge") && acceptedSwitch.includes("nur Text") && acceptedSwitch.includes("Meldung in Telegram") && acceptedSwitch.includes("Neustart anfordern") && !acceptedSwitch.includes("…"), acceptedSwitch);
+  const startAt = change.fake.sent.findIndex(c => c.url.endsWith("/rpc/embedding_reindex_start"));
+  const firstChange = change.fake.sent.findIndex(c => c.method === "POST" && /\/v1\/projects\/[a-z]+\/(functions\/deploy|secrets)/.test(c.url));
+  check("Zustimmen: Lauf reserviert vor den Änderungen", startAt > -1 && firstChange > startAt && !!change.fake.project.reindex?.leased);
+  check("Zustimmen: Hintergrundlauf mit demselben Inhaber", change.launches.length === 1 && change.launches[0].at(-1) === `--inhaber=${change.fake.project.reindex?.holder}`);
+  check("Zustimmen: Kennung bleibt bis zum Ende beim alten Anbieter", JSON.stringify(change.fake.project.registry) === JSON.stringify(OPENAI_DB.registry));
+  const afterSwitch = await js<string>(`document.documentElement.outerHTML`);
+  check("Zustimmen: Gemini-Schlüssel und Token nirgends im Dokument", !afterSwitch.includes(GEMINI.good) && !afterSwitch.includes(SB.token));
+  await shootAll("einrichtung-suche-wechsel-zugestimmt", showResult);
+
+  // Modellwechsel beim gleichen Anbieter (EMBEDDING_MODEL in der .env)
+  const model = await searchServer(`${CLOUD_ENV}EMBEDDING_PROVIDER=openai\nEMBEDDING_MODEL=text-embedding-3-large\n`, undefined, { ...OPENAI_DB });
+  await typeInto("field-SEARCH_OPENAI_KEY", OPENAI.good);
+  await typeInto("field-SUPABASE_SETUP_TOKEN", SB.token);
+  const modelChoices = await loadReindex();
+  check("Modellwechsel: angeboten mit neuem und altem Modell", (modelChoices.find(c => c.value === REINDEX_YES)?.label ?? "").includes("OpenAI (text-embedding-3-large) statt OpenAI (text-embedding-3-small)"), JSON.stringify(modelChoices));
+  check("Modellwechsel: noch nichts geändert", noStart(model.fake) && changes(model.fake) === 0);
+  await choose(`field-${REINDEX_FIELD}`, REINDEX_YES);
+  await shootAll("einrichtung-suche-wechsel-modell", showReindex);
+
+  // Fehler beim Laden der Schätzung (Migration 20260928 fehlt): nur Abbrechen mit Grund
+  const broken = await searchServer(CLOUD_ENV, undefined, { ...OPENAI_DB, reindexMissing: true });
+  await choose("field-EMBEDDING_PROVIDER", "gemini");
+  await fieldsAre(["EMBEDDING_PROVIDER", "SEARCH_GEMINI_KEY", "SUPABASE_SETUP_TOKEN", REINDEX_FIELD]);
+  await typeInto("field-SEARCH_GEMINI_KEY", GEMINI.good);
+  await typeInto("field-SUPABASE_SETUP_TOKEN", SB.token);
+  const brokenChoices = await loadReindex();
+  check("Schätzung nicht ladbar: nur Abbrechen, mit Grund", brokenChoices.length === 1 && brokenChoices[0].value === REINDEX_NO && brokenChoices[0].label.includes("20260928_embedding_reindex.sql"), JSON.stringify(brokenChoices));
+  await choose(`field-${REINDEX_FIELD}`, REINDEX_NO);
+  await shootAll("einrichtung-suche-wechsel-schaetzung-fehler", showReindex);
+  const brokenRun = await runSearch();
+  check("Schätzung nicht ladbar: Einrichten ändert nichts", brokenRun.includes("Nichts wurde geändert") && changes(broken.fake) === 0 && noStart(broken.fake), brokenRun);
+  await viewport(390);
+  check("Rückfrage, 390 px: kein waagrechtes Scrollen", await noHorizontalScroll(390));
+  await viewport(1280);
+
+  // --- Linux mit systemd: Art des Autostarts (Issue #207) ------------------------
+  /** Einrichtungs-Server auf einem Linux-Rechner als Attrappe, angemeldet, Schritt „Fertig“ offen */
+  async function linuxServer(world: Partial<World>) {
+    const c = await linuxCtx(world, { env: FULL_ENV, profile: PROFILE });
+    const linuxCode = generateSetupCode();
+    const s = await createSetupServer({ ctx: c, code: linuxCode, port: 0, supervisor: async () => null, startCommand: "cd ~/tybo && bun run start", log: () => {} });
+    linuxServers.push(s);
+    await goto(`${s.url}/`);
+    await waitFor(`document.getElementById("code-form")`);
+    await typeInto("code", formatSetupCode(linuxCode));
+    await click("#code-button");
+    await waitFor(`document.querySelectorAll(".setup-step").length === ${SETUP_STEPS.length}`);
+    await openStep("pruefung");
+    await waitFor(`document.getElementById("setup-autostart")`);
+    return { server: s, ctx: c };
+  }
+  const managerOptions = () => js<string>(`[...document.getElementById("setup-manager").options].map(o => o.value + "=" + o.textContent).join("|")`);
+  const showManager = () => js(`document.getElementById("setup-manager")?.scrollIntoView({ block: "center" })`);
+  const tickAutostart = () => js(`(() => { const c = document.getElementById("setup-autostart"); if (!c.checked) c.click(); })()`);
+
+  const pi = await linuxServer({ pm2: "absent" });
+  check("systemd: Auswahl „Art des Autostarts“ mit Vorschlag systemd und PM2", await waitFor(`document.getElementById("setup-manager")`) &&
+    (await managerOptions()) === "systemd=systemd-Benutzerdienst (Vorschlag)|pm2=PM2" &&
+    await js<boolean>(`document.getElementById("setup-manager").value === "systemd" && document.querySelector('label[for="setup-manager"]').textContent === "Art des Autostarts"`), await managerOptions());
+  check("systemd: Auswahl ohne Häkchen gesperrt", await js<boolean>(`document.getElementById("setup-manager").disabled && !document.getElementById("setup-autostart").checked`));
+  await shootAll("einrichtung-autostart-systemd-gesperrt", showManager);
+  await tickAutostart();
+  check("systemd: mit Häkchen bedienbar", await waitFor(`!document.getElementById("setup-manager").disabled`));
+  await shootAll("einrichtung-autostart-systemd", showManager);
+  await viewport(390);
+  check("systemd, 390 px: kein waagrechtes Scrollen", await noHorizontalScroll(390));
+  await viewport(1280);
+  await choose("setup-manager", "pm2");
+  await shootAll("einrichtung-autostart-pm2", showManager);
+  await click('button[data-action="finish"]');
+  check("PM2 gewählt: Abschluss nennt PM2", await waitFor(`document.querySelector(".settings-intro")?.textContent.includes("den Autostart (PM2) ein")`));
+  const piPlan = await pi.server.finished;
+  check("PM2 gewählt: Plan autostart mit PM2 bis nach dem Schließen", piPlan.kind === "autostart" && piPlan.manager === "pm2", JSON.stringify(piPlan));
+  check("PM2 gewählt: im Browser nichts eingerichtet oder gestartet", started(pi.ctx.run).length === 0, started(pi.ctx.run).join(" | "));
+  await shootAll("einrichtung-autostart-pm2-fertig");
+
+  const noManager = await linuxServer({ reachable: false, pm2: "absent" });
+  check("Benutzer-Manager antwortet nicht: kein Vorschlag, „Bitte wählen“, nur PM2", await waitFor(`document.getElementById("setup-manager")`) && (await managerOptions()) === "=Bitte wählen|pm2=PM2" && await js<boolean>(`document.getElementById("setup-manager").value === ""`), await managerOptions());
+  check("Benutzer-Manager antwortet nicht: Hinweis auf sudo/su", await js<boolean>(`[...document.querySelectorAll(".setup-note")].some(n => n.textContent.includes("nicht über sudo oder su"))`));
+  await tickAutostart();
+  await click('button[data-action="finish"]');
+  check("ohne Wahl: „Fertig“ abgelehnt mit Grund", await waitFor(`document.querySelector(".setup-result .actions-error")?.textContent.includes("nicht über sudo")`));
+  check("ohne Wahl: nicht abgeschlossen, nichts gestartet", !noManager.server.isFinished() && started(noManager.ctx.run).length === 0);
+  await shootAll("einrichtung-autostart-ohne-systemd", showManager);
+
   const csp = problems.filter(p => /Content Security Policy|Refused/i.test(p));
   check("keine CSP-Verstöße", csp.length === 0, csp.join(" | "));
   const errors = problems.filter(p => !/Failed to load resource/.test(p));
@@ -376,7 +671,10 @@ try {
   await chrome.exited;
   await server.stop();
   await flowServer?.stop();
+  for (const s of searchServers) await s.stop();
+  for (const s of linuxServers) await s.stop();
   await rm(dir, { recursive: true, force: true });
+  await cleanupFixture();
 }
 
 console.log(failures ? `\n${failures} Prüfung(en) fehlgeschlagen` : "\nAlle Prüfungen bestanden");

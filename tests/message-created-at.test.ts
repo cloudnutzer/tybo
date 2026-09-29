@@ -83,6 +83,11 @@ describe("Edge-Function store-telegram-message: messageRow", () => {
       embedding: [0.1, 0.2],
     });
   });
+
+  test("mit Angabe, womit der Vektor entstand (Issue #168): embedding_model nur zusammen mit dem Vektor", () => {
+    expect(messageRow(body, [0.1, 0.2], Date.now(), "gemini:gemini-embedding-2")).toMatchObject({ embedding: [0.1, 0.2], embedding_model: "gemini:gemini-embedding-2" });
+    expect("embedding_model" in messageRow(body, null, Date.now(), "gemini:gemini-embedding-2")).toBe(false);
+  });
 });
 
 describe("saveMessage und insertMessageDirect (Supabase)", () => {

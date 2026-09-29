@@ -23,8 +23,12 @@ export type SessionResetResult =
   /** Kein Session-Schlüssel ermittelbar (z. B. Gruppe nicht eingerichtet) */
   | { status: "unavailable" };
 
-/** Setzt die Session eines Gesprächs zurück; wirft bei Lese- oder Schreibfehlern */
-export type ConversationSessionReset = (conversationId: string) => Promise<SessionResetResult>;
+/**
+ * Setzt die Session eines Gesprächs zurück; wirft bei Lese- oder
+ * Schreibfehlern. whileBlocked (/motor, Issue #125) läuft nach dem Reset,
+ * solange neue Ausführungen noch gesperrt sind; wirft es, wirft der Reset.
+ */
+export type ConversationSessionReset = (conversationId: string, whileBlocked?: () => Promise<void>) => Promise<SessionResetResult>;
 
 export interface SessionResetDeps<S> {
   /** Session-Schlüssel wie bei einer Nachricht in diesem Gespräch; null, wenn keiner ermittelbar ist */
@@ -62,7 +66,7 @@ export function sessionResetNote(result: { reset: number; sessionMode: boolean }
 
 export function createConversationSessionReset<S>(deps: SessionResetDeps<S>): ConversationSessionReset {
   const log = deps.log ?? ((m: string) => console.log(`[web] ${m}`));
-  return async conversationId => {
+  return async (conversationId, whileBlocked) => {
     const key = deps.sessionKey(conversationId);
     if (!key) return { status: "unavailable" };
     // Prüfen und Sperren ohne await dazwischen: keine Ausführung schlüpft durch
@@ -74,6 +78,7 @@ export function createConversationSessionReset<S>(deps: SessionResetDeps<S>): Co
         void deps.distill(session).catch(e => log(`Session-Rückblick fehlgeschlagen (${e instanceof Error ? e.name : typeof e})`));
       }
       const reset = await deps.reset(key);
+      if (whileBlocked) await whileBlocked();
       return { status: "done", reset, sessionMode: deps.sessionModeEnabled() };
     } finally {
       release();

@@ -20,6 +20,8 @@ export const SCHEMA_FILES = [
   "db/schema.sql",
   "db/migrations/2026-07-02-fable-topics-memory.sql",
   "db/migrations/20260909_security_knowledge.sql",
+  "db/migrations/20260927_embedding_provider.sql",
+  "db/migrations/20260928_embedding_reindex.sql",
 ] as const;
 
 /** Name der Migration beim Anbieter: tybo_<dateiname ohne .sql>, nur a-z, 0-9 und _ */

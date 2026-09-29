@@ -40,6 +40,7 @@ describe("Schrittliste", () => {
       "telegram",
       "gruppe",
       "datenbank",
+      "suche",
       "profil",
       "modelle",
       "webui",
@@ -48,8 +49,8 @@ describe("Schrittliste", () => {
     ]);
   });
 
-  test("optional sind genau gruppe, modelle und webui", () => {
-    expect(SETUP_STEPS.filter(s => s.optional).map(s => s.id)).toEqual(["gruppe", "modelle", "webui"]);
+  test("optional sind genau gruppe, suche, modelle und webui", () => {
+    expect(SETUP_STEPS.filter(s => s.optional).map(s => s.id)).toEqual(["gruppe", "suche", "modelle", "webui"]);
   });
 
   test("jeder Schritt hat Titel, Beschreibung und Felder mit Hilfetext", () => {
@@ -65,7 +66,7 @@ describe("Schrittliste", () => {
   });
 
   test("Schritte ohne Schreiben und ohne Test sind die erwarteten", () => {
-    expect(SETUP_STEPS.filter(s => !s.apply).map(s => s.id)).toEqual(["voraussetzungen", "pruefung"]);
+    expect(SETUP_STEPS.filter(s => !s.apply).map(s => s.id)).toEqual(["voraussetzungen", "suche", "pruefung"]);
     expect(SETUP_STEPS.filter(s => !s.test).map(s => s.id)).toEqual(["profil", "webui"]);
   });
 
@@ -153,16 +154,16 @@ describe("Gesamtstatus", () => {
     const o = overallStatus(steps, {});
     expect(o.complete).toBe(false);
     expect(o.missing).toEqual(["voraussetzungen", "telegram", "datenbank", "profil", "autostart"]);
-    expect(o.open).toEqual(["gruppe", "modelle", "webui"]);
+    expect(o.open).toEqual(["gruppe", "suche", "modelle", "webui"]);
   });
 
   test("Pflicht erledigt, optionale übersprungen: fertig", () => {
     const o = overallStatus(
       steps,
       { voraussetzungen: "erledigt", telegram: "erledigt", datenbank: "erledigt", profil: "erledigt", autostart: "erledigt" },
-      ["gruppe", "modelle", "webui"],
+      ["gruppe", "suche", "modelle", "webui"],
     );
-    expect(o).toEqual({ complete: true, missing: [], open: [], skipped: ["gruppe", "modelle", "webui"] });
+    expect(o).toEqual({ complete: true, missing: [], open: [], skipped: ["gruppe", "suche", "modelle", "webui"] });
   });
 
   test("Pflichtschritt lässt sich nicht überspringen, teilweise zählt nicht", () => {
@@ -205,6 +206,8 @@ describe("Status auf leerer und fertiger Konfiguration", () => {
       telegram: "erledigt",
       gruppe: "erledigt",
       datenbank: "erledigt",
+      // Convex: die semantische Suche dieses Schritts gilt nur für Supabase (Issue #166)
+      suche: "fehlt",
       profil: "erledigt",
       modelle: "erledigt",
       webui: "erledigt",

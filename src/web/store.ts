@@ -9,6 +9,7 @@
  * Die Liste wird atomar geschrieben (temporäre Datei, dann umbenennen).
  */
 
+import type { EngineId } from "../lib/engines/types";
 import { appendFile, chmod, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pickApiAttachments, pickAttachment, type ApiAttachment, type MessageAttachment } from "./attachments";
@@ -43,6 +44,8 @@ export interface Conversation {
 export interface ReplyInfo {
   agent?: string;
   model?: string;
+  /** Motor der Antwort (Issue #125), nur wenn einer der bekannten; fehlt bei Fallback-Antworten */
+  engine?: EngineId;
   durationMs?: number;
 }
 
@@ -80,6 +83,13 @@ export function isChoiceId(value: unknown): value is string {
   return typeof value === "string" && CHOICE_ID_PATTERN.test(value);
 }
 
+/**
+ * Motoren wie ENGINE_IDS in src/lib/engines/types.ts (Issue #125); hier als
+ * eigene Liste, weil src/web zur Laufzeit nichts außerhalb von src/web lädt.
+ * tests/web-reply-info.test.ts hält beide gleich.
+ */
+export const REPLY_ENGINES: readonly EngineId[] = ["claude", "codex", "opencode"];
+
 /** Gültige Agentennamen (wie AGENT_NAME_PATTERN in agents.ts) */
 const REPLY_AGENT_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 export const MODEL_MAX_CHARS = 100;
@@ -88,7 +98,7 @@ const MAX_DURATION_MS = 86_400_000;
 
 /**
  * Nur gültige Angaben übernehmen: Agent nach Namensmuster, Modell als Text
- * ohne Steuerzeichen (höchstens 100 Zeichen), Dauer als ganze Millisekunden
+ * ohne Steuerzeichen (höchstens 100 Zeichen), Motor aus ENGINE_IDS, Dauer als ganze Millisekunden
  * zwischen 0 und einem Tag. Alles andere fällt weg, statt etwas zu erfinden.
  */
 export function pickReplyInfo(value: unknown): ReplyInfo {
@@ -100,6 +110,7 @@ export function pickReplyInfo(value: unknown): ReplyInfo {
     const model = v.model.trim();
     if (model && [...model].length <= MODEL_MAX_CHARS && !/[\p{Cc}]/u.test(model)) info.model = model;
   }
+  if (typeof v.engine === "string" && (REPLY_ENGINES as readonly string[]).includes(v.engine)) info.engine = v.engine as EngineId;
   if (typeof v.durationMs === "number" && Number.isFinite(v.durationMs) && v.durationMs >= 0 && v.durationMs <= MAX_DURATION_MS) {
     info.durationMs = Math.round(v.durationMs);
   }

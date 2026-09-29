@@ -42,6 +42,7 @@ import { chooseStartMode } from "../src/setup/start-mode";
 import { checkStep, setupOverview } from "../src/setup/steps";
 import { cleanup, FAKE, fakeProviders, leakedSecrets, root as testRoot, type FakeProviders } from "./setup-fixture";
 import { scripted } from "./setup-terminal-fixture";
+import { createClaudeEngine } from "../src/lib/engines";
 
 const REPO = resolve(import.meta.dir, "..");
 
@@ -243,6 +244,10 @@ async function runFresh(platform: NodeJS.Platform, answers: string[]): Promise<F
     bunVersion: "1.3.12",
     launchAgentsDir: join(home, "Library", "LaunchAgents"),
     pm2DumpPath,
+    // Kein systemd (Issue #207): auch auf einem Linux-Rechner mit systemd nur der PM2-Weg
+    systemdUserDir: join(home, ".config", "systemd", "user"),
+    systemdRunDir: join(dir, "run", "systemd", "system"),
+    user: "alex",
     run,
     providers,
     now: () => new Date("2026-09-25T10:00:00Z"),
@@ -296,8 +301,7 @@ async function firstReply(ctx: SetupContext) {
     return { text: REPLY, isError: false, sessionId: "sitzung-1" };
   };
   const deps: Partial<ChatTurnDeps> = {
-    callClaude: fakeClaude,
-    callClaudeStreaming: fakeClaude,
+    getEngine: () => createClaudeEngine({ callClaude: fakeClaude, callClaudeStreaming: fakeClaude }),
     callFallbackLLMWithSource: async (...args) => {
       fallbackCalls.push(args);
       return { text: "fallback", source: "none" };
@@ -356,6 +360,7 @@ const RUN_A = [
   FAKE.convexUrl,
   FAKE.convexToken,
   "",
+  "n", // Semantische Suche: Nein (gilt nur für Supabase)
   "Testperson",
   "Europe/Berlin",
   "", // Beruf leer
@@ -382,6 +387,7 @@ const RUN_B = [
   FAKE.serviceKey,
   FAKE.anonKey,
   "",
+  "n", // Semantische Suche: Nein (Issue #166; eigener Test in setup-search.test.ts)
   "Testperson",
   "Europe/Berlin",
   "Gärtnerei",
@@ -441,7 +447,7 @@ describe("frischer Rechner: tybo setup bis zur ersten Antwort", () => {
     expect(check.ok).toBe(true);
     expect(fresh.out).toContain("Alles eingerichtet und erreichbar.");
     expect(fresh.out).toContain("Alle Pflichtschritte sind erledigt.");
-    expect(fresh.out).toContain("Übersprungen: Forum-Gruppe, Modelle und Fallback, WebUI");
+    expect(fresh.out).toContain("Übersprungen: Forum-Gruppe, Semantische Suche, Modelle und Fallback, WebUI");
 
     // .env der Kopie: genau die eingegebenen Werte, Rechte 0600
     expect(await readEnvFile(ctx.envPath)).toEqual({
@@ -510,7 +516,8 @@ describe("frischer Rechner: tybo setup bis zur ersten Antwort", () => {
     expect(fresh.code).toBe(0);
     expect(fresh.left).toBe(0);
     expect(overview.complete).toBe(true);
-    expect(overview.open).toEqual([]);
+    // Semantische Suche übersprungen: bleibt offen, ohne „fertig“ zu verhindern
+    expect(overview.open).toEqual(["suche"]);
     expect(check.ok).toBe(true);
     expect(check.items?.map(i => i.label)).toEqual([
       "Voraussetzungen",

@@ -309,7 +309,7 @@ function webDeps(tools: IntentTurn["tools"] | "nie"): BotChatDeps {
     saveMessage: async () => true,
     // wie in src/bot.ts: processTurnIntents(text, turn.tools, turn)
     processIntents: (text, turn) => processTurnIntents(text, turn.tools, turn, gate),
-    abortClaudeCalls: () => 0,
+    abortEngineCalls: () => 0,
     isShuttingDown: () => false,
     scheduleRestartCheck: () => {},
     log: () => {},

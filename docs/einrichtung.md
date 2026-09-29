@@ -9,6 +9,10 @@ Bestätigung.
 Was der Assistent nicht übernimmt, steht am Ende unter
 [Was der Assistent nicht erledigt](#was-der-assistent-nicht-erledigt).
 
+tybo rund um die Uhr auf einem Raspberry Pi 5: [raspberry-pi.md](raspberry-pi.md)
+ergänzt diese Anleitung um Hardware, System, Claude CLI ohne Node.js,
+Autostart und Betrieb auf dem Pi.
+
 ## Schnellweg: ein Befehl
 
 Auf macOS und Linux (auch WSL) holt ein einziger Befehl tybo auf den Rechner
@@ -31,7 +35,13 @@ curl -fsSL https://tybo.ai/install | sh
 5. Installiert die Pakete (`bun install`) und legt den Befehl `tybo` an
    (`bun link`).
 6. Startet `tybo setup`, den Assistenten aus dieser Anleitung.
-7. Nennt am Ende, was noch fehlt: Bun im `PATH`, Node.js, Claude CLI.
+7. Nennt am Ende, was noch fehlt: Bun im `PATH` (steht in der Startdatei
+   deiner Shell schon ein Eintrag, empfiehlt er „neues Terminal öffnen oder
+   `source …`“ und nennt die zwei Zeilen als Rückfall, falls `tybo` danach
+   trotzdem fehlt; sonst nur die zwei Zeilen zum Eintragen), die Claude CLI (nativer Installer;
+   liegt sie schon in `~/.local/bin` und meldet dort ihre Version, nur der
+   Hinweis auf eine neue Sitzung, sonst der Hinweis zum Neuinstallieren)
+   und Node.js nur als Hinweis, wofür es gebraucht wird (PM2, Convex, npm).
 
 **Was er nicht tut:** Node.js, die Claude CLI und PM2 installiert er nicht,
 die kommen danach von Hand dazu (siehe [Voraussetzungen](#voraussetzungen)).
@@ -87,15 +97,22 @@ Schritt „Voraussetzungen“, installiert sie aber nicht selbst.
   ```bash
   curl -fsSL https://bun.sh/install | bash
   ```
-  Danach das Terminal neu öffnen oder Bun in den `PATH` holen:
+  Der Bun-Installer trägt Bun meist selbst in die Startdatei deiner Shell ein
+  (`~/.zshrc`, `~/.bashrc` oder `~/.bash_profile`). Öffne danach zuerst ein
+  neues Terminal bzw. eine neue SSH-Sitzung oder führe `source ~/.bashrc`
+  (bzw. die Datei, die er nennt) aus. Fehlt `bun` danach trotzdem, diese
+  zwei Zeilen von Hand eintragen:
   ```bash
   export BUN_INSTALL="$HOME/.bun"
   export PATH="$BUN_INSTALL/bin:$PATH"
   ```
-  Dauerhaft: die beiden Zeilen in `~/.zshrc` (macOS) bzw. `~/.bashrc`
-  (Linux) eintragen. Zu alt: `bun upgrade`.
-- **Node.js** 20.0.0 oder neuer, mit `npm` und `npx`. Beides wird unten für die
-  Claude CLI, PM2 und die Convex-Vorbereitung gebraucht. Installieren:
+  Zu alt: `bun upgrade`.
+- **Node.js** 20.0.0 oder neuer, mit `npm` und `npx`, nur in drei Fällen:
+  für PM2 (Autostart unter Windows und Linux ohne systemd), für die
+  Convex-Vorbereitung (`npx convex …`) und wenn du die Claude CLI über npm
+  statt mit dem nativen Installer holst (dann Node.js 22 oder neuer). Für
+  tybo selbst und die Claude CLI aus dem nativen Installer ist Node.js nicht
+  nötig. Installieren:
   auf macOS `brew install node` (mit [Homebrew](https://brew.sh)) oder das
   LTS-Paket von [nodejs.org](https://nodejs.org), auf Linux (Debian, Ubuntu)
   das LTS-Paket über [NodeSource](https://github.com/nodesource/distributions)
@@ -106,15 +123,28 @@ Schritt „Voraussetzungen“, installiert sie aber nicht selbst.
   zuerst Node.js aktualisieren und erst dann die Convex-Vorbereitung
   starten: Convex lehnt Node.js 18 ab. Der Assistent prüft Node.js nicht
   selbst.
-- **Claude CLI**, installiert und angemeldet:
+- **Claude CLI**, installiert und angemeldet. Auf macOS, Linux und in WSL
+  mit dem nativen Installer von Anthropic; er braucht weder Node.js noch
+  `sudo`, aktualisiert sich selbst und legt `claude` in `~/.local/bin` ab:
   ```bash
-  npm install -g @anthropic-ai/claude-code
+  curl -fsSL https://claude.ai/install.sh | bash
   claude          # einmal starten, dann /login
   ```
-  tybo nutzt dein Claude-Abo (oder einen `ANTHROPIC_API_KEY`) über die CLI.
+  Findet die Shell `claude` danach nicht, ist `~/.local/bin` in dieser
+  Sitzung noch nicht im `PATH`: neues Terminal bzw. neue SSH-Sitzung öffnen.
+  Hilft das nicht, `export PATH="$HOME/.local/bin:$PATH"` in `~/.zshrc`
+  bzw. `~/.bashrc` eintragen. Unter Windows (ohne WSL), oder wenn du npm
+  bevorzugst: `npm install -g @anthropic-ai/claude-code` (braucht Node.js 22
+  oder neuer; unter Linux oft nur mit `sudo`, und das automatische Update geht
+  dann nicht). tybo nutzt dein Claude-Abo (oder einen `ANTHROPIC_API_KEY`)
+  über die CLI.
 - **Git**: auf macOS `xcode-select --install`, auf Linux etwa
   `sudo apt install git`.
-- **Linux und Windows:** PM2 für den Autostart: `npm install -g pm2`.
+- **Linux mit systemd** (etwa Raspberry Pi OS, Debian, Ubuntu): für den
+  Autostart nichts weiter, er läuft als systemd-Benutzerdienst. PM2 nur, wenn
+  du lieber PM2 nimmst oder Supabase auf diesem Rechner betreibst. Für einen
+  Raspberry Pi 5 siehe [raspberry-pi.md](raspberry-pi.md).
+- **Linux ohne systemd und Windows:** PM2 für den Autostart: `npm install -g pm2`.
 - Ein **Telegram**-Konto.
 
 ### Starten
@@ -139,7 +169,7 @@ Weitere Aufrufe:
 | `tybo setup --web` | Einrichtung im Browser, siehe [Der Weg im Browser](#der-weg-im-browser) |
 
 Die Namen der Schritte für `tybo setup <schritt>`: `voraussetzungen`,
-`telegram`, `gruppe`, `datenbank`, `profil`, `modelle`, `webui`,
+`telegram`, `gruppe`, `datenbank`, `suche`, `profil`, `modelle`, `webui`,
 `autostart`, `pruefung`.
 
 Abbrechen geht jederzeit mit Strg+C. Schon gespeicherte Schritte bleiben, der
@@ -477,13 +507,8 @@ darin an und erklärt die Abhilfe: Supabase anhalten,
 - Kein Zugriff von einem VPS und nicht im Hybrid-Modus: die Adresse zeigt auf
   diesen Rechner.
 - tybo hat seine Datenbank nur, solange dieser Rechner läuft und Docker
-  gestartet ist. Nach einem Neustart des Rechners startest du Supabase mit
-  `tybo setup datenbank` (prüft auch das Netz und die Bindungen) oder im
-  Projektordner mit derselben Dienstauswahl wie der Assistent:
-  `bunx --bun supabase@2.118.0 start --workdir . -x studio,imgproxy,logflare,vector,realtime,supavisor,mailpit,postgres-meta`
-  (ohne `-x` starten auch die Dienste, die tybo nicht braucht). Ein eigener
-  Befehl und Autostart folgen.
-- Updates der Container und Sicherungen machst du vorerst von Hand.
+  gestartet ist. Nach einem Neustart startet der Autostart Supabase wieder
+  (Schritt 9), von Hand `tybo datenbank start`. Mehr im nächsten Abschnitt.
 
 Meldungen des Ablaufs:
 
@@ -501,6 +526,169 @@ Meldungen des Ablaufs:
 
 Mehr unter „Lokales Supabase startet nicht“ in
 [troubleshooting.md](troubleshooting.md).
+
+Am Ende sagt der Assistent einmal, ob Docker beim Anmelden von selbst
+startet: bei Docker Desktop liest er die Einstellung, bei OrbStack und Colima
+nennt er nur den Weg, unter Linux fragt er systemd.
+
+#### Supabase lokal im Alltag
+
+Für jeden Tag gibt es den Befehl `tybo datenbank`. Er tut nur etwas, wenn
+`SUPABASE_URL` in der `.env` genau auf `http://127.0.0.1:54421` zeigt; bei
+Supabase in der Cloud sagt er das und ändert nichts.
+
+| Befehl | Was er tut |
+|---|---|
+| `tybo datenbank start` | Startet Supabase mit derselben Dienstauswahl wie der Assistent. Wartet bis zu 5 Minuten auf Docker („Warte auf Docker“). Prüft vorher das Netz und danach, dass nichts aus dem Heimnetz erreichbar ist. Läuft schon alles, ändert er nichts. |
+| `tybo datenbank start --studio` | Dasselbe mit Studio, um die Daten im Browser anzusehen: `http://127.0.0.1:54423`, ohne Anmeldung, nur auf diesem Rechner. Läuft Supabase schon ohne Studio, hält er es kurz an und startet es mit Studio neu (die Daten bleiben). Studio wieder aus: `tybo datenbank stop`, dann `tybo datenbank start`. |
+| `tybo datenbank stop` | Hält Supabase an. Die Daten bleiben. |
+| `tybo datenbank status` | Läuft es, Adresse, Platz der Docker-Volumes. Zeigt keine Schlüssel. |
+| `tybo datenbank sichern` | Sicherung nach `data/backups/supabase-<JJJJMMTT-HHMM>/`. |
+| `tybo datenbank sichern --ziel <Ordner>` | Sicherung nach `<Ordner>/supabase-<JJJJMMTT-HHMM>/`. |
+
+**Nach einem Neustart des Rechners.** Zwei Dinge müssen von selbst starten:
+
+1. **Docker.** Docker Desktop: Settings, General, „Start Docker Desktop when
+   you sign in to your computer“ einschalten. OrbStack: Settings, „Start at
+   login“. Colima: einmal `brew services start colima`. Linux: meist schon an,
+   sonst `sudo systemctl enable docker`.
+2. **Supabase.** Der Schritt Autostart (`tybo setup autostart`) richtet
+   dafür einen eigenen Dienst ein: `ai.tybo.supabase` auf dem Mac,
+   `tybo-supabase` unter PM2. Er ruft beim Anmelden einmal
+   `tybo datenbank start` auf; die Container laufen in Docker weiter.
+   Protokoll: `logs/supabase.log`. Auf dem Mac endet der Dienst danach. Unter
+   PM2 bleibt `tybo-supabase` danach ohne Arbeit stehen (Status `online`, ein
+   kleiner Bun-Prozess): PM2 startet beim Hochfahren nur, was beim letzten
+   `pm2 save` lief, ein gestoppter Eintrag bliebe gestoppt. `online` heißt
+   darum nicht, dass der Start gelang: das Ergebnis steht in
+   `data/supabase-start.json`, `bun run setup:verify` wertet es aus. Wiederholt wird
+   der Start nicht, auch nicht, wenn der Prozess endet. Mit
+   `pm2 stop tybo-supabase` und danach `pm2 save` fällt er aus dem Autostart;
+   `tybo setup autostart` trägt ihn wieder ein. Läuft gerade ein Start, kehrt
+   `pm2 stop` erst zurück, wenn er sauber abgebrochen ist: halb gestartete
+   Container werden geprüft und nötigenfalls angehalten. PM2 wartet darauf
+   bis zu zehn Minuten (`--kill-timeout`), meist dauert es Sekunden. Auf dem
+   Mac gilt dasselbe beim Entladen von `ai.tybo.supabase` (`launchctl unload`,
+   `bun run uninstall`): launchd wartet bis zu zehn Minuten (`ExitTimeOut`).
+
+Warum der Dienst nötig ist, obwohl Docker die meisten Container von selbst
+neu startet: die Edge Runtime hat keine Neustart-Regel und fehlt nach einem
+Neustart, und `supabase start` holt sie nicht nach, solange die Datenbank
+läuft. `tybo datenbank start` erkennt das, hält Supabase kurz an und startet
+es vollständig neu (im Versuch 23 Sekunden, die Daten bleiben).
+`tybo datenbank status` zeigt „Edge Runtime fehlt“, wenn das noch aussteht.
+
+**Sichern.** `tybo datenbank sichern` legt einen neuen Ordner an (Rechte
+0700, nur für dich lesbar) mit vier Teilen und einem Inhaltsverzeichnis
+`sicherung.txt`:
+
+| Datei | Inhalt |
+|---|---|
+| `schema.sql` | Tabellen, Funktionen und Rechte von tybo |
+| `daten.sql` | Inhalte der Tabellen von tybo (Schema `public`): Gespräche, Gedächtnis, Ziele, Einträge zu Bildern |
+| `storage.sql` | Einträge des Bilder-Ordners in Supabase (`storage.buckets`, `storage.objects`) |
+| `bilder.tar.gz` | die Bilddateien selbst, aus dem Docker-Volume `supabase_storage_tybo` |
+
+Nicht dabei sind die übrigen Supabase-Schemas wie `auth` (Benutzerkonten von
+Supabase, tybo nutzt sie nicht). Eine vorhandene Sicherung wird nie
+überschrieben; zwei Sicherungen in derselben Minute bekommen
+`supabase-<Zeit>-2`. Scheitert ein Teil oder brichst du mit Strg+C ab, löscht
+der Befehl die unvollständige Sicherung und meldet es. Nur ein Ordner mit
+`sicherung.txt` ist vollständig.
+
+Die Sicherung läuft bei laufendem Bot. Die Reihenfolge ist fest: erst die
+Tabellen von tybo, dann die Einträge der Bilder, zuletzt die Dateien. So
+fehlt zu keinem gesicherten Eintrag die Datei; ein Bild, das während der
+Sicherung dazukommt, liegt höchstens als Datei ohne Eintrag bei. Willst du
+einen exakt ruhigen Stand, halte vorher den Bot an.
+
+Auf die Docker-Volumes als Sicherung ist kein Verlass: Docker Desktop nimmt
+seine Datenträger-Datei in der Regel von Time Machine aus. Lege die Sicherung
+darum in einen Ordner, den Time Machine oder dein Sicherungsprogramm
+erfasst, etwa `tybo datenbank sichern --ziel ~/Documents/tybo-sicherungen`.
+Die Dateien enthalten alle Gespräche und das Gedächtnis; bewahre sie nur an
+einem sicheren Ort auf.
+
+**Wiederherstellen.** Das ist für einen neuen Rechner oder nach einem
+Datenverlust gedacht, in eine **leere** Supabase. Ein zweiter Projektordner
+auf demselben Rechner ist keine eigene Instanz: `project_id = "tybo"` in
+`supabase/config.toml` heißt dieselben Docker-Volumes. Zum Ausprobieren also
+einen anderen Rechner (oder eine eigene Docker-VM) nehmen.
+
+1. tybo installieren. In die `.env` `SUPABASE_URL=http://127.0.0.1:54421`
+   eintragen (oder die alte `.env` zurückkopieren).
+2. Supabase leer starten: `tybo datenbank start`. Nicht vorher
+   `tybo setup datenbank`: der Assistent legt den Bilder-Ordner an, und
+   `storage.sql` würde dann an einem doppelten Eintrag scheitern.
+3. Im Ordner der Sicherung die drei SQL-Teile in dieser Reihenfolge einspielen.
+   `ON_ERROR_STOP=1` hält beim ersten Fehler an, statt halb weiterzumachen:
+   ```bash
+   cd ~/Documents/tybo-sicherungen/supabase-20260927-0805
+   docker exec -i supabase_db_tybo psql -U postgres -v ON_ERROR_STOP=1 -q < schema.sql
+   docker exec -i supabase_db_tybo psql -U postgres -v ON_ERROR_STOP=1 -q < daten.sql
+   docker exec -i supabase_db_tybo psql -U postgres -v ON_ERROR_STOP=1 -q < storage.sql
+   ```
+   Meldet einer davon einen Fehler (etwa „duplicate key“), war die Datenbank
+   nicht leer. Dann nicht weitermachen: Schritt 2 auf einer leeren
+   Supabase wiederholen.
+4. Die Bilddateien zurück in den Storage-Container kopieren und dem
+   Container-Benutzer geben:
+   ```bash
+   mkdir /tmp/tybo-bilder
+   tar -xzf bilder.tar.gz -C /tmp/tybo-bilder
+   docker cp /tmp/tybo-bilder/. supabase_storage_tybo:/mnt/
+   docker exec supabase_storage_tybo chown -R 0:0 /mnt
+   rm -rf /tmp/tybo-bilder
+   ```
+5. `tybo setup datenbank` mit dem Weg „Supabase auf diesem Rechner“: der
+   Assistent findet Tabellen und den privaten Bilder-Ordner vor, ändert daran
+   nichts, schreibt die Schlüssel in die `.env` und testet die Verbindung.
+6. Prüfen: `tybo datenbank status` zeigt „läuft“; im Chat nach etwas fragen,
+   das tybo sich gemerkt hatte; ein altes Bild öffnen lassen.
+
+**Updates.** Welche Supabase-CLI tybo nutzt, legt tybo selbst fest
+(`SUPABASE_CLI_VERSION` in `src/setup/local-supabase.ts`, heute 2.118.0; sie
+steht auch in jeder `sicherung.txt`). Die Versionen der Container hängen an
+dieser CLI. Eine neue kommt also nur mit einem Update von tybo; tybo
+aktualisiert weder die CLI noch die Container von selbst. Bei einem Update
+von tybo, das die Version ändert:
+
+1. `tybo datenbank sichern`
+2. `tybo datenbank stop`
+3. tybo aktualisieren (Installer erneut oder `git pull` und `bun install`)
+4. `tybo datenbank start`: die neue CLI lädt beim ersten Start die neuen
+   Images (einige Minuten)
+5. Prüfen wie oben unter Wiederherstellen, Schritt 6
+
+**Nie** `supabase stop --no-backup` ohne frische Sicherung. Die offizielle
+Anleitung von Supabase rät vor Updates dazu, weil dort die lokale Datenbank
+eine Entwicklungskopie ist, die sich aus Migrationen neu aufbauen lässt. Bei
+tybo ist sie die einzige Kopie von Gedächtnis und Verlauf; `--no-backup`
+löscht die Docker-Volumes und damit alles.
+
+**Ressourcen.** Gemessen mit der CLI 2.118.0 in einer Docker-VM mit 4 CPUs
+und 6 GB, fast leere Datenbank:
+
+| | ohne Studio | mit Studio |
+|---|---|---|
+| Container | 6 | 8 (dazu Studio und postgres-meta) |
+| Arbeitsspeicher der Container | rund 540 MB | rund 950 MB |
+| Docker-Images | 5,0 GB | 6,8 GB |
+| Daten (Volumes) | rund 80 MB, wächst mit Verlauf und Bildern | gleich |
+
+Dazu kommt der Speicher der Docker-VM selbst (Docker Desktop, OrbStack,
+Colima). Studio nur bei Bedarf einschalten.
+
+**Grenzen.**
+
+- Kein VPS und kein Hybrid-Modus: die Datenbank liegt auf diesem Rechner.
+- tybo hat sein Gedächtnis nur, solange dieser Rechner läuft und Docker und
+  Supabase gestartet sind. Kommt eine Telegram-Nachricht, während Supabase
+  steht (etwa in den ersten Minuten nach dem Anmelden), antwortet der Bot
+  ohne Gedächtnis und ohne Verlauf, und das Gespräch landet dann nicht im
+  Verlauf (tybo holt das nicht nach).
+- Keine zeitgesteuerte Sicherung: `tybo datenbank sichern` rufst du selbst
+  auf.
 
 #### Zugangsdaten selbst eintragen
 
@@ -587,7 +775,217 @@ das selbst.
 
 Beispiele für die Werte stehen auch in `.env.example`.
 
-### 5. Profil
+### 5. Semantische Suche (optional)
+
+tybo findet im Verlauf dann auch, was nur sinngemäß passt: Die Frage nach dem
+„Urlaub am Meer“ findet die Nachricht über „Ferien an der Nordsee“. Dafür
+erzeugen die Edge Functions von Supabase zu jeder Nachricht ein Embedding
+(eine Zahlenreihe, die die Bedeutung beschreibt). Ohne diesen Schritt
+speichert tybo Nachrichten ohne Embedding und sucht nur nach Text; alles
+andere läuft genauso.
+
+Der Schritt gilt nur für Supabase. Mit Convex läuft die semantische Suche
+über Convex selbst (`CLAUDE.md`, Phase 2.5).
+
+- **Anbieter der Embeddings:** wer die Embeddings rechnet. Zur Wahl:
+  - OpenAI (Standard): text-embedding-3-small, kostet Cent-Beträge (0,02 US-Dollar pro Million Tokens), braucht einen OpenAI-Schlüssel
+    (Guthaben auf [platform.openai.com](https://platform.openai.com); eine
+    Nachricht hat meist unter hundert Tokens, auch viele tausend Nachrichten
+    im Monat bleiben bei wenigen Cent).
+  - Google Gemini: gemini-embedding-2, im kostenlosen Kontingent gratis, braucht einen Gemini-Schlüssel
+    (aus [Google AI Studio](https://aistudio.google.com/apikey)). Das
+    Kontingent hat Grenzen pro Minute und Tag; im kostenlosen Kontingent darf
+    Google Eingaben laut seinen Bedingungen zur Verbesserung seiner Produkte
+    verwenden. tybo verlangt 1536 Werte (`outputDimensionality`, siehe
+    [Embeddings](https://ai.google.dev/gemini-api/docs/embeddings)).
+  - Ollama: bge-m3 auf diesem Rechner, kostenlos, braucht laufendes Ollama und Supabase auf diesem Rechner.
+    [bge-m3](https://ollama.com/library/bge-m3) ist mehrsprachig und rechnet
+    gut mit deutschen Texten (etwa 1,2 GB, 1024 Werte, die tybo mit Nullen
+    auf 1536 auffüllt; die Ähnlichkeit zweier Texte ändert sich dadurch
+    nicht). Die Texte verlassen für die Suche den Rechner nicht; für die
+    Antworten von tybo gilt das nicht, die schreibt weiter Claude. Mit
+    Supabase in der Cloud geht Ollama nicht: die Functions dort erreichen
+    deinen Rechner nicht, der Assistent lehnt das ab.
+
+  Die Datenbank merkt sich Anbieter und Modell beim ersten gelungenen Embedding (Tabelle
+  `embedding_settings`). Passt die Einstellung später nicht mehr dazu, entsteht
+  kein Embedding mehr und tybo sucht nur nach Text, bis es wieder passt; beim
+  Start steht dann eine Warnung im Log, und die Gesamtprüfung meldet es.
+  Datenbanken aus der Zeit vor der Anbieterwahl, die schon Embeddings haben,
+  laufen weiter mit OpenAI (text-embedding-3-small); ihre alten Werte
+  bekommen keine nachträgliche Kennung. Ein Wechsel (anderer Anbieter oder
+  anderes Modell) rechnet alles neu, nur nach Rückfrage, siehe „Anbieter
+  wechseln“ unten.
+- **OpenAI-Schlüssel für die semantische Suche:** nur bei OpenAI. Beginnt mit
+  `sk-`, unter
+  [platform.openai.com/api-keys](https://platform.openai.com/api-keys)
+  erzeugen. Das Feld gilt nur für diesen Lauf. Gespeichert wird der Schlüssel
+  als `OPENAI_API_KEY` dort, wo die Functions ihn lesen (Supabase-Geheimnis
+  bzw. `supabase/functions/.env`), und in der `.env`, weil tybo ihn auch
+  selbst braucht (Embeddings für Fakten und Bilder). Leer lassen heißt: nur
+  Textsuche, nachholen mit `tybo setup suche`. Steht schon ein Schlüssel in
+  der `.env`, nimmt der Assistent diesen.
+- **Gemini-Schlüssel für die semantische Suche:** nur bei Gemini. Wie der
+  OpenAI-Schlüssel, gespeichert als `GEMINI_API_KEY` (denselben Namen nutzt
+  auch die Spracherkennung).
+- **Adresse von Ollama:** nur bei Ollama, Vorschlag `http://localhost:11434`.
+  Die Functions laufen in Docker und bekommen dieselbe Adresse mit
+  `host.docker.internal` statt `localhost`.
+- **Fehlt das Ollama-Modell: jetzt mit ollama pull herunterladen?:** nur bei
+  Ollama. Ja: fehlt das Modell, lädt der Assistent es über Ollama herunter
+  (wie `ollama pull bge-m3`). Nein: er bricht in dem Fall ab und nennt den
+  Befehl.
+- **Supabase-Zugangstoken (für die Functions):** nur bei Supabase in der
+  Cloud, dasselbe Token (`sbp_…`) wie im Schritt Datenbank. Es gilt nur für
+  diesen Lauf und wird nirgends gespeichert.
+- **Neuberechnung beim Anbieterwechsel:** nur bei Supabase in der Cloud und
+  auf diesem Rechner. Der Assistent liest die Kennung der Datenbank. Ohne
+  Wechsel gibt es nur „Weiter“. Bei einem Wechsel stehen zur Wahl
+  „Abbrechen, nichts ändern“ und „Alles neu berechnen“ mit Umfang, Dauer und
+  Kosten (siehe „Anbieter wechseln“ unten). Das Feld gilt nur für diesen Lauf.
+
+Ein anderes Modell als den Standard des Anbieters stellt man ohne Assistent
+über `EMBEDDING_MODEL` in der `.env` ein (und gleich bei den Functions); der
+Assistent übernimmt es dann. Liefert ein Modell mehr als 1536 Werte, lehnt
+tybo es ab.
+
+Was der Assistent tut, je nach Weg der Datenbank:
+
+- **Supabase in der Cloud:** Über die Management-API von Supabase liefert er
+  die drei Edge Functions `store-telegram-message`, `search-memory` und
+  `embed-knowledge` aus
+  ([Deploy a function](https://supabase.com/docs/reference/api/v1-deploy-a-function))
+  und setzt das Geheimnis `OPENAI_API_KEY`, bei Gemini `GEMINI_API_KEY` samt
+  `EMBEDDING_PROVIDER` und `EMBEDDING_MODEL`
+  ([Secrets](https://supabase.com/docs/guides/functions/secrets)). Kein
+  Programm muss dafür installiert werden. Ist das Geheimnis bei Supabase schon
+  gesetzt (etwa von einem anderen Rechner), reicht das Zugangstoken: der
+  Assistent liefert die Functions aus und prüft, ohne den Schlüssel zu kennen.
+- **Supabase auf diesem Rechner:** Die Functions laufen schon in der Edge
+  Runtime von Supabase. Der Assistent trägt den Schlüssel (bei Gemini und
+  Ollama auch `EMBEDDING_PROVIDER` und `EMBEDDING_MODEL`, bei Ollama die
+  Adresse mit `host.docker.internal`) in `supabase/functions/.env` ein (Rechte
+  0600, nicht im Repo, andere Einträge bleiben) und startet Supabase einmal
+  neu, damit die Edge Runtime die Werte liest.
+  Die Daten bleiben; nach dem Start prüft er wie bei `tybo datenbank start`,
+  dass Supabase nur auf diesem Rechner erreichbar ist.
+- **Zugangsdaten selbst eingetragen:** An einem eigenen Server ändert der
+  Assistent nichts und richtet dort nur OpenAI ein (die Umgebung der
+  Functions kennt er nicht). Er schreibt nur `OPENAI_API_KEY` in die `.env` und prüft.
+  Functions und Geheimnis richtest du dort selbst ein: für jede der drei
+  Functions `supabase functions deploy <name> --no-verify-jwt`, dann
+  `supabase secrets set OPENAI_API_KEY=…`.
+
+Am Ende steht ein Test: Der Assistent speichert eine Probe-Nachricht über
+`store-telegram-message` (in einem eigenen Probe-Chat, nie in deinem
+Verlauf), sucht sie über `search-memory` nach Bedeutung und löscht sie wieder,
+auch wenn der Test scheitert oder abgebrochen wird. „Semantische Suche:
+aktiv“ steht erst, wenn genau diese Probe mit einer Ähnlichkeit größer 0
+gefunden wurde. Das Ergebnis (ohne Schlüssel) merkt sich tybo in
+`data/semantic-search.json`; die Übersicht und der Reiter „Status“ in den
+Einstellungen der WebUI zeigen „aktiv“ oder „nur Textsuche“, und die
+Gesamtprüfung (`tybo setup pruefung`) wiederholt den Test.
+
+#### Anbieter wechseln
+
+Vektoren verschiedener Anbieter oder Modelle sind nicht vergleichbar. Wählt
+man in `tybo setup suche` einen anderen Anbieter (oder steht in der `.env` ein
+anderes `EMBEDDING_MODEL`) als die Datenbank festhält, erkennt der Assistent
+den Wechsel und fragt bei „Neuberechnung beim Anbieterwechsel“:
+
+- „Abbrechen, nichts ändern“: keine Functions, keine Geheimnisse, keine
+  Änderung an `.env` und Datenbank. Ohne Antwort gilt dasselbe.
+- „Alles neu berechnen“ mit einer Schätzung, etwa „ca. 1.250 Einträge
+  (Verlauf 1.200, Erinnerungen 40, Wissen 10), etwa 125.000 Tokens; Dauer etwa
+  13 Minuten; Kosten: etwa 0,02 US-Dollar“. Gerechnet wird so: Tokens sind
+  Zeichen durch vier; Dauer ist die Zahl der Einträge mal der üblichen Zeit
+  je Anfrage (OpenAI 0,3 s, Gemini 0,4 s, Ollama 0,5 s) plus sechs Minuten
+  Wartezeit; Kosten nach Preisliste (OpenAI text-embedding-3-small 0,02,
+  text-embedding-3-large 0,13 US-Dollar je Million Tokens; Gemini im
+  kostenlosen Kontingent keine; Ollama keine; unbekannte Modelle: „unbekannt“).
+
+Mit Zustimmung beginnt der Assistent zuerst die Umstellung in der Datenbank
+(sie hält den Lauf für ihn fest). Rechnet gerade ein anderer Prozess auf ein
+anderes Ziel, bricht er hier ab, ohne Functions, Geheimnisse oder `.env`
+anzufassen. Sonst richtet er alles wie sonst ein und startet
+`tybo suche neu-berechnen` im Hintergrund (Ausgabe in
+`logs/embedding-reindex.log`), der den Lauf übernimmt. Scheitert die
+Einrichtung, gibt er den Lauf wieder frei. Neu berechnet werden Verlauf (`messages`),
+Erinnerungen (`memory`, nur Fakten), Wissen (`knowledge`) und Bilder
+(`assets`), auch Einträge, die bisher kein Embedding hatten. Anzeige-Meldungen
+(Pipeline, Briefing, Dateien) bekommen keins.
+
+Während der Umstellung:
+
+- sucht tybo nur nach Text. Die Datenbank prüft das selbst: jeder Eintrag
+  trägt, womit sein Vektor entstand (Spalte `embedding_model`), und die Suche
+  (auch das Ranking der Fakten im Bot) nennt, womit der Suchvektor entstand.
+  Während der Umstellung vergleicht die Datenbank gar nichts, danach nur
+  gleiche Modelle. Das gilt auch für einen Prozess, der sich die alte
+  Freigabe noch merkt, und für eine Anfrage, die vor dem Beginn losging.
+- Was in dieser Zeit neu gespeichert oder geändert wird, speichert die
+  Datenbank ohne Vektor und merkt es vor; die Neuberechnung zieht es am Ende
+  nach. Kommt ein alter Vektor erst nach dem Umschalten an, übernimmt die
+  Datenbank ihn nicht: bei unverändertem Text bleibt der neue Vektor, bei
+  neuem oder geändertem Text merkt sie den Eintrag vor, und der Bot rechnet
+  ihn nach. Ändert sich ein vorgemerkter Eintrag, während nachgerechnet wird,
+  verwirft sie das Ergebnis und rechnet aus dem neuen Text.
+- Vektoren und Suchen ohne Angabe, womit sie entstanden (Functions und Bot
+  von vor dieser Fassung), gelten nur, solange die Datenbank nie umgeschaltet
+  hat. Nach dem ersten Wechsel nimmt sie keine mehr an, auch nicht bei einem
+  Wechsel zurück zu OpenAI.
+- Die ersten sechs Minuten wartet die Neuberechnung, bevor sie neue Vektoren
+  schreibt.
+- Stapel zu 50 Einträgen; der Fortschritt steht nach jedem Stapel in der
+  Datenbank. Bei „zu viele Anfragen“ (HTTP 429) wartet sie, so lange der
+  Anbieter sagt (sonst 10 Sekunden, dann länger), und wiederholt denselben
+  Eintrag.
+- Lehnt der Anbieter einzelne Texte ab (etwa zu lang, HTTP 400), bleiben sie
+  vorgemerkt: die Neuberechnung meldet „nicht fertig“ und schaltet nicht um.
+  `tybo suche neu-berechnen` versucht sie erneut. Drei Ablehnungen
+  hintereinander brechen sofort ab (eher Schlüssel oder Modell falsch).
+- Bricht sie ab (Strg+C, Neustart des Rechners, Fehler), bleibt es bei der
+  Textsuche und die Kennung beim alten Anbieter. `tybo suche neu-berechnen`
+  setzt beim nächsten Stapel fort; `tybo suche status` zeigt den Stand. Es
+  rechnet immer nur ein Prozess; er verlängert seine Frist alle 30 Sekunden,
+  auch mitten in einem langsamen Stapel. Ein abgestürzter gibt den Lauf nach
+  zwei Minuten frei.
+
+Am Ende schaltet die Datenbank auf den neuen Anbieter um, der Assistent prüft
+die Suche mit einer Probe-Nachricht, und eine Meldung erscheint in Telegram und
+in der WebUI (nur zur Anzeige). Der laufende Bot nutzt die neue `.env` erst
+nach einem Neustart: in der WebUI „Neustart anfordern“. Automatisch neu
+gestartet wird nicht. Bei selbst eingetragenem Supabase stellt der Assistent
+nicht um. Mit Convex gibt es keinen Wechsel (dort bleibt es bei OpenAI).
+
+Gut zu wissen:
+
+- Ohne Wechsel bekommt alter Verlauf keine Embeddings nachträglich. Nach
+  Bedeutung findet tybo, was ab jetzt gespeichert wird.
+- Die Wissensbasis (`embed-knowledge`) bekommt ebenfalls Embeddings, gesucht
+  wird darin aber weiter nach Text. Nach Bedeutung sucht tybo im Verlauf.
+- Den neuen Schlüssel in der `.env` liest ein laufender Bot erst nach einem
+  Neustart.
+- Konnte die Probe nicht gelöscht werden, sagt der Assistent das. Der nächste
+  Lauf von `tybo setup suche` räumt übrig gebliebene Proben selbst weg.
+
+Typische Meldungen:
+
+| Meldung | Was tun |
+|---|---|
+| „OpenAI lehnt den Schlüssel ab. …“ | Unter platform.openai.com/api-keys einen neuen Schlüssel erzeugen. |
+| „OpenAI nimmt gerade nichts an: Guthaben aufgebraucht …“ | Guthaben bei OpenAI aufladen, dann `tybo setup suche`. |
+| „Die Edge Function … fehlt …“ | Cloud: `tybo setup suche` erneut. Auf diesem Rechner: `tybo datenbank start`, dann erneut. |
+| „Die Probe wurde nur per Textsuche gefunden …“ | Der Rest der Meldung nennt den Grund: fehlender Schlüssel (`tybo setup suche` mit Schlüssel erneut), Anbieter nicht erreichbar (bei Ollama: läuft es, ist es aus Docker erreichbar?) oder Anbieter passt nicht zur Datenbank. |
+| „Die Datenbank ist auf … festgelegt, eingestellt ist …“ | `EMBEDDING_PROVIDER` und `EMBEDDING_MODEL` in der `.env` wieder auf den genannten Anbieter stellen, oder `tybo setup suche` und „Alles neu berechnen“ wählen. |
+| „Die Datenbank enthält Vektoren ohne Anbieterkennung …“ | Mit OpenAI (text-embedding-3-small) geht es weiter wie bisher; für einen anderen Anbieter `tybo setup suche` und „Alles neu berechnen“. |
+| „Die Embeddings der Datenbank werden gerade auf … neu berechnet …“ | Nichts tun, bis die Meldung „Neuberechnung … fertig“ kommt. Steht sie still: `tybo suche status`, dann `tybo suche neu-berechnen`. |
+| „Semantische Suche: Neuberechnung nicht fertig. …“ | Der Rest der Meldung nennt den Grund (etwa Schlüssel abgelehnt oder einzelne Einträge abgelehnt). Beheben, dann `tybo suche neu-berechnen`; es geht beim letzten Stapel weiter, abgelehnte Einträge werden erneut versucht. |
+| „Der Datenbank fehlt die Tabelle embedding_settings …“ | `tybo setup datenbank` spielt die fehlende Migration ein, dann erneut. |
+| „Das Modell bge-m3 fehlt in Ollama. …“ | `ollama pull bge-m3` im Terminal, oder die Frage nach dem Herunterladen mit ja beantworten. |
+| „Ollama läuft nicht unter …“ | Ollama starten ([ollama.com/download](https://ollama.com/download)), dann erneut. |
+
+### 6. Profil
 
 Wer du bist und wo du lebst, damit Antworten und Zeiten passen.
 
@@ -601,7 +999,7 @@ entsteht `config/profile.md`. Gibt es die Datei schon, passt der Assistent nur
 über dich (Arbeitsstil, Vorlieben) trägst du später selbst in
 `config/profile.md` ein.
 
-### 6. Modelle und Fallback (optional)
+### 7. Modelle und Fallback (optional)
 
 Welches Claude-Modell antwortet und was einspringt, wenn Claude nicht
 erreichbar ist. Leer lassen heißt jeweils: Standard aus dem Code.
@@ -622,7 +1020,7 @@ Datei wie die Einstellungen der WebUI), nur der OpenRouter-Schlüssel in der
 `.env`. Der Test prüft den OpenRouter-Schlüssel und ob Ollama läuft und das
 Modell geladen ist.
 
-### 7. WebUI (optional)
+### 8. WebUI (optional)
 
 Mit dem Bot im Browser chatten, auch vom Handy im Heimnetz. Der
 Terminal-Chat `tybo` braucht sie ebenfalls.
@@ -634,7 +1032,7 @@ Terminal-Chat `tybo` braucht sie ebenfalls.
   (Handy im selben WLAN).
 - **Port (optional):** Standard 3100.
 
-### 8. Autostart
+### 9. Autostart
 
 tybo startet mit dem Rechner und nach Abstürzen von selbst. Keine Felder,
 nur die Frage „Autostart jetzt einrichten? [j/N]“. Eingerichtet wird nur der
@@ -643,14 +1041,30 @@ Watchdog.
 
 - **macOS:** launchd-Dienst `ai.tybo.telegram-relay` in
   `~/Library/LaunchAgents/`. Er startet sofort.
-- **Linux und Windows:** PM2-Dienst `tybo-telegram-relay`, danach speichert der
-  Assistent die Liste mit `pm2 save`. Damit PM2 nach einem Neustart des
-  Rechners selbst mitstartet, einmal von Hand:
+- **Supabase auf diesem Rechner:** zeigt `SUPABASE_URL` auf
+  `http://127.0.0.1:54421`, richtet der Schritt zusätzlich
+  `ai.tybo.supabase` (macOS) bzw. `tybo-supabase` (PM2) ein, mit eigener
+  Zeile in der Übersicht. Der Dienst ruft beim Anmelden einmal
+  `tybo datenbank start` auf (unter PM2 bleibt er danach ohne Arbeit stehen,
+  siehe „Supabase lokal im Alltag“). Ist der Bot schon eingerichtet, bleibt er unberührt, und nur der
+  Supabase-Dienst kommt dazu.
+- **Linux mit systemd** (etwa ein Raspberry Pi): Vorschlag ist ein
+  systemd-Benutzerdienst, PM2 ist wählbar. Der Assistent fragt vorher:
+  ```text
+  Wie soll der Autostart laufen?
+    1) systemd-Benutzerdienst (Vorschlag)
+    2) PM2
+  ```
+  Enter nimmt den Vorschlag. Mehr dazu unter
+  [Autostart mit systemd](#autostart-mit-systemd).
+- **Linux ohne systemd und Windows:** PM2-Dienst `tybo-telegram-relay`, danach
+  speichert der Assistent die Liste mit `pm2 save`. Damit PM2 nach einem
+  Neustart des Rechners selbst mitstartet, einmal von Hand:
   ```bash
   pm2 startup
   ```
   und die Zeile ausführen, die PM2 dann ausgibt (sie beginnt meist mit
-  `sudo`).
+  `sudo`). Dasselbe gilt, wenn du unter Linux mit systemd PM2 wählst.
 
 Läuft tybo schon in einem anderen Fenster (`bun run start`), dort erst
 beenden. Zwei Bots mit demselben Token holen sich dieselben Nachrichten.
@@ -658,7 +1072,70 @@ beenden. Zwei Bots mit demselben Token holen sich dieselben Nachrichten.
 Ohne Autostart startest du tybo von Hand im Projektordner mit
 `bun run start`; er läuft, bis das Fenster geschlossen wird.
 
-### 9. Gesamtprüfung
+#### Autostart mit systemd
+
+Ergänzt mit Issue #207 (Entscheidung 0011 nannte für Linux nur PM2). Der
+Assistent legt `~/.config/systemd/user/tybo-telegram-relay.service` an und
+startet ihn mit `systemctl --user enable --now tybo-telegram-relay`. Die
+Datei enthält den tatsächlichen Projektordner, den vollen Pfad zu Bun,
+`Restart=always` und einen eigenen `PATH` mit dem Ordner von Bun, dem Ordner
+der Claude CLI (aus `CLAUDE_PATH` oder dort, wo `claude` gefunden wurde),
+`~/.bun/bin` und `~/.local/bin`. Ein Benutzerdienst bekommt sonst nur die
+Systemordner und fände Claude nicht. Das Protokoll landet wie auf macOS in
+`logs/telegram-relay.log` und `logs/telegram-relay.error.log`, nicht im
+Journal: das eigene Journal ist auf Debian ohne die Gruppe `adm` oft nicht
+lesbar.
+
+Pfade mit Leerzeichen oder Zeichen wie `%`, `$`, `:` oder Anführungszeichen
+nimmt eine systemd-Dienstdatei nicht sicher auf. Liegt das Projekt in so
+einem Ordner, lehnt der Assistent ab; dann das Projekt verschieben oder PM2
+wählen.
+
+**Start ohne Anmeldung (Linger).** Ein Benutzerdienst startet nach einem
+Neustart des Rechners erst, wenn du dich anmeldest, außer Linger ist an. Der
+Assistent schaltet es ohne `sudo` ein (`loginctl enable-linger`); das geht,
+wenn polkit es erlaubt. Sonst steht am Ende genau ein Befehl da:
+
+```bash
+sudo loginctl enable-linger <dein-name>
+```
+
+Danach `tybo setup autostart` noch einmal (im Terminal genügt „Nochmal
+versuchen“); der Assistent prüft es und meldet „Autostart ist eingerichtet“.
+Selbst nachsehen: `loginctl show-user $USER -p Linger` (erwartet `Linger=yes`).
+
+**Im Alltag** (immer als dein Benutzer, nie mit `sudo`):
+
+```bash
+systemctl --user status tybo-telegram-relay     # läuft er?
+systemctl --user stop tybo-telegram-relay       # anhalten
+systemctl --user start tybo-telegram-relay      # starten
+systemctl --user restart tybo-telegram-relay    # neu starten (vom Terminal aus)
+tail -f logs/telegram-relay.log                 # Protokoll
+```
+
+Aus einer Antwort des Bots heraus nie `restart` oder `stop` aufrufen, sondern
+`bun run restart:request "Grund"`: der Bot beendet sich nach der laufenden
+Antwort, systemd startet ihn neu. Wiederholt man `tybo setup autostart` bei
+laufendem Dienst, bleibt er unberührt.
+
+**Schon unter PM2 eingerichtet?** Dann bleibt es bei PM2; der Assistent legt
+nie einen zweiten Dienst daneben an. Wechseln: erst
+`pm2 delete tybo-telegram-relay; pm2 save --force`, dann `tybo setup autostart`.
+Umgekehrt (systemd zu PM2): erst
+`systemctl --user disable --now tybo-telegram-relay` und die Dienstdatei
+löschen. Steht der Bot in beiden, oder lässt sich die PM2-Liste nicht lesen,
+startet der Assistent nichts.
+
+**Supabase auf diesem Rechner** läuft auch auf dem systemd-Weg weiter über
+PM2 (`tybo-supabase`). Dafür braucht es PM2 und `pm2 startup` wie oben.
+
+**Entfernen:** `bun run setup/uninstall.ts` hält den Dienst an, löscht die
+Datei und lädt systemd neu. Linger bleibt an, weil andere Benutzerdienste es
+brauchen können; ausschalten mit `loginctl disable-linger $USER` (ohne
+Berechtigung mit `sudo` davor).
+
+### 10. Gesamtprüfung
 
 Fasst zusammen, was eingerichtet ist und was noch fehlt, und testet jeden
 eingerichteten Schritt mit den gespeicherten Werten. „Alles eingerichtet und
@@ -685,7 +1162,10 @@ Das Terminal zeigt eine Adresse (`http://127.0.0.1:3100`) und einen
 **Einmal-Code**. Die Seite ist nur auf diesem Rechner erreichbar; dort den
 Code eingeben. Die Schritte und Felder sind dieselben wie im Terminal. Den
 Autostart richtet der Browser erst bei „Fertig“ ein (Häkchen „Autostart
-einrichten und tybo danach gleich starten“).
+einrichten und tybo danach gleich starten“), nachdem die Einrichtungsseite
+geschlossen ist. Unter Linux mit systemd steht darunter die Auswahl „Art des
+Autostarts“ (systemd-Benutzerdienst oder PM2). Fehlt danach nur noch der
+Start ohne Anmeldung, steht der `sudo`-Befehl dafür im Terminal.
 
 Fehlen beim Start des Bots Token oder Nutzer-ID, startet er von selbst in
 diesem Einrichtungsmodus, ohne Telegram; Adresse und Code stehen dann im Log.
@@ -711,9 +1191,13 @@ Zwei Dinge macht der Browser-Weg nicht, die musst du selbst erledigen:
 | „Das ist der öffentliche Publishable-Schlüssel …“ | Im Dashboard unter API Keys den Secret key kopieren, nicht den Publishable key. |
 | „Convex lehnt die Anmeldung ab. CONVEX_AUTH_TOKEN prüfen.“ | Token abgelaufen oder passt nicht zu `CONVEX_OWNER_TOKEN_IDENTIFIER`; siehe [Convex vorbereiten](#convex-vorbereiten). |
 | „Auf dem Convex-Projekt fehlen die Server-Funktionen. …“ | Im Projektordner `npx convex dev --once` ausführen. |
-| „Claude CLI nicht gefunden.“ | `npm install -g @anthropic-ai/claude-code`, Terminal neu öffnen. |
+| „Claude CLI nicht gefunden.“ | `curl -fsSL https://claude.ai/install.sh \| bash` (unter Windows ohne WSL `npm install -g @anthropic-ai/claude-code`), danach Terminal neu öffnen. |
+| „Claude CLI liegt in ~/.local/bin, das ist noch nicht im PATH: neue Sitzung öffnen. …“ | Nichts neu installieren: neues Terminal bzw. neue SSH-Sitzung öffnen. Hilft das nicht, die angezeigte Zeile `export PATH="$HOME/.local/bin:$PATH"` in `~/.zshrc` bzw. `~/.bashrc` eintragen. |
+| „Die Claude CLI ist da, startet aber nicht richtig …“ bzw. „… liegt in ~/.local/bin, startet dort aber nicht …“ (auch vom Installer) | Die CLI ist vorhanden, aber `claude --version` scheitert. Mit dem nativen Installer neu installieren; steht `CLAUDE_PATH` in der `.env`, den Pfad dort prüfen. |
 | „Claude CLI ist nicht angemeldet. …“ | `claude` starten, `/login`. |
-| „PM2 fehlt. Erst installieren mit: npm install -g pm2“ | PM2 installieren, dann `tybo setup autostart`. |
+| „PM2 fehlt. Erst installieren mit: npm install -g pm2“ | PM2 installieren, dann `tybo setup autostart`. Unter Linux mit systemd geht auch der systemd-Benutzerdienst ohne PM2. |
+| „Noch offen: nach einem Neustart des Rechners startet tybo erst, wenn du dich anmeldest. …“ | Den genannten Befehl `sudo loginctl enable-linger <name>` ausführen, dann `tybo setup autostart`. |
+| „Der systemd-Benutzerdienst antwortet nicht (systemctl --user). …“ | `tybo setup` als normaler Benutzer in einer Anmeldesitzung starten (SSH oder am Gerät), nicht über `sudo` oder `su`. Sonst PM2 wählen. |
 
 **Claude nicht im PATH unter launchd.** Antwortet der Bot über den Autostart
 nur mit Fallback-Modellen (OpenRouter, Ollama) oder gar nicht, obwohl
@@ -741,11 +1225,16 @@ Mehr Fehlerbilder: [`docs/troubleshooting.md`](troubleshooting.md).
   Bilder-Ordner selbst an, für Convex Deployment und OIDC-Aussteller (siehe
   oben). Zwischen den Wegen zieht der Assistent keine Daten um.
 - Supabase auf diesem Rechner (Docker) und Dauerbetrieb dafür.
-- Semantische Suche (OpenAI-Schlüssel für Embeddings).
+- Semantische Suche für Convex (dort über Convex selbst) und Embeddings für
+  schon gespeicherten Verlauf.
 - Agenten anpassen, Topic-IDs zuordnen, eigene Bots pro Agent.
 - Check-ins, Morgen-Briefing, Watchdog und Datenquellen (Gmail, Kalender,
   Notion, News).
 - Sprache, Anrufe, Transkription, Erinnerungen über Convex, VPS.
-- `pm2 startup` unter Linux (siehe Autostart).
+- `pm2 startup` unter Linux, wenn der Autostart über PM2 läuft (siehe Autostart).
+- `sudo loginctl enable-linger`, wenn Linger ohne Administratorrechte nicht
+  geht; der Assistent nennt den Befehl und prüft danach.
+- systemd-Dienste für Check-in, Briefing, Watchdog oder Supabase (die laufen
+  weiter über PM2 bzw. launchd).
 
 Diese Punkte beschreibt die `CLAUDE.md` in ihren Phasen.

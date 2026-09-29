@@ -99,7 +99,7 @@ async function start(options: Options): Promise<Ctx> {
     },
     saveMessage,
     processIntents: async () => {},
-    abortClaudeCalls: (key: string) => abortExecutions(key),
+    abortEngineCalls: (key: string) => abortExecutions(key),
     isShuttingDown: () => false,
     scheduleRestartCheck: () => {},
     log: () => {},
@@ -115,7 +115,7 @@ async function start(options: Options): Promise<Ctx> {
     ...turnDeps,
     ...telegramDeps,
     registry: commandRegistry,
-    services: { abortClaudeCalls: (key: string) => abortExecutions(key), getGoal: async () => undefined, pauseGoal: async () => {} } as unknown as CommandServices,
+    services: { abortEngineCalls: (key: string) => abortExecutions(key), getGoal: async () => undefined, pauseGoal: async () => {} } as unknown as CommandServices,
     sendAndRecord: async () => ({ sent: true, recorded: true }),
     resetConversation: async () => ({ status: "unavailable" }),
   });

@@ -351,7 +351,12 @@ geht das auch mit `tybo setup --web`, dann ohne laufenden Bot.
 - Den Verlauf, den der Browser anzeigt, speichert die WebUI zusätzlich lokal in
   `data/web/`, Anmeldungen in `data/web-sessions.json`.
 - Der Stopp-Knopf bricht die laufende Antwort ab, auch wenn sie noch in der
-  Warteschlange steht. Abgebrochene Antworten kommen nicht ins Gedächtnis.
+  Warteschlange steht (sofort, ohne auf einen freien Platz zu warten).
+  Abgebrochene Antworten kommen nicht ins Gedächtnis.
+- Wartet eine Antwort länger als 3 Sekunden auf einen freien Platz
+  (`MAX_AGENT_PROCESSES`), zeigt der Chat einmal „⏳ Warte auf einen freien
+  Platz …" mit den Gesprächen, die gerade laufen; siehe
+  `docs/troubleshooting.md`, „Antwort wartet".
 - Ein angeforderter Neustart (`bun run restart:request`) wartet auch auf
   laufende Web-Antworten. Wird der Bot trotzdem mitten in einer Antwort
   beendet, zeigt der Web-Chat denselben Hinweis wie Telegram („Der Bot wurde

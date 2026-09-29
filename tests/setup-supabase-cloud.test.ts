@@ -176,12 +176,12 @@ describe("zweiter Lauf", () => {
   test("nur die fehlende Migration wird eingespielt", async () => {
     const s = await setup({
       env: `${BASE_ENV}SUPABASE_URL=https://${SB.ref}.supabase.co\n`,
-      state: { projects: [ACTIVE], migrations: { [SB.ref]: ALL_MIGRATIONS.slice(0, 2) }, keys: { [SB.ref]: defaultKeys() } },
+      state: { projects: [ACTIVE], migrations: { [SB.ref]: ALL_MIGRATIONS.slice(0, -1) }, keys: { [SB.ref]: defaultKeys() } },
     });
     const result = await s.run();
     expect(result.ok).toBe(true);
     const posted = s.api.calls.filter(c => c.method === "POST" && c.path.endsWith("/database/migrations"));
-    expect(posted.map(c => c.body.name)).toEqual([migrationName(SCHEMA_FILES[2])]);
+    expect(posted.map(c => c.body.name)).toEqual([migrationName(SCHEMA_FILES[SCHEMA_FILES.length - 1])]);
     expect(result.message).toContain("ergänzt");
   });
 
@@ -585,7 +585,7 @@ describe("Schema", () => {
     const files = await loadSchemaFiles(s.ctx.root);
     const sent = s.api.state.queries.filter(q => q.includes("insert into supabase_migrations.schema_migrations"));
     // Die gescheiterte Datei vollständig (SQL und Verbuchung in einer Transaktion), die erste nicht erneut
-    expect(sent).toHaveLength(2);
+    expect(sent).toHaveLength(SCHEMA_FILES.length - 1);
     expect(fallbackInsert(target).test(sent[0])).toBe(true);
     expect(sent[0]).toContain(files[1].sql);
     expect(sent[0].startsWith("begin;")).toBe(true);
@@ -616,8 +616,9 @@ describe("Schema", () => {
     const second = await s.run();
     expect(second.ok).toBe(true);
     const sent = s.api.state.queries.filter(q => q.includes("insert into supabase_migrations.schema_migrations"));
-    expect(sent).toHaveLength(1);
-    expect(fallbackInsert(migrationName(SCHEMA_FILES[2])).test(sent[0])).toBe(true);
+    // Nur die Dateien nach der verbuchten
+    expect(sent).toHaveLength(SCHEMA_FILES.length - 2);
+    SCHEMA_FILES.slice(2).forEach((file, i) => expect(fallbackInsert(migrationName(file)).test(sent[i])).toBe(true));
     expect(s.api.state.migrations[SB.ref].filter(m => m.name === target)).toHaveLength(1);
     expect(s.api.state.migrations[SB.ref].map(m => m.name)).toEqual(SCHEMA_FILES.map(migrationName));
   });
@@ -646,9 +647,9 @@ describe("Schema", () => {
     keys.length = 0;
     const second = await s.run();
     expect(second.ok).toBe(true);
-    // Die verbuchte zweite Datei nicht erneut, nur die dritte
+    // Die verbuchte zweite Datei nicht erneut, nur die folgenden
     expect(firstKeys).toHaveLength(2);
-    expect(keys).toHaveLength(1);
+    expect(keys).toHaveLength(SCHEMA_FILES.length - 2);
     expect(keys[0]).toContain(migrationName(SCHEMA_FILES[2]));
     expect(s.api.state.migrations[SB.ref].filter(m => m.name === migrationName(SCHEMA_FILES[1]))).toHaveLength(1);
 

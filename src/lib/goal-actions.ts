@@ -46,7 +46,7 @@ export type GoalActionResult =
 export interface GoalActionOptions {
   /** createdAt des Ziels, auf das sich der Knopf bezieht; fehlt bei Befehlen */
   goalId?: number;
-  /** abortClaudeCalls aus src/lib/claude.ts */
+  /** abortEngineCalls aus src/lib/engines */
   abort(sessionKey: string): number;
   /**
    * Nur "more" und "stop": weitere Bedingung an das Ziel, die Goal-Engine

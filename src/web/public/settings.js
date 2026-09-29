@@ -2,7 +2,9 @@
 // zusätzlichen Anweisungen je Agent (Issue #38), System-Prompt, Board-Schalter,
 // neuen, gelöschten und wiederhergestellten Agenten (Issue #51), „Modelle" mit Standard,
 // Nebenmodellen und Fallback sowie „Status" mit „Jetzt neu starten" (Issue #39),
-// „Schlüssel" zum Setzen, Ersetzen und Entfernen von .env-Werten (Issue #63).
+// „Schlüssel" zum Setzen, Ersetzen und Entfernen von .env-Werten (Issue #63),
+// oben im Reiter „Agenten" der Abschnitt „Motor" mit Standard-Motor, Codex- und OpenCode-Einstellungen (Issue #129)
+// und abweichenden Gesprächen (Issue #126).
 // Wird vor app.js geladen; app.js ruft createSettingsView() auf und übergibt
 // api() (mit Umleitung zum Login bei 401), agentLabel() und onTab().
 // Nutzertext, Modellnamen, Anweisungen und Meldungen kommen nur über
@@ -77,8 +79,60 @@ const GLOBAL_SECTIONS = {
     { key: "ollamaModel", kind: "model", list: "ollama" },
     { key: "offlineOnly", kind: "offline" },
   ],
+  /**
+   * Abschnitt „Motor" (Issue #126, Entscheidung 0018). Die Felder liegen in
+   * der Datei verschachtelt (engine.default, engine.codex.model …); das
+   * Formular hält sie flach (engineFlat) und schreibt sie verschachtelt
+   * zurück (enginePatch). engine.topics ändert nur „Auf Standard".
+   */
+  engine: [
+    { key: "default", kind: "choice" },
+    { key: "codexModel", kind: "text" },
+    { key: "codexEffort", kind: "choice" },
+    { key: "codexSandbox", kind: "sandbox" },
+    // OpenCode (Issue #129): Modell aus `opencode models` oder frei, Variante frei mit Prüfung, Rechte
+    { key: "opencodeModel", kind: "model", list: "opencode" },
+    { key: "opencodeVariant", kind: "variant" },
+    { key: "opencodePermission", kind: "permission" },
+  ],
 };
-const LIST_LABELS = { claude: "Claude", openrouter: "OpenRouter", ollama: "Ollama" };
+const LIST_LABELS = { claude: "Claude", openrouter: "OpenRouter", ollama: "Ollama", opencode: "OpenCode" };
+
+/** Auswahlwert „Standard" beim Motor und beim Codex-Effort */
+const CHOICE_DEFAULT = " standard";
+/** Rechte-Stufe ohne eigenen Wert, wie DEFAULT_CODEX_SANDBOX in src/lib/settings.ts */
+const SANDBOX_DEFAULT = "full";
+const SANDBOX_LABELS = { "read-only": "Nur lesen", "workspace-write": "Projekt schreiben", full: "Voller Zugriff" };
+/** Rechte von OpenCode ohne eigenen Wert, wie DEFAULT_OPENCODE_PERMISSION in src/lib/settings.ts */
+const PERMISSION_DEFAULT = "auto";
+const PERMISSION_LABELS = { auto: "Automatisch freigeben", "ask-deny": "Fragen ablehnen" };
+/** Variante von OpenCode, wie OPENCODE_VARIANT_PATTERN in src/lib/settings.ts (ein Test gleicht ab) */
+const VARIANT_PATTERN = /^[a-z0-9-]{1,20}$/;
+/** Motoren, falls der Server keine nennt (ältere Antwort) */
+const ENGINE_FALLBACK = [{ id: "claude", label: "Claude Code" }, { id: "codex", label: "Codex" }, { id: "opencode", label: "OpenCode" }];
+/** Wo man sich anmeldet, je Motor */
+const ENGINE_LOGIN = { claude: "im Terminal claude starten, dann /login", codex: "codex login im Terminal", opencode: "opencode auth login im Terminal" };
+const ENGINE_TEXT = {
+  get intro() { return "Womit " + window.TYBO_BRAND.name + " antwortet. Der Standard gilt für jedes Gespräch ohne eigene Wahl; ein einzelnes Gespräch stellt /motor um."; },
+  codexNote: "Leer heißt: Codex nimmt den Wert aus seiner eigenen Konfiguration. Gilt ab der nächsten Nachricht mit Codex.",
+  opencodeNote: "Leer heißt: OpenCode nimmt Modell und Variante aus seiner eigenen Konfiguration. Gilt ab der nächsten Nachricht mit OpenCode. Anmeldung und Anbieter kommen aus OpenCode (opencode auth login).",
+  opencodeNoList: "Keine Modell-Liste von OpenCode geladen. Eigenes Modell bleibt möglich.",
+  variantHint: "Hängt vom Anbieter ab, etwa low, high, max oder thinking-8k. Leer: Standard von OpenCode.",
+  variantInvalid: "Die Variante besteht aus 1 bis 20 Zeichen: Kleinbuchstaben, Ziffern und Bindestrich.",
+  permissionNote: "Automatisch freigeben: OpenCode bestätigt seine Rückfragen selbst (--auto), was die OpenCode-Konfiguration ausdrücklich verbietet, bleibt verboten. Fragen ablehnen: jede Rückfrage von OpenCode wird abgelehnt, die Aktion unterbleibt.",
+  sandboxNote: "Voller Zugriff: Codex darf wie Claude Code alles, was dein Benutzerkonto darf, auch außerhalb des Projekts Dateien ändern, Befehle ausführen und ins Netz. Projekt schreiben: ändert nur Dateien im Projektordner. Nur lesen: liest und antwortet, ändert nichts.",
+  checking: "Verfügbarkeit wird geprüft …",
+  failed: "Verfügbarkeit und abweichende Gespräche konnten nicht geladen werden.",
+  availabilityUnknown: "Verfügbarkeit nicht ermittelbar.",
+  overridesTitle: "Abweichende Gespräche",
+  overridesHint: "Gespräche, die mit /motor einen eigenen Motor haben. „Auf Standard\" entfernt die Ausnahme; die nächste Nachricht beginnt dort eine neue Session, das Gedächtnis bleibt.",
+  overridesEmpty: "Keine. Alle Gespräche nehmen den Standard.",
+  gone: "Nicht mehr zuzuordnen",
+  goneHint: "Das Gespräch gibt es in der WebUI nicht mehr (Topic gelöscht oder andere Gruppe).",
+  resetDone: "Auf Standard gestellt.",
+  offline: "Server nicht erreichbar, nichts geändert.",
+  modelInvalid: "Der Modellname darf höchstens 200 Zeichen lang sein, ohne Leerzeichen und Steuerzeichen.",
+};
 
 /** Reiter „Status" (Issue #39): Abfragen nach „Jetzt neu starten" */
 const STATUS_POLL_MS = 3000;
@@ -292,6 +346,18 @@ function listEntries(list) {
   return out;
 }
 
+/**
+ * Liste von `opencode models` (Issue #129): Kennungen unverändert, die
+ * OpenRouter-Modelle zuerst (Anbieter des Maintainers, Entscheidung 0019),
+ * sonst in der Reihenfolge von OpenCode. Gewählt wird dabei nichts: ohne
+ * eigenen Wert bleibt „Standard aus der OpenCode-Konfiguration".
+ */
+function openCodeEntries(list) {
+  const entries = listEntries(list);
+  const first = entries.filter(e => e.id.startsWith("openrouter/"));
+  return first.concat(entries.filter(e => !e.id.startsWith("openrouter/")));
+}
+
 /** Einträge, die zum Filtertext passen (ohne Groß-/Kleinschreibung, in ID und Name) */
 function filterEntries(entries, filter) {
   const needle = String(filter || "").trim().toLowerCase();
@@ -305,6 +371,11 @@ function filterEntries(entries, filter) {
  */
 function globalFieldState(spec, saved, lists) {
   if (spec.kind === "effort") return { choice: typeof saved === "string" ? saved : EFFORT_DEFAULT };
+  if (spec.kind === "choice") return { choice: typeof saved === "string" ? saved : CHOICE_DEFAULT };
+  if (spec.kind === "text") return { text: typeof saved === "string" ? saved : "" };
+  if (spec.kind === "sandbox") return { choice: typeof saved === "string" ? saved : SANDBOX_DEFAULT };
+  if (spec.kind === "permission") return { choice: typeof saved === "string" ? saved : PERMISSION_DEFAULT };
+  if (spec.kind === "variant") return { text: typeof saved === "string" ? saved : "" };
   if (spec.kind === "offline") return { choice: saved === true ? "true" : saved === false ? "false" : OFFLINE_DEFAULT };
   const pick = (value, ids, empty) => {
     if (typeof value !== "string" || !value) return { choice: empty, custom: "", filter: "" };
@@ -323,6 +394,21 @@ function globalFieldState(spec, saved, lists) {
  */
 function globalFieldValue(spec, f) {
   if (spec.kind === "effort") return { value: f.choice === EFFORT_DEFAULT ? null : f.choice };
+  if (spec.kind === "choice") return { value: f.choice === CHOICE_DEFAULT ? null : f.choice };
+  // Voller Zugriff ist der Standard: ohne eigenen Wert gespeichert
+  if (spec.kind === "sandbox") return { value: f.choice === SANDBOX_DEFAULT ? null : f.choice };
+  // Automatisch freigeben ist der Standard: ohne eigenen Wert gespeichert
+  if (spec.kind === "permission") return { value: f.choice === PERMISSION_DEFAULT ? null : f.choice };
+  if (spec.kind === "variant") {
+    const variant = String(f.text || "").trim();
+    if (!variant) return { value: null };
+    return VARIANT_PATTERN.test(variant) ? { value: variant } : { error: ENGINE_TEXT.variantInvalid };
+  }
+  if (spec.kind === "text") {
+    if (!String(f.text || "").trim()) return { value: null };
+    const name = normalizeModelName(f.text);
+    return name === null || /\s/.test(name) ? { error: ENGINE_TEXT.modelInvalid } : { value: name };
+  }
   if (spec.kind === "offline") return { value: f.choice === "true" ? true : f.choice === "false" ? false : null };
   const model = () => {
     if (f.choice === MODEL_CUSTOM) {
@@ -343,13 +429,21 @@ function globalFieldValue(spec, f) {
  * Teiländerung eines Abschnitts für PATCH /api/settings: nur Felder, die vom
  * gespeicherten Stand abweichen. { patch } (null ohne Änderung) oder { error }.
  */
+/** Gespeicherter Wert zum Vergleich: fehlt er, null; „Voller Zugriff" ist wie kein eigener Wert */
+function savedFieldValue(spec, saved) {
+  if (saved === undefined) return null;
+  if (spec.kind === "sandbox" && saved === SANDBOX_DEFAULT) return null;
+  if (spec.kind === "permission" && saved === PERMISSION_DEFAULT) return null;
+  return saved;
+}
+
 function globalSectionPatch(section, fields, saved) {
   const own = saved && typeof saved === "object" ? saved : {};
   const patch = {};
   for (const spec of GLOBAL_SECTIONS[section] || []) {
     const result = globalFieldValue(spec, fields[spec.key]);
     if (result.error) return { error: result.error };
-    const before = own[spec.key] === undefined ? null : own[spec.key];
+    const before = savedFieldValue(spec, own[spec.key]);
     if (before !== result.value) patch[spec.key] = result.value;
   }
   return { patch: Object.keys(patch).length ? patch : null };
@@ -360,7 +454,54 @@ function globalFieldEdited(spec, f, saved) {
   if (!f) return false;
   const result = globalFieldValue(spec, f);
   if (result.error) return true;
-  return (saved === undefined ? null : saved) !== result.value;
+  return savedFieldValue(spec, saved) !== result.value;
+}
+
+/** Flache Formularfelder je Motor-Unterabschnitt und Feld in der Datei */
+const ENGINE_SUBFIELDS = {
+  codex: { codexModel: "model", codexEffort: "effort", codexSandbox: "sandbox" },
+  opencode: { opencodeModel: "model", opencodeVariant: "variant", opencodePermission: "permission" },
+};
+
+/**
+ * engine aus der Datei flach für das Formular: default, codexModel,
+ * codexEffort, codexSandbox, opencodeModel, opencodeVariant, opencodePermission
+ */
+function engineFlat(engine) {
+  const e = engine && typeof engine === "object" ? engine : {};
+  const out = {};
+  if (typeof e.default === "string") out.default = e.default;
+  for (const [name, fields] of Object.entries(ENGINE_SUBFIELDS)) {
+    const sub = e[name] && typeof e[name] === "object" ? e[name] : {};
+    for (const [flat, key] of Object.entries(fields)) if (typeof sub[key] === "string") out[flat] = sub[key];
+  }
+  return out;
+}
+
+/** Flache Teiländerung des Formulars als PATCH-Form { default, codex: { … }, opencode: { model, variant, permission } } */
+function enginePatch(flat) {
+  const out = {};
+  if ("default" in flat) out.default = flat.default;
+  for (const [name, fields] of Object.entries(ENGINE_SUBFIELDS)) {
+    const sub = {};
+    for (const [key, target] of Object.entries(fields)) if (key in flat) sub[target] = flat[key];
+    if (Object.keys(sub).length) out[name] = sub;
+  }
+  return out;
+}
+
+/**
+ * Zeile der Verfügbarkeit eines Motors: „angemeldet, Version 2.1.281",
+ * „nicht angemeldet: codex login im Terminal" usw. Ungeprüft ist nie
+ * „angemeldet".
+ */
+function engineAvailabilityText(a) {
+  if (!a || typeof a !== "object") return "unbekannt";
+  const version = typeof a.version === "string" && a.version ? "Version " + a.version : "";
+  if (a.installed !== true) return "nicht installiert";
+  if (a.loggedIn === true) return "angemeldet" + (version ? ", " + version : "");
+  if (a.loggedIn === false) return "nicht angemeldet: " + (ENGINE_LOGIN[a.engine] || "im Terminal anmelden") + (version ? " (" + version + ")" : "");
+  return "installiert" + (version ? ", " + version : "") + "; Anmeldung nicht feststellbar";
 }
 
 // --- Reiter „Status": Anzeige-Hilfen (Issue #39) ------------------------------
@@ -441,11 +582,18 @@ function createSettingsView(deps) {
      * Anbieter, dazu Fehlertexte je Anbieter (auch bei HTTP 200) und ob die
      * letzte Abfrage ganz scheiterte (bisherige Listen bleiben dann stehen).
      */
-    lists: { claude: [], openrouter: [], ollama: [] },
-    listErrors: { openrouter: null, ollama: null },
+    lists: { claude: [], openrouter: [], ollama: [], opencode: [] },
+    listErrors: { openrouter: null, ollama: null, opencode: null },
     listsFailed: false,
     /** Abschnitte im Reiter „Modelle": { fields, saving, error, saved, savedTimer, restart } */
     globals: new Map(),
+    /**
+     * Abschnitt „Motor" (Issue #126): GET /api/engines mit Standard,
+     * Verfügbarkeit und abweichenden Gesprächen. seq verwirft überholte
+     * Antworten; resetting: Schlüssel, der gerade auf Standard gestellt wird;
+     * rowError/rowDone: Meldung zu genau einer Zeile { key, text }.
+     */
+    engines: { phase: "idle", data: null, error: null, seq: 0, resetting: null, rowError: null, notice: null },
     /** Reiter „Status": phase idle|loading|ok|failed, seq wie bei den Anweisungen */
     status: { phase: "idle", data: null, error: null, seq: 0 },
     /**
@@ -717,8 +865,9 @@ function createSettingsView(deps) {
       claude: listEntries(data.claude && data.claude.models),
       openrouter: listEntries(data.openrouter && data.openrouter.models),
       ollama: listEntries(data.ollama && data.ollama.models),
+      opencode: openCodeEntries(data.opencode && data.opencode.models),
     };
-    state.listErrors = { openrouter: errorOf(data.openrouter), ollama: errorOf(data.ollama) };
+    state.listErrors = { openrouter: errorOf(data.openrouter), ollama: errorOf(data.ollama), opencode: errorOf(data.opencode) };
     state.listsFailed = false;
   }
 
@@ -727,11 +876,13 @@ function createSettingsView(deps) {
       claude: state.lists.claude.map(e => e.id),
       openrouter: state.lists.openrouter.map(e => e.id),
       ollama: state.lists.ollama.map(e => e.id),
+      opencode: state.lists.opencode.map(e => e.id),
     };
   }
 
   function savedGlobal(section) {
     const s = state.data && state.data.settings && state.data.settings[section];
+    if (section === "engine") return engineFlat(s);
     return s && typeof s === "object" ? s : {};
   }
 
@@ -786,7 +937,7 @@ function createSettingsView(deps) {
     clearSaved(g);
     render();
     const body = {};
-    body[section] = result.patch;
+    body[section] = section === "engine" ? enginePatch(result.patch) : result.patch;
     const attempt = ++state.sync.next;
     let error = null;
     try {
@@ -803,6 +954,8 @@ function createSettingsView(deps) {
         }, SAVED_MS);
         next.restart = data.restartRequired === true ? { status: "idle", message: null } : null;
         render();
+        // Standard-Motor geändert: Liste der abweichenden Gespräche neu (Issue #126)
+        if (section === "engine") void loadEngines();
         return;
       }
       error = errorText(data, "Speichern fehlgeschlagen (Fehler " + status + ").");
@@ -813,6 +966,64 @@ function createSettingsView(deps) {
     g.saving = false;
     g.error = error;
     render();
+  }
+
+  // --- Abschnitt „Motor" (Issue #126) ------------------------------------------
+
+  /** Stand aus GET /api/engines oder der Antwort auf „Auf Standard" übernehmen */
+  function adoptEngines(data) {
+    if (!data || typeof data !== "object" || !Array.isArray(data.overrides)) return false;
+    state.engines.data = data;
+    state.engines.phase = "ok";
+    state.engines.error = null;
+    return true;
+  }
+
+  async function loadEngines() {
+    const e = state.engines;
+    const seq = ++e.seq;
+    if (!e.data) e.phase = "loading";
+    render();
+    let ok = false;
+    try {
+      const res = await deps.api("GET", "/api/engines");
+      if (seq !== e.seq) return;
+      ok = res.ok && adoptEngines(res.data);
+      if (!ok) e.error = errorText(res.data, ENGINE_TEXT.failed);
+    } catch {
+      if (seq !== e.seq) return;
+      e.error = ENGINE_TEXT.failed;
+    }
+    if (!ok && !e.data) e.phase = "failed";
+    render();
+  }
+
+  /** „Auf Standard": entfernt genau die Ausnahme dieses Schlüssels */
+  async function resetEngineOverride(key) {
+    const e = state.engines;
+    if (e.resetting) return;
+    e.resetting = key;
+    e.rowError = null;
+    e.notice = null;
+    const seq = ++e.seq;
+    render();
+    try {
+      const res = await deps.api("POST", "/api/engines/reset", { key });
+      if (res.ok && adoptEngines(res.data)) {
+        e.notice = ENGINE_TEXT.resetDone;
+      } else {
+        // 404: gibt es nicht mehr; der mitgeschickte Stand ist dann der aktuelle
+        if (res.status === 404) adoptEngines(res.data);
+        e.rowError = { key, text: errorText(res.data, "Zurücksetzen fehlgeschlagen (Fehler " + res.status + ").") };
+      }
+    } catch {
+      e.rowError = { key, text: ENGINE_TEXT.offline };
+    }
+    e.resetting = null;
+    // Ein zwischendurch gestartetes Laden ist neuer als diese Antwort und gewinnt
+    if (seq !== e.seq) return;
+    render();
+    focusKey("engine-reset-done");
   }
 
   // --- Reiter „Status" (Issue #39) ----------------------------------------------
@@ -1935,6 +2146,8 @@ function createSettingsView(deps) {
     const field = h("div", { className: "settings-field" }, [
       h("label", { className: "settings-label", for: "settings-model-" + name, text: "Modell" }),
       h("span", { className: "settings-select" }, [select]),
+      // Issue #126: Agenten-Modelle gehen nie an Codex oder OpenCode
+      h("p", { className: "actions-hint settings-engine-scope", text: "gilt für Claude Code" }),
     ]);
     if (f.model === MODEL_CUSTOM) {
       const custom = h("input", {
@@ -2707,7 +2920,7 @@ function createSettingsView(deps) {
         id: id + "-custom",
         className: "settings-input",
         type: "text",
-        placeholder: o.listName === "openrouter" ? "Modell-ID, z.B. vendor/modell" : o.listName === "ollama" ? "Modellname, z.B. qwen3:8b" : "Modell-ID, z.B. claude-sonnet-5",
+        placeholder: o.listName === "openrouter" ? "Modell-ID, z.B. vendor/modell" : o.listName === "ollama" ? "Modellname, z.B. qwen3:8b" : o.listName === "opencode" ? "anbieter/modell, z.B. openrouter/anthropic/claude-opus-5.5" : "Modell-ID, z.B. claude-sonnet-5",
         "aria-label": "Eigenes Modell: " + o.label,
         autocomplete: "off",
         spellcheck: "false",
@@ -2804,7 +3017,7 @@ function createSettingsView(deps) {
       ]),
     ].concat(globalSaveNodes("defaults"));
     return sectionNode("defaults", "Standard für alle Agenten", [
-      "Gilt für jeden Agenten ohne eigenen Wert, ab seiner nächsten Nachricht.",
+      "Gilt für jeden Agenten ohne eigenen Wert, ab seiner nächsten Nachricht. Gilt für Claude Code; Codex und OpenCode haben eigene Werte im Reiter Agenten unter Motor.",
       ownersHint(),
     ], nodes);
   }
@@ -2927,6 +3140,221 @@ function createSettingsView(deps) {
       globalModelField({ section: "fallback", key: "ollamaModel", label: "Ollama-Modell", entries: state.lists.ollama, defaultLabel: inheritedLabel(inh.ollamaModel), listName: "ollama" }),
       offlineField(),
     ].concat(globalSaveNodes("fallback")));
+  }
+
+  // --- Anzeige „Motor" (Issue #126) --------------------------------------------
+
+  function engineList() {
+    const list = state.data && state.data.engineOptions && Array.isArray(state.data.engineOptions.engines) ? state.data.engineOptions.engines : ENGINE_FALLBACK;
+    return list.filter(e => e && typeof e.id === "string" && typeof e.label === "string");
+  }
+
+  function engineName(id) {
+    const hit = engineList().find(e => e.id === id);
+    return hit ? hit.label : String(id);
+  }
+
+  /** Auswahlfeld eines Abschnittsfelds (Motor, Codex-Effort, Rechte) mit Neuzeichnen bei Änderung */
+  function engineSelect(key, label, options, hint) {
+    const g = globalForm("engine");
+    const f = g.fields[key];
+    const id = "settings-g-engine-" + key;
+    const select = h("select", { id, className: "settings-input", "data-focus-key": "g-engine:" + key, disabled: g.saving });
+    for (const o of options) select.appendChild(h("option", { value: o.value, text: o.text }));
+    select.value = f.choice;
+    select.addEventListener("change", () => {
+      f.choice = select.value;
+      g.error = null;
+      clearSaved(g);
+      render();
+    });
+    const field = h("div", { className: "settings-field" }, [
+      h("label", { className: "settings-label", for: id, text: label }),
+      h("span", { className: "settings-select" }, [select]),
+    ]);
+    if (hint) field.appendChild(h("p", { className: "actions-hint", text: hint }));
+    return field;
+  }
+
+  /** „Standard (Claude Code, Voreinstellung)": was ohne eigenen Wert gilt (TYBO_ENGINE oder Claude Code) */
+  function engineDefaultLabel() {
+    const inh = state.data.inheritedModels && state.data.inheritedModels.engine && state.data.inheritedModels.engine.default;
+    if (!inh || typeof inh.value !== "string") return "Standard";
+    const source = SOURCE_LABELS[inh.source];
+    return "Standard (" + engineName(inh.value) + (source ? ", " + source : "") + ")";
+  }
+
+  function availabilityNode() {
+    const e = state.engines;
+    if (!e.data) {
+      return h("p", { className: e.phase === "failed" ? "actions-error" : "actions-hint", role: "status", text: e.phase === "failed" ? e.error || ENGINE_TEXT.failed : ENGINE_TEXT.checking });
+    }
+    const list = Array.isArray(e.data.availability) ? e.data.availability : null;
+    if (!list) return h("p", { className: "actions-hint", role: "status", text: ENGINE_TEXT.availabilityUnknown });
+    const ul = h("ul", { className: "settings-keys settings-engines", "aria-label": "Verfügbarkeit der Motoren" });
+    for (const a of list) {
+      if (!a || typeof a.engine !== "string") continue;
+      const ready = a.installed === true && a.loggedIn === true;
+      const item = h("li", { "data-set": ready ? "true" : "false", "data-engine": a.engine }, [
+        h("span", { className: "settings-key-name", text: typeof a.label === "string" ? a.label : engineName(a.engine) }),
+        h("span", { className: "settings-key-state", text: engineAvailabilityText(a) }),
+      ]);
+      ul.appendChild(item);
+    }
+    return ul;
+  }
+
+  function codexModelField() {
+    return engineTextField("codexModel", "Modell", "Standard aus der Codex-Konfiguration");
+  }
+
+  /** Freies Textfeld eines Motor-Felds (Codex-Modell, OpenCode-Variante); Enter speichert */
+  function engineTextField(key, label, placeholder, hint) {
+    const g = globalForm("engine");
+    const f = g.fields[key];
+    const id = "settings-g-engine-" + key;
+    const input = h("input", {
+      id,
+      className: "settings-input",
+      type: "text",
+      placeholder,
+      autocomplete: "off",
+      spellcheck: "false",
+      "data-focus-key": "g-engine:" + key,
+      disabled: g.saving,
+    });
+    input.value = f.text;
+    input.addEventListener("input", () => {
+      f.text = input.value;
+      g.error = null;
+      clearSaved(g);
+      updateGlobalSave("engine");
+    });
+    input.addEventListener("keydown", event => {
+      if (event.key !== "Enter" || event.isComposing) return;
+      event.preventDefault();
+      void saveGlobal("engine");
+    });
+    const field = h("div", { className: "settings-field" }, [h("label", { className: "settings-label", for: id, text: label }), input]);
+    if (hint) field.appendChild(h("p", { className: "actions-hint", text: hint }));
+    return field;
+  }
+
+  /** Verfügbarkeit von OpenCode aus GET /api/engines (checkEngine), im Abschnitt OpenCode */
+  function openCodeAvailabilityNode() {
+    const e = state.engines;
+    const list = e.data && Array.isArray(e.data.availability) ? e.data.availability : null;
+    const a = list && list.find(x => x && x.engine === "opencode");
+    if (!a) return null;
+    const ready = a.installed === true && a.loggedIn === true;
+    const text = ready || typeof a.message !== "string" || !a.message ? engineAvailabilityText(a) : a.message;
+    return h("p", { className: "actions-hint settings-engine-state", role: "status", "data-engine": "opencode", "data-ready": ready ? "true" : "false", text: "OpenCode: " + text });
+  }
+
+  function openCodeGroup(options) {
+    const titleId = "settings-g-engine-opencode";
+    const levels = Array.isArray(options.opencodePermissionLevels) ? options.opencodePermissionLevels : Object.keys(PERMISSION_LABELS);
+    const standard = typeof options.opencodeDefaultPermission === "string" ? options.opencodeDefaultPermission : PERMISSION_DEFAULT;
+    const permissionOrder = ["auto", "ask-deny"].filter(v => levels.includes(v));
+    const nodes = [
+      h("h4", { className: "settings-label", id: titleId, text: "OpenCode" }),
+      h("p", { className: "actions-hint", text: ENGINE_TEXT.opencodeNote }),
+      openCodeAvailabilityNode(),
+      globalModelField({
+        section: "engine",
+        key: "opencodeModel",
+        label: "Modell",
+        entries: state.lists.opencode,
+        defaultLabel: "Standard aus der OpenCode-Konfiguration",
+        listName: "opencode",
+      }),
+    ];
+    // Ohne Liste (Abruf gescheitert, ältere Antwort): das Feld bleibt frei eingebbar
+    if (!state.lists.opencode.length && !state.listErrors.opencode) {
+      nodes.push(h("p", { className: "actions-hint", role: "status", text: ENGINE_TEXT.opencodeNoList }));
+    }
+    nodes.push(
+      engineTextField("opencodeVariant", "Variante (Effort)", "Standard von OpenCode", ENGINE_TEXT.variantHint),
+      engineSelect(
+        "opencodePermission",
+        "Rechte",
+        permissionOrder.map(v => ({ value: v, text: PERMISSION_LABELS[v] + (v === standard ? " (Standard)" : "") })),
+        ENGINE_TEXT.permissionNote
+      )
+    );
+    return h("div", { className: "settings-field settings-aux", role: "group", "aria-labelledby": titleId }, nodes.filter(Boolean));
+  }
+
+  function overridesNode() {
+    const e = state.engines;
+    const titleId = "settings-g-engine-overrides";
+    const nodes = [
+      h("h4", { className: "settings-label", id: titleId, text: ENGINE_TEXT.overridesTitle }),
+      h("p", { className: "actions-hint", text: ENGINE_TEXT.overridesHint }),
+    ];
+    if (e.notice) nodes.push(h("p", { className: "settings-status", role: "status", tabindex: "-1", "data-focus-key": "engine-reset-done", text: e.notice }));
+    if (!e.data) {
+      if (e.phase === "failed") {
+        const again = quietButton("engine-reload", "Erneut laden", () => void loadEngines());
+        nodes.push(again);
+      }
+      return h("div", { className: "settings-field", role: "group", "aria-labelledby": titleId }, nodes);
+    }
+    const list = e.data.overrides.filter(o => o && typeof o.key === "string");
+    if (!list.length) {
+      nodes.push(h("p", { className: "settings-empty", text: ENGINE_TEXT.overridesEmpty }));
+      return h("div", { className: "settings-field", role: "group", "aria-labelledby": titleId }, nodes);
+    }
+    const ul = h("ul", { className: "settings-engine-overrides", "aria-labelledby": titleId });
+    for (const o of list) {
+      const gone = o.conversationId === null || typeof o.title !== "string";
+      const busy = e.resetting === o.key;
+      const name = h("span", { className: "settings-engine-conversation" }, [
+        h("span", { className: "settings-engine-title", text: gone ? ENGINE_TEXT.gone : o.title }),
+        h("span", { className: "engine-pill", "data-engine": String(o.engine), text: typeof o.label === "string" ? o.label : engineName(o.engine) }),
+      ]);
+      const button = quietButton("engine-reset:" + o.key, busy ? "Wird zurückgesetzt …" : "Auf Standard", () => void resetEngineOverride(o.key), {
+        disabled: !!e.resetting,
+      });
+      button.setAttribute("aria-label", "Auf Standard: " + (gone ? ENGINE_TEXT.gone : o.title));
+      const row = h("li", { "data-key": o.key }, [name, button]);
+      if (gone) row.appendChild(h("p", { className: "actions-hint", text: ENGINE_TEXT.goneHint }));
+      if (e.rowError && e.rowError.key === o.key) row.appendChild(h("p", { className: "actions-error", role: "alert", text: e.rowError.text }));
+      ul.appendChild(row);
+    }
+    nodes.push(ul);
+    // Fehler zu einer Zeile, die es nicht mehr gibt (404): über der Liste
+    if (e.rowError && !list.some(o => o.key === e.rowError.key)) nodes.push(h("p", { className: "actions-error", role: "alert", text: e.rowError.text }));
+    return h("div", { className: "settings-field", role: "group", "aria-labelledby": titleId }, nodes);
+  }
+
+  function engineSection() {
+    const options = state.data.engineOptions && typeof state.data.engineOptions === "object" ? state.data.engineOptions : {};
+    const efforts = Array.isArray(options.codexEffortLevels) ? options.codexEffortLevels : [];
+    const sandboxes = Array.isArray(options.codexSandboxLevels) ? options.codexSandboxLevels : Object.keys(SANDBOX_LABELS);
+    const sandboxOrder = ["full", "workspace-write", "read-only"].filter(v => sandboxes.includes(v));
+    const codexTitle = "settings-g-engine-codex";
+    const codex = h("div", { className: "settings-field settings-aux", role: "group", "aria-labelledby": codexTitle }, [
+      h("h4", { className: "settings-label", id: codexTitle, text: "Codex" }),
+      h("p", { className: "actions-hint", text: ENGINE_TEXT.codexNote }),
+      codexModelField(),
+      engineSelect("codexEffort", "Effort", [{ value: CHOICE_DEFAULT, text: "Standard aus der Codex-Konfiguration" }].concat(efforts.map(l => ({ value: String(l), text: String(l) })))),
+      engineSelect(
+        "codexSandbox",
+        "Rechte",
+        sandboxOrder.map(v => ({ value: v, text: SANDBOX_LABELS[v] + (v === SANDBOX_DEFAULT ? " (Standard)" : "") })),
+        ENGINE_TEXT.sandboxNote
+      ),
+    ]);
+    return sectionNode("engine", "Motor", [ENGINE_TEXT.intro], [
+      availabilityNode(),
+      engineSelect("default", "Standard-Motor", [{ value: CHOICE_DEFAULT, text: engineDefaultLabel() }].concat(engineList().map(e => ({ value: e.id, text: e.label })))),
+      codex,
+      // Nur, wenn der Server OpenCode als wählbar nennt (ältere Antworten kennen engine.opencode nicht)
+      engineList().some(e => e.id === "opencode") ? openCodeGroup(options) : null,
+      ...globalSaveNodes("engine"),
+      overridesNode(),
+    ]);
   }
 
   function modelsPanel() {
@@ -3076,7 +3504,7 @@ function createSettingsView(deps) {
 
   function statusFacts(d) {
     const version = d.version && typeof d.version === "object" ? d.version : {};
-    const supervisor = d.supervisor === "launchd" ? "launchd" : d.supervisor === "pm2" ? "PM2" : d.supervisor === null ? "keiner" : "unbekannt";
+    const supervisor = d.supervisor === "launchd" ? "launchd" : d.supervisor === "pm2" ? "PM2" : d.supervisor === "systemd" ? "systemd" : d.supervisor === null ? "keiner" : "unbekannt";
     const storage = { convex: "Convex", supabase: "Supabase", none: "keiner" }[d.storage] || "unbekannt";
     const running = d.running && typeof d.running === "object" ? d.running : {};
     const count = v => (typeof v === "number" && isFinite(v) ? String(v) : "unbekannt");
@@ -3087,6 +3515,8 @@ function createSettingsView(deps) {
       fact("Laufzeit", formatUptime(d.uptimeSeconds) + (started ? ", seit " + started : "")),
       fact("Supervisor", supervisor),
       fact("Speicher", storage),
+      // Nur mit Supabase: „aktiv" erst nach bestandenem Nachweis (tybo setup suche)
+      ...(d.storage === "supabase" ? [fact("Semantische Suche", d.semanticSearch === "aktiv" ? "aktiv" : d.semanticSearch === "textsuche" ? "nur Textsuche" : "unbekannt")] : []),
       fact("Sessions", formatSessions(d.sessions)),
       // Getrennt, nicht addiert: eine Antwort kann in beiden Zählern stecken
       fact("Ausführungen (laufend und wartend)", count(running.executions)),
@@ -3121,6 +3551,21 @@ function createSettingsView(deps) {
       children.push(h("p", { className: "settings-group-label", text: group }), ul);
     }
     return sectionNode("keys", "Schlüssel", [SETTINGS_TEXT.keysNote], children);
+  }
+
+  /** Motoren (Issue #126): je Motor installiert, angemeldet, Version; nur diese Felder */
+  function engineStatusSection(engines) {
+    if (!Array.isArray(engines)) return sectionNode("engines", "Motoren", [], [h("p", { className: "actions-hint", text: "unbekannt" })]);
+    const ul = h("ul", { className: "settings-keys settings-engines", "aria-label": "Motoren" });
+    for (const a of engines) {
+      if (!a || typeof a.engine !== "string") continue;
+      const ready = a.installed === true && a.loggedIn === true;
+      ul.appendChild(h("li", { "data-set": ready ? "true" : "false", "data-engine": a.engine }, [
+        h("span", { className: "settings-key-name", text: typeof a.label === "string" ? a.label : a.engine }),
+        h("span", { className: "settings-key-state", text: engineAvailabilityText(a) }),
+      ]));
+    }
+    return sectionNode("engines", "Motoren", [], [ul]);
   }
 
   function restartSection() {
@@ -3182,6 +3627,7 @@ function createSettingsView(deps) {
         refresh,
       ]),
       statusFacts(st.data),
+      engineStatusSection(st.data.engines),
       keysSection(st.data.keys),
       restartSection()
     );
@@ -3221,7 +3667,9 @@ function createSettingsView(deps) {
     el.panel.replaceChildren(...[
       ...failed,
       ...catalogProblemNodes(),
-      h("p", { className: "settings-intro", text: "System-Prompt, Modell, Effort und zusätzliche Anweisungen je Agent. Speichern gilt pro Agent." }),
+      // Motor oben (Issue #126): Standard, Codex, abweichende Gespräche
+      engineSection(),
+      h("p", { className: "settings-intro", text: "System-Prompt, Modell, Effort und zusätzliche Anweisungen je Agent. Modell und Effort gelten für Claude Code. Speichern gilt pro Agent." }),
       agentNoticeNode(),
       catalogReady ? createSection() : null,
       list,
@@ -3259,6 +3707,10 @@ function createSettingsView(deps) {
     // Bei jedem Öffnen frisch laden (in Telegram per /agent geändert, andere Browser)
     if (!wasOpen) {
       void load();
+      // Motor (Issue #126): Verfügbarkeit und Ausnahmen bei jedem Öffnen frisch
+      state.engines.notice = null;
+      state.engines.rowError = null;
+      void loadEngines();
       state.agentNotice = null;
       void loadCatalog();
       // Prompts wie die Anweisungen; ein offener Entwurf bleibt stehen (Issue #51)
@@ -3311,6 +3763,7 @@ function createSettingsView(deps) {
     for (const i of state.instructions.values()) if (i.busy || (typeof i.text === "string" && i.text.trim())) return true;
     for (const b of state.boards.values()) if (b.busy) return true;
     if (state.creating) return true;
+    if (state.engines.resetting) return true;
     if (state.keys.editors.size || state.keys.pending.size) return true;
     return false;
   }

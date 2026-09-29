@@ -176,6 +176,8 @@ function setup(options: Options = {}) {
     if (admin) return apis.agents.handle(admin[1], admin[2], method, body);
     if (path === "/api/settings") return method === "PATCH" ? apis.settings.patch(body) : apis.settings.get();
     if (path === "/api/models") return { status: 200, body: { claude: { models: ["claude-opus-5-5", "claude-sonnet-5"], custom: true }, openrouter: { models: [] }, ollama: { models: [] } } };
+    // Motor (Issue #126): hier nur Beiwerk, geprüft in web-app-settings.test.ts
+    if (path === "/api/engines") return { status: 200, body: { default: { engine: "claude", source: "code" }, engines: [], overrides: [], availability: [] } };
     if (path === "/api/conversations" && method === "GET") {
       // Wie server.ts: Chat-ID der Forum-Gruppe neben den Topics
       const telegram = demo.topics.telegram;

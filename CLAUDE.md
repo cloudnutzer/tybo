@@ -84,13 +84,15 @@ Claude Code will ask for permission before running commands or editing files. Wh
 > the cloud, set up from a personal access token `sbp_…`: project, schema, private bucket,
 > keys, `.env`; the token is used for that run only and stored nowhere. Alternatively it
 > stores and tests existing Supabase or Convex credentials; it does not create the Convex
-> OIDC issuer), Phase 3 (name, timezone, optional profession, `config/profile.md`;
+> OIDC issuer), Phase 2.5 for Supabase (step `suche`: OpenAI key, Edge Functions and
+> secret via the Management API in the cloud or `supabase/functions/.env` locally, test with
+> a probe message; skippable, then text search only), Phase 3 (name, timezone, optional profession, `config/profile.md`;
 > no interview about work style), the forum group from Phase 4 (group ID only), fallback
 > models from Phase 8 (default model, effort, OpenRouter, Ollama), the WebUI, and Phase 7
 > for the bot itself (`telegram-relay` via launchd or PM2; no check-in, briefing or
 > watchdog services, and on Linux `pm2 startup` stays a manual step).
 >
-> `tybo setup` does **not** do: this environment scan of old installs, Phase 2.5,
+> `tybo setup` does **not** do: this environment scan of old installs, Phase 2.5 for Convex,
 > agent customization and topic IDs from Phase 4, multi-bot tokens, Phase 6 and 6.5,
 > the other integrations from Phase 8 (voice, calls, transcription), Phase 8.5, 9 and 10.
 > For those, follow the phases below.
@@ -304,7 +306,8 @@ Enable AI-powered memory search. Without this, the bot still works — it just u
 - Convex actions automatically generate embeddings for new messages and assets
 
 ### If using Supabase:
-- Save an OpenAI or Gemini API key to `.env` as `OPENAI_API_KEY` or `GEMINI_API_KEY`
+Faster: `tybo setup suche` (deploys the Edge Functions, sets the secret, tests with a probe message; details in `docs/einrichtung.md`, section "5. Semantische Suche")
+- Choose the embedding provider with `EMBEDDING_PROVIDER` (`openai` default, `gemini`, `ollama` for Supabase on this machine) and save its key (`OPENAI_API_KEY` or `GEMINI_API_KEY`); the database records the provider on first use (`embedding_settings`, Issue #167). Switching provider or model later: `tybo setup suche` offers to recompute everything (estimate, confirmation), then `tybo suche neu-berechnen` runs in the background with text search only until it finishes (`tybo suche status`, Issue #168)
 - Edge functions handle embedding generation (advanced setup)
 - Basic text search works immediately without this step
 
@@ -846,7 +849,7 @@ Details: `src/lib/restart-request.ts`, `docs/troubleshooting.md`
   `src/lib/goal-choices.ts`: Knoepfe an die goalId gebunden, auch im Browser). `/goal pause|weiter|stop|status|max <n>`. Zustand in
   `data/goals.json`.
 - **`/stop`**: killt die laufenden Claude-Subprozesse des Topics
-  (`abortClaudeCalls` in `src/lib/claude.ts`, Prozessbaum via pkill) und
+  (`abortEngineCalls` in `src/lib/engines/calls.ts`, Prozessbaum via pkill) und
   pausiert ein aktives Ziel. Kein Fallback-LLM bei Abbruch.
 - **Session-Review** (`src/lib/session-distill.ts`): beim Session-Ende schlaegt
   der Bot Merk-Eintraege und erkannte Routinen per Inline-Buttons vor, statt

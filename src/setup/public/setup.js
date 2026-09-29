@@ -646,6 +646,7 @@ function createSetupView(deps) {
     step.resultBox = result;
 
     let autostart = null;
+    let manager = null;
     if (!overview.supervisor && overview.autostart !== "erledigt") {
       const label = el("label", "setup-check");
       autostart = el("input");
@@ -654,13 +655,44 @@ function createSetupView(deps) {
       label.appendChild(autostart);
       label.appendChild(el("span", null, "Autostart einrichten und " + brandName() + " danach gleich starten"));
       nodes.push(label);
+      // Linux mit systemd (Issue #207): systemd-Benutzerdienst oder PM2
+      const choice = overview.autostartChoice;
+      const choices = choice && Array.isArray(choice.choices) ? choice.choices : [];
+      if (choices.length > 1 || (choices.length === 1 && !choice.default)) {
+        const wrap = el("div", "settings-field setup-manager");
+        const title = el("label", "settings-label", "Art des Autostarts");
+        title.htmlFor = "setup-manager";
+        const box = el("span", "settings-select");
+        manager = el("select", "settings-input");
+        manager.id = "setup-manager";
+        if (!choice.default) {
+          const empty = el("option", null, "Bitte wählen");
+          empty.value = "";
+          manager.appendChild(empty);
+        }
+        for (const c of choices) {
+          const o = el("option", null, c.label + (c.value === choice.default ? " (Vorschlag)" : ""));
+          o.value = c.value;
+          manager.appendChild(o);
+        }
+        manager.value = choice.default || "";
+        manager.disabled = true;
+        autostart.addEventListener("change", () => {
+          manager.disabled = !autostart.checked;
+        });
+        box.appendChild(manager);
+        wrap.appendChild(title);
+        wrap.appendChild(box);
+        nodes.push(wrap);
+      }
+      if (choice && choice.note) nodes.push(el("p", "setup-note", choice.note));
     }
     const hint = overview.supervisor
       ? "Nach „Fertig“ startet " + brandName() + " von selbst neu und ist dann in Telegram erreichbar."
       : "Ohne Autostart steht nach „Fertig“ der Befehl zum Starten da.";
     nodes.push(el("p", "setup-note", hint));
     const actions = el("div", "settings-actions setup-actions");
-    const done = actionButton("Fertig", "primary-button settings-save", "finish", () => finish(autostart ? autostart.checked : false));
+    const done = actionButton("Fertig", "primary-button settings-save", "finish", () => finish(autostart ? autostart.checked : false, manager && manager.value ? manager.value : undefined));
     if (!overview.ready) {
       done.disabled = true;
       done.setAttribute("data-blocked", "true");
@@ -671,11 +703,11 @@ function createSetupView(deps) {
     return nodes;
   }
 
-  async function finish(autostart) {
+  async function finish(autostart, manager) {
     if (busy) return;
     setBusy(true);
     try {
-      const res = await call("POST", "/api/setup/finish", { autostart });
+      const res = await call("POST", "/api/setup/finish", autostart && manager ? { autostart, manager } : { autostart });
       if (res.status !== 200) {
         showResult(step.resultBox, false, (res.data && res.data.error) || "Fertig ging nicht (Fehler " + res.status + ").");
         setBusy(false);

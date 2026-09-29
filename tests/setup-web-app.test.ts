@@ -11,8 +11,9 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { parseEnvContent } from "../src/lib/env-file";
 import { cleanup, FAKE, FULL_ENV, SECRETS } from "./setup-fixture";
-import { CODE, login, PROFILE, startSetup, type Started } from "./setup-web-fixture";
+import { CODE, login, PROFILE, startSetup, type Started, type TestCtx } from "./setup-web-fixture";
 import { TYBO_BRAND } from "./brand-fixture";
+import { linuxCtx } from "./systemd-fixture";
 
 const publicDir = resolve(import.meta.dir, "..", "src", "setup", "public");
 const setupSource = await readFile(resolve(publicDir, "setup.js"), "utf8");
@@ -94,7 +95,7 @@ afterAll(cleanup);
 
 interface Sent { method: string; path: string; body: any }
 
-async function openApp(options: { env?: string; profile?: string } = {}) {
+async function openApp(options: { env?: string; profile?: string; ctx?: TestCtx } = {}) {
   reset();
   const s = await startSetup(options);
   running.push(s);
@@ -156,14 +157,14 @@ describe("Aufbau", () => {
     const app = await openApp({ env: "" });
     const buttons = app.stepButtons();
     expect(buttons.map(b => b.attributes["data-step"])).toEqual([
-      "voraussetzungen", "telegram", "gruppe", "datenbank", "profil", "modelle", "webui", "autostart", "pruefung",
+      "voraussetzungen", "telegram", "gruppe", "datenbank", "suche", "profil", "modelle", "webui", "autostart", "pruefung",
     ]);
     expect(buttons[0].attributes["data-state"]).toBe("erledigt");
     expect(buttons[1].attributes["data-state"]).toBe("fehlt");
     expect(all(buttons[2]).map(n => n.textContent)).toContain("fehlt, optional");
     expect(buttons.filter(b => b.attributes["aria-current"] === "step").map(b => b.attributes["data-step"])).toEqual(["telegram"]);
     expect(app.view.state().current).toBe("telegram");
-    expect(app.text()).toContain("Schritt 2 von 9");
+    expect(app.text()).toContain("Schritt 2 von 10");
     expect(app.text()).toContain("Noch kein Telegram-Bot eingerichtet.");
     expect(htmlWrites).toEqual([]);
   });
@@ -186,7 +187,7 @@ describe("Aufbau", () => {
     expect(all(app.field("TELEGRAM_BOT_TOKEN")).map(n => n.textContent)).toContain("gesetzt");
     expect(app.button("apply")!.textContent).toBe("Speichern");
     expect(app.button("test")!.textContent).toBe("Testen");
-    for (const id of ["voraussetzungen", "gruppe", "datenbank", "profil", "modelle", "webui", "autostart", "pruefung"]) await app.openStep(id);
+    for (const id of ["voraussetzungen", "gruppe", "datenbank", "suche", "profil", "modelle", "webui", "autostart", "pruefung"]) await app.openStep(id);
     expect(leaks()).toEqual([]);
     expect(htmlWrites).toEqual([]);
   });
@@ -292,6 +293,34 @@ describe("Fertig", () => {
     expect(app.navigations).toEqual([]);
     const again = await fetch(`${app.s.base}/api/setup/code`, { method: "POST", headers: { Origin: app.s.origin }, body: JSON.stringify({ code: CODE }) });
     expect(again.status).toBe(401);
+  });
+
+  test("Linux mit systemd: Auswahl systemd/PM2 erst mit Häkchen, gewählter Weg geht mit „Fertig“ mit (Issue #207)", async () => {
+    const ctx = await linuxCtx({ pm2: "absent" }, { env: FULL_ENV, profile: PROFILE });
+    const app = await openApp({ ctx: ctx as unknown as TestCtx });
+    await app.openStep("pruefung");
+    const select = all(app.panel()).find(n => n.id === "setup-manager")!;
+    expect(select.tagName).toBe("SELECT");
+    expect(select.children.map(o => [o.value, o.textContent])).toEqual([
+      ["systemd", "systemd-Benutzerdienst (Vorschlag)"],
+      ["pm2", "PM2"],
+    ]);
+    expect(select.value).toBe("systemd");
+    expect(select.disabled).toBe(true);
+    const autostart = all(app.panel()).find(n => n.id === "setup-autostart")!;
+    autostart.checked = true;
+    await autostart.dispatch("change");
+    expect(select.disabled).toBe(false);
+    select.value = "pm2";
+    await app.click("finish");
+    expect(app.sent.at(-1)).toEqual({ method: "POST", path: "/api/setup/finish", body: { autostart: true, manager: "pm2" } });
+    expect(app.text()).toContain("den Autostart (PM2) ein");
+  });
+
+  test("macOS: keine Auswahl, Körper wie bisher", async () => {
+    const app = await openApp({ env: FULL_ENV, profile: PROFILE });
+    await app.openStep("pruefung");
+    expect(all(app.panel()).find(n => n.id === "setup-manager")).toBeUndefined();
   });
 
   test("abgemeldet (401): zurück zur Code-Seite", async () => {

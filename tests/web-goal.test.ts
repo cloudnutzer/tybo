@@ -295,7 +295,7 @@ async function start(options: StartOptions = {}): Promise<Ctx> {
     },
     saveMessage,
     processIntents: async () => {},
-    abortClaudeCalls: abort,
+    abortEngineCalls: abort,
     isShuttingDown: () => false,
     scheduleRestartCheck: () => {},
     log: () => {},
@@ -311,7 +311,7 @@ async function start(options: StartOptions = {}): Promise<Ctx> {
     isSessionModeEnabled: () => true,
     getGoal,
     pauseGoal: async () => {},
-    abortClaudeCalls: abort,
+    abortEngineCalls: abort,
     goals: {
       get: getGoal,
       set: setGoal,

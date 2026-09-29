@@ -2,9 +2,11 @@ import { atomicWriteFile } from "./atomic-file";
 /**
  * Session Distillate + Auto-Review (docs/topic-sessions.md F-4).
  *
- * When a per-topic Claude session ends (idle expiry, /new, model change) and
- * it had enough substance, we resume the OLD session one last time (on the
- * cheap aux model, AUX_MODEL_DISTILL) and ask for two things:
+ * When a per-topic session ends (idle expiry, /new, model or engine change)
+ * and it had enough substance, we resume the OLD session one last time and
+ * ask for two things. Fortgesetzt wird über den Motor der Session (Issue
+ * #122): bei Claude auf dem billigen Aux-Modell (AUX_MODEL_DISTILL), bei
+ * anderen Motoren mit dem Modell der Session.
  *
  *   1. Durable insights as [REMEMBER:]/[GOAL:] intent tags.
  *   2. Routine detection: did this session demonstrate a repeatable
@@ -28,7 +30,8 @@ import { acquireFileLock, releaseFileLock } from "./file-lock";
 import { callAux } from "./aux-model";
 import { processIntents } from "./memory";
 import { log as sbLog } from "./convex";
-import type { BotSession } from "./session-manager";
+import { getEngine } from "./engines";
+import { normalizeSession, type BotSession } from "./session-manager";
 
 const DISTILL_MIN_TURNS = parseInt(
   process.env.SESSION_DISTILL_MIN_TURNS || "6",
@@ -163,7 +166,9 @@ export function takePendingReview(id: string, now = Date.now()): Promise<Pending
     const review = Object.prototype.hasOwnProperty.call(pending, id) ? pending[id] : undefined;
     if (!review) return { result: undefined, changed: false };
     delete pending[id];
-    return { result: isReviewExpired(review, now) ? undefined : review, changed: true };
+    if (isReviewExpired(review, now)) return { result: undefined, changed: true };
+    // Snapshots aus der Zeit vor Issue #122 tragen noch claudeSessionId ohne engine
+    return { result: review.session ? { ...review, session: normalizeSession(review.session) } : review, changed: true };
   });
 }
 
@@ -291,7 +296,7 @@ export async function stageRoutineReview(opts: StageRoutineReviewOptions): Promi
 
 /** A session is worth distilling when it had a real conversation. */
 export function shouldDistill(session: BotSession): boolean {
-  return !!session.claudeSessionId && session.messageCount >= DISTILL_MIN_TURNS;
+  return !!session.engineSessionId && session.messageCount >= DISTILL_MIN_TURNS;
 }
 
 /**
@@ -339,14 +344,43 @@ export function describeTags(tags: string): string {
   return lines.join("\n");
 }
 
-/** Nur fuer Tests austauschbar: Aux-Aufruf und direktes Schreiben */
+/** Nur fuer Tests austauschbar: Aux-Aufruf, Motor und direktes Schreiben */
 export interface DistillDeps {
   callAux: typeof callAux;
   processIntents: typeof processIntents;
+  getEngine?: typeof getEngine;
+}
+
+const DISTILL_TIMEOUT_MS = 300_000;
+
+/**
+ * Die beendete Session einmal fortsetzen, über ihren eigenen Motor. Claude
+ * wie bisher über callAux (Aux-Modell "distill" samt Effort-Regeln und
+ * Claude-Ersatz, wenn OpenRouter/Ollama eingestellt ist); andere Motoren mit
+ * dem Modell der Session. Eine fremde Session-ID geht nie an Claude: ist der
+ * Motor nicht verfügbar, wirft getEngine und es gibt kein Destillat.
+ */
+async function resumeForDistill(session: BotSession, deps: DistillDeps): Promise<{ text: string; isError: boolean }> {
+  if (session.engine === "claude") {
+    return deps.callAux("distill", DISTILL_PROMPT, {
+      resumeSessionId: session.engineSessionId,
+      timeoutMs: DISTILL_TIMEOUT_MS,
+    });
+  }
+  const engine = (deps.getEngine ?? getEngine)(session.engine);
+  const result = await engine.run({
+    prompt: DISTILL_PROMPT,
+    streaming: false,
+    model: session.model,
+    ...(session.engineSessionId ? { resumeSessionId: session.engineSessionId } : {}),
+    timeoutMs: DISTILL_TIMEOUT_MS,
+    cwd: process.cwd(),
+  });
+  return { text: result.text || "", isError: result.isError || !!result.aborted || !!result.timedOut || !result.text };
 }
 
 /**
- * Resume the ended session once (cheap aux model), extract insights and a
+ * Resume the ended session once (über ihren Motor), extract insights and a
  * possible routine, and stage both for user confirmation. Never throws.
  */
 export async function distillSession(
@@ -354,10 +388,7 @@ export async function distillSession(
   deps: DistillDeps = { callAux, processIntents }
 ): Promise<void> {
   try {
-    const result = await deps.callAux("distill", DISTILL_PROMPT, {
-      resumeSessionId: session.claudeSessionId,
-      timeoutMs: 300_000,
-    });
+    const result = await resumeForDistill(session, deps);
 
     if (result.isError || !result.text || /^\s*NONE\s*$/.test(result.text)) {
       return;

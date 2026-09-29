@@ -12,7 +12,14 @@
  *   bun run setup/configure-services.ts --service telegram-relay
  *   bun run setup/configure-services.ts --service all
  *
- * Services: telegram-relay, smart-checkin, morning-briefing, watchdog, all
+ * Services: telegram-relay, smart-checkin, morning-briefing, watchdog, supabase, all
+ *
+ * supabase (Issue #165): PM2-Prozess tybo-supabase, der über die Hülle
+ * scripts/run-once-and-stay.ts einmal `tybo datenbank start` ausführt und
+ * danach ohne Arbeit stehen bleibt (autorestart aus). Nur so startet PM2 ihn
+ * nach „pm2 save“ beim Hochfahren wieder; ein beendeter Eintrag („stopped“)
+ * bliebe gestoppt. „all“ nimmt ihn nur mit, wenn SUPABASE_URL auf das
+ * Supabase dieses Rechners zeigt.
  *
  * Importsicher: main() läuft nur als Skript (import.meta.main). Die
  * Einrichtung (src/setup/steps/autostart.ts) ruft configurePM2Service mit
@@ -29,22 +36,52 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
-import { PM2_PREFIX as TYBO_PM2_PREFIX, pm2Name as tyboPm2Name } from "../src/lib/service-names";
+import { readEnvFile } from "../src/lib/env-file";
+import { PM2_PREFIX as TYBO_PM2_PREFIX, pm2Name as tyboPm2Name, SUPABASE_SERVICE, SUPABASE_START_STATE } from "../src/lib/service-names";
+import { isLocalSupabaseUrl, PM2_KILL_TIMEOUT_MS } from "../src/setup/local-supabase";
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
 const PROJECT_ROOT = dirname(import.meta.dir);
-export const SERVICES = ["telegram-relay", "smart-checkin", "morning-briefing", "watchdog"] as const;
+export const SERVICES = ["telegram-relay", "smart-checkin", "morning-briefing", "watchdog", "supabase"] as const;
 export type ServiceName = (typeof SERVICES)[number];
+
+/** Hülle für tybo-supabase: einmal ausführen, dann stehen bleiben */
+export const ONCE_WRAPPER = "scripts/run-once-and-stay.ts";
+
+/**
+ * PM2-Optionen für tybo-supabase: kein Neustart durch PM2, und beim Beenden
+ * die volle Frist für Bereinigung, Schutz-Stopp und Nachprüfung, bevor PM2
+ * SIGKILL schickt (Nachweis: scripts/pm2-stop-proof.ts)
+ */
+export const SUPABASE_PM2_OPTIONS = ["--no-autorestart", "--kill-timeout", String(PM2_KILL_TIMEOUT_MS)];
+
+/** Zeitgrenze für pm2 delete tybo-supabase: wartet bis zu PM2_KILL_TIMEOUT_MS */
+export const SUPABASE_DELETE_TIMEOUT_MS = PM2_KILL_TIMEOUT_MS + 60_000;
+
+/**
+ * Dienste zu --service: ein bekannter Name genau so, „all“ alle, den
+ * Supabase-Dienst aber nur, wenn SUPABASE_URL in der .env (envPath) auf das
+ * Supabase dieses Rechners zeigt (Issue #165); fehlt die .env oder die
+ * Adresse, ohne ihn. null bei unbekanntem Namen. Startet nichts.
+ */
+export async function selectServices(serviceArg: string, envPath: string): Promise<ServiceName[] | null> {
+  if (serviceArg === "all") {
+    const env = await readEnvFile(envPath).catch(() => ({}) as Record<string, string>);
+    return SERVICES.filter(s => s !== SUPABASE_SERVICE || isLocalSupabaseUrl(env.SUPABASE_URL));
+  }
+  return SERVICES.includes(serviceArg as ServiceName) ? [serviceArg as ServiceName] : null;
+}
 
 /** PM2-Aufruf und Pfade; in Tests durch Attrappen ersetzbar */
 export interface Pm2Deps {
   projectRoot: string;
   /** Befehl für PM2, etwa ["npx", "pm2"] oder ["pm2"] */
   pm2: string[];
-  run(cmd: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }>;
+  /** timeoutMs: Zeitgrenze, wo der Aufruf länger dauern darf (pm2 delete tybo-supabase) */
+  run(cmd: string[], options?: { timeoutMs?: number }): Promise<{ ok: boolean; stdout: string; stderr: string }>;
   log(line: string): void;
 }
 
@@ -68,8 +105,9 @@ interface ScheduleConfig {
   check_in_intervals?: ScheduleInterval[];
 }
 
-// Daemon services (always-running) vs periodic (scheduled)
-const DAEMON_SERVICES: ServiceName[] = ["telegram-relay", "watchdog"];
+// Daemon services (always-running) vs periodic (scheduled); supabase läuft
+// als einmaliger PM2-Prozess (Issue #165), braucht also auch PM2
+export const DAEMON_SERVICES: ServiceName[] = ["telegram-relay", "watchdog", "supabase"];
 const PERIODIC_SERVICES: ServiceName[] = ["smart-checkin", "morning-briefing"];
 
 // ---------------------------------------------------------------------------
@@ -140,6 +178,7 @@ function getScriptPath(service: ServiceName, projectRoot = PROJECT_ROOT): string
     "smart-checkin": "src/smart-checkin.ts",
     "morning-briefing": "src/morning-briefing.ts",
     watchdog: "src/watchdog.ts",
+    supabase: "scripts/tybo.ts",
   };
   return join(projectRoot, scriptMap[service]);
 }
@@ -175,14 +214,33 @@ export async function configurePM2Service(service: ServiceName, deps: Pm2Deps = 
   const scriptPath = getScriptPath(service, deps.projectRoot);
   const logPath = join(deps.projectRoot, "logs", `${service}.log`);
   const log = deps.log;
-  const startArgs = [
-    ...deps.pm2, "start", "bun",
-    "--name", pm2Name,
-    "--", "run", scriptPath,
-    "--output", logPath,
-    "--error", logPath,
-    "--merge-logs",
-  ];
+  // Supabase (Issue #165): PM2-Optionen vor dem Trenner „--“, dahinter nur die
+  // Argumente für bun. Die Hülle run-once-and-stay führt tybo datenbank start
+  // einmal aus und bleibt dann stehen: nur ein laufender Eintrag startet nach
+  // pm2 save beim Hochfahren wieder. SUPABASE_PM2_OPTIONS: kein Neustart durch
+  // PM2, lange Frist beim Beenden. --state: Startzustand und Exit-Code für die
+  // Gesamtprüfung
+  const startArgs =
+    service === SUPABASE_SERVICE
+      ? [
+          ...deps.pm2, "start", "bun",
+          "--name", pm2Name,
+          ...SUPABASE_PM2_OPTIONS,
+          "--output", logPath,
+          "--error", logPath,
+          "--merge-logs",
+          "--", "--no-env-file", join(deps.projectRoot, ONCE_WRAPPER),
+          "--state", join(deps.projectRoot, SUPABASE_START_STATE),
+          scriptPath, "datenbank", "start",
+        ]
+      : [
+          ...deps.pm2, "start", "bun",
+          "--name", pm2Name,
+          "--", "run", scriptPath,
+          "--output", logPath,
+          "--error", logPath,
+          "--merge-logs",
+        ];
 
   log(`\n  ${bold(service)} (PM2 daemon)`);
 
@@ -195,7 +253,8 @@ export async function configurePM2Service(service: ServiceName, deps: Pm2Deps = 
 
   // Vorhandenen neuen Prozess entfernen; bleibt er, startet kein weiterer
   if (names.includes(pm2Name)) {
-    const removed = await deps.run([...deps.pm2, "delete", pm2Name]);
+    // Ein laufender Supabase-Start braucht zum Beenden bis zu PM2_KILL_TIMEOUT_MS
+    const removed = await deps.run([...deps.pm2, "delete", pm2Name], service === SUPABASE_SERVICE ? { timeoutMs: SUPABASE_DELETE_TIMEOUT_MS } : undefined);
     if (!removed.ok) {
       log(`  ${FAIL} Existing delete failed: ${pm2Name} may still be running, nothing started`);
       return false;
@@ -398,12 +457,8 @@ async function main() {
     process.exit(1);
   }
 
-  let targets: ServiceName[];
-  if (serviceArg === "all") {
-    targets = [...SERVICES];
-  } else if (SERVICES.includes(serviceArg as ServiceName)) {
-    targets = [serviceArg as ServiceName];
-  } else {
+  const targets = await selectServices(serviceArg, join(PROJECT_ROOT, ".env"));
+  if (!targets) {
     console.log(`\n  ${red(`Unknown service: ${serviceArg}`)}`);
     console.log(`  Valid options: ${SERVICES.join(", ")}, all`);
     process.exit(1);
@@ -425,7 +480,7 @@ async function main() {
   if (hasDaemon) {
     const pm2Ok = await checkPM2();
     if (!pm2Ok) {
-      console.log(`\n  ${red("PM2 is required for daemon services (telegram-relay, watchdog).")}`);
+      console.log(`\n  ${red("PM2 is required for daemon services (telegram-relay, watchdog, supabase).")}`);
       console.log(`  Install: ${cyan("npm install -g pm2")}`);
       process.exit(1);
     }

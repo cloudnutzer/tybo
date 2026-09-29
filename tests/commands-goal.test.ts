@@ -56,7 +56,7 @@ function services(): CommandServices {
     isSessionModeEnabled: () => true,
     getGoal,
     pauseGoal: async () => {},
-    abortClaudeCalls: key => (aborts.push(key), 0),
+    abortEngineCalls: key => (aborts.push(key), 0),
     goals,
   } as unknown as CommandServices;
 }

@@ -11,8 +11,12 @@
  * Instead, request a restart by creating the marker file
  * data/restart-requested (`bun run restart:request "note"`). The bot checks
  * the marker after every delivered reply and every 30 s while idle, and
- * exits only when no Claude subprocess or agent execution is running.
- * launchd (KeepAlive) or PM2 then starts it again with the new code.
+ * exits only when no Claude subprocess, agent execution or goal loop is running.
+ * launchd (KeepAlive), PM2 or systemd (Restart=always, Issue #207) then
+ * starts it again with the new code.
+ * Ab dem Entschluss nimmt der Bot keine neuen Turns mehr an und antwortet
+ * „startet gerade neu" (src/lib/restart-control.ts, Issue #190); aktive
+ * Ziele laufen nach dem Start weiter.
  */
 
 import { execFile } from "node:child_process";
@@ -58,7 +62,12 @@ export async function clearRestartRequest(file = RESTART_MARKER): Promise<void> 
   await unlink(file).catch(() => {});
 }
 
-export type Supervisor = "launchd" | "pm2";
+export type Supervisor = "launchd" | "pm2" | "systemd";
+
+/** Name für Meldungen */
+export function supervisorName(supervisor: Supervisor): string {
+  return supervisor === "pm2" ? "PM2" : supervisor;
+}
 
 /**
  * Which supervisor starts the bot again after process.exit()?
@@ -70,14 +79,50 @@ export interface SupervisorDeps {
   platform: NodeJS.Platform;
   /** Output of `launchctl list <label>`; tests pass a fake, never the real launchctl */
   launchctlList(label: string): Promise<string>;
+  /**
+   * Ausgabe von `systemctl --user show <unit> --property=MainPID,Restart`
+   * (Issue #207); Tests setzen eine Attrappe ein, nie das echte systemctl
+   */
+  systemctlShow(unit: string): Promise<string>;
 }
+
+/**
+ * Setzt die Dienstdatei von `tybo setup autostart` (setup/configure-systemd.ts):
+ * Name des systemd-Benutzerdiensts, unter dem der Bot läuft
+ */
+export const SYSTEMD_UNIT_ENV = "TYBO_SYSTEMD_UNIT";
 
 const defaultSupervisorDeps: SupervisorDeps = {
   env: process.env,
   platform: process.platform,
   launchctlList: async label =>
     (await execFileAsync("launchctl", ["list", label], { timeout: 5000 })).stdout,
+  systemctlShow: async unit =>
+    (await execFileAsync("systemctl", ["--user", "show", unit, "--property=MainPID,Restart"], { timeout: 5000 })).stdout,
 };
+
+/**
+ * systemd zählt nur, wenn alles zusammenpasst: der Prozess läuft in einem
+ * systemd-Dienst (INVOCATION_ID), die Dienstdatei von tybo hat ihren Namen
+ * gesetzt, systemd nennt genau diese PID als Hauptprozess und startet nach
+ * jedem Ende neu (Restart=always; on-failure startete nach einem sauberen
+ * Exit nicht neu, der Bot bliebe aus).
+ */
+async function underSystemd(pid: number, d: SupervisorDeps): Promise<boolean> {
+  const unit = d.env[SYSTEMD_UNIT_ENV]?.trim();
+  if (!d.env.INVOCATION_ID || !unit || !/^[\w@.-]+\.service$/.test(unit)) return false;
+  try {
+    const props: Record<string, string> = {};
+    for (const line of (await d.systemctlShow(unit)).split("\n")) {
+      const at = line.indexOf("=");
+      if (at > 0) props[line.slice(0, at).trim()] = line.slice(at + 1).trim();
+    }
+    return Number(props.MainPID) === pid && props.Restart === "always";
+  } catch {
+    // systemctl fehlt oder der Benutzer-Manager antwortet nicht
+    return false;
+  }
+}
 
 export async function detectSupervisor(
   pid = process.pid,
@@ -85,6 +130,7 @@ export async function detectSupervisor(
 ): Promise<Supervisor | null> {
   const d = { ...defaultSupervisorDeps, ...deps };
   if (d.env.pm_id !== undefined) return "pm2";
+  if (d.platform === "linux" && (await underSystemd(pid, d))) return "systemd";
   if (d.platform === "darwin") {
     for (const label of supervisorLabels(d.env)) {
       try {

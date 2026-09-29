@@ -137,13 +137,13 @@ describe("Rückfrage zum Vorschlag", () => {
   test("Routine-Angebot: eigene Knöpfe „Als Routine speichern“/„Verwerfen“, Sitzung in der Ablage", async () => {
     const h = harness();
     setReviewNotifier(h.notifier);
-    const session = { key: `dm:${USER}:general`, claudeSessionId: "s1", agentName: "general", messageCount: 9 } as BotSession;
+    const session = { key: `dm:${USER}:general`, engine: "claude", engineSessionId: "s1", agentName: "general", messageCount: 9 } as BotSession;
     const id = await stageRoutineReview({ chatId: USER, description: "Wochenbericht bauen", session });
     const [choice] = await listChoices();
     expect(choice).toMatchObject({ kind: "review", ref: id, conversation: { type: "telegram", chatId: USER }, options: REVIEW_ROUTINE_OPTIONS });
     expect(choice.text).toContain('"Wochenbericht bauen"');
     expect(h.delivered[0].json.reply_markup.inline_keyboard[0].map((b: any) => b.callback_data)).toEqual([`ch|${choice.id}|routine`, `ch|${choice.id}|no`]);
-    expect(pendingOnDisk()[id]).toMatchObject({ type: "routine", routineDescription: "Wochenbericht bauen", session: { claudeSessionId: "s1" } });
+    expect(pendingOnDisk()[id]).toMatchObject({ type: "routine", routineDescription: "Wochenbericht bauen", session: { engine: "claude", engineSessionId: "s1" } });
   });
 });
 

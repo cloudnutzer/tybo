@@ -14,6 +14,7 @@ import { resolveAux } from "../src/lib/aux-model";
 import { defaultEffort } from "../src/lib/claude";
 import { FALLBACK_OFFLINE_ONLY, OLLAMA_MODEL, OPENROUTER_MODEL } from "../src/lib/fallback-llm";
 import { getSettings, setSettingsPath } from "../src/lib/settings";
+import { configuredEngine, setTopicEngine } from "../src/lib/engine-choice";
 import { effectiveSettings, botSettings } from "../src/web/bot-settings";
 import type { WebServer } from "../src/web/server";
 import { createRevisionClock } from "../src/web/revision";
@@ -29,6 +30,7 @@ const ENV_KEYS = [
   "OPENROUTER_MODEL",
   "OLLAMA_MODEL",
   "FALLBACK_OFFLINE_ONLY",
+  "TYBO_ENGINE",
 ] as const;
 const savedEnv: Record<string, string | undefined> = {};
 for (const k of ENV_KEYS) savedEnv[k] = process.env[k];
@@ -627,5 +629,182 @@ describe("Geerbte Werte für den Reiter „Modelle\" (Issue #39)", () => {
         }
       }
     }
+  });
+});
+
+describe("Motor in /api/settings (Issue #126)", () => {
+  const TOPIC_KEY = "topic:-1001234567890:42";
+  const DM_KEY = "dm:4242";
+
+  test("GET: Standard ohne Datei Claude Code aus dem Code, Motoren, Codex-Stufen und Rechte", async () => {
+    const ctx = await server();
+    const body = await (await ctx.api("/api/settings")).json();
+    expect(body.effective.engine).toEqual({ default: { value: "claude", source: "code" } });
+    expect(body.inheritedModels.engine).toEqual({ default: { value: "claude", source: "code" } });
+    expect(body.engineOptions).toEqual({
+      engines: [
+        { id: "claude", label: "Claude Code" },
+        { id: "codex", label: "Codex" },
+        { id: "opencode", label: "OpenCode" },
+      ],
+      codexEffortLevels: ["low", "medium", "high", "xhigh", "max"],
+      codexSandboxLevels: ["read-only", "workspace-write", "full"],
+      codexDefaultSandbox: "full",
+      opencodePermissionLevels: ["ask-deny", "auto"],
+      opencodeDefaultPermission: "auto",
+    });
+  });
+
+  test("Akzeptanz: Standard „Codex\" speichern schreibt engine.default, Ausnahmen bleiben, wirkt ohne Neustart", async () => {
+    await writeFile(file, JSON.stringify({ engine: { topics: { [TOPIC_KEY]: "claude" } } }));
+    const ctx = await server();
+    const res = await ctx.api("/api/settings", "PATCH", { engine: { default: "codex" } });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(await readFileJson()).toEqual({ engine: { default: "codex", topics: { [TOPIC_KEY]: "claude" } } });
+    expect(body.effective.engine.default).toEqual({ value: "codex", source: "settings" });
+    // „Standard (…)" darunter: ohne eigenen Wert gälte Claude Code aus dem Code
+    expect(body.inheritedModels.engine.default).toEqual({ value: "claude", source: "code" });
+    expect(configuredEngine(DM_KEY)).toEqual({ engine: "codex", source: "settings" });
+    expect(configuredEngine(TOPIC_KEY)).toEqual({ engine: "claude", source: "topic" });
+    expect(ctx.logs).toContain("Einstellungen geändert: engine.default");
+  });
+
+  test("TYBO_ENGINE: Standard aus .env, geerbt nach dem Entfernen des eigenen Werts", async () => {
+    process.env.TYBO_ENGINE = "codex";
+    await writeFile(file, JSON.stringify({ engine: { default: "claude" } }));
+    const ctx = await server();
+    let body = await (await ctx.api("/api/settings")).json();
+    expect(body.effective.engine.default).toEqual({ value: "claude", source: "settings" });
+    expect(body.inheritedModels.engine.default).toEqual({ value: "codex", source: "env" });
+    body = await (await ctx.api("/api/settings", "PATCH", { engine: { default: null } })).json();
+    expect(body.settings).toEqual({});
+    expect(body.effective.engine.default).toEqual({ value: "codex", source: "env" });
+  });
+
+  test("Codex: Modell, Effort samt max, Rechte; leere Felder und null entfernen die Überschreibung", async () => {
+    await writeFile(file, JSON.stringify({ agents: { research: { model: "claude-sonnet-5" } }, engine: { topics: { [DM_KEY]: "codex" } } }));
+    const ctx = await server();
+    let res = await ctx.api("/api/settings", "PATCH", { engine: { codex: { model: " gpt-5.6-sol ", effort: "max", sandbox: "workspace-write" } } });
+    expect(res.status).toBe(200);
+    expect(await readFileJson()).toEqual({
+      agents: { research: { model: "claude-sonnet-5" } },
+      engine: { topics: { [DM_KEY]: "codex" }, codex: { model: "gpt-5.6-sol", effort: "max", sandbox: "workspace-write" } },
+    });
+    // Leeres Modell und Effort null: Codex nimmt wieder seine Konfiguration, die Rechte bleiben
+    res = await ctx.api("/api/settings", "PATCH", { engine: { codex: { model: "", effort: null } } });
+    expect(res.status).toBe(200);
+    expect(await readFileJson()).toEqual({
+      agents: { research: { model: "claude-sonnet-5" } },
+      engine: { topics: { [DM_KEY]: "codex" }, codex: { sandbox: "workspace-write" } },
+    });
+    // codex null entfernt den Abschnitt, die Ausnahme bleibt
+    res = await ctx.api("/api/settings", "PATCH", { engine: { codex: null } });
+    expect(await readFileJson()).toEqual({ agents: { research: { model: "claude-sonnet-5" } }, engine: { topics: { [DM_KEY]: "codex" } } });
+  });
+
+  test("OpenCode: Standard, Modell, Variante, Rechte; leer und null entfernen, andere Motorwerte und Ausnahmen bleiben (Issue #129)", async () => {
+    await writeFile(
+      file,
+      JSON.stringify({ engine: { default: "codex", topics: { [DM_KEY]: "codex", [TOPIC_KEY]: "opencode" }, codex: { model: "gpt-5.6-sol", sandbox: "read-only" } } })
+    );
+    const ctx = await server();
+    let res = await ctx.api("/api/settings", "PATCH", {
+      engine: { default: "opencode", opencode: { model: " openrouter/anthropic/claude-opus-5.5 ", variant: "thinking-8k", permission: "ask-deny" } },
+    });
+    expect(res.status).toBe(200);
+    let body = await res.json();
+    expect(await readFileJson()).toEqual({
+      engine: {
+        default: "opencode",
+        topics: { [DM_KEY]: "codex", [TOPIC_KEY]: "opencode" },
+        codex: { model: "gpt-5.6-sol", sandbox: "read-only" },
+        opencode: { model: "openrouter/anthropic/claude-opus-5.5", variant: "thinking-8k", permission: "ask-deny" },
+      },
+    });
+    expect(body.effective.engine.default).toEqual({ value: "opencode", source: "settings" });
+    expect(configuredEngine("dm:1")).toEqual({ engine: "opencode", source: "settings" });
+    expect(ctx.logs).toContain("Einstellungen geändert: engine.default, engine.opencode.model, engine.opencode.variant, engine.opencode.permission");
+    // Werte nie im Log
+    expect(ctx.logs.join("\n")).not.toContain("claude-opus-5.5");
+
+    // Variante wie im Issue auch mit Bindestrich vorn und an der Längengrenze
+    for (const variant of ["-x", "a".repeat(20)]) {
+      res = await ctx.api("/api/settings", "PATCH", { engine: { opencode: { variant } } });
+      expect(res.status).toBe(200);
+      expect((await readFileJson()).engine.opencode.variant).toBe(variant);
+    }
+
+    // Leeres Modell: OpenCode nimmt wieder seine Konfiguration; Variante null; Rechte bleiben
+    res = await ctx.api("/api/settings", "PATCH", { engine: { opencode: { model: "", variant: null } } });
+    expect(res.status).toBe(200);
+    expect((await readFileJson()).engine.opencode).toEqual({ permission: "ask-deny" });
+
+    // Rechte zurück auf Standard: der leere Abschnitt verschwindet, Codex und Ausnahmen bleiben
+    res = await ctx.api("/api/settings", "PATCH", { engine: { opencode: { permission: null } } });
+    body = await res.json();
+    expect(await readFileJson()).toEqual({
+      engine: { default: "opencode", topics: { [DM_KEY]: "codex", [TOPIC_KEY]: "opencode" }, codex: { model: "gpt-5.6-sol", sandbox: "read-only" } },
+    });
+    expect(body.settings.engine.opencode).toBeUndefined();
+
+    // opencode null entfernt den ganzen Abschnitt
+    await ctx.api("/api/settings", "PATCH", { engine: { opencode: { variant: "high" } } });
+    await ctx.api("/api/settings", "PATCH", { engine: { opencode: null } });
+    expect((await readFileJson()).engine.opencode).toBeUndefined();
+  });
+
+  test("Akzeptanz: ungültige Rechte-Stufe 400 mit Meldung, Datei unverändert", async () => {
+    const before = JSON.stringify({ engine: { default: "codex", codex: { sandbox: "full" }, topics: { [DM_KEY]: "claude" } } });
+    await writeFile(file, before);
+    const ctx = await server();
+    const res = await ctx.api("/api/settings", "PATCH", { engine: { codex: { sandbox: "danger-full-access" } } });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("Ungültige Einstellungen: engine.codex.sandbox (erlaubt: read-only, workspace-write, full)");
+    expect(body.error).not.toContain("danger");
+    expect(await readFile(file, "utf-8")).toBe(before);
+  });
+
+  test("ungültige Werte und Felder: 400, nichts gespeichert", async () => {
+    const before = JSON.stringify({ engine: { topics: { [TOPIC_KEY]: "codex" } } });
+    await writeFile(file, before);
+    const ctx = await server();
+    const cases: [unknown, string][] = [
+      [{ engine: { default: "gemini" } }, "Ungültige Einstellungen: engine.default (erlaubt: claude, codex, opencode)"],
+      [{ engine: { opencode: { variant: "a".repeat(21) } } }, "Ungültige Einstellungen: engine.opencode.variant (1 bis 20 Zeichen aus a-z, 0-9 und -)"],
+      [{ engine: { opencode: { variant: "High" } } }, "Ungültige Einstellungen: engine.opencode.variant (1 bis 20 Zeichen aus a-z, 0-9 und -)"],
+      [{ engine: { opencode: { model: "openai/gpt 5" } } }, "Ungültige Einstellungen: engine.opencode.model (ungültiger Modellname)"],
+      [{ engine: { opencode: { permission: "full" } } }, "Ungültige Einstellungen: engine.opencode.permission (erlaubt: ask-deny, auto)"],
+      [{ engine: { opencode: { sandbox: "full" } } }, "Unbekanntes Feld: engine.opencode.sandbox"],
+      [{ engine: { opencode: "auto" } }, "Falscher Typ: engine.opencode"],
+      [{ engine: { codex: { effort: "ultra" } } }, "Ungültige Einstellungen: engine.codex.effort (erlaubt: low, medium, high, xhigh, max)"],
+      [{ engine: { codex: { model: "gpt 5" } } }, "Ungültige Einstellungen: engine.codex.model (ungültiger Modellname)"],
+      [{ engine: { topics: { [TOPIC_KEY]: null } } }, "Unbekanntes Feld: engine.topics"],
+      [{ engine: { codex: { fast: true } } }, "Unbekanntes Feld: engine.codex.fast"],
+      [{ engine: null }, "Falscher Typ: engine"],
+      [{ engine: { default: 1 } }, "Falscher Typ: engine.default"],
+    ];
+    for (const [patch, error] of cases) {
+      const res = await ctx.api("/api/settings", "PATCH", patch);
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe(error);
+    }
+    expect(await readFile(file, "utf-8")).toBe(before);
+  });
+
+  test("gemeinsame Schreibkette mit /motor: gleichzeitige Änderungen verlieren keinen Eintrag", async () => {
+    const ctx = await server();
+    await Promise.all([
+      ctx.api("/api/settings", "PATCH", { engine: { default: "codex" } }),
+      setTopicEngine(TOPIC_KEY, "claude"),
+      ctx.api("/api/settings", "PATCH", { engine: { codex: { sandbox: "read-only" } } }),
+      setTopicEngine(DM_KEY, "codex"),
+      ctx.api("/api/settings", "PATCH", { agents: { critic: { effort: "low" } } }),
+    ]);
+    expect(await readFileJson()).toEqual({
+      agents: { critic: { effort: "low" } },
+      engine: { default: "codex", topics: { [TOPIC_KEY]: "claude", [DM_KEY]: "codex" }, codex: { sandbox: "read-only" } },
+    });
   });
 });

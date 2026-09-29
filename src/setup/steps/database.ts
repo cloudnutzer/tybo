@@ -41,7 +41,7 @@ import {
   tokenProblem,
 } from "../supabase-cloud";
 import { isSupabaseCloudUrl, SUPABASE_TOKEN_PAGE } from "../supabase-management";
-import { LOCAL_API_PORT, localPlan, runSupabaseLocal, startHint } from "../local-supabase";
+import { isLocalSupabaseUrl, localPlan, runSupabaseLocal, startHint } from "../local-supabase";
 
 export type DbBackend = "convex" | "supabase";
 /** Wege im Assistenten; supabase ist „Zugangsdaten selbst eintragen“ */
@@ -55,16 +55,8 @@ const httpsRule = (label: string) => (v: string) => (HTTPS_URL.test(v) ? null : 
 export const supabaseUrlRule = (label: string) => (v: string) =>
   HTTPS_URL.test(v) || LOOPBACK_HTTP_URL.test(v) ? null : `${label} muss mit https:// beginnen (http:// nur für 127.0.0.1 oder localhost)`;
 
-/** Genau die Adresse, die der lokale Ablauf schreibt (Port aus supabase/config.toml) */
-export function isLocalSupabaseUrl(url: string | undefined): boolean {
-  if (!url) return false;
-  try {
-    const u = new URL(url.trim());
-    return u.protocol === "http:" && (u.hostname === "127.0.0.1" || u.hostname === "localhost") && u.port === String(LOCAL_API_PORT);
-  } catch {
-    return false;
-  }
-}
+/** Genau die Adresse, die der lokale Ablauf schreibt; liegt seit Issue #165 in local-supabase.ts */
+export { isLocalSupabaseUrl };
 
 const isConvex = (v: SetupValues) => v.DB_BACKEND === "convex";
 const isSupabase = (v: SetupValues) => v.DB_BACKEND === "supabase";

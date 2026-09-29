@@ -20,7 +20,8 @@ import {
 } from "../src/web/bot-turn";
 import { createTelegramLiveFeed, createTelegramSource } from "../src/web/bot-telegram";
 import { createWebServer, type WebServer, type WebServerDeps } from "../src/web/server";
-import { ConversationStore, pickReplyInfo } from "../src/web/store";
+import { ConversationStore, pickReplyInfo, REPLY_ENGINES } from "../src/web/store";
+import { ENGINE_IDS } from "../src/lib/engines/types";
 import { createTelegramMessageLog } from "../src/web/telegram";
 
 const root = await mkdtemp(join(tmpdir(), "tybo-reply-info-"));
@@ -40,7 +41,7 @@ function deps(core: (o: TurnOptions) => Promise<string>, saved: WebSavedMessage[
       return true;
     },
     processIntents: async () => {},
-    abortClaudeCalls: key => abortExecutions(key),
+    abortEngineCalls: key => abortExecutions(key),
     isShuttingDown: () => false,
     scheduleRestartCheck: () => {},
     log: () => {},
@@ -58,11 +59,20 @@ describe("pickReplyInfo", () => {
     expect(pickReplyInfo({ model: "x".repeat(101), durationMs: Number.NaN })).toEqual({});
     expect(pickReplyInfo({ durationMs: 1234.6 })).toEqual({ durationMs: 1235 });
     expect(pickReplyInfo({ durationMs: 86_400_001 })).toEqual({});
+    // Motor (Issue #125): nur bekannte Kennungen
+    expect(pickReplyInfo({ engine: "codex", model: "gpt-5.6-sol" })).toEqual({ engine: "codex", model: "gpt-5.6-sol" });
+    expect(pickReplyInfo({ engine: "claude" })).toEqual({ engine: "claude" });
+    expect(pickReplyInfo({ engine: "gpt" })).toEqual({});
+    expect(pickReplyInfo({ engine: 1 })).toEqual({});
     expect(pickReplyInfo({ model: "  qwen3:8b  " })).toEqual({ model: "qwen3:8b" });
     // HTML-artige Modellnamen bleiben Text; entschärft wird bei der Anzeige (textContent)
     expect(pickReplyInfo({ model: "<img src=x>" })).toEqual({ model: "<img src=x>" });
     expect(pickReplyInfo(null)).toEqual({});
     expect(pickReplyInfo("x")).toEqual({});
+  });
+
+  test("Motor-Liste der WebUI entspricht ENGINE_IDS (Issue #125)", () => {
+    expect([...REPLY_ENGINES]).toEqual([...ENGINE_IDS]);
   });
 
   test("replyInfoFrom: ohne Meldung nur der Agent, nie ein Modell", () => {
@@ -106,6 +116,19 @@ describe("Web-Gespräch (createBotChat)", () => {
     expect(saved[1]!.metadata).toMatchObject({ model: "minimax/minimax-m2.7" });
   });
 
+  test("Codex-Antwort: der Motor steht im Ergebnis und in den gespeicherten Angaben (Issue #125)", async () => {
+    const saved: WebSavedMessage[] = [];
+    const chat = createBotChat(
+      deps(async o => {
+        o.onInfo?.({ agent: o.agentName, engine: "codex", model: "gpt-5.6-sol", durationMs: 5_000 });
+        return "Antwort";
+      }, saved)
+    );
+    const result = await chat.runTurn(turn("w5"));
+    expect(result.info).toEqual({ agent: "research", engine: "codex", model: "gpt-5.6-sol", durationMs: 5_000 });
+    expect(saved[1]!.metadata).toEqual({ agent: "research", engine: "codex", model: "gpt-5.6-sol", durationMs: 5_000, channel: "web" });
+  });
+
   test("Abbruch: keine Angaben, nichts gespeichert", async () => {
     const saved: WebSavedMessage[] = [];
     const chat = createBotChat(deps(async () => ABORT_REPLY, saved));
@@ -138,6 +161,17 @@ describe("Telegram-Gespräch (createTelegramChat)", () => {
     const reply = saved.find(m => m.role === "assistant")!;
     expect(reply.metadata).toMatchObject({ topicId: 443, agent: "finance", model: "claude-opus-5-5", durationMs: 1_234, channel: "web" });
     expect(saved.find(m => m.role === "user")!.metadata).not.toHaveProperty("model");
+  });
+
+  test("Codex-Antwort im Topic: Motor in metadata (Issue #125)", async () => {
+    const saved: WebSavedMessage[] = [];
+    const chat = telegramChat(async o => {
+      o.onInfo?.({ agent: o.agentName, engine: "codex", durationMs: 700 });
+      return "ok";
+    }, saved);
+    const result = await chat.runTurn({ ...turn("topic-443"), messageId: undefined });
+    expect(result.info).toEqual({ agent: "finance", engine: "codex", durationMs: 700 });
+    expect(saved.find(m => m.role === "assistant")!.metadata).toMatchObject({ engine: "codex", durationMs: 700 });
   });
 });
 
@@ -182,15 +216,16 @@ describe("src/bot.ts: direkt in Telegram ausgelöste Antworten", async () => {
   test("JSON- und Streaming-Turn bekommen onInfo durchgereicht", () => {
     expect(body("callClaudeUnlocked")).toMatch(/runJsonTurn\(\{[\s\S]*onInfo,\n/);
     expect(body("callClaudeWithProgressUnlocked")).toMatch(/runStreamingTurn\(\{[\s\S]*onInfo,\n/);
-    expect(body("callClaude")).toContain("callClaudeUnlocked(userMessage, chatId, agentName, topicId, onInfo, onTools)");
-    expect(body("callClaudeWithProgress")).toContain("callClaudeWithProgressUnlocked(ctx, userMessage, chatId, agentName, topicId, onInfo, onTools)");
+    expect(body("callClaude")).toContain("callClaudeUnlocked(userMessage, chatId, agentName, topicId, onInfo, onTools, onSessionId, onSessionMeta)");
+    expect(body("callClaudeWithProgress")).toContain("callClaudeWithProgressUnlocked(ctx, userMessage, chatId, agentName, topicId, onInfo, onTools, onSessionId, onSessionMeta)");
   });
 
   test("Textantworten speichern Modell und Dauer in metadata", () => {
     const src = body("callClaudeAndReply");
     expect(src).toContain("const turn = turnInfoCollector();");
-    expect(src).toContain("callClaudeWithProgress(ctx, userMessage, chatId, agentName, topicId, turn.onInfo, turn.onTools)");
-    expect(src).toContain("callClaude(userMessage, chatId, agentName, topicId, turn.onInfo, turn.onTools)");
+    // Issue #189: zusätzlich die Session-ID des Turns für eine Rückfrage
+    expect(src).toContain("callClaudeWithProgress(ctx, userMessage, chatId, agentName, topicId, turn.onInfo, turn.onTools, turn.onSessionId, turn.onSessionMeta)");
+    expect(src).toContain("callClaude(userMessage, chatId, agentName, topicId, turn.onInfo, turn.onTools, turn.onSessionId, turn.onSessionMeta)");
     expect(src).toContain("metadata: { agent: agentName, topicId, ...turn.metadata() }");
   });
 });

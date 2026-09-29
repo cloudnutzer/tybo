@@ -3,13 +3,15 @@ import { authorizeServer } from "../_shared/auth.ts";
 import { adminKey } from "../_shared/admin-key.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.116.0";
 import { corsHeaders } from "../_shared/cors.ts";
+import { embedForDatabase, embeddingKey, firstReport, MISSING_COLUMN_CODES, type EnvReader } from "../_shared/embedding.ts";
+
+const denoEnv: EnvReader = (name) => Deno.env.get(name);
 
 /**
- * Edge function: Generate an OpenAI embedding for a knowledge entry
- * and store it in the knowledge table.
- *
- * Requires OPENAI_API_KEY set as a Supabase secret.
- * If not set, returns success with embedded: false (knowledge still saved,
+ * Edge function: Generate an embedding for a knowledge entry and store it in
+ * the knowledge table. Anbieter aus EMBEDDING_PROVIDER (openai, gemini,
+ * ollama; Standard openai mit OPENAI_API_KEY), siehe _shared/embedding.ts.
+ * Ohne Schlüssel: success with embedded: false (knowledge still saved,
  * just without semantic search capability).
  */
 Deno.serve(async (req) => {
@@ -32,47 +34,42 @@ Deno.serve(async (req) => {
       );
     }
 
-    const openaiKey = Deno.env.get("OPENAI_API_KEY");
+    // Embedding vom eingestellten Anbieter (EMBEDDING_PROVIDER, Standard OpenAI)
+    const embedded = await embedForDatabase(text, denoEnv, fetch, { url: Deno.env.get("SUPABASE_URL") ?? "", key: serviceKey });
+    // Passt der Anbieter nicht zur Datenbank: einmal ins Log (fester Satz ohne Werte)
+    if (!embedded.ok && embedded.reason === "gesperrt" && firstReport(embedded.message)) console.warn(embedded.message);
 
-    if (!openaiKey) {
-      // No OpenAI key — knowledge is saved but without embedding
+    if (!embedded.ok && (embedded.reason === "kein-zugang" || embedded.reason === "gesperrt")) {
+      // Kein Schlüssel oder Anbieter passt nicht zur Datenbank: Wissen ist gespeichert, nur ohne Embedding
       return new Response(
-        JSON.stringify({ ok: true, embedded: false, reason: "OPENAI_API_KEY not set" }),
+        JSON.stringify({ ok: true, embedded: false, reason: embedded.message }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
     }
 
-    // Generate embedding
-    const res = await fetch("https://api.openai.com/v1/embeddings", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${openaiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "text-embedding-3-small",
-        input: text,
-      }),
-    });
-
-    if (!res.ok) {
-      const errText = await res.text();
+    if (!embedded.ok) {
+      // Fester Satz ohne Antworttext des Anbieters (der kann Schlüsselteile enthalten)
       return new Response(
-        JSON.stringify({ ok: false, error: `OpenAI error: ${errText}` }),
+        JSON.stringify({ ok: false, error: `Embedding fehlgeschlagen: ${embedded.message}` }),
         { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
     }
 
-    const data = await res.json();
-    const embedding = data.data[0].embedding;
+    const embedding = embedded.vector;
 
     // Store embedding in the knowledge table
     const supabase = createClient(Deno.env.get("SUPABASE_URL")!, serviceKey);
 
-    const { error } = await supabase
+    // Mit Angabe embedding_model prüft die Datenbank den Vektor beim Schreiben (Issue #168);
+    // fehlt ihr die Spalte (Migration 20260928 nicht eingespielt), ohne Angabe wie vorher
+    const label = embedded.config ? embeddingKey(embedded.config) : undefined;
+    let { error } = await supabase
       .from("knowledge")
-      .update({ embedding })
+      .update(label ? { embedding, embedding_model: label } : { embedding })
       .eq("id", knowledge_id);
+    if (error && label && MISSING_COLUMN_CODES.includes(String(error.code))) {
+      ({ error } = await supabase.from("knowledge").update({ embedding }).eq("id", knowledge_id));
+    }
 
     if (error) {
       return new Response(

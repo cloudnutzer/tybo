@@ -39,7 +39,7 @@ describe("tybo setup --liste", () => {
     expect(r.err).toBe("");
     expect(prompter.asked).toEqual([]);
     expect(r.out).toMatch(/2\. Telegram\s+erledigt\s+Token und Nutzer-ID sind gesetzt\./);
-    expect(r.out).toMatch(/8\. Autostart\s+fehlt/);
+    expect(r.out).toMatch(/9\. Autostart\s+fehlt/);
     // Keine Verbindungstests: weder Telegram noch Datenbank noch Claude-Probeaufruf
     const probes = ctx.providers.calls.map(c => c.method);
     expect(probes).not.toContain("telegramGetMe");
@@ -58,7 +58,7 @@ describe("tybo setup --liste", () => {
     ctx.providers.results.claudeVersion = { ok: false, message: "Claude CLI nicht gefunden." };
     const r = await tyboSetup(["--liste"], ctx, scripted([]));
     expect(r.out).toMatch(/1\. Voraussetzungen\s+teilweise/);
-    expect(r.out).toContain("Claude CLI: npm install -g @anthropic-ai/claude-code");
+    expect(r.out).toContain("Claude CLI: curl -fsSL https://claude.ai/install.sh | bash");
   });
 });
 

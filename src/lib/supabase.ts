@@ -10,6 +10,8 @@ import { createClient, SupabaseClient } from "@supabase/supabase-js";
 // Eine Prüfung für Bot und Edge-Function (Issue #69), deshalb aus supabase/functions
 import { acceptedCreatedAt } from "../../supabase/functions/_shared/created-at";
 import { supabaseHeaders } from "./supabase-keys";
+import { embedForDatabase, embedWithConfig, factVectorsFor, registryTarget, type ConfiguredEmbedding } from "./embedding";
+import { embeddingColumns, MISSING_COLUMN_CODES, type FetchLike, type RegistryTarget } from "../../supabase/functions/_shared/embedding";
 
 export { acceptedCreatedAt };
 
@@ -757,11 +759,23 @@ export async function addFact(content: string): Promise<boolean> {
 }
 
 /**
- * Generate an embedding via OpenAI (text-embedding-3-small, 1536 dims).
+ * Embedding für die Supabase-Spalten (memory.embedding und Suchanfragen
+ * dagegen), 1536 Werte, Anbieter aus EMBEDDING_PROVIDER (Issue #167,
+ * src/lib/embedding.ts). Ohne EMBEDDING_PROVIDER wie bisher OpenAI
+ * text-embedding-3-small. Gekürzt auf 8000 Zeichen wie vor #167.
  * Returns null when no key is set or the call fails — callers degrade to
  * lexical ranking.
  */
 export async function generateEmbedding(text: string): Promise<number[] | null> {
+  return embedForDatabase(text.substring(0, 8000));
+}
+
+/**
+ * Suchanfrage für Convex: unverändert OpenAI text-embedding-3-small, denn die
+ * Vektoren in Convex entstehen dort mit OpenAI (convex/embeddings.ts).
+ * EMBEDDING_PROVIDER gilt nur für Supabase.
+ */
+export async function generateOpenAiEmbedding(text: string): Promise<number[] | null> {
   const key = process.env.OPENAI_API_KEY;
   if (!key) return null;
   try {
@@ -784,13 +798,21 @@ export async function generateEmbedding(text: string): Promise<number[] | null> 
   }
 }
 
-/** Generate + store the embedding for one memory row. Never throws. */
+/**
+ * Generate + store the embedding for one memory row. Never throws. Mit Angabe
+ * embedding_model (Issue #168): die Datenbank prüft sie beim Schreiben und
+ * verwirft einen Vektor eines anderen Anbieters. Fehlt ihr die Spalte
+ * (Migration 20260928 nicht eingespielt), ohne Angabe wie vorher.
+ */
 async function embedFact(id: string, content: string): Promise<void> {
   try {
     const sb = getSupabase();
-    const embedding = await generateEmbedding(content);
-    if (!sb || !embedding) return;
-    await sb.from("memory").update({ embedding }).eq("id", id);
+    const embedded = await embedWithConfig(content.substring(0, 8000));
+    if (!sb || !embedded) return;
+    const { error } = await sb.from("memory").update(embeddingColumns(embedded.vector, embedded.config)).eq("id", id);
+    if (error && MISSING_COLUMN_CODES.includes(String(error.code))) {
+      await sb.from("memory").update({ embedding: embedded.vector }).eq("id", id);
+    }
   } catch {
     // Non-critical — fact is stored, just without vector ranking
   }
@@ -1120,11 +1142,35 @@ export function buildMemoryContextString(
 export async function getMemoryContext(userMessage?: string): Promise<string> {
   const [facts, goals] = await Promise.all([getFacts(), getActiveGoals()]);
   const totalChars = facts.reduce((n, f) => n + f.content.length + 3, 0);
-  const queryEmbedding =
-    userMessage && totalChars > MEMORY_FACTS_CHAR_BUDGET
-      ? await generateEmbedding(userMessage)
-      : null;
-  return buildMemoryContextString(facts, goals, userMessage, queryEmbedding);
+  if (!userMessage || totalChars <= MEMORY_FACTS_CHAR_BUDGET) return buildMemoryContextString(facts, goals, userMessage, null);
+  const query = await embedWithConfig(userMessage.substring(0, 8000));
+  const ranked = await verifiedFactVectors(facts, query);
+  return buildMemoryContextString(ranked.facts, goals, userMessage, ranked.queryEmbedding);
+}
+
+/**
+ * Fakten für das Ranking nach Vektoren (Issue #168): verglichen werden nur
+ * Vektoren, die die Datenbank für Anbieter und Modell des Suchvektors
+ * herausgibt (embedding_fact_vectors), nie die aus getFacts. Läuft eine
+ * Umstellung oder hält die Datenbank inzwischen einen anderen Anbieter fest,
+ * kommt nichts zurück: dann lexikalisches Ranking. Fehlt der Datenbank die
+ * Migration, gibt es keine Umstellung, und es bleibt beim Ranking wie vorher.
+ */
+export async function verifiedFactVectors(
+  facts: MemoryItem[],
+  query: ConfiguredEmbedding | null,
+  deps: { target?: RegistryTarget | null; fetch?: FetchLike } = {},
+): Promise<{ facts: MemoryItem[]; queryEmbedding: number[] | null }> {
+  const strip = () => facts.map(f => ({ ...f, embedding: null }) as MemoryItem);
+  const target = deps.target === undefined ? registryTarget() : deps.target;
+  if (!query || !target) return { facts: strip(), queryEmbedding: null };
+  const vectors = await factVectorsFor(query.config, target, deps.fetch);
+  if (vectors === "fehlt") return { facts, queryEmbedding: query.vector };
+  if (!vectors || vectors.size === 0) return { facts: strip(), queryEmbedding: null };
+  return {
+    facts: facts.map(f => ({ ...f, embedding: vectors.get(String(f.id)) ?? null }) as MemoryItem),
+    queryEmbedding: query.vector,
+  };
 }
 
 /**
