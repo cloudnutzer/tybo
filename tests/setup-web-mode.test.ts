@@ -27,7 +27,7 @@ function launch(ctx: TestCtx, options: Partial<SetupModeOptions> = {}) {
   const done = runSetupMode({
     root: ctx.root,
     env: {},
-    startMode: { mode: "setup", reason: "missing", missing: ["TELEGRAM_BOT_TOKEN", "TELEGRAM_USER_ID"] },
+    startMode: { mode: "setup", reason: "missing", missing: ["TELEGRAM_BOT_TOKEN", "TELEGRAM_USER_ID"], message: "Richte Telegram oder die WebUI ein, sonst erreicht dich tybo nirgends." },
     supervisor: async () => null,
     ctx,
     code: CODE,
@@ -64,7 +64,7 @@ describe("Start ohne Token", () => {
     expect(url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
     expect((await fetch(`${url}/code`)).status).toBe(200);
     const text = run.logs.join("\n");
-    expect(text).toContain("in der .env fehlt TELEGRAM_BOT_TOKEN und TELEGRAM_USER_ID");
+    expect(text).toContain("Einrichtungsmodus: Richte Telegram oder die WebUI ein, sonst erreicht dich tybo nirgends.");
     expect(text).toContain(`Im Browser auf diesem Rechner öffnen: ${url}`);
     expect(text).toContain(`Einmal-Code: ${formatSetupCode(CODE)}`);
     // Läuft weiter, bis jemand abbricht
@@ -74,6 +74,22 @@ describe("Start ohne Token", () => {
     await expect(fetch(`${url}/code`)).rejects.toThrow();
     // Kein Telegram, kein Claude: keine Anbieter-Aufrufe ohne Anfrage aus dem Browser
     expect(ctx.providers.calls).toEqual([]);
+  });
+
+  test("Issue #228: halbes Telegram und ungültige WebUI zeigen den echten Grund im Log", async () => {
+    for (const [env, expected] of [
+      [{ TELEGRAM_BOT_TOKEN: "123:abc" }, "Einrichtungsmodus: Telegram halb eingerichtet: TELEGRAM_BOT_TOKEN ist gesetzt, TELEGRAM_USER_ID fehlt."],
+      [{ WEB_ENABLED: "true", WEB_PASSWORD: "kurz" }, "WebUI falsch eingerichtet: WEB_PASSWORD ist kürzer als 12 Zeichen."],
+    ] as const) {
+      const ctx = await makeCtx({ env: "# leer\n" });
+      const startMode = chooseStartMode(env);
+      expect(startMode.mode).toBe("setup");
+      const run = launch(ctx, { startMode: startMode as any });
+      await run.ready;
+      expect(run.logs.join("\n")).toContain(expected);
+      run.interrupt();
+      expect(await run.done).toBe(130);
+    }
   });
 
   test("WEB_HOST=0.0.0.0 ändert nichts: nur 127.0.0.1; WEB_PORT wird genutzt, ungültig heißt 3100", () => {
@@ -132,7 +148,9 @@ describe("„Fertig“", () => {
     const cookie = await session(url);
     const r = await finish(url, cookie);
     expect(r.status).toBe(409);
-    expect(r.data.missing).toEqual(["Telegram", "Datenbank", "Profil"]);
+    // Telegram ist seit Issue #228 optional; dafür gilt die Kanalregel
+    expect(r.data.missing).toEqual(["Datenbank", "Profil"]);
+    expect(r.data.error).toBe("Vor „Fertig“ fehlt noch: Datenbank, Profil. Richte Telegram oder die WebUI ein, sonst erreicht dich tybo nirgends.");
     expect((await fetch(`${url}/api/setup/overview`, { headers: { Cookie: cookie } })).status).toBe(200);
     run.interrupt();
     expect(await run.done).toBe(130);

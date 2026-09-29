@@ -331,7 +331,13 @@ function serialized<T>(path: string, lockWaitMs: number | undefined, fn: () => P
   return run;
 }
 
-async function modify(path: string, changes: ReadonlyArray<readonly [string, string | null]>, options: EnvWriteOptions): Promise<EnvWriteResult> {
+async function modify(
+  path: string,
+  changes: ReadonlyArray<readonly [string, string | null]>,
+  options: EnvWriteOptions,
+  /** Unter der Sperre geprüft: false heißt, nichts schreiben */
+  guard?: (current: Record<string, string>) => boolean,
+): Promise<EnvWriteResult> {
   // früh ablehnen, vor Sperre und Sicherung
   for (const [name, value] of changes) {
     checkName(name);
@@ -340,6 +346,7 @@ async function modify(path: string, changes: ReadonlyArray<readonly [string, str
   const io: EnvFileIo = { ...defaultIo, ...options.io };
   return serialized(path, options.lockWaitMs, async () => {
     const current = await readCurrent(path);
+    if (guard && !guard(parseEnvContent(current ?? ""))) return { changed: false, backup: null };
     let content = current ?? "";
     let changed = false;
     for (const [name, value] of changes) {
@@ -387,4 +394,18 @@ export function updateEnvValues(
   options: EnvWriteOptions = {},
 ): Promise<EnvWriteResult> {
   return modify(path, changes, options);
+}
+
+/**
+ * Setzt die Werte nur, wenn unter der Sperre noch keiner der Namen einen
+ * Wert hat (Push-Schlüssel, Issue #225): Starten Bot und Einrichtung
+ * gleichzeitig, gewinnt der erste, der zweite ändert nichts. Vorhandene
+ * Werte werden nie ersetzt, auch nicht, wenn nur einer davon fehlt.
+ */
+export function addEnvValuesIfMissing(
+  path: string,
+  values: ReadonlyArray<readonly [string, string]>,
+  options: EnvWriteOptions = {},
+): Promise<EnvWriteResult> {
+  return modify(path, values, options, current => values.every(([name]) => (current[name] ?? "").trim() === ""));
 }

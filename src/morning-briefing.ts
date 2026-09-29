@@ -22,7 +22,7 @@ import { readFile } from "fs/promises";
 import { join } from "path";
 import { loadEnv } from "./lib/env";
 import { fetchAll, getAvailableSources } from "./lib/data-sources";
-import { sendViaOutbox, type OutboxSender } from "./lib/outbox";
+import { outboxDelivered, sendViaOutbox, type OutboxSender } from "./lib/outbox";
 
 // Erst nach loadEnv() in initConfig() gesetzt; der Import allein tut nichts
 let CHAT_ID = "";
@@ -38,10 +38,11 @@ function initConfig(): void {
 /** Senden und festhalten (Entscheidung 0006): Direktchat, Quelle briefing */
 export const defaultSend: OutboxSender = sendViaOutbox;
 
-/** Schickt das fertige Briefing an den Direktchat; true, wenn gesendet. */
+/** Schickt das fertige Briefing an den Direktchat; true, wenn zugestellt. */
 export async function sendBriefing(briefing: string, send: OutboxSender = defaultSend): Promise<boolean> {
   console.log("📤 Sending morning briefing...");
-  const { sent } = await send({ text: briefing, source: "briefing" });
+  // Zugestellt heißt auch: ohne Telegram für die WebUI festgehalten (Issue #227)
+  const sent = outboxDelivered(await send({ text: briefing, source: "briefing" }));
   if (sent) {
     console.log("✅ Briefing sent!");
   } else {

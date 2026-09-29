@@ -353,13 +353,16 @@ describe("bestehende Präfixe unverändert", () => {
   test("src/bot.ts: Rückfragen nach Besitzerprüfung und alten Freigabe-Knöpfen, vor dem allgemeinen Handler", () => {
     const source = readFileSync(join(import.meta.dir, "..", "src", "bot.ts"), "utf8");
     const owner = source.indexOf("if (userId !== ALLOWED_USER_ID)");
-    const tool = source.indexOf('bot.on("callback_query:data", legacyToolApprovalMiddleware(ALLOWED_USER_ID));');
-    const ours = source.indexOf("installTelegramChoices(bot, telegramChoices);");
-    const general = source.indexOf('bot.on("callback_query:data", (ctx) =>');
+    const tool = source.indexOf('telegramHandlers.on("callback_query:data", legacyToolApprovalMiddleware(ALLOWED_USER_ID ?? ""));');
+    const ours = source.indexOf("if (telegramRuntime.telegram) installTelegramChoices(telegramHandlers, telegramChoices);");
+    const general = source.indexOf('telegramHandlers.on("callback_query:data", (ctx) =>');
     expect(owner).toBeGreaterThan(-1);
     expect(tool).toBeGreaterThan(owner);
     expect(ours).toBeGreaterThan(tool);
     expect(general).toBeGreaterThan(ours);
-    expect(source).toContain("createTelegramChoices({ api: bot.api, owner: ALLOWED_USER_ID })");
+    // Issue #227/#228: Rückfragen aus der Telegram-Laufzeit; ohne Telegram nur für die WebUI festhalten
+    expect(source).toContain("const telegramChoices = telegramRuntime.choices;");
+    const runtime = readFileSync(join(import.meta.dir, "..", "src", "lib", "telegram-runtime.ts"), "utf8");
+    expect(runtime).toContain("telegram: () => telegramConfigured(env),");
   });
 });

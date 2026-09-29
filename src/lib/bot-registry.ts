@@ -39,12 +39,23 @@ const AGENT_ALIASES: Record<string, string> = {
   operations: "coo",
 };
 
+export interface BotRegistryOptions {
+  /** Umgebung für die Agenten-Tokens; Standard process.env */
+  env?: Record<string, string | undefined>;
+  /** Bot-Fabrik für Agenten-Bots (Issue #228, testbar); Standard new Bot(token) */
+  createBot?: (token: string) => Bot;
+}
+
 export class BotRegistry {
   private primary: Bot;
   private bots: Map<string, Bot> = new Map();
+  private env: Record<string, string | undefined>;
+  private createBot: (token: string) => Bot;
 
-  constructor(primaryBot: Bot) {
+  constructor(primaryBot: Bot, options: BotRegistryOptions = {}) {
     this.primary = primaryBot;
+    this.env = options.env ?? process.env;
+    this.createBot = options.createBot ?? (token => new Bot(token));
     // Issue #52: jede Sendung über den Haupt-Bot ohne Link-Vorschau, Text bereinigt
     installTelegramOutputGuard(primaryBot.api);
   }
@@ -57,10 +68,10 @@ export class BotRegistry {
     const initPromises: Promise<void>[] = [];
 
     for (const [agent, envVar] of Object.entries(AGENT_TOKEN_MAP)) {
-      const token = process.env[envVar];
+      const token = this.env[envVar]?.trim();
       if (!token) continue;
 
-      const agentBot = new Bot(token);
+      const agentBot = this.createBot(token);
       installTelegramOutputGuard(agentBot.api);
       initPromises.push(
         agentBot

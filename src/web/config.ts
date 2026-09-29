@@ -14,8 +14,9 @@ export interface WebConfig {
   allowedHosts: string[];
   /**
    * Öffentliche Adresse hinter dem Cloudflare Tunnel (Issue #98, Entscheidung
-   * 0014), z. B. https://app.tybo.ai. Ohne sie gibt es keine getunnelten
-   * Anfragen, alles bleibt wie im Heimnetz.
+   * 0014), z. B. https://tybo.example.org (eigene Domain), oder im Tailnet
+   * (https://<gerät>.<tailnet>.ts.net, Issue #231, siehe remoteKind). Ohne
+   * sie gibt es keine getunnelten Anfragen, alles bleibt wie im Heimnetz.
    */
   publicOrigin?: string | null;
   /**
@@ -74,7 +75,7 @@ export function loadWebConfig(env: Env): WebConfigResult {
     if (!publicOrigin) {
       return {
         status: "invalid",
-        reason: "WEB_PUBLIC_ORIGIN muss eine https-Adresse ohne Pfad sein, z. B. https://app.tybo.ai",
+        reason: "WEB_PUBLIC_ORIGIN muss eine https-Adresse ohne Pfad sein, z. B. https://tybo.example.org oder https://rechner.tailnet.ts.net",
       };
     }
   }
@@ -116,6 +117,31 @@ export function parseAccessConfig(
     return { status: "invalid", reason: "WEB_ACCESS_AUD ist kein gültiger Application Audience Tag" };
   }
   return { status: "ok", access: { team, aud } };
+}
+
+/**
+ * Zugang von unterwegs (Issue #231): eine Adresse im Tailnet
+ * (https://<gerät>.<tailnet>.ts.net) läuft über `tailscale serve`, jede
+ * andere über den Cloudflare Tunnel mit Access. Stehen zu einer
+ * Tailscale-Adresse trotzdem Access-Werte in der .env, gilt Cloudflare: dann
+ * scheitert jede Anfrage ohne Access-Nachweis (sicherer Ausfall).
+ */
+export type RemoteKind = "cloudflare" | "tailscale";
+
+/** Endet der Host eines gültigen Origins auf .ts.net? */
+export function isTailscaleOrigin(origin: string | null | undefined): boolean {
+  if (!origin) return false;
+  try {
+    return new URL(origin).hostname.endsWith(".ts.net");
+  } catch {
+    return false;
+  }
+}
+
+/** Weg der öffentlichen Adresse; null ohne WEB_PUBLIC_ORIGIN */
+export function remoteKind(config: Pick<WebConfig, "publicOrigin" | "access">): RemoteKind | null {
+  if (!config.publicOrigin) return null;
+  return isTailscaleOrigin(config.publicOrigin) && !config.access ? "tailscale" : "cloudflare";
 }
 
 /**

@@ -19,7 +19,8 @@ afterAll(cleanup);
 /** Antworten für einen vollständigen Durchlauf auf leerer Konfiguration */
 const FULL_RUN = [
   "", // Auswahl nach der Übersicht: nur offene Schritte
-  // Telegram
+  // Telegram (optional seit Issue #228)
+  "j",
   FAKE.token,
   FAKE.userId,
   "", // Speichern? (Standard Ja)
@@ -46,6 +47,8 @@ const FULL_RUN = [
   "2", // Heimnetz
   "", // Port Standard
   "",
+  // Zugang vom Handy (optional, Issue #231)
+  "n",
   // Autostart
   "j",
 ];
@@ -78,10 +81,10 @@ describe("tybo setup: Durchlauf", () => {
 
     // Übersicht vor den Schritten, mit Status
     expect(r.out).toMatch(/1\. Voraussetzungen\s+erledigt/);
-    expect(r.out).toMatch(/2\. Telegram\s+fehlt/);
+    expect(r.out).toMatch(/2\. Telegram \(optional\)\s+fehlt/);
     expect(r.out).toMatch(/3\. Forum-Gruppe \(optional\)\s+fehlt/);
-    expect(r.out).toContain("10. Gesamtprüfung");
-    expect(r.out.indexOf("10. Gesamtprüfung")).toBeLessThan(r.out.indexOf("Schritt 1 von"));
+    expect(r.out).toContain("11. Gesamtprüfung");
+    expect(r.out.indexOf("11. Gesamtprüfung")).toBeLessThan(r.out.indexOf("Schritt 1 von"));
 
     // Verbindungstests mit Ergebnis, Gesamtprüfung am Ende
     expect(r.out).toContain("Verbindungstest: bestanden. Verbunden mit @test_bot");
@@ -109,7 +112,7 @@ describe("tybo setup: Durchlauf", () => {
     const before = await readFile(ctx.envPath, "utf8");
 
     // Nur noch die offenen optionalen Schritte werden angeboten
-    const prompter = scripted(["", "n", "n", "n"]);
+    const prompter = scripted(["", "n", "n", "n", "n"]);
     const r = await runWith({ mode: "all" }, ctx, prompter);
     expect(r.code).toBe(0);
     expect(prompter.left()).toBe(0);
@@ -118,10 +121,12 @@ describe("tybo setup: Durchlauf", () => {
       "Jetzt einrichten? [J/n] ",
       "Jetzt einrichten? [J/n] ",
       "Jetzt einrichten? [J/n] ",
+      "Jetzt einrichten? [J/n] ",
     ]);
-    expect(r.out).toContain("Schritt 1 von 3: Forum-Gruppe (optional)");
-    expect(r.out).toContain("Schritt 2 von 3: Semantische Suche (optional)");
-    expect(r.out).toContain("Schritt 3 von 3: Modelle und Fallback (optional)");
+    expect(r.out).toContain("Schritt 1 von 4: Forum-Gruppe (optional)");
+    expect(r.out).toContain("Schritt 2 von 4: Semantische Suche (optional)");
+    expect(r.out).toContain("Schritt 3 von 4: Modelle und Fallback (optional)");
+    expect(r.out).toContain("Schritt 4 von 4: Zugang vom Handy (optional)");
     expect(r.out).not.toContain("Bot-Token");
     expect(await readFile(ctx.envPath, "utf8")).toBe(before);
     // Gesamtprüfung läuft trotzdem mit den gespeicherten Werten
@@ -131,12 +136,12 @@ describe("tybo setup: Durchlauf", () => {
   test("erledigten Schritt auswählen: wird gezeigt, leere Eingaben behalten die Werte", async () => {
     const ctx = await linuxCtx({ env: FULL_ENV, profile: "# Testperson\n" });
     const before = await readFile(ctx.envPath, "utf8");
-    // Auswahl 2 = Telegram; Enter behält Token und Nutzer-ID; offen sind noch Semantische Suche und Autostart (beide abgelehnt)
-    const prompter = scripted(["2", "", "", "n", "n"]);
+    // Auswahl 2 = Telegram; Enter behält Token und Nutzer-ID; offen sind noch Semantische Suche, Zugang vom Handy und Autostart (alle abgelehnt)
+    const prompter = scripted(["2", "", "", "n", "n", "n"]);
     const r = await runWith({ mode: "all" }, ctx, prompter);
     expect(r.code).toBe(0);
     expect(prompter.left()).toBe(0);
-    expect(r.out).toContain("Schritt 1 von 3: Telegram");
+    expect(r.out).toContain("Schritt 1 von 4: Telegram");
     expect(r.out).toContain("Ist gesetzt. Enter behält den bisherigen Wert.");
     expect(r.out).toContain("Keine neuen Eingaben, alles bleibt, wie es ist.");
     // Gesetzte Werte werden nie angezeigt
@@ -162,13 +167,118 @@ describe("tybo setup: Durchlauf", () => {
     const ctx = await linuxCtx();
     const answers = [...FULL_RUN];
     const at = answers.indexOf(FAKE.webPassword);
-    // WebUI-Schritt überspringen: statt "j", "j", Passwort, "2", "", "" nur "n"
-    answers.splice(at - 2, 6, "n");
+    // WebUI-Schritt überspringen: statt "j", "j", Passwort, "2", "", "" nur "n"; ohne WebUI kommt der Zugang vom Handy ohne Frage
+    answers.splice(at - 2, 7, "n");
     const r = await runWith({ mode: "all" }, ctx, scripted(answers));
     expect(r.code).toBe(0);
     expect(r.out).toContain("WebUI ist aus.");
+    expect(r.out).toContain("Ohne WebUI gibt es keinen Zugang vom Handy: übersprungen.");
     expect(r.out).not.toContain("http://127.0.0.1");
     expect(r.out).not.toContain("Chat im Terminal mit tybo");
+  });
+});
+
+/** Issue #228: Durchlauf ohne Telegram, nur mit WebUI */
+const WEB_ONLY_RUN = [
+  "", // Auswahl: nur offene Schritte
+  "n", // Telegram: Jetzt einrichten? nein
+  // WebUI kommt als nächster Schritt
+  "j",
+  "j", // einschalten
+  FAKE.webPassword,
+  "1", // Nur dieser Rechner
+  "", // Port Standard
+  "", // Speichern
+  // Forum-Gruppe: ohne Telegram ohne Frage übersprungen
+  // Datenbank
+  "4",
+  FAKE.convexUrl,
+  FAKE.convexToken,
+  "j",
+  "n", // Semantische Suche
+  "Testperson",
+  "Europe/Berlin",
+  "",
+  "",
+  "n", // Modelle
+  "n", // Zugang vom Handy (Issue #231)
+  "j", // Autostart
+];
+
+describe("Issue #228: tybo setup ohne Telegram", () => {
+  test("Telegram übersprungen, WebUI eingerichtet: fertig, WebUI als nächster Schritt, Gruppe ohne Frage übersprungen", async () => {
+    const ctx = await linuxCtx();
+    const prompter = scripted(WEB_ONLY_RUN);
+    const r = await runWith({ mode: "all" }, ctx, prompter);
+    expect(r.code).toBe(0);
+    expect(prompter.left()).toBe(0);
+    const env = parseEnvContent(await readFile(ctx.envPath, "utf8"));
+    expect(env.TELEGRAM_BOT_TOKEN).toBeUndefined();
+    expect(env.WEB_ENABLED).toBe("true");
+    // Die WebUI kommt direkt nach Telegram, vor Forum-Gruppe und Datenbank
+    expect(r.out).toContain("Ohne Telegram brauchst du die WebUI, sonst erreicht dich tybo nirgends. Sie kommt als nächster Schritt.");
+    expect(r.out).toContain("Schritt 2 von 9: WebUI (optional)");
+    expect(r.out).toContain("Ohne Telegram gibt es keine Forum-Gruppe: übersprungen.");
+    expect(r.out.indexOf("WebUI (optional)")).toBeLessThan(r.out.indexOf("Forum-Gruppe (optional)\n"));
+    expect(r.out).toContain("Alle Pflichtschritte sind erledigt.");
+    expect(r.out).not.toContain("Noch offen");
+    // Endtext passend zum Kanal: WebUI, kein Telegram-Satz
+    expect(r.out).toContain("tybo läuft über den Autostart. Öffne die WebUI unter http://127.0.0.1:3100.");
+    expect(r.out).not.toContain("Schreib deinem Bot in Telegram");
+    expect(ctx.providers.calls.filter(c => c.method.startsWith("telegram"))).toEqual([]);
+    expect(leakedSecrets(r.out)).toEqual([]);
+  });
+
+  test("Telegram und WebUI übersprungen: WebUI nur nach Rückfrage mit dem Kanal-Satz, danach offen", async () => {
+    const ctx = await linuxCtx();
+    const answers = [...WEB_ONLY_RUN];
+    // WebUI: nein, dann „Trotzdem überspringen?“ ja
+    answers.splice(2, 6, "n", "j");
+    answers.splice(answers.length - 2, 1); // ohne WebUI kommt der Zugang vom Handy ohne Frage
+    answers[answers.length - 1] = "n"; // Autostart ablehnen
+    const prompter = scripted(answers);
+    const r = await runWith({ mode: "all" }, ctx, prompter);
+    expect(r.code).toBe(0);
+    expect(prompter.left()).toBe(0);
+    expect(prompter.asked.map(a => a.question)).toContain("Trotzdem überspringen? [j/N] ");
+    expect(r.out).toContain("Noch offen: Richte Telegram oder die WebUI ein, sonst erreicht dich tybo nirgends.");
+    expect(r.out).not.toContain("Noch offen (Pflicht): Telegram");
+    expect(r.out).not.toContain("Alle Pflichtschritte sind erledigt.");
+    expect(r.out).toContain("Erst fertig einrichten: tybo setup (oder einzeln: tybo setup telegram, tybo setup webui)");
+  });
+
+  test("Rückfrage verneint: die WebUI wird doch eingerichtet", async () => {
+    const ctx = await linuxCtx();
+    const answers = [...WEB_ONLY_RUN];
+    // WebUI: nein, dann „Trotzdem überspringen?“ Enter (nein), danach die Felder wie sonst
+    answers.splice(2, 1, "n", "");
+    const prompter = scripted(answers);
+    const r = await runWith({ mode: "all" }, ctx, prompter);
+    expect(r.code).toBe(0);
+    expect(prompter.left()).toBe(0);
+    expect(parseEnvContent(await readFile(ctx.envPath, "utf8")).WEB_ENABLED).toBe("true");
+    expect(r.out).toContain("Alle Pflichtschritte sind erledigt.");
+  });
+
+  test("Telegram halb eingerichtet und übersprungen: offen, auch mit WebUI", async () => {
+    const env = FULL_ENV.split("\n").filter(l => !l.startsWith("TELEGRAM_USER_ID=")).join("\n");
+    const ctx = await linuxCtx({ env, profile: "# Testperson\n" });
+    // Auswahl Enter, Telegram nein, Semantische Suche nein, Zugang vom Handy nein, Autostart nein
+    const prompter = scripted(["", "n", "n", "n", "n"]);
+    const r = await runWith({ mode: "all" }, ctx, prompter);
+    expect(r.code).toBe(0);
+    expect(prompter.left()).toBe(0);
+    expect(r.out).toMatch(/2\. Telegram \(optional\)\s+teilweise/);
+    expect(r.out).toContain("Noch offen: Telegram halb eingerichtet: TELEGRAM_BOT_TOKEN ist gesetzt, TELEGRAM_USER_ID fehlt. Beide Werte setzen oder beide entfernen.");
+    // Mit gültiger WebUI kein Zwang zur WebUI, aber auch kein „fertig“
+    expect(r.out).not.toContain("Sie kommt als nächster Schritt.");
+    expect(r.out).not.toContain("Alle Pflichtschritte sind erledigt.");
+  });
+
+  test("Endtext mit Telegram und WebUI: beides", async () => {
+    const ctx = await linuxCtx();
+    const r = await runWith({ mode: "all" }, ctx, scripted(FULL_RUN));
+    expect(r.out).toContain("tybo läuft über den Autostart. Schreib deinem Bot in Telegram oder öffne die WebUI unter http://127.0.0.1:3100.");
   });
 });
 
@@ -186,8 +296,8 @@ describe("Gesamtprüfung schlägt fehl", () => {
 
   test("Durchlauf: gespeichertes Token ungültig, erneut eingeben, danach bestanden", async () => {
     const ctx = await staleTokenCtx();
-    // Auswahl Enter, Semantische Suche und Autostart ablehnen, dann Telegram erneut: neues Token, Nutzer-ID behalten, speichern
-    const prompter = scripted(["", "n", "n", "e", NEW_TOKEN, "", ""]);
+    // Auswahl Enter, Semantische Suche, Zugang vom Handy und Autostart ablehnen, dann Telegram erneut: neues Token, Nutzer-ID behalten, speichern
+    const prompter = scripted(["", "n", "n", "n", "e", NEW_TOKEN, "", ""]);
     const r = await runWith({ mode: "all" }, ctx, prompter);
     expect(r.code).toBe(0);
     expect(prompter.left()).toBe(0);
@@ -204,7 +314,7 @@ describe("Gesamtprüfung schlägt fehl", () => {
   test("Durchlauf: ungültiges Token übersprungen, Fehler steht in der Zusammenfassung", async () => {
     const ctx = await staleTokenCtx();
     const before = await readFile(ctx.envPath, "utf8");
-    const prompter = scripted(["", "n", "n", "ü"]);
+    const prompter = scripted(["", "n", "n", "n", "ü"]);
     const r = await runWith({ mode: "all" }, ctx, prompter);
     expect(r.code).toBe(0);
     expect(prompter.left()).toBe(0);
@@ -254,7 +364,7 @@ describe("Eingaben deuten", () => {
     expect(parseSelection("")).toEqual([]);
     expect(parseSelection("2, 6 telegram")).toEqual(["telegram", "profil"]);
     expect(parseSelection("5 suche")).toEqual(["suche"]);
-    expect(parseSelection("10")).toBeNull();
+    expect(parseSelection("12")).toBeNull();
     expect(parseSelection("quatsch")).toBeNull();
   });
 });

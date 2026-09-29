@@ -364,8 +364,11 @@ describe("WebUI-Server sieht Katalogänderungen ohne Neustart", () => {
 
     await createAgent(planer);
     expect(await names()).toContain("projekt-planer");
-    expect((await api("/api/conversations", "POST", { agent: "projekt-planer" })).status).toBe(201);
-    expect(created).toEqual(["projekt-planer"]);
+    // Ohne Forum-Gruppe ein Web-Gespräch mit dem neuen Agenten (Issue #227), kein Topic
+    const res = await api("/api/conversations", "POST", { agent: "projekt-planer" });
+    expect(res.status).toBe(201);
+    expect(((await res.json()) as any).conversation.agent).toBe("projekt-planer");
+    expect(created).toEqual([]);
     expect((await api("/api/agents/projekt-planer/instructions")).status).toBe(200);
 
     await deleteAgent("finance");

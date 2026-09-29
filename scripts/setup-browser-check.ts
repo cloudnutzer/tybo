@@ -38,6 +38,12 @@
  * nicht antwortet (kein Vorschlag, Hinweis, „Fertig“ ohne Wahl abgelehnt).
  * „Fertig“ schließt hier nur den Server: eingerichtet wird nichts, es startet
  * kein Dienst.
+ *
+ * Issue #228: ohne Telegram. Frisches Projekt, „Weiter“ bei Telegram öffnet
+ * die WebUI; ohne Kanal ist „Fertig“ gesperrt und nennt den Kanal-Satz. Nach
+ * dem Einrichten der WebUI führt „Weiter“ zu den übrigen Schritten zurück
+ * (Datenbank, nicht Autostart), „Fertig“ ist frei, und der Abschluss nennt die
+ * WebUI-Adresse statt Telegram.
  */
 
 import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -115,6 +121,7 @@ const server = await createSetupServer({
 });
 const base = server.url;
 let flowServer: SetupServer | null = null;
+let noTelegramServer: SetupServer | null = null;
 const searchServers: SetupServer[] = [];
 const linuxServers: SetupServer[] = [];
 
@@ -658,6 +665,78 @@ try {
   check("ohne Wahl: nicht abgeschlossen, nichts gestartet", !noManager.server.isFinished() && started(noManager.ctx.run).length === 0);
   await shootAll("einrichtung-autostart-ohne-systemd", showManager);
 
+  // --- Ohne Telegram (Issue #228) -------------------------------------------------
+  const ntDir = await mkdtemp(join(tmpdir(), "tybo-setup-ohne-telegram-"));
+  await mkdir(join(ntDir, "config"), { recursive: true });
+  await mkdir(join(ntDir, "launchd"), { recursive: true });
+  await writeFile(join(ntDir, ".env"), "# leer, wie nach dem ersten Klonen\n", { mode: 0o600 });
+  const ntCtx = createSetupContext({
+    root: ntDir,
+    home: join(ntDir, "home"),
+    platform: "darwin",
+    launchAgentsDir: join(ntDir, "home", "Library", "LaunchAgents"),
+    pm2DumpPath: join(ntDir, "home", ".pm2", "dump.pm2"),
+    run,
+    providers,
+    fetch: fakeSupabaseApi().fetch,
+  });
+  const ntCode = generateSetupCode();
+  noTelegramServer = await createSetupServer({ ctx: ntCtx, code: ntCode, port: 0, supervisor: async () => null, startCommand: "cd ~/tybo && bun run start", log: () => {} });
+  const ntUrl = noTelegramServer.url;
+  const ntPort = new URL(ntUrl).port;
+  // Absichtlich anders als der Port des Assistenten: das Ende muss den gespeicherten WEB_PORT nennen
+  const ntWebPort = ntPort === "3456" ? "3457" : "3456";
+  await goto(`${ntUrl}/`);
+  await waitFor(`document.getElementById("code-form")`);
+  await typeInto("code", formatSetupCode(ntCode));
+  await click("#code-button");
+  check("ohne Telegram: erster offener Schritt ist Telegram (optional)", await waitFor(
+    `document.querySelector('.setup-step[aria-current="step"]')?.dataset.step === "telegram" && document.querySelector(".setup-title")?.parentElement?.textContent.includes("optional")`,
+  ));
+  check("ohne Telegram: Beschreibung nennt die WebUI", await js<boolean>(`document.getElementById("setup-panel").textContent.includes("Ohne Telegram erreichst du ${BRAND.name} über die WebUI")`));
+  await openStep("pruefung");
+  check("ohne Kanal: „Fertig“ gesperrt mit dem Kanal-Satz", await waitFor(
+    `document.querySelector('button[data-action="finish"]')?.disabled && document.getElementById("setup-panel").textContent.includes("Richte Telegram oder die WebUI ein, sonst erreicht dich ${BRAND.name} nirgends.")`,
+  ));
+  await shootAll("einrichtung-ohne-kanal-pruefung");
+  await openStep("telegram");
+  await click('button[data-action="next"]');
+  check("„Weiter“ bei Telegram ohne WebUI öffnet die WebUI", await waitFor(`document.querySelector('.setup-step[aria-current="step"]')?.dataset.step === "webui"`));
+  await choose("field-WEB_ENABLED", "true");
+  await fieldsAre(["WEB_ENABLED", "WEB_PASSWORD", "WEB_HOST", "WEB_PORT"]);
+  await typeInto("field-WEB_PASSWORD", "browser-check-passwort");
+  await choose("field-WEB_HOST", "127.0.0.1");
+  await typeInto("field-WEB_PORT", ntWebPort);
+  await shootAll("einrichtung-ohne-telegram-webui");
+  await click('button[data-action="apply"]');
+  check("WebUI gespeichert", await waitFor(`document.querySelector('.setup-step[data-step="webui"]').dataset.state === "erledigt"`));
+  check("Passwort nirgends im Dokument", !(await js<string>(`document.documentElement.outerHTML`)).includes("browser-check-passwort"));
+  await click('button[data-action="next"]');
+  check("danach „Weiter“ zu den übrigen Schritten: Datenbank, nicht Autostart", await waitFor(`document.querySelector('.setup-step[aria-current="step"]')?.dataset.step === "datenbank"`));
+  await js(`(() => { const s = document.getElementById("field-DB_BACKEND"); s.value = "convex"; s.dispatchEvent(new Event("change")); })()`);
+  await waitFor(`!document.querySelector('[data-field="CONVEX_URL"]').hidden`);
+  await typeInto("field-CONVEX_URL", "https://happy-otter-123.convex.cloud");
+  await typeInto("field-CONVEX_AUTH_TOKEN", "convex-platzhalter-token-1234");
+  await click('button[data-action="apply"]');
+  check("ohne Telegram: Datenbank gespeichert", await waitFor(`document.querySelector('.setup-step[data-step="datenbank"]').dataset.state === "erledigt"`));
+  await openStep("profil");
+  await typeInto("field-USER_NAME", "Beispiel");
+  await typeInto("field-USER_TIMEZONE", "Europe/Berlin");
+  await click('button[data-action="apply"]');
+  check("ohne Telegram: Profil gespeichert", await waitFor(`document.querySelector('.setup-step[data-step="profil"]').dataset.state === "erledigt"`));
+  await openStep("pruefung");
+  check("Telegram übersprungen, WebUI eingerichtet: „Fertig“ ist frei", await waitFor(`document.querySelector('button[data-action="finish"]') && !document.querySelector('button[data-action="finish"]').disabled`));
+  await shootAll("einrichtung-ohne-telegram-pruefung");
+  await viewport(390);
+  check("ohne Telegram, 390 px: kein waagrechtes Scrollen", await noHorizontalScroll(390));
+  await viewport(1280);
+  await click('button[data-action="finish"]');
+  check("Ende nennt die WebUI-Adresse", await waitFor(`document.querySelector(".setup-reach")?.textContent === ${JSON.stringify(`Nach dem Start: Öffne die WebUI unter http://127.0.0.1:${ntWebPort}.`)}`));
+  check("Ende ohne Telegram-Satz", !(await js<string>(`document.getElementById("setup-panel").textContent`)).includes("Telegram"));
+  await shootAll("einrichtung-ohne-telegram-fertig");
+  check("ohne Telegram: Server meldet Abschluss", noTelegramServer.isFinished());
+  await rm(ntDir, { recursive: true, force: true });
+
   const csp = problems.filter(p => /Content Security Policy|Refused/i.test(p));
   check("keine CSP-Verstöße", csp.length === 0, csp.join(" | "));
   const errors = problems.filter(p => !/Failed to load resource/.test(p));
@@ -671,6 +750,7 @@ try {
   await chrome.exited;
   await server.stop();
   await flowServer?.stop();
+  await noTelegramServer?.stop();
   for (const s of searchServers) await s.stop();
   for (const s of linuxServers) await s.stop();
   await rm(dir, { recursive: true, force: true });

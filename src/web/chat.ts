@@ -235,6 +235,13 @@ export interface ChatHubOptions {
    * Gesprächs, damit die Reihenfolge bleibt. Ohne decorate fällt choiceId weg.
    */
   decorate?: (conversationId: string, message: ApiMessage) => Promise<ApiMessage>;
+  /**
+   * Die Antwort eines Turns ist gespeichert und gesendet (Issue #226, Push).
+   * Nur die eigentliche Antwort: keine Fehler, Abbrüche, Rückfragen, Nacharbeit
+   * oder Befehle. source ist die Herkunft der Nachricht, auf die der Turn
+   * antwortet. Läuft unabhängig davon, ob jemand zuhört; Fehler landen im Log.
+   */
+  onReply?: (event: { conversationId: string; text: string; agent?: string; source: MessageSource }) => void;
 }
 
 const encoder = new TextEncoder();
@@ -250,6 +257,7 @@ export class ChatHub {
   private readonly log: (message: string) => void;
   private readonly publishUserMessages: boolean;
   private readonly decorate?: (conversationId: string, message: ApiMessage) => Promise<ApiMessage>;
+  private readonly onReply?: ChatHubOptions["onReply"];
   /** Ereignisse je Gespräch, die auf eine Ergänzung (decorate) warten */
   private readonly pending = new Map<string, Promise<void>>();
   private readonly running = new Map<string, RunningTurn>();
@@ -267,6 +275,7 @@ export class ChatHub {
     this.log = options.log ?? (() => {});
     this.publishUserMessages = !!options.publishUserMessages;
     this.decorate = options.decorate;
+    this.onReply = options.onReply;
   }
 
   get available(): boolean {
@@ -659,13 +668,19 @@ export class ChatHub {
    * choiceId, Ergebnis einer Entscheidung) ablegen und an die offenen Browser
    * senden. Läuft im Gespräch gerade ein Turn oder Befehl, erst danach: ein
    * Vorschlag aus der Antwort steht so unter ihr. Wartet nie selbst; Fehler
-   * (etwa Gespräch inzwischen gelöscht) landen nur im Log.
+   * (etwa Gespräch inzwischen gelöscht) landen nur im Log. onStored läuft nach
+   * dem Senden mit der gespeicherten Nachricht (Issue #226: Push für Meldungen).
    */
-  postAfterTurn(id: string, message: NewMessage): void {
+  postAfterTurn(id: string, message: NewMessage, onStored?: (stored: StoredMessage) => void): void {
     const work = this.whenIdle(id)
       .then(async () => {
         const stored = await this.store.appendMessage(id, message);
         this.publishApiMessage(id, toApiMessage(stored));
+        try {
+          onStored?.(stored);
+        } catch (e) {
+          this.log(`Nachfolge zu einer Nachricht in ${id} fehlgeschlagen (${e instanceof Error ? e.name : typeof e})`);
+        }
       })
       .catch(e => this.log(`Nachricht in Gespräch ${id} nicht abgelegt (${e instanceof Error ? e.name : typeof e})`));
     this.turns.add(work);
@@ -820,6 +835,15 @@ export class ChatHub {
     for (const s of [...set]) s.send(chunk);
   }
 
+  private notifyReply(conversationId: string, text: string, agent: string | undefined, source: MessageSource): void {
+    if (!this.onReply) return;
+    try {
+      this.onReply({ conversationId, text, ...(agent ? { agent } : {}), source });
+    } catch (e) {
+      this.log(`Benachrichtigung zu Gespräch ${conversationId} fehlgeschlagen (${e instanceof Error ? e.name : typeof e})`);
+    }
+  }
+
   /** Nacharbeit eines Turns (Issue #76); ihre Fehler beenden nur sie, nie den Turn */
   private async runFollowUp(id: string, followUp: NonNullable<TurnResult["followUp"]>, signal: AbortSignal): Promise<void> {
     try {
@@ -928,8 +952,10 @@ export class ChatHub {
     // Erst speichern, dann senden, dann Nacharbeit, dann die Sperre lösen
     try {
       const stored = await this.store.appendMessage(id, reply);
-      if (stored.role === "assistant") this.publishApiMessage(id, toApiMessage(stored));
-      else this.publish(id, "error", stored);
+      if (stored.role === "assistant") {
+        this.publishApiMessage(id, toApiMessage(stored));
+        this.notifyReply(id, stored.text, stored.agent ?? conversation.agent, source);
+      } else this.publish(id, "error", stored);
       if (followUp && stored.role === "assistant") {
         // Eigener Lebenszyklus: der Stopp-Knopf bricht die Rückfragen ab, die Antwort bleibt gespeichert
         const controller = new AbortController();

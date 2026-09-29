@@ -157,10 +157,10 @@ describe("als Prozess", () => {
     expect(r.stdout).toContain("--topic");
   });
 
-  test("ohne Bot-Token: 2, nichts abgelegt", () => {
+  test("ohne Bot-Token und ohne Datenbank: 1, nicht festgehalten, nichts abgelegt (Issue #227)", () => {
     const r = run(["--source", "pipeline", "--text", "Hallo"]);
-    expect(r.code).toBe(EXIT_USAGE);
-    expect(r.stderr).toContain("TELEGRAM_BOT_TOKEN fehlt");
+    expect(r.code).toBe(EXIT_SEND_FAILED);
+    expect(r.stderr).toContain("Nicht festgehalten");
     expect(existsSync(join(root, "data"))).toBe(false);
   });
 });

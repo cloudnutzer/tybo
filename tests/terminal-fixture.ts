@@ -220,6 +220,12 @@ export interface TyboServerOptions {
   commands?: boolean;
   /** Issue #120: Rückfragen-Register im Speicher (siehe createTestChoiceRegister) */
   choices?: boolean;
+  /**
+   * Issue #228: ohne Telegram bzw. ohne Forum-Gruppe. Nur der Direktchat
+   * (API-ID dm, im Bot die Chat-ID "web"), keine Topics, keine Gruppe:
+   * „Neues Gespräch" legt ein Web-Gespräch an
+   */
+  withoutTelegram?: boolean;
 }
 
 export async function startTyboServer(options: TyboServerOptions = {}): Promise<TerminalTestServer> {
@@ -237,6 +243,13 @@ export async function startTyboServer(options: TyboServerOptions = {}): Promise<
     const web = await conversationStore.createConversation("research");
     await conversationStore.renameConversation(web.id, "Altes Web-Gespräch");
     webConversationId = web.id;
+  }
+  if (options.withoutTelegram) {
+    const list = telegram.listConversations.bind(telegram);
+    const get = telegram.getConversation.bind(telegram);
+    telegram.listConversations = async () => ({ ...(await list()), topics: [] });
+    telegram.getConversation = async id => (id === "dm" ? get(id) : null);
+    telegram.groupChatId = () => null;
   }
   const historyFails = options.historyFails;
   if (historyFails) {

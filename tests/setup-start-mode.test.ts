@@ -13,17 +13,19 @@ import { FAKE } from "./setup-fixture";
 
 const repo = resolve(import.meta.dir, "..");
 const FULL = { TELEGRAM_BOT_TOKEN: FAKE.token, TELEGRAM_USER_ID: FAKE.userId };
+const WEB = { WEB_ENABLED: "true", WEB_PASSWORD: FAKE.webPassword };
 
 describe("chooseStartMode", () => {
   test("beide Telegram-Werte vorhanden: normaler Start", () => {
     expect(chooseStartMode(FULL)).toEqual({ mode: "normal" });
   });
 
-  test("fehlendes Token: Einrichtungsmodus statt Exit", () => {
+  test("fehlendes Token: Einrichtungsmodus statt Exit (halbes Telegram)", () => {
     expect(chooseStartMode({ TELEGRAM_USER_ID: FAKE.userId })).toEqual({
       mode: "setup",
       reason: "missing",
       missing: ["TELEGRAM_BOT_TOKEN"],
+      message: "Telegram halb eingerichtet: TELEGRAM_USER_ID ist gesetzt, TELEGRAM_BOT_TOKEN fehlt. Beide Werte setzen oder beide entfernen.",
     });
   });
 
@@ -32,11 +34,38 @@ describe("chooseStartMode", () => {
       mode: "setup",
       reason: "missing",
       missing: ["TELEGRAM_USER_ID"],
+      message: "Telegram halb eingerichtet: TELEGRAM_BOT_TOKEN ist gesetzt, TELEGRAM_USER_ID fehlt. Beide Werte setzen oder beide entfernen.",
     });
   });
 
-  test("leere .env: beide fehlen", () => {
-    expect(chooseStartMode({})).toEqual({ mode: "setup", reason: "missing", missing: [...REQUIRED_START_KEYS] });
+  test("leere .env: beide fehlen, Kanal-Satz", () => {
+    expect(chooseStartMode({})).toEqual({
+      mode: "setup",
+      reason: "missing",
+      missing: [...REQUIRED_START_KEYS],
+      message: "Richte Telegram oder die WebUI ein, sonst erreicht dich tybo nirgends.",
+    });
+  });
+
+  test("Issue #228: nur WebUI, ohne Telegram: normaler Start", () => {
+    expect(chooseStartMode(WEB)).toEqual({ mode: "normal" });
+    expect(chooseStartMode({ ...WEB, TELEGRAM_BOT_TOKEN: "your_bot_token_here", TELEGRAM_USER_ID: "" })).toEqual({ mode: "normal" });
+  });
+
+  test("Issue #228: halbes Telegram mit gültiger WebUI: Einrichtungsmodus", () => {
+    const mode = chooseStartMode({ ...WEB, TELEGRAM_BOT_TOKEN: FAKE.token });
+    expect(mode.mode).toBe("setup");
+    expect((mode as any).message).toStartWith("Telegram halb eingerichtet: ");
+    const invalid = chooseStartMode({ ...WEB, ...FULL, TELEGRAM_USER_ID: "alex" });
+    expect((invalid as any).message).toContain("TELEGRAM_USER_ID ist keine Zahl");
+  });
+
+  test("Issue #228: WebUI ungültig ohne Telegram: Einrichtungsmodus mit dem Grund; mit Telegram normal", () => {
+    const mode = chooseStartMode({ WEB_ENABLED: "true", WEB_PASSWORD: "kurz" });
+    expect(mode.mode).toBe("setup");
+    expect((mode as any).message).toContain("WEB_PASSWORD ist kürzer als 12 Zeichen");
+    expect(chooseStartMode({ ...FULL, WEB_ENABLED: "true", WEB_PASSWORD: "kurz" })).toEqual({ mode: "normal" });
+    expect(chooseStartMode({ ...FULL, WEB_ENABLED: "false" })).toEqual({ mode: "normal" });
   });
 
   test("leere Werte und Platzhalter aus .env.example zählen als fehlend", () => {
@@ -58,14 +87,17 @@ describe("chooseStartMode", () => {
 });
 
 describe("src/bot.ts (nur als Text)", () => {
-  test("wählt den Modus vor jeder Bot-Initialisierung und vor den FATAL-Prüfungen", async () => {
+  test("wählt den Modus vor jeder Bot-Initialisierung; kein FATAL-Abbruch mehr (Issue #228)", async () => {
     const bot = await Bun.file(join(repo, "src", "bot.ts")).text();
     expect(bot).toContain('import { chooseStartMode } from "./setup/start-mode";');
     const choose = bot.indexOf("const startMode = chooseStartMode(process.env);");
     const run = bot.indexOf('const { runSetupMode } = await import("./setup/web-mode");');
     expect(choose).toBeGreaterThan(bot.indexOf("await loadEnv("));
     expect(run).toBeGreaterThan(choose);
-    for (const later of ["FATAL: TELEGRAM_BOT_TOKEN", "FATAL: TELEGRAM_USER_ID", "new Bot(BOT_TOKEN)", "acquireLock())", "startWebUi({"]) {
+    // Ohne Telegram startet der Bot mit der WebUI allein: kein exit(1) je Schlüssel
+    expect(bot).not.toContain("FATAL: TELEGRAM_BOT_TOKEN");
+    expect(bot).not.toContain("FATAL: TELEGRAM_USER_ID");
+    for (const later of ["createTelegramRuntime({ env: process.env })", "acquireLock())", "startWebUi({"]) {
       expect(bot.indexOf(later)).toBeGreaterThan(run);
     }
     // Der Einrichtungsmodus endet mit process.exit, der Bot-Teil läuft danach nie

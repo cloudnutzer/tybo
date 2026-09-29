@@ -267,18 +267,19 @@ describe("API-Routen", () => {
     expect((await (await api(ctx, "/api/conversations")).json()).conversations).toHaveLength(1);
   });
 
-  test("ältere Gespräche auflisten; Anlegen ohne Topic-Verwaltung 503, kein Web-Gespräch", async () => {
+  test("Gespräche auflisten; Anlegen ohne Forum-Gruppe legt ein Web-Gespräch an (Issue #227)", async () => {
     const ctx = await start();
     const a = await createConversation(ctx);
     const b = await createConversation(ctx, { agent: "research" });
+    const created: string[] = [];
     for (const body of [undefined, "{}", '{"agent":"research"}']) {
       const res = await api(ctx, "/api/conversations", { method: "POST", body });
-      expect(res.status).toBe(503);
-      expect((await res.json()).error).toBe("Topics verwalten ist nicht eingerichtet");
+      expect(res.status).toBe(201);
+      created.push((await res.json()).conversation.id);
     }
 
     const list = (await (await api(ctx, "/api/conversations")).json()).conversations;
-    expect(list.map((c: any) => c.id).sort()).toEqual([a, b].sort());
+    expect(list.map((c: any) => c.id).sort()).toEqual([a, b, ...created].sort());
     const first = list.find((c: any) => c.id === a);
     expect(first).toMatchObject({ title: "Neues Gespräch", agent: "general" });
     expect(Object.keys(first).sort()).toEqual(["agent", "createdAt", "id", "title", "updatedAt"]);

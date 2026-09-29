@@ -374,9 +374,50 @@ function createSetupView(deps) {
     return overview.steps.findIndex(s => s.id === id);
   }
 
+  /**
+   * Kanäle aus der Übersicht (Issue #228): nur ok oder nicht. Ohne Angabe
+   * (eigener Schrittkatalog) gilt Telegram als eingerichtet, alles wie früher.
+   */
+  function channels() {
+    return overview.channels || { ready: true, telegram: true, webui: false };
+  }
+
+  /** Umweg Telegram → WebUI: danach geht es mit den Schritten nach Telegram weiter */
+  let detourFrom = null;
+
   function nextStepId() {
-    const i = stepIndex(current);
-    return i >= 0 && i + 1 < overview.steps.length ? overview.steps[i + 1].id : null;
+    const ids = overview.steps.map(s => s.id);
+    const ch = channels();
+    // Telegram weitergeklickt oder übersprungen, keine WebUI: sonst erreicht tybo niemanden
+    if (current === "telegram" && !ch.telegram && !ch.webui && ids.includes("webui")) return "webui";
+    const from = current === "webui" && detourFrom ? detourFrom : current;
+    const i = ids.indexOf(from);
+    if (i < 0) return null;
+    for (let j = i + 1; j < ids.length; j++) {
+      // Die WebUI war schon dran; ohne Telegram gibt es keine Forum-Gruppe
+      if (ids[j] === "webui" && detourFrom) continue;
+      if (ids[j] === "gruppe" && !ch.telegram && overview.channels) continue;
+      // Ohne WebUI gibt es keinen Zugang vom Handy (Issue #231)
+      if (ids[j] === "zugang" && !ch.webui && overview.channels) continue;
+      return ids[j];
+    }
+    return null;
+  }
+
+  /**
+   * Adresse der WebUI nach dem Start: vom Server aus der gespeicherten,
+   * geprüften Konfiguration (WEB_PORT), nie der Port dieses Assistenten
+   */
+  function webAddress() {
+    return channels().webAddress || "http://127.0.0.1:3100";
+  }
+
+  /** Endtext passend zu den Kanälen: WebUI, Telegram oder beides */
+  function reachText() {
+    const ch = channels();
+    if (ch.telegram && ch.webui) return "Schreib deinem Bot in Telegram oder öffne die WebUI unter " + webAddress() + ".";
+    if (ch.webui) return "Öffne die WebUI unter " + webAddress() + ".";
+    return "Schreib deinem Bot in Telegram.";
   }
 
   function header(s) {
@@ -455,7 +496,13 @@ function createSetupView(deps) {
       if (s.canTest) actionButtons.push(actionButton("Testen", "quiet-button", "test", () => test()));
     }
     const next = nextStepId();
-    if (next) actionButtons.push(actionButton("Weiter", "quiet-button", "next", () => open(next)));
+    if (next) {
+      actionButtons.push(actionButton("Weiter", "quiet-button", "next", () => {
+        // Umweg merken: nach der WebUI zurück zu den Schritten nach Telegram
+        if (current === "telegram" && next === "webui") detourFrom = "telegram";
+        open(next);
+      }));
+    }
     s.actionsBox.replaceChildren(...actionButtons);
     setBusy(busy);
   }
@@ -687,8 +734,10 @@ function createSetupView(deps) {
       }
       if (choice && choice.note) nodes.push(el("p", "setup-note", choice.note));
     }
+    const ch = channels();
+    const where = ch.telegram && ch.webui ? "in Telegram und in der WebUI" : ch.webui ? "in der WebUI" : "in Telegram";
     const hint = overview.supervisor
-      ? "Nach „Fertig“ startet " + brandName() + " von selbst neu und ist dann in Telegram erreichbar."
+      ? "Nach „Fertig“ startet " + brandName() + " von selbst neu und ist dann " + where + " erreichbar."
       : "Ohne Autostart steht nach „Fertig“ der Befehl zum Starten da.";
     nodes.push(el("p", "setup-note", hint));
     const actions = el("div", "settings-actions setup-actions");
@@ -729,6 +778,8 @@ function createSetupView(deps) {
       pre.appendChild(el("code", null, data.command));
       nodes.push(pre);
     }
+    // Wie man tybo danach erreicht (Issue #228): WebUI, Telegram oder beides
+    nodes.push(el("p", "settings-intro setup-reach", (data.command ? "Nach dem Start: " : "") + reachText()));
     nodes.push(el("p", "setup-note", "Der Einmal-Code gilt jetzt nicht mehr. Dieses Fenster kann zu."));
     panel.replaceChildren(...nodes);
     const h1 = nodes[0];
@@ -760,13 +811,19 @@ function createSetupView(deps) {
     }
   }
 
-  /** Erster Schritt, der nicht erledigt ist; sonst die Gesamtprüfung */
+  /**
+   * Erster Pflichtschritt, der nicht erledigt ist; ohne bereiten Kanal
+   * (Issue #228) zählt Telegram dazu. Sonst die Gesamtprüfung
+   */
   async function start() {
     try {
       const res = await call("GET", "/api/setup/overview");
       if (!res.ok) throw new Error("laden");
       overview = res.data;
-      const first = overview.steps.find(s => s.state !== "erledigt" && !s.optional) || overview.steps[overview.steps.length - 1];
+      const channelOpen = overview.channels && !overview.channels.ready;
+      const first =
+        overview.steps.find(s => s.state !== "erledigt" && (!s.optional || (channelOpen && s.id === "telegram"))) ||
+        overview.steps[overview.steps.length - 1];
       await open(first.id);
     } catch (e) {
       if (e.message !== "abgemeldet") panel.replaceChildren(el("p", "actions-error", "Einrichtung ließ sich nicht laden. Seite neu laden."));

@@ -2,12 +2,14 @@
  * Dateinachweis für GET /api/files/<id> im Bot-Prozess (Issue #47): Die id
  * muss in einem festgehaltenen Nur-Anzeige-Eintrag des Direktchats oder der
  * Forum-Gruppe stehen, dessen Gespräch es in der WebUI gibt (nicht in einem
- * gelöschten Topic). Wie bot-telegram.ts bindet nur src/bot.ts diese Datei
+ * gelöschten Topic). Seit Issue #227 auch im Web-Direktchat ("web") und in
+ * reinen Web-Gesprächen (web:<uuid>), nur solange es das Gespräch gibt. Wie bot-telegram.ts bindet nur src/bot.ts diese Datei
  * ein; alle Zugriffe kommen als Abhängigkeiten herein.
  */
 
 import { join } from "node:path";
 import { findDisplayOnlyFile, type DisplayOnlyRow } from "../lib/convex";
+import { dmChatId } from "../lib/channels";
 import { PROJECT_ROOT } from "../lib/env";
 import type { TopicStateEntry } from "../lib/topic-state";
 import type { FileSource, FilesDeps } from "./files";
@@ -17,10 +19,11 @@ import { parseTelegramConversationId } from "./telegram";
 
 type Env = Record<string, string | undefined>;
 
-const USER_ID_PATTERN = /^\d{1,20}$/;
+const USER_ID_PATTERN = /^(\d{1,20}|web)$/;
+const WEB_CONVERSATION_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export interface FileSourceDeps {
-  /** TELEGRAM_USER_ID */
+  /** Chat des Direktchats: TELEGRAM_USER_ID, ohne Telegram "web" */
   userId?: string;
   /** Chat-ID der Forum-Gruppe, bei jedem Aufruf neu */
   groupId(): string | null;
@@ -33,19 +36,22 @@ export interface FileSourceDeps {
 export function createFileSource(deps: FileSourceDeps): FileSource {
   const userId = deps.userId && USER_ID_PATTERN.test(deps.userId) ? deps.userId : null;
   return {
-    async find(id: string): Promise<NoticeFile | null> {
+    async find(id: string, webConversationIds: string[] = []): Promise<NoticeFile | null> {
       let groupId: string | null = null;
       try {
         groupId = deps.groupId();
       } catch {
         groupId = null;
       }
-      const chatIds = [userId, groupId].filter((c): c is string => !!c);
+      // Web-Gespräche nur, wenn es sie gibt (gelöschte fehlen in der Liste)
+      const webChats = webConversationIds.filter(c => WEB_CONVERSATION_PATTERN.test(c)).map(c => `web:${c}`);
+      const chatIds = [userId, groupId, ...webChats].filter((c): c is string => !!c);
       if (chatIds.length === 0) return null;
       const row = await deps.find(id, chatIds);
       if (!row || typeof row.chat_id !== "string") return null;
       const file = pickNotice(row.metadata)?.file;
       if (!file || file.id !== id) return null;
+      if (webChats.includes(row.chat_id)) return file;
       const metadata = row.metadata && typeof row.metadata === "object" ? row.metadata : {};
       const conversationId = liveConversationId({ chatId: row.chat_id, metadata }, userId, groupId);
       if (!conversationId) return null;
@@ -64,7 +70,7 @@ export function createFileSource(deps: FileSourceDeps): FileSource {
 export function createBotFiles(env: Env): FilesDeps {
   return {
     source: createFileSource({
-      userId: env.TELEGRAM_USER_ID,
+      userId: dmChatId(env),
       groupId: () => botGroupId(env),
       find: findDisplayOnlyFile,
       topicState: chatId => botTopicState.forChat(chatId),

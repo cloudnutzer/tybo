@@ -13,6 +13,7 @@ import type { EngineId } from "../lib/engines/types";
 import { appendFile, chmod, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pickApiAttachments, pickAttachment, type ApiAttachment, type MessageAttachment } from "./attachments";
+import { pickNoticeFile, type NoticeFile } from "./notice";
 
 export const DEFAULT_DATA_DIR = join(process.env.GO_PROJECT_ROOT || process.cwd(), "data", "web");
 export const DEFAULT_TITLE = "Neues Gespräch";
@@ -64,6 +65,8 @@ export interface StoredMessage extends ReplyInfo {
   attachments?: ApiAttachment[];
   /** Rückfrage aus dem Register, deren Knöpfe unter der Nachricht stehen (Issue #115) */
   choiceId?: string;
+  /** Datei einer Meldung aus der Outbox (Issue #227, nur bei kind "notice"), Download über /api/files */
+  file?: NoticeFile;
 }
 
 export interface NewMessage extends ReplyInfo {
@@ -74,7 +77,11 @@ export interface NewMessage extends ReplyInfo {
   source?: string;
   attachments?: ApiAttachment[];
   choiceId?: string;
+  file?: NoticeFile;
 }
+
+/** Kennung einer übernommenen Meldung (Issue #227): msgId aus dem Nachrichtenspeicher */
+const NOTICE_KEY_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
 /** Wie ID_RE in src/lib/choices.ts: Kennung einer Rückfrage aus dem Register */
 export const CHOICE_ID_PATTERN = /^[A-Za-z0-9]{1,12}$/;
@@ -251,16 +258,36 @@ export class ConversationStore {
 
   /** Hängt eine Nachricht an. Unbekannte oder ungültige ID: Fehler. */
   async appendMessage(id: string, msg: NewMessage): Promise<StoredMessage> {
+    return (await this.append(id, msg))!;
+  }
+
+  /**
+   * Meldung aus dem Nachrichtenspeicher übernehmen (Issue #227), höchstens
+   * einmal: key wird die ID der Nachricht; gibt es sie im Gespräch schon
+   * (auch nach einem Neustart), passiert nichts. null: schon da oder das
+   * Gespräch gibt es nicht (mehr).
+   */
+  async appendNoticeOnce(id: string, msg: NewMessage & { kind: "notice" }, key: string): Promise<StoredMessage | null> {
+    if (!NOTICE_KEY_PATTERN.test(key)) throw new Error("Ungültige Kennung");
+    return this.append(id, msg, key);
+  }
+
+  private async append(id: string, msg: NewMessage, key?: string): Promise<StoredMessage | null> {
     if (!isConversationId(id)) throw new Error("Ungültige Gesprächs-ID");
     // Anhänge (Issue #112) ohne Adressen ablegen; die kommen beim Lesen aus der Gesprächs-ID
     const attached: MessageAttachment[] = (msg.attachments ?? [])
       .map(pickAttachment)
       .filter((a): a is MessageAttachment => a !== null);
+    const file = msg.kind === "notice" ? pickNoticeFile(msg.file) : null;
     return this.serialized(async () => {
       const conversation = this.conversations.get(id);
-      if (!conversation) throw new Error("Unbekanntes Gespräch");
+      if (!conversation) {
+        if (key !== undefined) return null;
+        throw new Error("Unbekanntes Gespräch");
+      }
+      if (key !== undefined && (await this.readMessages(id)).some(m => m.id === key)) return null;
       const stored: Omit<StoredMessage, "attachments"> & { attachments?: MessageAttachment[] } = {
-        id: crypto.randomUUID(),
+        id: key ?? crypto.randomUUID(),
         role: msg.role,
         text: msg.text,
         createdAt: this.timestamp(),
@@ -269,7 +296,7 @@ export class ConversationStore {
         ...(msg.role === "assistant" && isChoiceId(msg.choiceId) ? { choiceId: msg.choiceId } : {}),
         ...(msg.role === "user" && attached.length ? { attachments: attached } : {}),
         ...(msg.kind === "notice"
-          ? { kind: "notice" as const, ...(msg.source ? { source: msg.source } : {}) }
+          ? { kind: "notice" as const, ...(msg.source ? { source: msg.source } : {}), ...(file ? { file } : {}) }
           : msg.role === "assistant"
             ? pickReplyInfo(msg)
             : {}),

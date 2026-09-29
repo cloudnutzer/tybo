@@ -4,7 +4,8 @@
 // Nebenmodellen und Fallback sowie „Status" mit „Jetzt neu starten" (Issue #39),
 // „Schlüssel" zum Setzen, Ersetzen und Entfernen von .env-Werten (Issue #63),
 // oben im Reiter „Agenten" der Abschnitt „Motor" mit Standard-Motor, Codex- und OpenCode-Einstellungen (Issue #129)
-// und abweichenden Gesprächen (Issue #126).
+// und abweichenden Gesprächen (Issue #126), „Benachrichtigungen" für Web Push
+// auf diesem Gerät aus push.js (Issue #225).
 // Wird vor app.js geladen; app.js ruft createSettingsView() auf und übergibt
 // api() (mit Umleitung zum Login bei 401), agentLabel() und onTab().
 // Nutzertext, Modellnamen, Anweisungen und Meldungen kommen nur über
@@ -18,6 +19,8 @@ const SETTINGS_TABS = [
   { id: "modelle", label: "Modelle", ready: true },
   { id: "schluessel", label: "Schlüssel", ready: true },
   { id: "status", label: "Status", ready: true },
+  // Web Push (Issue #225): nur mit push.js (vor settings.js geladen)
+  ...(typeof createPushSettings === "function" ? [{ id: "benachrichtigungen", label: "Benachrichtigungen", ready: true }] : []),
 ];
 /** Auswahlwerte, die kein Modellname sein können (Modellnamen haben keine Leerzeichen am Rand) */
 const MODEL_DEFAULT = " standard";
@@ -641,6 +644,19 @@ function createSettingsView(deps) {
      */
     keys: { phase: "idle", data: null, error: null, seq: 0, loadSeq: 0, loading: false, editors: new Map(), confirm: null, removing: null, rows: new Map(), restart: null, writes: new Map(), applied: new Map(), pending: new Map(), overlapped: new Set(), reconcile: new Set() },
   };
+
+  /** Reiter „Benachrichtigungen" (Issue #225) aus push.js; ohne push.js gibt es ihn nicht */
+  const pushSettings = typeof createPushSettings === "function"
+    ? createPushSettings({ api: deps.api, win: window, storage: pushStorage(), render, h, sectionNode })
+    : null;
+
+  function pushStorage() {
+    try {
+      return window.localStorage || null;
+    } catch {
+      return null;
+    }
+  }
 
   // --- Bausteine ------------------------------------------------------------
 
@@ -3637,6 +3653,10 @@ function createSettingsView(deps) {
   function renderPanel() {
     el.notice.hidden = true;
     el.notice.textContent = "";
+    if (state.tab === "benachrichtigungen" && pushSettings) {
+      el.panel.replaceChildren(...pushSettings.nodes());
+      return;
+    }
     if (state.tab === "status") {
       el.panel.replaceChildren(...statusPanel());
       return;
@@ -3700,6 +3720,8 @@ function createSettingsView(deps) {
       state.keys.rows.clear();
       void loadKeys();
     }
+    // Benachrichtigungen (Issue #225): Geräte und Abo bei jedem Öffnen des Reiters frisch
+    if (state.tab === "benachrichtigungen" && pushSettings && (!wasOpen || previousTab !== "benachrichtigungen")) pushSettings.open();
     // Status bei jedem Öffnen des Reiters frisch; wartet ein Neustart, geht das Nachfragen weiter
     if (state.tab === "status" && (!wasOpen || previousTab !== "status")) {
       void loadStatus().then(() => scheduleStatusPoll());
@@ -3765,6 +3787,7 @@ function createSettingsView(deps) {
     if (state.creating) return true;
     if (state.engines.resetting) return true;
     if (state.keys.editors.size || state.keys.pending.size) return true;
+    if (pushSettings && pushSettings.isBusy()) return true;
     return false;
   }
 

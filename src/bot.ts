@@ -14,23 +14,26 @@ import { createWebServer, type WebServer } from "./web/server";
 import { createApprovalTurns, createBotChat, createTelegramChat, webMediaDir } from "./web/bot-turn";
 import { createBotSessionReset } from "./web/bot-session-reset";
 import { createBotCommands } from "./web/bot-commands";
-import { createTelegramVoiceSender, createVoiceSynthesis } from "./lib/voice-message";
+import { createVoiceSynthesis } from "./lib/voice-message";
 import { createBotGoals } from "./web/bot-goals";
 import { createBotChoices } from "./web/bot-choices";
 import { sendAndRecord } from "./lib/outbox";
+import { dmChatId, isWebChatId, telegramConfigured } from "./lib/channels";
+import { createUserNotifier } from "./lib/user-notify";
 import type { IntentTurn } from "./web/bot-turn";
 import { createBotTelegram, createBotTelegramLive, botGroupId } from "./web/bot-telegram";
 import { startWebUi } from "./web/startup";
 import { chooseStartMode } from "./setup/start-mode";
+import { BRAND } from "./brand";
 import { createBotTopics } from "./web/bot-topics";
 import { botInstructions, botSettings } from "./web/bot-settings";
 import { createBotStatus } from "./web/bot-status";
 import { createBotEngines } from "./web/bot-engines";
 import { createBotKeys } from "./web/bot-keys";
+import { prepareBotPush } from "./web/bot-push";
 import { createBotFiles } from "./web/bot-files";
 import { UploadStore } from "./web/uploads";
 import { handleTopicServiceMessage, topicChanges } from "./web/topic-changes";
-import { rightsFromChatMember, type TelegramTopicApi } from "./web/topics";
 import { botAgentCatalog } from "./web/bot-agents";
 import { setToolApprovalHandler } from "./lib/tools/registry";
 import { createChoiceToolApproval, expireOrphanedToolChoices } from "./lib/tool-approval";
@@ -44,7 +47,7 @@ import { createChoiceToolApproval, expireOrphanedToolChoices } from "./lib/tool-
  * Usage: bun run src/bot.ts
  */
 
-import { Bot, Context, InputFile } from "grammy";
+import { Composer, Context, InputFile } from "grammy";
 import { join } from "path";
 import { readFile, writeFile, mkdir, unlink, stat } from "fs/promises";
 import { createWriteStream, existsSync } from "fs";
@@ -123,10 +126,11 @@ import {
   runningGoalLoopCount,
   goalResumeOnStart,
 } from "./lib/goal-engine";
-import { createTelegramGoalStatus, GOAL_NOTICE_SOURCE, handleGoalCallback, runGoalAction } from "./lib/goal-actions";
+import { createTelegramGoalStatus, handleGoalCallback, runGoalAction } from "./lib/goal-actions";
 import { createGoalChoices, GOAL_NO_BUTTONS_HINT } from "./lib/goal-choices";
 import { legacyToolApprovalMiddleware } from "./lib/telegram-tool-approval";
-import { createTelegramChoices, installTelegramChoices } from "./lib/telegram-choices";
+import { installTelegramChoices } from "./lib/telegram-choices";
+import { createTelegramRuntime, startAfterFirstSweep } from "./lib/telegram-runtime";
 import { learnFromSource } from "./lib/learn";
 import { captureTopicName, getTopicNames, recordTopicName, recordTopicNameIfMissing } from "./lib/topic-names";
 import { createQueueNotifier } from "./lib/queue-notice";
@@ -141,7 +145,8 @@ import { textToSpeech, initiatePhoneCall, isVoiceEnabled, isCallEnabled, waitFor
 import { isTranscriptionEnabled, getTranscriptionProvider } from "./lib/transcribe";
 import {
   saveMessage,
-  saveDisplayOnlyMessage,
+  getDisplayOnlyPage,
+  onMessageSaved,
   searchMessages,
   getRecentMessages,
   log as sbLog,
@@ -173,7 +178,6 @@ import { classifyComplexity } from "./lib/model-router";
 import * as creditGuard from "./lib/credit-guard";
 
 // Multi-Bot Agent Identity
-import { BotRegistry } from "./lib/bot-registry";
 import { capInvocations, parseInvocationTags, stripInvocationTags, executeVisibleInvocation } from "./lib/cross-agent";
 
 // Agents
@@ -226,20 +230,11 @@ if (startMode.mode === "setup") {
   process.exit(await runSetupMode({ root: PROJECT_ROOT, env: process.env, startMode, supervisor: () => detectSupervisor() }));
 }
 
-if (!BOT_TOKEN) {
-  console.error("FATAL: TELEGRAM_BOT_TOKEN is required. Set it in .env");
-  process.exit(1);
-}
-
-if (!ALLOWED_USER_ID) {
-  console.error("FATAL: TELEGRAM_USER_ID is required. Set it in .env");
-  process.exit(1);
-}
-
-const bot = new Bot(BOT_TOKEN);
-// Issue #52: jede Sendung und Bearbeitung über diesen Bot (ctx.reply,
-// ctx.editMessageText, direkte Api-Aufrufe) ohne Link-Vorschau, Text bereinigt
-installTelegramOutputGuard(bot.api);
+// Telegram-Teil (Issue #228, Entscheidung 0021): mit Telegram grammY-Bot samt
+// Output-Guard (Issue #52), Agenten-Bots und Rückfragen; ohne Telegram (nur
+// WebUI) kein Bot, kein Polling, keine Handler, keine Agenten-Bots, kein getMe.
+// Halbes Telegram kommt nicht bis hier: das erledigt chooseStartMode oben
+const telegramRuntime = createTelegramRuntime({ env: process.env });
 
 // ABORT_REPLY (lib/chat-turn): sentinel returned by callClaude/
 // callClaudeWithProgress when the subprocess was killed via /stop; callers
@@ -276,13 +271,23 @@ function resolveAgentName(raw: string): string | undefined {
   return isActiveAgent(canonical) ? canonical : undefined;
 }
 
-// Deliver the credit-guard's 80% warning + plan-change nudge to the owner's chat.
-creditGuard.setNotifier((msg) =>
-  bot.api.sendMessage(process.env.TELEGRAM_USER_ID || "", msg).catch(() => {})
-);
+// Bot-interne Meldungen an den Nutzer (Issue #227): Neustart, Credit-Guard, liegengebliebene
+// Aufgaben, Goal-Status. Alles ueber die Outbox: mit Telegram dorthin und einmal fuer die WebUI
+// festgehalten, ohne Telegram nur in der WebUI. Rueckfall fuer Ziele, die die Outbox ablehnt:
+// der Haupt-Bot wie bisher (sendStatusMessage)
+const notifyUser = createUserNotifier({
+  telegram: () => telegramConfigured(process.env),
+  send: (input) => sendAndRecord(input),
+  sendTelegram: (chatId, text, topicId, buttons) =>
+    sendStatusMessage(chatId, text, topicId, buttons ? { inline_keyboard: buttons } : undefined),
+  dmChatId: () => String(ALLOWED_USER_ID),
+});
 
-// Multi-bot registry (agent-specific bots for visible identities)
-const botRegistry = new BotRegistry(bot);
+// Deliver the credit-guard's 80% warning + plan-change nudge to the owner's chat (Klartext wie bisher).
+creditGuard.setNotifier((msg) => void notifyUser(msg, { format: "plain" }));
+
+// Multi-bot registry (agent-specific bots for visible identities); ohne Telegram ohne Netz
+const botRegistry = telegramRuntime.agents;
 
 // Befehls-Schicht (Issue #74): gemeinsame Funktionen fuer Telegram, Browser
 // und Terminal; Telegram-eigene Teile setzt telegramCommandInput dazu
@@ -490,8 +495,14 @@ const heartbeatInterval = setInterval(async () => {
 // Stale task reminders: check every 15 minutes
 const staleTaskInterval = setInterval(async () => {
   try {
-    if (BOT_TOKEN && ALLOWED_USER_ID) {
-      const reminded = await checkStaleTasks(BOT_TOKEN, ALLOWED_USER_ID);
+    // Gemeinsamer Meldeweg (Issue #227): mit Telegram samt Knoepfen wie bisher und fuer die WebUI
+    // festgehalten, ohne Telegram nur in der WebUI. Aufgaben des Direktchats: Telegram-Nutzer-ID
+    // (auch uebrig gebliebene nach dem Abschalten von Telegram) oder "web"
+    const owners = [...new Set([ALLOWED_USER_ID, dmChatId(process.env)].filter((id): id is string => !!id))];
+    if (owners.length) {
+      const reminded = await checkStaleTasks(BOT_TOKEN ?? "", owners, undefined, {
+        notify: (text, target) => notifyUser(text, target),
+      });
       if (reminded > 0) {
         console.log(`Sent ${reminded} stale task reminder(s)`);
       }
@@ -531,7 +542,7 @@ async function shutdown(signal: string): Promise<void> {
   clearInterval(restartCheckInterval);
 
   try {
-    bot.stop();
+    telegramRuntime.stop();
   } catch {
     // Bot may not have started
   }
@@ -586,7 +597,10 @@ const restartControl = createRestartControl({
   busyCount: () => activeEngineCallCount() + activeExecutionCount() + runningGoalLoopCount(),
   detectSupervisor: () => detectSupervisor(),
   closeIntake,
-  send: (text, chatId, topicId) => sendStatusMessage(chatId || String(ALLOWED_USER_ID), text, topicId),
+  // Gemeinsamer Weg (Issue #227): mit Telegram wie bisher, ohne nur in die WebUI
+  send: async (text, chatId, topicId) => {
+    await notifyUser(text, { chatId, topicId });
+  },
   shutdown: reason => shutdown(reason),
   isShuttingDown: () => isShuttingDown,
 });
@@ -614,14 +628,12 @@ process.on("uncaughtException", async (error) => {
 // 6. Security Middleware
 // ---------------------------------------------------------------------------
 
-// Global error handler — prevents Grammy from dumping full Context objects
-bot.catch((err) => {
-  const e = err.error;
-  const errMsg = e instanceof Error ? e.message : String(e);
-  console.error(`BotError [update ${err.ctx?.update?.update_id}]: ${errMsg}`);
-});
+// Alle Telegram-Handler sammeln sich hier und hängen erst beim Start am Bot
+// (telegramRuntime.bot, Issue #228): ohne Telegram gibt es keinen Bot, also
+// auch keine Handler. Den globalen Fehler-Handler setzt telegramRuntime
+const telegramHandlers = new Composer<Context>();
 
-bot.use(async (ctx, next) => {
+telegramHandlers.use(async (ctx, next) => {
   const userId = String(ctx.from?.id || "");
   if (userId !== ALLOWED_USER_ID) {
     // Silently ignore messages from unauthorized users
@@ -631,13 +643,14 @@ bot.use(async (ctx, next) => {
 });
 
 // Freigabe-Knöpfe "toolapproval:" aus der Zeit vor dem Rückfragen-Register (Issue #116)
-bot.on("callback_query:data", legacyToolApprovalMiddleware(ALLOWED_USER_ID));
+telegramHandlers.on("callback_query:data", legacyToolApprovalMiddleware(ALLOWED_USER_ID ?? ""));
 
 // Rückfragen-Register (Issue #114): "ch|"-Knöpfe nach der Besitzerprüfung und
 // vor dem allgemeinen Callback-Handler; der Zuhörer zieht Telegram-Nachrichten
 // nach, wenn eine Frage im Browser/Terminal entschieden wird oder abläuft
-const telegramChoices = createTelegramChoices({ api: bot.api, owner: ALLOWED_USER_ID });
-installTelegramChoices(bot, telegramChoices);
+// Ohne Telegram (Issue #227) halten Rückfragen nur für die WebUI fest, ohne Knöpfe in Telegram
+const telegramChoices = telegramRuntime.choices;
+if (telegramRuntime.telegram) installTelegramChoices(telegramHandlers, telegramChoices);
 
 // Merk-Vorschlaege und Routine-Angebote (Issue #117): eine Entscheidung aus
 // Telegram, Browser oder Terminal nimmt den Vorschlag genau einmal heraus
@@ -649,10 +662,12 @@ const reviewResults = createReviewResults({
   decideReview: (action, reviewId) => decideReview(action, reviewId),
   createRoutine: (session, hint, epoch) => createRoutineFromSession(session, hint, {}, epoch),
   sendAndRecord: (input) => sendAndRecord(input),
-  sendTelegram: (chatId, text, topicId) => sendDirectMessage(chatId, text, topicId),
+  // Web-Direktchat ohne Telegram (Issue #227): der Bericht kommt ueber saveMessage in den Verlauf
+  sendTelegram: (chatId, text, topicId) => (isWebChatId(chatId) ? Promise.resolve() : sendDirectMessage(chatId, text, topicId)),
   saveMessage: (message) => saveMessage(message),
   postWeb: postReviewToWeb,
-  dmChatId: () => ALLOWED_USER_ID || undefined,
+  // Kopie im Direktchat nur mit Telegram; ohne zeigt das Web-Gespraech selbst (und Push)
+  dmChatId: () => (telegramConfigured(process.env) ? ALLOWED_USER_ID || undefined : undefined),
 });
 onChoiceDecided("review", reviewResults.handler);
 
@@ -701,7 +716,7 @@ void expireOrphanedToolChoices()
 // Service-Nachrichten ohne Text: Name merken und offene WebUI-Browser
 // benachrichtigen, nur fuer die Forum-Gruppe der WebUI. Fehler loggt
 // handleTopicServiceMessage selbst.
-bot.on(["message:forum_topic_created", "message:forum_topic_edited"], (ctx) => {
+telegramHandlers.on(["message:forum_topic_created", "message:forum_topic_edited"], (ctx) => {
   void handleTopicServiceMessage(
     {
       groupId: () => botGroupId(process.env),
@@ -715,7 +730,7 @@ bot.on(["message:forum_topic_created", "message:forum_topic_edited"], (ctx) => {
 
 // --- Text Messages ---
 
-bot.on("message:text", (ctx) => {
+telegramHandlers.on("message:text", (ctx) => {
   // Fire-and-forget: don't block Grammy's update loop
   handleUpdateScope(ctx, () => handleTextMessage(ctx)).catch((err) => {
     console.error("Text handler error:", err);
@@ -1012,7 +1027,7 @@ async function handleTextMessage(ctx: Context): Promise<void> {
 
 // --- Voice Messages ---
 
-bot.on("message:voice", (ctx) => {
+telegramHandlers.on("message:voice", (ctx) => {
   handleUpdateScope(ctx, () => handleVoiceMessage(ctx)).catch((err) => {
     console.error("Voice handler error:", err);
   });
@@ -1092,7 +1107,7 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
 
 // --- Photo Messages ---
 
-bot.on("message:photo", (ctx) => {
+telegramHandlers.on("message:photo", (ctx) => {
   handleUpdateScope(ctx, () => handlePhotoMessage(ctx)).catch((err) => {
     console.error("Photo handler error:", err);
   });
@@ -1184,7 +1199,7 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
 
 // --- Document Messages ---
 
-bot.on("message:document", (ctx) => {
+telegramHandlers.on("message:document", (ctx) => {
   handleUpdateScope(ctx, () => handleDocumentMessage(ctx)).catch((err) => {
     console.error("Document handler error:", err);
   });
@@ -1270,7 +1285,7 @@ async function handleDocumentMessage(ctx: Context): Promise<void> {
 
 // --- Video Messages ---
 
-bot.on(["message:video", "message:video_note"], (ctx) => {
+telegramHandlers.on(["message:video", "message:video_note"], (ctx) => {
   handleUpdateScope(ctx, () => handleVideoMessage(ctx)).catch((err) => {
     console.error("Video handler error:", err);
   });
@@ -1364,7 +1379,7 @@ async function handleVideoMessage(ctx: Context): Promise<void> {
 
 // --- Callback Queries (Human-in-the-Loop Buttons) ---
 
-bot.on("callback_query:data", (ctx) => {
+telegramHandlers.on("callback_query:data", (ctx) => {
   handleUpdateScope(ctx, () => handleCallbackQuery(ctx)).catch((err) => {
     console.error("Callback query error:", err);
   });
@@ -1934,31 +1949,16 @@ function extractUserName(profile: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Send a long response directly via bot.api (no Context needed).
- * Converts Markdown to HTML, chunks long messages, retries as plain text.
+ * Send a long response directly via the main bot (no Context needed).
+ * Markdown als HTML, in Stücken, Rückfall Klartext: telegramRuntime.sendMessage
+ * (ohne Telegram abgelehnt, Issue #228).
  */
-async function sendDirectMessage(
+function sendDirectMessage(
   chatId: string | number,
   text: string,
   threadId?: number
 ): Promise<void> {
-  const html = markdownToTelegramHTML(text);
-  const chunks = chunkForTelegram(html);
-  const opts: Record<string, any> = { link_preview_options: NO_LINK_PREVIEW };
-  if (threadId) opts.message_thread_id = threadId;
-
-  for (const chunk of chunks) {
-    try {
-      await bot.api.sendMessage(chatId, chunk, { parse_mode: "HTML", ...opts });
-    } catch (htmlErr) {
-      console.warn(`[sendDirectMessage] HTML send failed (${chunk.length} chars), retrying plain:`, htmlErr);
-      try {
-        await bot.api.sendMessage(chatId, stripHtmlTags(chunk), opts);
-      } catch (plainErr) {
-        console.error(`[sendDirectMessage] DELIVERY FAILED (${chunk.length} chars) — message lost:`, plainErr);
-      }
-    }
-  }
+  return telegramRuntime.sendMessage(chatId, text, threadId);
 }
 
 /**
@@ -1969,9 +1969,10 @@ async function sendDirectMessage(
 const processDeps: ProcessBackgroundDeps = {
   sessionKey: (chatId, threadId) => sessionKeyFor(chatId, threadId ?? null),
   send: (chatId, text, threadId) => sendDirectMessage(chatId, text, threadId),
-  typing: async chatId => { await bot.api.sendChatAction(chatId, "typing"); },
+  typing: chatId => telegramRuntime.typing(chatId),
   downloadPhoto: async photoFileId => {
-    // VPS forwarded a photo — download from Telegram
+    // VPS forwarded a photo: download from Telegram (ohne Telegram gibt es nichts zu laden)
+    if (!telegramRuntime.telegram) return null;
     const file = await fetch(
       `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${photoFileId}`
     ).then((r) => r.json()) as any;
@@ -2075,21 +2076,14 @@ const webChat = createBotChat({ ...webTurnDeps, uploads: webUploads, approvals: 
 const telegramWebChat = createTelegramChat({
   ...webTurnDeps,
   approvals: approvalTurns,
-  userId: process.env.TELEGRAM_USER_ID,
+  userId: dmChatId(process.env),
   groupId: () => botGroupId(process.env),
   agentForTopic: (topicId, chatId) => getAgentByTopicId(topicId, chatId),
   // Klartext ohne HTML-Modus: der Text kommt unveraendert an; Fehler wirft (dann kein Turn)
-  sendPlain: async (chatId, text, threadId) => {
-    await bot.api.sendMessage(chatId, text, threadId ? { message_thread_id: threadId } : {});
-  },
+  sendPlain: (chatId, text, threadId) => telegramRuntime.sendPlain(chatId, text, threadId),
   sendAsAgent: (agent, chatId, text, threadId) => botRegistry.sendAsAgent(agent, chatId, text, { threadId }),
   // Anhaenge (Issue #72): vom Haupt-Bot als Foto bzw. Dokument, Beschriftung als Klartext; Fehler wirft
-  sendFile: async (chatId, file, { as, caption, threadId }) => {
-    const input = new InputFile(file.bytes, file.name);
-    const options = { caption, ...(threadId ? { message_thread_id: threadId } : {}) };
-    if (as === "photo") await bot.api.sendPhoto(chatId, input, options);
-    else await bot.api.sendDocument(chatId, input, options);
-  },
+  sendFile: (chatId, file, options) => telegramRuntime.sendFile(chatId, file, options),
   uploads: webUploads,
   // [INVOKE:] aus Browser-Antworten wie in Telegram (Issue #76): Budget, Rechte, Antwort vom Agenten-Bot
   invokeBudget: INVOKE_BUDGET,
@@ -2097,32 +2091,10 @@ const telegramWebChat = createTelegramChat({
   // Aktives /goal: Gates und Judge auch nach Antworten im Browser
   onAgentTurn: (sessionKey, agent, response) => void onAgentTurnForGoal(sessionKey, agent, response),
 });
-// Topics aus der WebUI anlegen und verwalten (Issue #29): Adapter um grammY
-// bot.api. Rechte des Haupt-Bots per getChatMember mit der eigenen Bot-ID.
-let mainBotId: number | null = null;
-const telegramTopicApi: TelegramTopicApi = {
-  createForumTopic: async (chatId, name) => ({ topicId: (await bot.api.createForumTopic(chatId, name)).message_thread_id }),
-  editForumTopic: async (chatId, topicId, name) => {
-    await bot.api.editForumTopic(chatId, topicId, { name });
-  },
-  closeForumTopic: async (chatId, topicId) => {
-    await bot.api.closeForumTopic(chatId, topicId);
-  },
-  reopenForumTopic: async (chatId, topicId) => {
-    await bot.api.reopenForumTopic(chatId, topicId);
-  },
-  deleteForumTopic: async (chatId, topicId) => {
-    await bot.api.deleteForumTopic(chatId, topicId);
-  },
-  getMyRights: async chatId => {
-    mainBotId ??= (await bot.api.getMe()).id;
-    return rightsFromChatMember(await bot.api.getChatMember(chatId, mainBotId));
-  },
-};
 // Slash-Befehle aus Browser und Terminal (Issue #74): dieselbe Befehls-Schicht
 // wie Telegram; Antworten gehen ueber den Haupt-Bot und werden als Meldung festgehalten
 const webResetConversation = createBotSessionReset({
-  userId: process.env.TELEGRAM_USER_ID,
+  userId: dmChatId(process.env),
   groupId: () => botGroupId(process.env),
   agentForTopic: (topicId, chatId) => getAgentByTopicId(topicId, chatId),
 });
@@ -2130,12 +2102,10 @@ const webCommands = createBotCommands({
   ...webTurnDeps,
   registry: commandRegistry,
   services: commandServices,
-  userId: process.env.TELEGRAM_USER_ID,
+  userId: dmChatId(process.env),
   groupId: () => botGroupId(process.env),
   agentForTopic: (topicId, chatId) => getAgentByTopicId(topicId, chatId),
-  sendPlain: async (chatId, text, threadId) => {
-    await bot.api.sendMessage(chatId, text, threadId ? { message_thread_id: threadId } : {});
-  },
+  sendPlain: (chatId, text, threadId) => telegramRuntime.sendPlain(chatId, text, threadId),
   sendAndRecord: (input) => sendAndRecord(input),
   resetConversation: webResetConversation,
   sendAsAgent: (agent, chatId, text, threadId) => botRegistry.sendAsAgent(agent, chatId, text, { threadId }),
@@ -2150,7 +2120,8 @@ const webCommands = createBotCommands({
   // den Bytes, WAV nach Ogg/Opus (sonst keine Sprachnachricht); Versand per sendVoice ueber
   // den Haupt-Bot, nicht gespeichert
   voice: createVoiceSynthesis({ enabled: isVoiceEnabled, textToSpeech, log: (m) => console.log(`[web] ${m}`) }),
-  sendVoice: createTelegramVoiceSender(bot.api),
+  // Ohne Telegram kein Voice-Sender (Issue #228): /voice meldet dann, dass es nicht geht
+  sendVoice: telegramRuntime.voiceSender,
 });
 webServer = await startWebUi({
   env: process.env,
@@ -2166,7 +2137,8 @@ webServer = await startWebUi({
   resetSession: sessionKey => resetSession(sessionKey),
   // /new aus tybo (Issue #61): gleicher Schluessel wie beim Schreiben, Destillat wie /new
   resetConversation: webResetConversation,
-  topics: createBotTopics(process.env, telegramTopicApi),
+  // Topics aus der WebUI (Issue #29) nur mit Telegram (Issue #228): ohne keine Topic-API, Rechte group: false
+  topics: telegramRuntime.topicApi ? createBotTopics(process.env, telegramRuntime.topicApi) : undefined,
   // Einstellungsseiten (Issue #36): config/settings.json und /agent-Anweisungen
   settings: botSettings,
   instructions: botInstructions,
@@ -2177,19 +2149,21 @@ webServer = await startWebUi({
   // Motor-Wahl in der WebUI (Issue #126): Standard, Codex-Einstellungen, abweichende Gespraeche,
   // Verfuegbarkeit (Claude Code wird dabei wirklich geprueft), Motor-Pille in der Kopfzeile
   engines: createBotEngines({
-    userId: process.env.TELEGRAM_USER_ID,
+    userId: dmChatId(process.env),
     groupId: () => botGroupId(process.env),
     agentForTopic: (topicId, chatId) => getAgentByTopicId(topicId, chatId),
   }),
   // Schluessel-Seite (Issue #62): dieselbe .env, die oben geladen wurde; Aendern nur mit WEB_ALLOW_KEY_EDIT=true
   keys: createBotKeys(process.env),
+  // Web Push (Issue #225): VAPID-Schluessel aus der .env, fehlen beide, legt der Bot sie hier einmal an
+  push: (await prepareBotPush(process.env)) ?? undefined,
   // Dateien aus Meldungen (Issue #47): nur mit festgehaltenem Eintrag, aus data/outbox
   files: createBotFiles(process.env),
   uploads: webUploads,
   commands: webCommands,
   // Status-Karte der Ziele (Issue #76): dieselben Aktionen wie die Telegram-Knoepfe
   goals: createBotGoals({
-    userId: process.env.TELEGRAM_USER_ID,
+    userId: dmChatId(process.env),
     groupId: () => botGroupId(process.env),
     agentForTopic: (topicId, chatId) => getAgentByTopicId(topicId, chatId),
     get: getGoal,
@@ -2200,35 +2174,30 @@ webServer = await startWebUi({
   }),
   // Rueckfrage-Knoepfe (Issue #115): dasselbe Register wie die Telegram-Knoepfe (#114)
   choices: createBotChoices(process.env),
+  // Meldungen fuer reine Web-Gespraeche (Issue #227): notify, Jobs und pipeline-say mit
+  // TYBO_CONVERSATION_ID; der Bot uebernimmt sie ins Web-Gespraech und holt nach Ausfaellen nach
+  webNotices: { page: getDisplayOnlyPage, onMessageSaved },
 });
 
 // ---------------------------------------------------------------------------
 // 11. Bot Startup
 // ---------------------------------------------------------------------------
 
-// Initialize multi-bot agent identities (outbound-only, no polling)
-await botRegistry.initialize();
+// Initialize multi-bot agent identities (outbound-only, no polling); ohne Telegram nichts
+await telegramRuntime.initialize();
 
 // ---------------------------------------------------------------------------
 // Goal engine, session review, tool approval — bot-level wiring
 // ---------------------------------------------------------------------------
 
-/** Send a plain/HTML status message, optionally with an inline keyboard. */
-async function sendStatusMessage(
+/** Send a plain/HTML status message, optionally with an inline keyboard (telegramRuntime.sendStatus). */
+function sendStatusMessage(
   chatId: string,
   text: string,
   threadId?: number,
   keyboard?: unknown
 ): Promise<void> {
-  const opts: Record<string, any> = { link_preview_options: NO_LINK_PREVIEW };
-  if (threadId) opts.message_thread_id = threadId;
-  if (keyboard) opts.reply_markup = keyboard;
-  const html = markdownToTelegramHTML(text);
-  try {
-    await bot.api.sendMessage(chatId, html, { parse_mode: "HTML", ...opts });
-  } catch {
-    await bot.api.sendMessage(chatId, stripHtmlTags(html), opts).catch(() => {});
-  }
+  return telegramRuntime.sendStatus(chatId, text, threadId, keyboard);
 }
 
 initGoalEngine({
@@ -2243,21 +2212,17 @@ initGoalEngine({
   },
   // Abbruch durch Neustart/SIGTERM pausiert kein Ziel (Issue #190)
   isShuttingDown: () => isShuttingDown,
+  // Web-Direktchat ohne Telegram (Issue #227): die Antwort kommt ueber saveMessage in den Verlauf
   sendAsAgent: (goalAgent, goalChatId, goalText, goalTopicId) =>
-    botRegistry.sendAsAgent(goalAgent, goalChatId, goalText, { threadId: goalTopicId }),
+    isWebChatId(goalChatId) ? Promise.resolve() : botRegistry.sendAsAgent(goalAgent, goalChatId, goalText, { threadId: goalTopicId }),
   // Telegram wie bisher; Pause, Wartet, Fertig zusaetzlich als Meldung fuer die WebUI (Issue #76).
   // Die Budget-Frage als Rueckfrage mit Knoepfen in Telegram und Browser (Issue #118)
   sendStatus: createTelegramGoalStatus({
-    send: sendStatusMessage,
+    // Gemeinsamer Meldeweg (Issue #227): mit Telegram gesendet und genau einmal festgehalten,
+    // ohne Telegram nur fuer die WebUI; der Zwischenstand je Turn nur in Telegram
+    notify: notifyUser,
     ask: (target, text) => goalChoices.ask(target, text),
     noButtonsHint: GOAL_NO_BUTTONS_HINT,
-    record: (target, message) =>
-      saveDisplayOnlyMessage({
-        chat_id: target.chatId,
-        role: "assistant",
-        content: message.text,
-        metadata: { display_only: true, source: GOAL_NOTICE_SOURCE, ...(target.topicId ? { topicId: target.topicId } : {}) },
-      }),
   }),
 });
 
@@ -2277,12 +2242,13 @@ await mcpManager.init().catch((err: any) => {
 });
 
 console.log("=".repeat(50));
-console.log("Go Telegram Bot - Starting");
+console.log(`${BRAND.name} - Starting`);
 console.log("=".repeat(50));
 console.log(`PID:         ${process.pid}`);
 console.log(`Project:     ${PROJECT_ROOT}`);
 console.log(`Timezone:    ${TIMEZONE}`);
 console.log(`Health:      http://localhost:${HEALTH_PORT}/health`);
+console.log(`Telegram:    ${telegramRuntime.telegram ? "an" : "nicht eingerichtet (nur WebUI)"}`);
 console.log(`WebUI:       ${webServer ? "an (Adressen in der [web]-Zeile oben)" : "aus"}`);
 console.log(`Claude:      ${CLAUDE_PATH}`);
 console.log(`Voice:       ${isVoiceEnabled() ? "enabled" : "disabled"}`);
@@ -2334,18 +2300,17 @@ void recoverJobsUntilSettled(createJobDeps({ root: PROJECT_ROOT, env: process.en
 const sweepChoices = () => telegramChoices.sweep()
   .then(expired => { if (expired.length) console.log(`[choices] ${expired.length} Rückfragen abgelaufen`); })
   .catch(e => console.error(`[choices] Ablauf-Prüfung gescheitert (${e instanceof Error ? e.name : "Fehler"})`));
-void sweepChoices();
+const firstSweep = sweepChoices();
 setInterval(() => { void sweepChoices(); }, 60_000).unref();
 
 // Start polling. Aktive Ziele nach einem Neustart erst fortsetzen, wenn grammY
-// die Initialisierung abgeschlossen hat (onStart, Issue #190)
+// die Initialisierung abgeschlossen hat (onStart, Issue #190); ohne Telegram
+// (Issue #228) genau einmal hier, nach WebUI, Goal-Engine, Review, MCP und der
+// ersten Ablauf-Prüfung (startAfterFirstSweep wartet sie ab).
+// Die Handler hängen nur mit Telegram am Bot
 const resumeGoalsOnStart = goalResumeOnStart();
-bot.start({
-  onStart: (botInfo) => {
-    console.log(`Bot online as @${botInfo.username}`);
-    void resumeGoalsOnStart();
-  },
-});
+telegramRuntime.bot?.use(telegramHandlers);
+void startAfterFirstSweep(telegramRuntime, firstSweep, resumeGoalsOnStart);
 
 async function callClaude(userMessage: string, chatId: string, agentName = "general", topicId?: number, onInfo?: (info: TurnInfo) => void, onTools?: (tools: TurnTools | undefined) => void, onSessionId?: SessionIdListener, onSessionMeta?: SessionMetaListener): Promise<string> {
   try {

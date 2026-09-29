@@ -160,23 +160,27 @@ describe("Agentenliste", () => {
       { name: "research", label: "Research" },
     ]);
     expect((await api(ctx, "/api/conversations", "POST", { agent: "cto" })).status).toBe(400);
-    // Gültiger Agent: geprüft wird bestanden, ohne Topic-Verwaltung dann 503 (Issue #29)
-    expect((await api(ctx, "/api/conversations", "POST", { agent: "research" })).status).toBe(503);
+    // Gültiger Agent: geprüft wird bestanden; ohne Forum-Gruppe ein Web-Gespräch (Issue #227)
+    expect((await api(ctx, "/api/conversations", "POST", { agent: "research" })).status).toBe(201);
   });
 });
 
 describe("Anlegen mit Agent", () => {
-  test("gültige Agenten bestehen die Prüfung (ohne Topic-Verwaltung 503), unbekannter Agent 400; nie ein Web-Gespräch", async () => {
+  test("gültige Agenten bestehen die Prüfung (ohne Forum-Gruppe Web-Gespräch, Issue #227), unbekannter Agent 400 ohne Gespräch", async () => {
     const ctx = await start();
+    const agents: string[] = [];
     for (const body of [{ agent: "research" }, {}, undefined]) {
-      expect((await api(ctx, "/api/conversations", "POST", body)).status).toBe(503);
+      const res = await api(ctx, "/api/conversations", "POST", body);
+      expect(res.status).toBe(201);
+      agents.push((await res.json()).conversation.agent);
     }
+    expect(agents).toEqual(["research", "general", "general"]);
     for (const agent of ["hacker", "zz", "general2", 5, "", null]) {
       const res = await api(ctx, "/api/conversations", "POST", { agent });
       expect(res.status).toBe(400);
       expect((await res.json()).error).toBe("Ungültiger Agent");
     }
-    expect((await (await api(ctx, "/api/conversations")).json()).conversations).toHaveLength(0);
+    expect((await (await api(ctx, "/api/conversations")).json()).conversations).toHaveLength(3);
   });
 });
 

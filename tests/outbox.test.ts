@@ -198,11 +198,12 @@ describe("Eingabevertrag", () => {
     expect(recorded).toHaveLength(0);
   });
 
-  test("ohne Bot-Token wird nichts gesendet", async () => {
-    const { deps, sent } = fakeDeps();
+  test("ohne Bot-Token wird nichts gesendet, nur für die WebUI festgehalten (Issue #227)", async () => {
+    const { deps, sent, recorded } = fakeDeps();
     const result = await sendAndRecord({ text: "x", source: "pipeline" }, { ...deps, botToken: "" });
-    expect(result.error?.kind).toBe("invalid");
+    expect(result).toEqual({ sent: false, recorded: true });
     expect(sent).toHaveLength(0);
+    expect(recorded[0].chat_id).toBe("web");
   });
 });
 

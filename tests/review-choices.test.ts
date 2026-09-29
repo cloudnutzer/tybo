@@ -303,7 +303,7 @@ describe("Akzeptanz: Verwerfen in Telegram", () => {
     expect(w.applied).toEqual([]);
     expect(pendingOnDisk()).toEqual({});
     // Live-Änderung an das Gespräch (SSE choice), daraus zeigt app.js „Erledigt: Verwerfen · in Telegram“
-    const change = w.changes.find(c => c.choice.id === choice.id)!;
+    const change = w.changes.find(c => c.choice.id === choice.id && !c.created)!;
     expect(change.conversationId).toBe("topic-9");
     expect(change.choice).toMatchObject({ state: "done", options: [], result: { key: "no", label: "Verwerfen", via: "telegram" } });
     expect(edits()).toEqual([{ chatId: GROUP, messageId, text: `${choice.text}\n\n✓ Verwerfen (in Telegram)` }]);
@@ -471,7 +471,7 @@ describe("Reines Web-Gespräch", () => {
     const { choice, messageId } = await webProposal();
     await w.click(`ch|${choice.id}|no`, messageId, USER);
     expect(w.applied).toEqual([]);
-    const change = w.changes.find(c => c.choice.id === choice.id)!;
+    const change = w.changes.find(c => c.choice.id === choice.id && !c.created)!;
     expect(change).toMatchObject({ conversationId: WEB_ID, copyInDm: true, choice: { state: "done", result: { label: "Verwerfen", via: "telegram" } } });
     expect(w.web.at(-1)!.post.text).toBe(REVIEW_TEXT.discarded);
   });
@@ -654,7 +654,8 @@ describe("Verdrahtung in src/bot.ts", async () => {
   test("Handler der Art review über decideReview, Ergebnis über sendAndRecord, Routine wie bisher", () => {
     expect(bot).toContain('onChoiceDecided("review", reviewResults.handler);');
     expect(bot).toContain("createRoutine: (session, hint, epoch) => createRoutineFromSession(session, hint, {}, epoch),");
-    expect(bot).toContain("sendTelegram: (chatId, text, topicId) => sendDirectMessage(chatId, text, topicId),");
+    // Issue #227: Web-Chat-IDs nie an Telegram
+    expect(bot).toContain("sendTelegram: (chatId, text, topicId) => (isWebChatId(chatId) ? Promise.resolve() : sendDirectMessage(chatId, text, topicId)),");
     expect(bot).toContain("saveMessage: (message) => saveMessage(message),");
     // Die Routine-Ausführung steht nicht mehr im Callback-Handler
     expect(bot).not.toContain("createRoutineFromSession(\n        decision.session");

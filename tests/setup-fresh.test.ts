@@ -352,6 +352,7 @@ function methods(p: FakeProviders): string[] {
 
 const RUN_A = [
   "", // Auswahl nach der Übersicht: nur offene Schritte
+  "j", // Telegram (optional seit Issue #228): Jetzt einrichten?
   FAKE.token,
   FAKE.userId,
   "", // Speichern? Standard Ja
@@ -376,6 +377,7 @@ const RUN_A = [
 
 const RUN_B = [
   "",
+  "j", // Telegram: Jetzt einrichten?
   FAKE.token,
   FAKE.userId,
   "",
@@ -406,6 +408,9 @@ const RUN_B = [
   "1", // Nur dieser Rechner
   "", // Port: Standard
   "",
+  "j", // Zugang vom Handy: Jetzt einrichten? (Issue #231)
+  "3", // Nur auf diesem Rechner, keinen zusätzlichen Zugang einrichten
+  "", // Speichern? (ändert nichts)
   "j", // Autostart jetzt einrichten?
 ];
 
@@ -516,8 +521,10 @@ describe("frischer Rechner: tybo setup bis zur ersten Antwort", () => {
     expect(fresh.code).toBe(0);
     expect(fresh.left).toBe(0);
     expect(overview.complete).toBe(true);
-    // Semantische Suche übersprungen: bleibt offen, ohne „fertig“ zu verhindern
-    expect(overview.open).toEqual(["suche"]);
+    // Semantische Suche übersprungen, Zugang vom Handy „nur dieser Rechner“: bleiben offen, ohne „fertig“ zu verhindern
+    expect(overview.open).toEqual(["suche", "zugang"]);
+    expect(fresh.out).toContain("Kein zusätzlicher Zugang eingerichtet.");
+    expect(fresh.out).toContain("Geprüft, unverändert: Zugang vom Handy");
     expect(check.ok).toBe(true);
     expect(check.items?.map(i => i.label)).toEqual([
       "Voraussetzungen",
@@ -531,7 +538,7 @@ describe("frischer Rechner: tybo setup bis zur ersten Antwort", () => {
     expect(fresh.out).toContain("Gespeichert: Telegram, Forum-Gruppe, Datenbank, Profil, Modelle und Fallback, WebUI, Autostart");
     expect(fresh.out).toContain("tybo läuft über den Autostart");
 
-    // .env: Telegram, Gruppe, Supabase, Profil, OpenRouter-Schlüssel, WebUI; Modelle stehen nicht hier
+    // .env: Telegram, Gruppe, Supabase, Profil, OpenRouter-Schlüssel, WebUI samt Push-Schlüsseln (Issue #225); Modelle stehen nicht hier
     expect(await readEnvFile(ctx.envPath)).toEqual({
       TELEGRAM_BOT_TOKEN: FAKE.token,
       TELEGRAM_USER_ID: FAKE.userId,
@@ -545,6 +552,8 @@ describe("frischer Rechner: tybo setup bis zur ersten Antwort", () => {
       WEB_ENABLED: "true",
       WEB_PASSWORD: FAKE.webPassword,
       WEB_HOST: "127.0.0.1",
+      WEB_PUSH_PUBLIC_KEY: expect.stringMatching(/^B[A-Za-z0-9_-]{86}$/),
+      WEB_PUSH_PRIVATE_KEY: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
     });
     expect((await stat(ctx.envPath)).mode & 0o777).toBe(0o600);
     expect(await readFile(ctx.profilePath, "utf8")).toBe(

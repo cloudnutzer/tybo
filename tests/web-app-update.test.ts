@@ -5,6 +5,7 @@
 // beim Sichtbarwerden (höchstens einmal pro Minute), genau ein Hinweis im Chat
 // und in den Einstellungen, Entwürfe über das Neuladen, Rückfrage bei
 // laufender Aufnahme, laufendem Upload und anderem, was verloren ginge.
+// Seit Issue #224: Registrierung des Service Workers und Übernahme beim Neuladen.
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -97,6 +98,34 @@ interface Options {
   /** Attrappe der Einstellungsansicht mit ungespeicherten Änderungen */
   settingsUnsaved?: boolean;
   stored?: string;
+  /** Service-Worker-Schnittstelle (Issue #224); ohne sie gibt es keine */
+  serviceWorker?: FakeContainer;
+  /** Sicherer Kontext (HTTPS, localhost); Standard ja */
+  secure?: boolean;
+}
+
+/** Attrappe eines wartenden Workers: merkt sich Nachrichten */
+class FakeWorker {
+  messages: unknown[] = [];
+  postMessage(message: unknown) { this.messages.push(message); }
+}
+
+/** Attrappe für navigator.serviceWorker samt Registrierung (Issue #224) */
+class FakeContainer {
+  registered: [string, unknown][] = [];
+  listeners: Record<string, (() => void)[]> = {};
+  fail = false;
+  registration = {
+    waiting: null as FakeWorker | null,
+    updates: 0,
+    update() { this.updates++; return Promise.resolve(); },
+  };
+  register(path: string, options: unknown) {
+    this.registered.push([path, options]);
+    return this.fail ? Promise.reject(new Error("abgelehnt")) : Promise.resolve(this.registration);
+  }
+  addEventListener(type: string, fn: () => void) { (this.listeners[type] ??= []).push(fn); }
+  emit(type: string) { for (const fn of this.listeners[type] ?? []) fn(); }
 }
 
 function setup(options: Options = {}) {
@@ -163,8 +192,9 @@ function setup(options: Options = {}) {
   let reloads = 0;
   const window: Record<string, any> = {
     TYBO_BRAND,
-    isSecureContext: true,
+    isSecureContext: options.secure ?? true,
     navigator: {
+      ...(options.serviceWorker ? { serviceWorker: options.serviceWorker } : {}),
       mediaDevices: {
         getUserMedia() {
           if ((options.microphone ?? "grant") === "grant") return Promise.resolve(new FakeStream());
@@ -208,6 +238,8 @@ function setup(options: Options = {}) {
   };
   let uploadSeq = 0;
   const fetch = async (path: string, init?: { method?: string; body?: unknown; headers?: Record<string, string> }) => {
+    // Anwesenheit (Issue #226) läuft nebenher und zählt hier nicht mit
+    if (path === "/api/presence") return { ok: true, status: 204, json: async () => ({}) } as any;
     const method = init?.method ?? "GET";
     server.requests.push(`${method} ${path}`);
     if (path === "/api/version") {
@@ -740,5 +772,150 @@ describe("Neu laden und Entwürfe (Issue #111, Schritt 3)", () => {
       await settle();
       expect(app.input.value).toBe("");
     }
+  });
+});
+
+describe("Service Worker und Neue Version (Issue #224)", () => {
+  async function withUpdate(options: Options = {}) {
+    const app = await started(options);
+    app.server.version = NEWER;
+    await app.reconnectConversation();
+    expect(app.noteText()).toBe("Neue Version von tybo verfügbar");
+    return app;
+  }
+
+  test("registriert /sw.js mit Scope / und updateViaCache none, nur im sicheren Kontext", async () => {
+    const secure = new FakeContainer();
+    await started({ serviceWorker: secure });
+    expect(secure.registered).toEqual([["/sw.js", { scope: "/", updateViaCache: "none" }]]);
+    const insecure = new FakeContainer();
+    await started({ serviceWorker: insecure, secure: false });
+    expect(insecure.registered).toEqual([]);
+  });
+
+  test("abgelehnte Registrierung bleibt still, Neu laden geht wie bisher", async () => {
+    const container = new FakeContainer();
+    container.fail = true;
+    const app = await withUpdate({ serviceWorker: container });
+    app.press("Neu laden");
+    expect(app.reloads()).toBe(1);
+  });
+
+  test("neue Version erkannt: der Worker wird gleich geprüft", async () => {
+    const container = new FakeContainer();
+    const app = await started({ serviceWorker: container });
+    await app.reconnectConversation();
+    expect(container.registration.updates).toBe(0);
+    app.server.version = NEWER;
+    await app.reconnectConversation();
+    expect(container.registration.updates).toBe(1);
+  });
+
+  test("ohne wartenden Worker: sofort neu laden", async () => {
+    const container = new FakeContainer();
+    const app = await withUpdate({ serviceWorker: container });
+    app.press("Neu laden");
+    expect(app.reloads()).toBe(1);
+  });
+
+  test("wartender Worker: erst skip-waiting, geladen wird nach der Übernahme, genau einmal", async () => {
+    const container = new FakeContainer();
+    const waiting = new FakeWorker();
+    const app = await withUpdate({ serviceWorker: container });
+    container.registration.waiting = waiting;
+    app.type("Entwurf bleibt");
+    app.press("Neu laden");
+    expect(waiting.messages).toEqual([{ type: "skip-waiting" }]);
+    expect(app.reloads()).toBe(0);
+    // Entwürfe sind schon vor dem Warten gesichert
+    expect(JSON.parse(app.session[DRAFTS_KEY])).toEqual({ drafts: { "topic-8": "Entwurf bleibt" } });
+    container.emit("controllerchange");
+    expect(app.reloads()).toBe(1);
+    // Die Frist danach lädt nicht noch einmal
+    app.advance(5000);
+    expect(app.reloads()).toBe(1);
+  });
+
+  test("Übernahme bleibt aus: nach höchstens 3 Sekunden trotzdem neu laden", async () => {
+    const container = new FakeContainer();
+    const app = await withUpdate({ serviceWorker: container });
+    container.registration.waiting = new FakeWorker();
+    app.press("Neu laden");
+    app.advance(2999);
+    expect(app.reloads()).toBe(0);
+    app.advance(1);
+    expect(app.reloads()).toBe(1);
+    container.emit("controllerchange");
+    expect(app.reloads()).toBe(1);
+  });
+
+  test("während der Übernahme ist die Seite gesperrt, Eingabe bis controllerchange wird gesichert", async () => {
+    const container = new FakeContainer();
+    const app = await withUpdate({ serviceWorker: container });
+    container.registration.waiting = new FakeWorker();
+    app.type("Erster Teil");
+    app.press("Neu laden");
+    expect(app.elements["main"].inert).toBe(true);
+    expect(app.elements["sidebar"].inert).toBe(true);
+    expect(app.input.readOnly).toBe(true);
+    // Trotz Sperre geändert (etwa durch eine Erweiterung): geht nicht verloren
+    app.type("Erster Teil und mehr");
+    container.emit("controllerchange");
+    expect(app.reloads()).toBe(1);
+    expect(JSON.parse(app.session[DRAFTS_KEY])).toEqual({ drafts: { "topic-8": "Erster Teil und mehr" } });
+  });
+
+  test("Eingabe während der Übernahme bis zur Frist wird gesichert", async () => {
+    const container = new FakeContainer();
+    const app = await withUpdate({ serviceWorker: container });
+    container.registration.waiting = new FakeWorker();
+    app.press("Neu laden");
+    app.type("Nachgetippt");
+    app.advance(3000);
+    expect(app.reloads()).toBe(1);
+    expect(JSON.parse(app.session[DRAFTS_KEY])).toEqual({ drafts: { "topic-8": "Nachgetippt" } });
+  });
+
+  test("neues Verlustrisiko während der Übernahme: nicht laden, erneut fragen, entsperren", async () => {
+    const container = new FakeContainer();
+    const app = await withUpdate({ serviceWorker: container, storage: "full" });
+    container.registration.waiting = new FakeWorker();
+    app.press("Neu laden");
+    expect(app.reloads()).toBe(0);
+    // Ohne Entwurf ging nichts verloren; jetzt kommt Text dazu, der Speicher ist voll
+    app.type("Wichtiger Text");
+    container.emit("controllerchange");
+    expect(app.reloads()).toBe(0);
+    expect(app.noteText()).toBe("Entwürfe ließen sich nicht sichern und gehen verloren. Trotzdem neu laden?");
+    expect(app.input.value).toBe("Wichtiger Text");
+    expect(app.input.readOnly).toBe(false);
+    expect(app.elements["main"].inert).toBe(false);
+    // Die Frist lädt danach nicht still nach
+    app.advance(5000);
+    expect(app.reloads()).toBe(0);
+    app.press("Abbrechen");
+    expect(app.reloads()).toBe(0);
+    expect(app.input.value).toBe("Wichtiger Text");
+  });
+
+  test("Entwurfsschutz vor der Übernahme: Rückfrage bei Aufnahme, Abbrechen schickt nichts, Bestätigen übernimmt", async () => {
+    const container = new FakeContainer();
+    const waiting = new FakeWorker();
+    const app = await withUpdate({ serviceWorker: container });
+    container.registration.waiting = waiting;
+    app.tapRecord();
+    await settle();
+    app.press("Neu laden");
+    expect(app.noteText()).toBe("Eine Sprachaufnahme läuft und geht verloren. Trotzdem neu laden?");
+    expect(waiting.messages).toEqual([]);
+    app.press("Abbrechen");
+    expect(waiting.messages).toEqual([]);
+    expect(app.recorders[0].state).toBe("recording");
+    app.press("Neu laden");
+    app.press("Neu laden");
+    expect(waiting.messages).toEqual([{ type: "skip-waiting" }]);
+    expect(app.recorders[0].state).toBe("inactive");
+    container.emit("controllerchange");
+    expect(app.reloads()).toBe(1);
   });
 });

@@ -9,6 +9,7 @@
 import { closeSync, openSync, readFileSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { webConversationOf } from "../channels";
 import { defaultOutboxDeps, sendAndRecord, type OutboxDeps } from "../outbox";
 import { subprocessEnv } from "../subprocess-env";
 import { resolveGroupId } from "../../web/bot-telegram";
@@ -80,8 +81,11 @@ export function outboxDepsFor(root: string, env: Env): OutboxDeps {
 /** Umgebung für Claude: ohne Geheimnisse (subprocessEnv), mit dem Gespräch der Rückmeldung */
 export function jobClaudeEnv(root: string, env: Env, status: JobStatus): Record<string, string> {
   const result = subprocessEnv({ env, cwd: root, home: env.HOME ?? homedir() });
-  // subprocessEnv hat vererbte Gesprächsvariablen schon entfernt
-  if (status.target.chatId) result.TYBO_CHAT_ID = status.target.chatId;
+  // subprocessEnv hat vererbte Gesprächsvariablen schon entfernt; ein
+  // Web-Gespräch (web:<uuid>, Issue #227) geht als TYBO_CONVERSATION_ID mit
+  const web = webConversationOf(status.target.chatId);
+  if (web) result.TYBO_CONVERSATION_ID = web;
+  else if (status.target.chatId) result.TYBO_CHAT_ID = status.target.chatId;
   if (status.target.topicId !== undefined) result.TYBO_TOPIC_ID = String(status.target.topicId);
   result.TYBO_JOB_ID = status.id;
   return result;

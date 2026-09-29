@@ -46,6 +46,7 @@
 import { networkInterfaces } from "node:os";
 import { BRAND } from "../brand";
 import { loadWebConfig } from "../web/config";
+import { checkChannels, NO_CHANNEL_MESSAGE, reachText, webLocalUrl } from "./channels";
 import { readSetupEnv, type SetupContext } from "./context";
 import {
   enteredValues,
@@ -239,6 +240,16 @@ class SetupRun {
   readonly out: SafeOut;
   readonly interrupt = new Interrupt();
   readonly outcomes = new Map<StepId, Outcome>();
+  /**
+   * Telegram übersprungen und keine WebUI (Issue #228): die WebUI lässt sich
+   * dann nur nach Rückfrage mit dem Kanal-Satz überspringen
+   */
+  requireWebui = false;
+
+  /** Kanalprüfung auf der aktuellen .env (Issue #228) */
+  async channels() {
+    return checkChannels(await this.interrupt.guard(readSetupEnv(this.ctx).catch(() => ({}) as Record<string, string>)));
+  }
   /** Schreibstand des laufenden Schritts; null außerhalb eines Schritts */
   progress: WriteProgress | null = null;
   readonly steps: readonly SetupStep[];
@@ -547,7 +558,11 @@ class SetupRun {
     const status = await this.interrupt.guard(step.status(this.ctx));
     this.out.line(`  Stand: ${status.detail}`);
 
-    if (step.optional && !chosen && !(await this.askYesNo("Jetzt einrichten?", true))) return "übersprungen";
+    if (step.optional && !chosen && !(await this.askYesNo("Jetzt einrichten?", true))) {
+      if (!(step.id === "webui" && this.requireWebui)) return "übersprungen";
+      this.out.line(`  ${NO_CHANNEL_MESSAGE}`);
+      if (await this.askYesNo("Trotzdem überspringen?", false)) return "übersprungen";
+    }
     if (!step.apply && step.fields.length === 0) return this.checkOnly(step);
 
     let previous: SetupValues = {};
@@ -758,13 +773,19 @@ class SetupRun {
     if (checkFailed.length) this.out.line(`  Gesamtprüfung fehlgeschlagen: ${checkFailed.map(titleOf).join(", ")}`);
 
     const overall = await this.interrupt.guard(setupOverview(this.ctx, skipped));
+    const channelsOpen = !!overall.channels && !overall.channels.ready;
     if (overall.missing.length) this.out.line(`  Noch offen (Pflicht): ${overall.missing.map(titleOf).join(", ")}`);
-    else this.out.line("  Alle Pflichtschritte sind erledigt.");
+    // Kanalregel (Issue #228): Telegram oder WebUI, statt „Noch offen (Pflicht): Telegram“
+    if (channelsOpen) this.out.line(`  Noch offen: ${overall.channels!.message}`);
+    if (!overall.missing.length && !channelsOpen) this.out.line("  Alle Pflichtschritte sind erledigt.");
     if (overall.open.length) this.out.line(`  Optional, noch nicht eingerichtet: ${overall.open.map(titleOf).join(", ")}`);
 
     this.out.line();
     this.out.line("Nächster Schritt");
     const needsSetup = overall.missing.filter(id => id !== "autostart");
+    if (channelsOpen) {
+      for (const id of ["telegram", "webui"] as const) if (!needsSetup.includes(id)) needsSetup.push(id);
+    }
     if (checkFailed.length) {
       this.out.line(`  Erst die fehlgeschlagene Prüfung beheben: ${checkFailed.map(id => `${BRAND.cli} setup ${id}`).join(", ")}`);
     }
@@ -773,7 +794,8 @@ class SetupRun {
     } else if (checkFailed.length) {
       // Kein „läuft, schreib deinem Bot“, solange eine Prüfung fehlschlägt
     } else if (!overall.missing.includes("autostart")) {
-      this.out.line(`  ${BRAND.name} läuft über den Autostart. Schreib deinem Bot in Telegram.`);
+      const env = await readSetupEnv(this.ctx).catch(() => ({}) as Record<string, string>);
+      this.out.line(`  ${BRAND.name} läuft über den Autostart. ${reachText(overall.channels ?? { telegram: true, webui: false }, webLocalUrl(env))}`);
     } else {
       this.out.line(`  Zum Ausprobieren starten: cd ${this.ctx.root} && bun run start`);
       this.out.line("  (läuft, bis das Fenster geschlossen wird)");
@@ -950,10 +972,40 @@ async function runMode(run: SetupRun, args: SetupArgs): Promise<number> {
 
   const todo = STEP_ORDER.filter(s => open.includes(s.id) || chosen.includes(s.id));
   const skipped: StepId[] = [];
-  for (const [i, step] of todo.entries()) {
+  for (let i = 0; i < todo.length; i++) {
+    const step = todo[i];
+    // Ohne Telegram (Issue #228) gibt es keine Forum-Gruppe; ausdrücklich gewählt läuft sie trotzdem
+    if (step.id === "gruppe" && !chosen.includes("gruppe") && (await run.channels()).telegram.state !== "ok") {
+      out.line();
+      out.line(`Schritt ${i + 1} von ${todo.length}: ${getStep("gruppe")!.title} (optional)`);
+      out.line("  Ohne Telegram gibt es keine Forum-Gruppe: übersprungen.");
+      run.outcomes.set(step.id, "übersprungen");
+      skipped.push(step.id);
+      continue;
+    }
+    // Ohne WebUI (Issue #231) gibt es keinen Zugang vom Handy; ausdrücklich gewählt läuft er trotzdem
+    if (step.id === "zugang" && !chosen.includes("zugang") && (await run.channels()).webui.state !== "ok") {
+      out.line();
+      out.line(`Schritt ${i + 1} von ${todo.length}: ${getStep("zugang")!.title} (optional)`);
+      out.line("  Ohne WebUI gibt es keinen Zugang vom Handy: übersprungen.");
+      run.outcomes.set(step.id, "übersprungen");
+      skipped.push(step.id);
+      continue;
+    }
     const outcome = await run.runStep(step, `Schritt ${i + 1} von ${todo.length}: `, chosen.includes(step.id));
     run.outcomes.set(step.id, outcome);
     if (outcome === "übersprungen") skipped.push(step.id);
+    if (step.id === "telegram") {
+      const channels = await run.channels();
+      if (channels.telegram.state !== "ok" && channels.webui.state !== "ok") {
+        // Ohne Telegram erreicht tybo den Nutzer nur über die WebUI: als nächsten Schritt vorschlagen
+        run.requireWebui = true;
+        const at = todo.findIndex(s => s.id === "webui");
+        if (at > i + 1) todo.splice(i + 1, 0, ...todo.splice(at, 1));
+        out.line();
+        out.line(`  Ohne Telegram brauchst du die WebUI, sonst erreicht dich ${BRAND.name} nirgends. Sie kommt als nächster Schritt.`);
+      }
+    }
   }
   const checkFailed = await run.finalCheck();
   await run.printEnd(skipped, checkFailed);

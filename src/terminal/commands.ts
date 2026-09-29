@@ -66,7 +66,7 @@ export const COMMAND_HELP = [
   "  /gespraeche              Gespräche mit Nummer, Agent, letzter Aktivität",
   "  /wechsel <Nr. oder Name> in ein anderes Gespräch; Nummer aus der letzten",
   "                           /gespraeche-Liste, auch topic-<n> oder dm",
-  "  /neu [Agent] [Titel]     neues Topic in Telegram, ohne Agent: General",
+  "  /neu [Agent] [Titel]     neues Gespräch, ohne Agent: General",
   "  /zuordnen <Agent>        Agent dieses Topics ändern",
   `  /quit                    ${BRAND.name} beenden`,
   "Alle anderen Befehle führt der Bot aus wie in Telegram, z.B. /new, /stop,",

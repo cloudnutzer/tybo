@@ -338,7 +338,9 @@ describe("Verdrahtung", () => {
     const wiring = block.slice(0, block.indexOf("\n});"));
     expect(wiring).toContain("groupId: () => botGroupId(process.env)");
     expect(wiring).toContain("agentForTopic: (topicId, chatId) => getAgentByTopicId(topicId, chatId)");
-    expect(wiring).toContain("await bot.api.sendMessage(chatId, text, threadId ? { message_thread_id: threadId } : {});");
+    expect(wiring).toContain("sendPlain: (chatId, text, threadId) => telegramRuntime.sendPlain(chatId, text, threadId),");
+    const runtime = await Bun.file(join(import.meta.dir, "..", "src", "lib", "telegram-runtime.ts")).text();
+    expect(runtime).toContain("await bot.api.sendMessage(chatId, text, threadId ? { message_thread_id: threadId } : {});");
     expect(wiring).not.toContain("parse_mode");
     expect(wiring).toContain("botRegistry.sendAsAgent(agent, chatId, text, { threadId })");
     const call = bot.slice(bot.indexOf("webServer = await startWebUi({"));

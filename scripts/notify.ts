@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 /**
  * Meldung oder Datei an Telegram schicken und für die WebUI festhalten
- * (Entscheidung 0006, src/lib/outbox.ts).
+ * (Entscheidung 0006, src/lib/outbox.ts). Ohne Telegram (Issue #227) nur für
+ * die WebUI festhalten.
  *
  *   bun run notify --source pipeline --text "Issue 45 gemergt"
  *   bun run notify --source datei --file tmp/report.html --caption "Report"
@@ -9,14 +10,17 @@
  *
  * Mit --topic geht es in dieses Topic der Forum-Gruppe (1 ist General), die
  * Umgebung zählt dann nicht. Ohne --topic gilt das Gespräch aus der Umgebung,
- * die tybo seinen Claude-Subprozessen mitgibt (Issue #46): TYBO_TOPIC_ID
- * als Topic, TYBO_CHAT_ID als Chat; sind beide nicht gesetzt, der Direktchat. Ungültige Werte dort ergeben Exit 2 ohne Versand, nie den
- * Direktchat. Exit-Code: 0 gesendet (auch wenn das Festhalten scheiterte),
- * 1 Telegram hat abgelehnt, 2 falsche Eingabe.
+ * die tybo seinen Claude-Subprozessen mitgibt (Issue #46): TYBO_CONVERSATION_ID
+ * als Web-Gespräch (Issue #227, geht vor), sonst TYBO_TOPIC_ID als Topic und
+ * TYBO_CHAT_ID als Chat (auch "web", der Direktchat ohne Telegram); sind alle
+ * nicht gesetzt, der Direktchat. Ungültige Werte dort ergeben Exit 2 ohne
+ * Versand, nie den Direktchat. Exit-Code: 0 zugestellt (gesendet, auch wenn
+ * das Festhalten scheiterte, bzw. für die WebUI festgehalten), 1 Telegram hat
+ * abgelehnt oder das Festhalten für die WebUI scheiterte, 2 falsche Eingabe.
  */
 
 import { loadEnv } from "../src/lib/env";
-import { defaultOutboxDeps, sendAndRecord, type OutboxDeps, type SendAndRecordInput } from "../src/lib/outbox";
+import { defaultOutboxDeps, outboxDelivered, sendAndRecord, type OutboxDeps, type SendAndRecordInput } from "../src/lib/outbox";
 
 export const EXIT_OK = 0;
 export const EXIT_SEND_FAILED = 1;
@@ -28,7 +32,7 @@ export const USAGE = `Aufruf: bun run notify --source <name> [--text <text>] [--
   --file        Datei, höchstens 50 MB
   --caption     Beschriftung der Datei, höchstens 1024 Zeichen
   --topic       Topic der Forum-Gruppe (1 = General); ohne: Gespräch aus
-                TYBO_TOPIC_ID/TYBO_CHAT_ID, sonst Direktchat
+                TYBO_CONVERSATION_ID bzw. TYBO_TOPIC_ID/TYBO_CHAT_ID, sonst Direktchat
   --plain       Text unverändert als Klartext senden, ohne Formatierung
   --no-preview  Keine Link-Vorschau
 Werte, die mit -- beginnen, als --text=<wert> übergeben.`;
@@ -80,19 +84,27 @@ export function parseNotifyArgs(argv: string[]): { input: SendAndRecordInput } |
 }
 
 const TOPIC_PATTERN = /^[1-9]\d{0,9}$/;
-const CHAT_PATTERN = /^-?\d{1,20}$/;
+const CHAT_PATTERN = /^(-?\d{1,20}|web)$/;
+const CONVERSATION_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 /**
  * Ergänzt das Ziel aus der Umgebung, wenn --topic fehlt. Gesetzte, aber
- * leere oder ungültige Werte sind ein Fehler. Sind Chat und Topic gesetzt,
- * gehen beide an die Zielprüfung von sendAndRecord (ein fremder Chat wird
- * dort abgelehnt, nicht vom Topic überdeckt).
+ * leere oder ungültige Werte sind ein Fehler. TYBO_CONVERSATION_ID (Issue
+ * #227) geht vor und wird zur Chat-ID web:<uuid>; TYBO_CHAT_ID und
+ * TYBO_TOPIC_ID zählen dann nicht (sie kommen nie zusammen aus einem
+ * Gespräch). Sind Chat und Topic gesetzt, gehen beide an die Zielprüfung von
+ * sendAndRecord (ein fremder Chat wird dort abgelehnt, nicht vom Topic überdeckt).
  */
 export function applyEnvTarget(
   input: SendAndRecordInput,
   env: Record<string, string | undefined>
 ): { input: SendAndRecordInput } | { error: string } {
   if (input.topicId !== undefined) return { input };
+  const conversation = env.TYBO_CONVERSATION_ID;
+  if (conversation !== undefined) {
+    if (!CONVERSATION_PATTERN.test(conversation)) return { error: "TYBO_CONVERSATION_ID ist ungültig (Gesprächs-ID erwartet)" };
+    return { input: { ...input, chatId: `web:${conversation}` } };
+  }
   const topic = env.TYBO_TOPIC_ID;
   const chat = env.TYBO_CHAT_ID;
   const result: SendAndRecordInput = { ...input };
@@ -136,11 +148,13 @@ export async function runNotify(
     return EXIT_USAGE;
   }
   const result = await sendAndRecord(targeted.input, deps());
-  if (result.error) {
-    io.err(`Nicht gesendet: ${result.error.message}`);
-    return result.error.kind === "send" ? EXIT_SEND_FAILED : EXIT_USAGE;
+  if (result.error || !outboxDelivered(result)) {
+    const kind = result.error?.kind;
+    io.err(`${kind === "record" ? "Nicht festgehalten" : "Nicht gesendet"}: ${result.error?.message ?? "unbekannt"}`);
+    return kind === "invalid" ? EXIT_USAGE : EXIT_SEND_FAILED;
   }
-  io.out(result.recorded ? "Gesendet und für die WebUI festgehalten." : "Gesendet, aber nicht festgehalten (siehe Log).");
+  if (!result.sent) io.out("Für die WebUI festgehalten (ohne Telegram).");
+  else io.out(result.recorded ? "Gesendet und für die WebUI festgehalten." : "Gesendet, aber nicht festgehalten (siehe Log).");
   return EXIT_OK;
 }
 

@@ -106,7 +106,8 @@ export function conversationForExecution(key: string | undefined): ChoiceConvers
   if (kind === "web" && parts.length === 2 && WEB_CONVERSATION.test(parts[1])) {
     return { type: "web", conversationId: parts[1] };
   }
-  if (kind === "dm" && parts.length === 2 && TELEGRAM_USER.test(parts[1])) {
+  // Direktchat, ohne Telegram dm:web (Issue #227)
+  if (kind === "dm" && parts.length === 2 && (TELEGRAM_USER.test(parts[1]) || parts[1] === "web")) {
     return { type: "telegram", chatId: parts[1] };
   }
   if (kind === "group" && parts.length === 2 && TELEGRAM_GROUP.test(parts[1])) {

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1f2023" media="(prefers-color-scheme: dark)">
+  <script src="/theme.js"></script>
+  <title>{{brand.name}} nicht erreichbar</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <script src="/offline.js" defer></script>
+</head>
+<body class="login offline">
+  <main class="login-panel">
+    <h1 class="wordmark wordmark-large">{{brand.name}} nicht erreichbar</h1>
+    <p class="login-lead">Die Seite lässt sich gerade nicht laden. Meist liegt es an einem dieser Gründe:</p>
+    <ul class="offline-reasons">
+      <li>Der Rechner, auf dem {{brand.name}} läuft, ist aus oder schläft.</li>
+      <li>Die Verbindung von unterwegs (Tunnel) ist unterbrochen.</li>
+      <li>Dieses Gerät hat gerade kein Netz.</li>
+    </ul>
+    <button type="button" id="retry" class="primary-button">Erneut versuchen</button>
+  </main>
+</body>
+</html>

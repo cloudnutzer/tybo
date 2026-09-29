@@ -519,7 +519,7 @@ describe("Bot-Start: verwaiste Jobs", () => {
     expect(bot).toContain('import { recoverJobsUntilSettled } from "./lib/jobs/control";');
     expect(bot).toContain("recoverJobsUntilSettled(createJobDeps({ root: PROJECT_ROOT, env: process.env }))");
     // vor dem Polling, nicht erst in einem Handler
-    expect(bot.indexOf("recoverJobsUntilSettled(createJobDeps")).toBeLessThan(bot.indexOf("bot.start({"));
+    expect(bot.indexOf("recoverJobsUntilSettled(createJobDeps")).toBeLessThan(bot.indexOf("void startAfterFirstSweep(telegramRuntime, firstSweep, resumeGoalsOnStart);"));
   });
 });
 
@@ -744,10 +744,12 @@ describe("Befehlseinstiege: bun run job und tybo job", () => {
     }
   }, 30_000);
 
-  test("Ende zu Ende mit Claude-Attrappe: losgelöster Wächter, Bericht, Meldung ohne Telegram abgelehnt", async () => {
+  test("Ende zu Ende mit Claude-Attrappe: losgelöster Wächter, Bericht, Meldung ohne Telegram nur für die WebUI", async () => {
     const { root: r, cleanup: done } = tempRoot("jobs-e2e-");
+    let watcherPid: number | undefined;
     try {
-      // Direktchat bekannt, aber kein Token: sendAndRecord lehnt ab, bevor irgendetwas ins Netz geht
+      // Kein Token (Issue #227): sendAndRecord will nur für die WebUI festhalten, geht nie ins
+      // Netz; ohne Datenbank scheitert das Festhalten, der Wächter versucht es später erneut
       writeFileSync(join(r, ".env"), "TELEGRAM_USER_ID=4242\n");
       const fake = join(r, "fake-claude.sh");
       writeFileSync(fake, `#!/bin/sh\ncat > auftrag-gelesen.txt\necho "Attrappe arbeitet"\nprintf 'Alles erledigt.' > "data/jobs/$TYBO_JOB_ID/report.md"\n`);
@@ -766,14 +768,28 @@ describe("Befehlseinstiege: bun run job und tybo job", () => {
       let status: JobStatus | null = null;
       for (let i = 0; i < 200; i++) {
         status = await readStatus(r, id);
-        if (status?.notice?.state === "failed" || status?.notice?.state === "sent") break;
+        if (status?.notice?.error || status?.notice?.state === "sent") break;
         await Bun.sleep(50);
       }
-      expect(status).toMatchObject({ phase: "ended", outcome: "success", exitCode: 0, notice: { state: "failed", error: "TELEGRAM_BOT_TOKEN fehlt" } });
+      watcherPid = status?.watcher?.pid;
+      expect(status).toMatchObject({
+        phase: "ended",
+        outcome: "success",
+        exitCode: 0,
+        notice: { state: "pending", attempts: 1, error: "Meldung nicht für die WebUI festgehalten" },
+      });
       expect(status!.watcher!.pid).not.toBe(p.pid);
       expect(readFileSync(join(r, "auftrag-gelesen.txt"), "utf8")).toContain(`Tu so als ob.\n\n---\nSchreibe am Ende einen kurzen Bericht nach data/jobs/${id}/report.md`);
       expect(readFileSync(jobFile(r, id, "log"), "utf8")).toContain("Attrappe arbeitet");
     } finally {
+      // Der eigene Wächter dieses Tests wartet sonst noch auf die weiteren Versuche
+      if (watcherPid) {
+        try {
+          process.kill(watcherPid);
+        } catch {
+          // schon beendet
+        }
+      }
       done();
     }
   }, 30_000);

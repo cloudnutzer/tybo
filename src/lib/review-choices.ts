@@ -43,6 +43,7 @@ import {
   type DecideOutcome,
 } from "./choices";
 import type { ReviewDecision } from "./intent-gate";
+import { outboxDelivered } from "./channels";
 import type { SendAndRecordInput, SendAndRecordResult } from "./outbox";
 import { REVIEW_MAX_AGE_MS, type ReviewNotifier, type ReviewProposal } from "./session-distill";
 import { sessionEpochSnapshot, type BotSession } from "./session-manager";
@@ -82,7 +83,8 @@ export function routineStartText(description: string): string {
   return `🔁 Ich friere die Routine ein ("${description}"), das kann ein paar Minuten dauern...`;
 }
 
-const TELEGRAM_CHAT = /^-?\d{1,20}$/;
+/** Telegram-Chat oder der Web-Direktchat "web" ohne Telegram (Issue #227) */
+const TELEGRAM_CHAT = /^(-?\d{1,20}|web)$/;
 const WEB_CHAT = /^web:([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/;
 
 /** Gespräch eines Vorschlags aus Chat und Topic; null, wenn der Chat unbekannt ist */
@@ -251,7 +253,8 @@ export function createReviewResults(deps: ReviewResultsDeps): ReviewResults {
   async function record(input: SendAndRecordInput, what: string): Promise<void> {
     try {
       const result = await deps.sendAndRecord(input);
-      if (!result.sent) log(`[Review] ${what} nicht nach Telegram gesendet`);
+      // Ohne Telegram für die WebUI festgehalten zählt als zugestellt (Issue #227)
+      if (!outboxDelivered(result)) log(`[Review] ${what} nicht nach Telegram gesendet`);
     } catch (e) {
       log(`[Review] ${what} nicht nach Telegram gesendet (${errorName(e)})`);
     }

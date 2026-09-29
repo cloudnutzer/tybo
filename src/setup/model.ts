@@ -46,6 +46,7 @@ export const STEP_IDS = [
   "profil",
   "modelle",
   "webui",
+  "zugang",
   "autostart",
   "pruefung",
 ] as const;
@@ -467,25 +468,41 @@ export function maskValues(text: string, values: Iterable<string | undefined>): 
 // ---------------------------------------------------------------------------
 
 export interface OverallStatus {
-  /** Alle Pflichtschritte erledigt */
+  /** Alle Pflichtschritte erledigt und mindestens ein Kanal bereit */
   complete: boolean;
   /** Pflichtschritte, die noch nicht erledigt sind */
   missing: StepId[];
   /** Optionale Schritte, die weder erledigt noch übersprungen sind */
   open: StepId[];
   skipped: StepId[];
+  /**
+   * Kanalregel (Issue #228, src/setup/channels.ts): null ohne Prüfung (etwa
+   * eigene Schrittkataloge in Tests), sonst bereit oder nicht, mit Satz
+   */
+  channels: OverallChannels | null;
+}
+
+export interface OverallChannels {
+  ready: boolean;
+  /** Warum nicht bereit (Kanal-Satz, halbes Telegram, ungültige WebUI) bzw. was läuft */
+  message: string;
+  telegram: boolean;
+  webui: boolean;
 }
 
 /**
  * Gesamtstatus über alle Schritte außer „pruefung“ (die fasst selbst
  * zusammen). Überspringen gilt nur für optionale Schritte; ein
  * übersprungener Pflichtschritt bleibt fehlend. „teilweise“ zählt nicht als
- * erledigt.
+ * erledigt. Seit Issue #228 ist Telegram optional; stattdessen gilt die
+ * Kanalregel (channels): ohne bereiten Kanal ist die Einrichtung nie
+ * fertig, auch nicht mit übersprungenem Telegram-Schritt.
  */
 export function overallStatus(
   steps: ReadonlyArray<Pick<SetupStep, "id" | "optional">>,
   states: Partial<Record<StepId, StepState>>,
   skipped: Iterable<StepId> = [],
+  channels: OverallChannels | null = null,
 ): OverallStatus {
   const skip = new Set(skipped);
   const missing: StepId[] = [];
@@ -501,7 +518,8 @@ export function overallStatus(
       else open.push(step.id);
     }
   }
-  return { complete: missing.length === 0, missing, open, skipped: skippedOut };
+  const channelsReady = channels ? channels.ready : true;
+  return { complete: missing.length === 0 && channelsReady, missing, open, skipped: skippedOut, channels };
 }
 
 /** Status aus der Anzahl erfüllter Teile */

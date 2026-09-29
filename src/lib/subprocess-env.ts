@@ -54,9 +54,10 @@ const CLI_AUTH = new Set(["ANTHROPIC_API_KEY"]);
 
 /**
  * Gespräch eines Aufrufs. Vererbte Werte werden immer entfernt, bevor das
- * Gespräch des Aufrufs gesetzt wird.
+ * Gespräch des Aufrufs gesetzt wird. TYBO_CONVERSATION_ID (Issue #227): reines
+ * Web-Gespräch als Rückmeldeziel.
  */
-export const CONVERSATION_VARS: readonly string[] = ["TYBO_CHAT_ID", "TYBO_TOPIC_ID"];
+export const CONVERSATION_VARS: readonly string[] = ["TYBO_CHAT_ID", "TYBO_TOPIC_ID", "TYBO_CONVERSATION_ID"];
 
 /**
  * Markiert jeden Subprozess von tybo: Hooks in .claude/settings.local.json
@@ -144,8 +145,11 @@ export function isOpenCodeProviderCredential(
   return isSecretName(name) || !PROVIDER_SETTING.test(name);
 }
 
-/** Immer entfernt, auch bei Freigabe oder MCP-Referenz */
-const ALWAYS_REMOVED = new Set(["CLAUDECODE", ...CONVERSATION_VARS, "WEB_PASSWORD"]);
+/**
+ * Immer entfernt, auch bei Freigabe oder MCP-Referenz. WEB_PUSH_PRIVATE_KEY
+ * (Issue #225): mit ihm könnte jeder im Namen von tybo an die Geräte pushen.
+ */
+const ALWAYS_REMOVED = new Set(["CLAUDECODE", ...CONVERSATION_VARS, "WEB_PASSWORD", "WEB_PUSH_PRIVATE_KEY"]);
 
 export function isSecretName(name: string): boolean {
   return SECRET_PATTERNS.some(p => p.test(name));
@@ -164,14 +168,18 @@ export function allowList(env: Env): Set<string> {
 /**
  * Gespräch des laufenden Aufrufs für Subprozesse (Issue #46), abgeleitet aus
  * dem Schlüssel der Ausführung (sessionKeyFor): dm:<id> und group:<id>
- * setzen TYBO_CHAT_ID, topic:<chat>:<n> zusätzlich TYBO_TOPIC_ID. web:,
- * background, kein Kontext oder ein unbekanntes Format setzen nichts. `bun run notify` im
- * Subprozess legt Dateien so im richtigen Gespräch ab.
+ * setzen TYBO_CHAT_ID, topic:<chat>:<n> zusätzlich TYBO_TOPIC_ID. Seit Issue
+ * #227: dm:web (Direktchat ohne Telegram) setzt TYBO_CHAT_ID=web, web:<uuid>
+ * TYBO_CONVERSATION_ID=<uuid>. background, kein Kontext oder ein unbekanntes
+ * Format setzen nichts. `bun run notify` im Subprozess legt Dateien so im
+ * richtigen Gespräch ab.
  */
 export function conversationEnv(key: string | undefined): Record<string, string> {
   if (!key) return {};
-  const dm = /^dm:(\d{1,20})$/.exec(key);
+  const dm = /^dm:(\d{1,20}|web)$/.exec(key);
   if (dm) return { TYBO_CHAT_ID: dm[1] };
+  const web = /^web:([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/.exec(key);
+  if (web) return { TYBO_CONVERSATION_ID: web[1] };
   const group = /^group:(-\d{1,20})$/.exec(key);
   if (group) return { TYBO_CHAT_ID: group[1] };
   const topic = /^topic:(-?\d{1,20}):([1-9]\d{0,9})$/.exec(key);
@@ -595,8 +603,8 @@ export function filterSubprocessEnv(opts: SubprocessEnvOptions = {}): EnvFilterR
     }
     env[name] = value;
   }
-  // WEB_PASSWORD wird immer entfernt, gehört aber in die Liste der Geheimnisse
-  if (source.WEB_PASSWORD !== undefined) removed.push("WEB_PASSWORD");
+  // WEB_PASSWORD und WEB_PUSH_PRIVATE_KEY werden immer entfernt, gehören aber in die Liste der Geheimnisse
+  for (const name of ["WEB_PASSWORD", "WEB_PUSH_PRIVATE_KEY"]) if (source[name] !== undefined) removed.push(name);
 
   Object.assign(env, SUBPROCESS_MARKER);
   Object.assign(env, conversationEnv(opts.conversationKey));

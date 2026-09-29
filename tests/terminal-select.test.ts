@@ -129,3 +129,20 @@ describe("state.json", () => {
     expect(await loadState(file)).toEqual({});
   });
 });
+
+describe("Issue #228: ohne Telegram", () => {
+  const WEB_ONLY: ConversationSummary[] = [
+    { id: "dm", title: "Direktchat", agent: "general", kind: "dm" },
+    { id: "0f0e0d0c-0b0a-4908-8706-050403020100", title: "Plan", agent: "research", kind: "web" },
+  ];
+
+  test("ohne Topics und ohne gespeichertes Gespräch: Direktchat (API-ID dm)", () => {
+    const r = selectConversation(WEB_ONLY, {});
+    expect(r.ok && r.conversation.id).toBe("dm");
+  });
+
+  test("gespeichertes Web-Gespräch wird wieder gewählt", () => {
+    const r = selectConversation(WEB_ONLY, { savedId: "0f0e0d0c-0b0a-4908-8706-050403020100" });
+    expect(r.ok && r.conversation.kind).toBe("web");
+  });
+});

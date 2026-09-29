@@ -18,13 +18,18 @@
  * Cloudflare-Access-Nachweis für getunnelte Anfragen seit Issue #99 (./access).
  * Oberflächen-Version in index.html und unter /api/version seit Issue #111 (./ui-version).
  * Rückfrage-Knöpfe aus dem Register seit Issue #115 (./choices).
+ * Installierbare Web-App (Manifest, Symbole, Service Worker, Offline-Seite)
+ * seit Issue #224 (./manifest, ./service-worker).
+ * Web Push (Schlüssel, Abos pro Gerät, Test) seit Issue #225 (./push-api).
+ * Anwesenheit offener Seiten (POST /api/presence) seit Issue #226 (./presence),
+ * Push von selbst für Antworten, Rückfragen und Meldungen (./push-triggers).
  * Importiert nichts aus src/bot.ts; die Einbindung dort folgt in #6.
  */
 
 import { BRAND_SCRIPT_PATH, brandHtmlResponse, brandScriptResponse } from "./brand-asset";
-import { realpath, stat } from "node:fs/promises";
-import { extname, join, resolve, sep } from "node:path";
-import type { WebConfig } from "./config";
+import { mkdir, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { dirname, extname, join, resolve, sep } from "node:path";
+import { remoteKind, type WebConfig } from "./config";
 import {
   ChatHub,
   toApiMessage,
@@ -37,7 +42,7 @@ import {
 } from "./chat";
 import { AGENT_NAME_PATTERN, agentList, DEFAULT_AGENT, FALLBACK_AGENT_NAMES, type AgentInfo } from "./agents";
 import { AGENT_ADMIN_PATH, agentAdminMethods, AGENTS_TEXT, createAgentsApi, type AgentCatalogPort } from "./agent-catalog";
-import { ConversationStore, isChoiceId, isConversationId, normalizeCustomTitle, webSessionKey } from "./store";
+import { ConversationStore, DEFAULT_DATA_DIR, isChoiceId, isConversationId, normalizeCustomTitle, webSessionKey } from "./store";
 import {
   createTelegramMessageLog,
   parseBeforeCursor,
@@ -58,6 +63,7 @@ import { FILES_PATH, serveOutboxFile, type FilesDeps } from "./files";
 import { FILE_NAME_HEADER, MAX_ATTACHMENT_BYTES, parseAttachmentName, toApiAttachment, type ApiAttachment } from "./attachments";
 import { UPLOAD_TEXT, UploadStore, validateIds } from "./uploads";
 import { NOTICE_SOURCE_PATTERN, OUTBOX_FILE_ID_PATTERN, type NoticeFile } from "./notice";
+import { startWebNoticeImport, type WebNotice, type WebNoticeImportDeps } from "./web-notices";
 import { createCliToken, parseBearer, type CliToken } from "./cli-token";
 import { ACCESS_JWT_HEADER, ACCESS_REASON_TEXT, createAccessVerifier, type AccessResult, type FetchCerts } from "./access";
 import { SESSION_RESET_TEXT, sessionResetNote, type ConversationSessionReset } from "./session-reset";
@@ -65,6 +71,12 @@ import { COMMANDS_TEXT, type CommandMatchInfo, type CommandPort } from "./comman
 import { GOAL_CARD_TEXT, isGoalCardAction, type GoalPort } from "./goals";
 import { CHOICE_TEXT, choiceViewFor, type ChoiceChange, type ChoicePort } from "./choices";
 import { computeUiVersion, UI_VERSION_PATH } from "./ui-version";
+import { MANIFEST_PATH, manifestResponse, SHARE_TARGET_PATH } from "./manifest";
+import { SERVICE_WORKER_PATH, serviceWorkerResponse } from "./service-worker";
+import { createPushApi, PUSH_TEXT, type PushDeps } from "./push-api";
+import { PushSubscriptionStore } from "./push-store";
+import { parsePresenceReport, PresenceTracker } from "./presence";
+import { createPushNotifier, type PushNotifier } from "./push-triggers";
 import {
   LoginLimiter,
   hashToken,
@@ -74,6 +86,7 @@ import {
   isPublicHost,
   isPublicOrigin,
   isSameOrigin,
+  isRemoteRequest,
   requestOrigin,
   passwordMatches,
 } from "./auth";
@@ -100,6 +113,8 @@ const ATTACHMENT_PATH = /^\/api\/conversations\/([^/]+)\/attachments(?:\/([^/]+)
 export const TELEGRAM_ACTIVITY_PATH = "/api/telegram/events";
 /** Rechte des Bots in der Forum-Gruppe (Issue #29) */
 export const TELEGRAM_RIGHTS_PATH = "/api/telegram/rights";
+/** Anwesenheit offener Seiten (Issue #226) */
+export const PRESENCE_PATH = "/api/presence";
 /** Schlüssel des Sammelstroms im Telegram-Hub; kollidiert nicht mit dm und topic-<n> */
 const ACTIVITY_STREAM = "telegram-activity";
 export const DEFAULT_PUBLIC_DIR = join(import.meta.dir, "public");
@@ -109,20 +124,34 @@ export const SECURITY_HEADERS: Record<string, string> = {
     "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; " +
     // Aufnahmen vor dem Senden abspielen (Issue #109): nur Objekt-URLs der eigenen Seite
     "media-src 'self' blob:; " +
-    "connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+    "connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; " +
+    // Installierbare Web-App (Issue #224): ausdrücklich statt über default-src
+    "worker-src 'self'; manifest-src 'self'",
   "X-Frame-Options": "DENY",
   "Referrer-Policy": "no-referrer",
   "X-Content-Type-Options": "nosniff",
 };
 
-/** Ohne Session erreichbar, dazu /brand.js. Host- und Origin-Prüfung gelten trotzdem. */
-const PUBLIC_ASSETS: Record<string, string> = {
+/**
+ * Ohne Session erreichbar, dazu /brand.js und /manifest.webmanifest. Host-,
+ * Origin- und Access-Prüfung (Tunnel) gelten trotzdem. Nichts davon verrät
+ * etwas über den Nutzer.
+ */
+export const PUBLIC_ASSETS: Record<string, string> = {
   "/login": "login.html",
   "/login.js": "login.js",
   "/theme.js": "theme.js",
   "/style.css": "style.css",
   "/favicon.svg": "favicon.svg",
   "/apple-touch-icon.png": "apple-touch-icon.png",
+  // Symbole der installierbaren Web-App (Issue #224), aus scripts/web-icons.ts
+  "/icon-192.png": "icon-192.png",
+  "/icon-512.png": "icon-512.png",
+  "/icon-maskable-512.png": "icon-maskable-512.png",
+  // Service Worker und die Seite „nicht erreichbar" samt Knopf-Skript
+  "/sw.js": "sw.js",
+  "/offline.html": "offline.html",
+  "/offline.js": "offline.js",
 };
 
 const CONTENT_TYPES: Record<string, string> = {
@@ -143,6 +172,8 @@ export const ACCESS_DENIED_TEXT =
   "Zugang von unterwegs nur mit gültiger Cloudflare-Access-Anmeldung. Bitte die Seite neu laden und erneut anmelden.";
 /** Gleiche Access-Meldungen im Log höchstens einmal pro Minute und Besucher */
 const ACCESS_LOG_INTERVAL_MS = 60 * 1000;
+/** Web Push (Issue #225): ein Gerät umbenennen oder entfernen */
+const PUSH_DEVICE_PATH = /^\/api\/push\/subscriptions\/([^/]+)$/;
 /** /api/keys/<name>; die Namensprüfung selbst macht ./keys */
 const KEY_PATH = /^\/api\/keys\/([^/]*)$/;
 
@@ -155,7 +186,10 @@ interface RequestAuth {
   session: string;
   isAuthorized(): boolean;
   source: MessageSource;
-  /** Über den Cloudflare Tunnel (Issue #99): etwa Schlüssel nur lesen */
+  /**
+   * Von unterwegs (Issue #99): über den Tunnel, über Tailscale oder sonst
+   * weitergeleitet (isRemoteRequest, Issue #231); etwa Schlüssel nur lesen
+   */
   tunneled: boolean;
 }
 
@@ -291,6 +325,21 @@ export interface WebServerDeps {
    */
   keys?: KeysPort;
   /**
+   * Web Push (Issue #225): VAPID-Schlüssel und Kontakt, in bot.ts aus
+   * prepareBotPush (./bot-push). Abos in <dataDir>/push-subscriptions.json.
+   * Ohne ihn meldet GET /api/push available: false, die übrigen Routen 503.
+   */
+  push?: PushDeps;
+  /**
+   * Meldungen für reine Web-Gespräche (Issue #227): Einträge unter web:<uuid>
+   * aus dem Nachrichtenspeicher (notify, Jobs, pipeline-say mit
+   * TYBO_CONVERSATION_ID) übernimmt der Server in das Web-Gespräch, höchstens
+   * einmal, und holt nach einem Neustart nach (Zeitpunkt in
+   * <dataDir>/notice-cursor.json). In bot.ts getDisplayOnlyPage und
+   * onMessageSaved; ohne sie keine Übernahme.
+   */
+  webNotices?: Pick<WebNoticeImportDeps, "page" | "onMessageSaved" | "intervalMs" | "every"> & { cursorFile?: string };
+  /**
    * Anhänge aus dem Web-Chat (Issue #72): POST /api/conversations/<id>/attachments,
    * attachments in POST .../messages und der Download. In bot.ts eine
    * UploadStore auf data/uploads, dieselbe wie im Telegram-Turn. Der Server
@@ -336,6 +385,8 @@ export interface WebServer {
   url: string;
   /** Offene SSE-Verbindungen (für Tests) */
   eventStreamCount(): number;
+  /** Meldet ein Tab dieses Gespräch gerade als sichtbar (Issue #226, für Tests) */
+  isConversationVisible(conversationId: string): boolean;
   /**
    * Legt eine Nachricht in einem reinen Web-Gespräch ab und schickt sie an
    * dessen offene Browser (Issue #117: Merk-Vorschläge und ihr Ergebnis).
@@ -451,6 +502,8 @@ async function serveFile(publicDir: string, urlPath: string, uiVersion: string):
   if (!file) return null;
   // Name aus src/brand.ts in Titel und Wortmarke (Issue #100), Oberflächen-Version (Issue #111)
   if (extname(file).toLowerCase() === ".html") return brandHtmlResponse(file, uiVersion);
+  // Service Worker (Issue #224): Version und Name eingesetzt, neue Bytes je Oberflächen-Version
+  if (urlPath === SERVICE_WORKER_PATH) return serviceWorkerResponse(file, uiVersion);
   const type = CONTENT_TYPES[extname(file).toLowerCase()] ?? "application/octet-stream";
   return new Response(Bun.file(file), { headers: { "Content-Type": type } });
 }
@@ -486,9 +539,12 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
   const accessVerifier = config.access
     ? createAccessVerifier({ access: config.access, fetchCerts: deps.accessCerts, now, log })
     : null;
-  if (config.publicOrigin && !accessVerifier) {
+  // Weg von unterwegs (Issue #231): Tailscale nur für eine ts.net-Adresse ohne Access-Werte
+  const remote = remoteKind(config);
+  if (remote === "cloudflare" && !accessVerifier) {
     log("WEB_PUBLIC_ORIGIN ist gesetzt, Cloudflare Access aber nicht (WEB_ACCESS_TEAM, WEB_ACCESS_AUD): Anfragen über den Tunnel werden abgelehnt");
   }
+  if (remote === "tailscale") log("Zugang von unterwegs über Tailscale (WEB_PUBLIC_ORIGIN), Anmeldung mit dem WebUI-Passwort");
   const accessLogged = new Map<string, number>();
   /** Nur Ergebnis und Grund, nie das Token; gleiche Meldungen gebremst */
   function logAccess(who: string, result: AccessResult): void {
@@ -500,6 +556,8 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     accessLogged.set(line, t);
     log(line);
   }
+  // Anwesenheit (Issue #226): welches Gespräch gerade auf einem Tab sichtbar offen ist, nur im Speicher
+  const presence = new PresenceTracker({ now });
   const store = deps.conversationStore ?? new ConversationStore({ dir: deps.dataDir, now: deps.now });
   if (!deps.conversationStore) await store.load();
   /**
@@ -533,7 +591,13 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     if (failed) log(`Rückfragen im Verlauf von ${conversationId} nicht lesbar`);
     return out;
   }
-  const hub = new ChatHub({ store, chat: deps.chat, keepaliveMs: deps.keepaliveMs, log, decorate: decorateMessage });
+  /** Push von selbst (Issue #226); gesetzt, sobald die Abos geladen sind, ohne Push nie */
+  let notifier: PushNotifier | null = null;
+  /** Fertige Antwort eines Turns aus einem der Hubs: Push, wenn das Gespräch nirgends sichtbar ist */
+  const onReply = (event: { conversationId: string; text: string; agent?: string; source: MessageSource }) => {
+    void notifier?.reply({ conversationId: event.conversationId, text: event.text, agent: event.agent, origin: event.source });
+  };
+  const hub = new ChatHub({ store, chat: deps.chat, keepaliveMs: deps.keepaliveMs, log, decorate: decorateMessage, onReply });
   const catalog = deps.agentCatalog;
   const agentSource = deps.agents ?? (catalog ? () => catalog.list().map(a => ({ name: a.name })) : FALLBACK_AGENT_NAMES.map(name => ({ name })));
   const currentAgents = (): AgentInfo[] => agentList(typeof agentSource === "function" ? agentSource() : agentSource);
@@ -567,6 +631,26 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     : null;
   // Nie mit unlocked: Sperren aufheben darf nur der Einrichtungsmodus (M8) intern
   const keysApi = deps.keys ? createKeysApi(deps.keys, log) : null;
+  // Web Push (Issue #225): Abos pro Gerät neben den Gesprächen
+  let pushApi: ReturnType<typeof createPushApi> | null = null;
+  if (deps.push) {
+    const pushStore = new PushSubscriptionStore({
+      file: deps.push.file ?? PushSubscriptionStore.fileIn(deps.dataDir ?? DEFAULT_DATA_DIR),
+      now: deps.now,
+      telegram: deps.push.telegram,
+    });
+    await pushStore.load();
+    const api = createPushApi(pushStore, deps.push, log);
+    pushApi = api;
+    notifier = createPushNotifier({
+      devices: () => pushStore.list(),
+      send: (device, message, options) => api.send(device, message, options),
+      isVisible: id => presence.isVisible(id),
+      title: id => conversationTitleFor(id),
+      now,
+      log,
+    });
+  }
   // Telegram-Gespräche: eigener Hub, Nachrichten speichert der Turn in Supabase
   const telegramHub = new ChatHub({
     store: createTelegramMessageLog(deps.now),
@@ -575,6 +659,7 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     log,
     publishUserMessages: true,
     decorate: decorateMessage,
+    onReply,
   });
   const hubs = [hub, telegramHub];
   const hubFor = (id: string) => (parseTelegramConversationId(id) ? telegramHub : hub);
@@ -586,6 +671,11 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     try {
       stopChoices = deps.choices.subscribe((change: ChoiceChange) => {
         const owner = change.conversationId;
+        // Neue Frage (Issue #226): nur Push, die Knöpfe bringt die Nachricht dazu; die Kopie im Direktchat pusht nicht
+        if (change.created) {
+          if (owner) void notifier?.choice({ conversationId: owner, choiceId: change.choice.id, ...(change.kind ? { kind: change.kind } : {}) });
+          return;
+        }
         if (owner) hubFor(owner).publishChoice(owner, { conversationId: owner, choice: change.choice });
         if (change.copyInDm && owner !== "dm") {
           telegramHub.publishChoice("dm", { conversationId: "dm", choice: choiceViewFor(change.choice, owner, "dm") });
@@ -612,11 +702,77 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     try {
       stopLive = deps.telegramLive.subscribe(event => {
         if (event.message) telegramHub.publishMessage(event.conversationId, event.message);
+        // Meldungen pushen (Issue #226); Antworten aus Telegram meldet Telegram selbst
+        const m = event.message;
+        if (m?.kind === "notice") {
+          void notifier?.notice({
+            conversationId: event.conversationId,
+            text: m.text,
+            ...(m.source ? { source: m.source } : {}),
+            ...(m.file ? { file: { name: m.file.name } } : {}),
+            ...(m.choiceId || m.choice ? { choiceId: m.choiceId ?? m.choice!.id } : {}),
+          });
+        }
         telegramHub.publishActivity(ACTIVITY_STREAM, { id: event.conversationId, lastActivity: event.at });
       });
     } catch (e) {
       log(`Live-Nachrichten aus Telegram nicht verfügbar (${e instanceof Error ? e.name : typeof e})`);
     }
+  }
+  // Meldungen für reine Web-Gespräche (Issue #227): aus dem Nachrichtenspeicher übernehmen,
+  // entdoppelt über die msgId, mit Push wie jede Meldung
+  let stopWebNotices: (() => void) | null = null;
+  if (deps.webNotices) {
+    const importDeps = deps.webNotices;
+    const cursorFile = importDeps.cursorFile ?? join(store.dir, "notice-cursor.json");
+    const importNotice = async (conversationId: string, notice: WebNotice) => {
+      const stored = await store.appendNoticeOnce(
+        conversationId,
+        {
+          role: "assistant",
+          text: notice.text,
+          kind: "notice",
+          ...(notice.source ? { source: notice.source } : {}),
+          ...(notice.file ? { file: notice.file } : {}),
+          ...(notice.choiceId ? { choiceId: notice.choiceId } : {}),
+        },
+        notice.id
+      );
+      if (!stored) return;
+      hub.publishMessage(conversationId, toApiMessage(stored));
+      void notifier?.notice({
+        conversationId,
+        text: stored.text,
+        ...(notice.source ? { source: notice.source } : {}),
+        ...(notice.file ? { file: { name: notice.file.name } } : {}),
+        ...(notice.choiceId ? { choiceId: notice.choiceId } : {}),
+      });
+    };
+    stopWebNotices = startWebNoticeImport({
+      conversationIds: async () => (await store.listConversations()).map(c => c.id),
+      page: importDeps.page,
+      ...(importDeps.onMessageSaved ? { onMessageSaved: importDeps.onMessageSaved } : {}),
+      post: importNotice,
+      cursor: {
+        read: async () => {
+          try {
+            const parsed = JSON.parse(await readFile(cursorFile, "utf8"));
+            return typeof parsed?.at === "string" ? parsed.at : null;
+          } catch {
+            return null;
+          }
+        },
+        write: async at => {
+          const tmp = `${cursorFile}.${process.pid}.tmp`;
+          await mkdir(dirname(cursorFile), { recursive: true, mode: 0o700 });
+          await writeFile(tmp, JSON.stringify({ at }), { mode: 0o600 });
+          await rename(tmp, cursorFile);
+        },
+      },
+      ...(importDeps.intervalMs ? { intervalMs: importDeps.intervalMs } : {}),
+      ...(importDeps.every ? { every: importDeps.every } : {}),
+      log,
+    });
   }
   // In Telegram umbenannte oder angelegte Topics (Issue #32): an alle Seitenleisten nur die ID
   let stopTopicChanges: (() => void) | null = null;
@@ -665,6 +821,16 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
       log(`Telegram-Gespräche nicht lesbar (${errorName(e)})`);
       return { dm: null, topics: [] };
     }
+  }
+
+  /** Titel eines Gesprächs für Benachrichtigungen (Issue #226); leer, wenn unbekannt */
+  async function conversationTitleFor(id: string): Promise<string> {
+    if (parseTelegramConversationId(id)) {
+      const telegram = await listTelegram();
+      if (id === "dm") return telegram.dm?.title ?? "";
+      return telegram.topics.find(t => t.id === id)?.title ?? "";
+    }
+    return (await store.getConversation(id))?.title ?? "";
   }
 
   /** Alle Gespräche der WebUI mit Namen, für die Motor-Ausnahmen (Issue #126) */
@@ -1183,7 +1349,9 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     if (!deps.files || !OUTBOX_FILE_ID_PATTERN.test(id)) return notFound();
     let file: NoticeFile | null;
     try {
-      file = await deps.files.source.find(id);
+      // Reine Web-Gespräche, die es gibt (Issue #227): Meldungen mit Dateien unter web:<uuid>
+      const webIds = (await store.listConversations()).map(c => c.id);
+      file = await deps.files.source.find(id, webIds);
     } catch (e) {
       log(`Datei-Eintrag nicht lesbar (${errorName(e)})`);
       return json({ error: "Datei gerade nicht abrufbar" }, 503);
@@ -1302,7 +1470,8 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     }
     if (path === TELEGRAM_RIGHTS_PATH) {
       if (method !== "GET") return methodNotAllowed("GET");
-      if (!deps.topics) return json({ error: TOPIC_TEXT.notConfigured }, 503);
+      // Ohne Topic-Verwaltung (kein Telegram, Issue #228) gibt es keine Gruppe: Neues Gespräch legt Web-Gespräche an
+      if (!deps.topics) return json({ manageTopics: false, deleteMessages: false, group: false });
       const result = await deps.topics.rights();
       return json(result.body, result.status);
     }
@@ -1353,6 +1522,8 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
         method === "PUT" ? await keysApi.put(keyMatch[1], body, request) : await keysApi.remove(keyMatch[1], request);
       return json(result.body, result.status);
     }
+    if (path === "/api/push" || path.startsWith("/api/push/")) return pushRoutes(req, path, method, body, auth);
+    if (path === PRESENCE_PATH) return presenceRoute(method, body, auth);
     if (path === "/api/commands") {
       if (method !== "GET") return methodNotAllowed("GET");
       if (!deps.commands) return json({ error: COMMANDS_TEXT.notConfigured }, 503);
@@ -1441,10 +1612,16 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
       if (typeof agent !== "string" || !AGENT_NAME_PATTERN.test(agent) || !agentNames.has(agent)) {
         return json({ error: "Ungültiger Agent" }, 400);
       }
-      // Seit Issue #29 (Entscheidung 0005) immer ein Telegram-Topic, nie ein Web-Gespräch
-      if (!deps.topics) return json({ error: TOPIC_TEXT.notConfigured }, 503);
-      const created = await deps.topics.create(agent);
-      return json(created.body, created.status);
+      // Mit Forum-Gruppe ein Telegram-Topic (Issue #29, Entscheidung 0005); ohne Gruppe,
+      // mit oder ohne Telegram, ein reines Web-Gespräch (Issue #227, Nachtrag zu 0005)
+      if (groupChatId()) {
+        if (!deps.topics) return json({ error: TOPIC_TEXT.notConfigured }, 503);
+        const created = await deps.topics.create(agent);
+        return json(created.body, created.status);
+      }
+      const conversation = await store.createConversation(agent);
+      log(`Web-Gespräch angelegt (Agent ${agent})`);
+      return json({ conversation }, 201);
     }
 
     const choiceMatch = CHOICE_PATH.exec(path);
@@ -1507,26 +1684,76 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     return json({ stopping: hub.stop(id) });
   }
 
+  /**
+   * Web Push (Issue #225): nur für den Browser, nicht für den Terminal-Zugang
+   * (der hat weder Service Worker noch Origin-Prüfung). Schreiben braucht wie
+   * überall Sitzung und passenden Origin, über den Tunnel den Access-Nachweis.
+   */
+  async function pushRoutes(req: Request, path: string, method: string, body: string, auth: RequestAuth): Promise<Response> {
+    if (auth.source !== "web") return json({ error: "Nur im Browser" }, 403);
+    if (path === "/api/push") {
+      if (method !== "GET") return methodNotAllowed("GET");
+      if (!pushApi) return json({ available: false, reason: PUSH_TEXT.notConfigured, devices: [] });
+      const result = pushApi.get();
+      return json(result.body, result.status);
+    }
+    if (path === "/api/push/subscriptions") {
+      if (method !== "POST") return methodNotAllowed("POST");
+      if (!pushApi) return json({ error: PUSH_TEXT.notConfigured }, 503);
+      const result = await pushApi.subscribe(body, req.headers.get("user-agent"));
+      return json(result.body, result.status);
+    }
+    if (path === "/api/push/test") {
+      if (method !== "POST") return methodNotAllowed("POST");
+      if (!pushApi) return json({ error: PUSH_TEXT.notConfigured }, 503);
+      const result = await pushApi.test(body);
+      return json(result.body, result.status);
+    }
+    const device = PUSH_DEVICE_PATH.exec(path);
+    if (device) {
+      if (method !== "PATCH" && method !== "DELETE") return methodNotAllowed("PATCH, DELETE");
+      if (!pushApi) return json({ error: PUSH_TEXT.notConfigured }, 503);
+      const result = method === "PATCH" ? await pushApi.rename(device[1], body) : await pushApi.remove(device[1]);
+      return json(result.body, result.status);
+    }
+    return json({ error: "Nicht gefunden" }, 404);
+  }
+
+  /**
+   * POST /api/presence (Issue #226): Anwesenheit eines Tabs, nur aus dem
+   * Browser. Anmeldung und Origin prüft route() wie bei jedem Schreiben.
+   * Auch eine verspätete Meldung ergibt 204, sie ändert nur nichts.
+   */
+  function presenceRoute(method: string, body: string, auth: RequestAuth): Response {
+    if (auth.source !== "web") return json({ error: "Nur im Browser" }, 403);
+    if (method !== "POST") return methodNotAllowed("POST");
+    const report = parsePresenceReport(body);
+    if (!report) return json({ error: "Ungültige Anfrage" }, 400);
+    presence.report(report, { session: auth.session, isAuthorized: () => auth.isAuthorized() });
+    return new Response(null, { status: 204 });
+  }
+
   async function route(req: Request, peerIp: string, keepOpen: () => void): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
     const method = req.method.toUpperCase();
 
-    // Getunnelt (Issue #98): nur der öffentliche Host, nur der öffentliche Origin;
-    // sonst alles wie im Heimnetz
-    const origin = requestOrigin(req, peerIp, config.publicOrigin);
+    // Getunnelt (Issue #98, Tailscale seit #231): nur der öffentliche Host, nur
+    // der öffentliche Origin; sonst alles wie im Heimnetz
+    const origin = requestOrigin(req, peerIp, config.publicOrigin, remote ?? "cloudflare");
     const publicOrigin = origin.tunneled ? config.publicOrigin! : null;
     const hostOk = publicOrigin
       ? isPublicHost(req.headers.get("host"), publicOrigin)
       : isAllowedHost(req.headers.get("host"), hostCheck);
     if (!hostOk) return text("Misdirected Request", 421);
     // Für Log und Login-Bremse; getunnelte Besucher zählen getrennt von lokalen Adressen
-    const who = origin.tunneled ? `${origin.clientIp} (Tunnel)` : origin.clientIp;
+    const who = origin.via === "tailscale" ? `${origin.clientIp} (Tailscale)` : origin.tunneled ? `${origin.clientIp} (Tunnel)` : origin.clientIp;
     const limiterKey = origin.tunneled ? `tunnel:${origin.clientIp}` : origin.clientIp;
 
     // Access-Nachweis (Issue #99) vor Anmeldung, Body und Routing: gilt für
-    // Login, statische Dateien, Downloads, Uploads und Live-Verbindungen
-    if (origin.tunneled) {
+    // Login, statische Dateien, Downloads, Uploads und Live-Verbindungen.
+    // Über Tailscale gibt es kein Access; dort schützen Tailnet und Passwort
+    if (origin.tunneled && origin.via === "cloudflare") {
       const access: AccessResult = accessVerifier
         ? await accessVerifier.verify(req.headers.get(ACCESS_JWT_HEADER))
         : { ok: false, reason: "nicht-eingerichtet" };
@@ -1534,6 +1761,15 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
       if (!access.ok) {
         return path === "/api" || path.startsWith("/api/") ? json({ error: ACCESS_DENIED_TEXT }, 403) : text(ACCESS_DENIED_TEXT, 403);
       }
+    }
+
+    // Teilen-Ziel (Issue #229): den POST fängt sonst der Service Worker ab.
+    // Kommt er doch an (Worker noch nicht aktiv), wird nichts gelesen, nichts
+    // gespeichert und ohne Origin- und Login-Prüfung auf die Startseite
+    // umgeleitet; hinter dem Tunnel gilt der Access-Nachweis oben trotzdem.
+    if (path === SHARE_TARGET_PATH && method === "POST") {
+      await discardBody(req);
+      return new Response(null, { status: 303, headers: { Location: "/" } });
     }
 
     const cookieToken = readCookie(req, COOKIE_NAME);
@@ -1553,7 +1789,8 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     if (WRITE_METHODS.has(method) && !viaTerminal && !originOk) return json({ error: "Fremder Origin" }, 403);
 
     // Die Demo-Session ist ein lokales Sonderrecht und gilt nie über den Tunnel
-    const token = demoToken && !origin.tunneled && !sessions.isValid(cookieToken) ? demoToken : cookieToken;
+    // oder eine andere Weiterleitung (Tailscale, Issue #231)
+    const token = demoToken && origin.local && !sessions.isValid(cookieToken) ? demoToken : cookieToken;
     const loggedIn = viaTerminal || sessions.isValid(token);
     const auth: RequestAuth = viaTerminal
       ? { session: terminal!.sessionId, isAuthorized: () => terminal!.isActive(), source: "terminal", tunneled: false }
@@ -1561,7 +1798,8 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
           session: token ? hashToken(token) : "",
           isAuthorized: () => sessions.isValid(token),
           source: "web",
-          tunneled: origin.tunneled,
+          // Auch weitergeleitet ohne passende öffentliche Adresse (Issue #231)
+          tunneled: isRemoteRequest(req, peerIp, origin),
         };
 
     // Upload (Issue #72): Rohdaten mit eigener Grenze, erst nach Anmeldung und
@@ -1611,6 +1849,7 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     }
 
     if (path === BRAND_SCRIPT_PATH && (method === "GET" || method === "HEAD")) return brandScriptResponse();
+    if (path === MANIFEST_PATH && (method === "GET" || method === "HEAD")) return manifestResponse();
     const publicAsset = PUBLIC_ASSETS[path];
     if (publicAsset && (method === "GET" || method === "HEAD")) {
       if (path === "/login" && loggedIn) return redirect("/");
@@ -1634,6 +1873,7 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
         if (token !== demoToken) {
           await sessions.revoke(token);
           if (token) for (const h of hubs) h.closeSession(hashToken(token));
+          if (token) presence.clearSession(hashToken(token));
         }
         return json({ ok: true }, 200, { "Set-Cookie": sessionCookie("", 0, origin.tunneled) });
       }
@@ -1697,16 +1937,25 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
   return {
     url: `http://${displayHost}:${server.port}`,
     eventStreamCount: () => hub.subscriberCount() + telegramHub.subscriberCount(),
+    isConversationVisible: id => presence.isVisible(id),
     async postToConversation(conversationId, post) {
       if (stopped || !isConversationId(conversationId) || typeof post.text !== "string" || !post.text.trim()) return false;
       if (!(await store.getConversation(conversationId))) return false;
       const source = post.kind === "notice" && typeof post.source === "string" && NOTICE_SOURCE_PATTERN.test(post.source) ? post.source : undefined;
-      hub.postAfterTurn(conversationId, {
-        role: "assistant",
-        text: post.text,
-        ...(post.kind === "notice" ? { kind: "notice" as const, ...(source ? { source } : {}) } : {}),
-        ...(isChoiceId(post.choiceId) ? { choiceId: post.choiceId } : {}),
-      });
+      const choiceId = isChoiceId(post.choiceId) ? post.choiceId : undefined;
+      hub.postAfterTurn(
+        conversationId,
+        {
+          role: "assistant",
+          text: post.text,
+          ...(post.kind === "notice" ? { kind: "notice" as const, ...(source ? { source } : {}) } : {}),
+          ...(choiceId ? { choiceId } : {}),
+        },
+        // Meldung abgelegt: Push (Issue #226), wenn das Gespräch nirgends sichtbar ist
+        post.kind === "notice"
+          ? stored => void notifier?.notice({ conversationId, text: stored.text, ...(source ? { source } : {}), ...(choiceId ? { choiceId } : {}) })
+          : undefined
+      );
       return true;
     },
     async stop(options?: ChatShutdownOptions) {
@@ -1715,6 +1964,8 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
       await cliToken?.remove();
       stopLive?.();
       stopLive = null;
+      stopWebNotices?.();
+      stopWebNotices = null;
       stopGoals?.();
       stopGoals = null;
       stopChoices?.();

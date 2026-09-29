@@ -2,7 +2,7 @@
 <html lang="de">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="color-scheme" content="light dark">
   <meta name="tybo-ui-version" id="ui-version" content="{{ui.version}}">
   <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
@@ -12,7 +12,13 @@
   <link rel="stylesheet" href="/style.css">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="{{brand.name}}">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <script src="/brand.js"></script>
+  <script src="/push.js" defer></script>
   <script src="/settings.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
@@ -134,6 +140,10 @@
     <form id="composer" class="composer" novalidate>
       <p id="closed-note" class="composer-note" hidden>Dieses Topic ist geschlossen. Zum Schreiben im Menü oben rechts „Wieder öffnen" wählen.</p>
       <ul id="command-list" class="command-list" role="listbox" aria-label="Befehle" hidden></ul>
+      <div id="share-note" class="share-note" role="status" hidden>
+        <span id="share-text" class="share-text"></span>
+        <button type="button" id="share-move" class="quiet-button share-move" aria-controls="sidebar" aria-expanded="false">Anderes Gespräch</button>
+      </div>
       <p id="attach-note" class="composer-note attach-note" role="alert" hidden></p>
       <ul id="attachments" class="attachment-list" aria-label="Anhänge" hidden></ul>
       <div class="composer-box">
@@ -141,6 +151,17 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21.4 11.1l-9.2 9.2a6 6 0 01-8.5-8.5l9.2-9.2a4 4 0 015.7 5.7l-9.2 9.2a2 2 0 01-2.8-2.8l8.5-8.5"/></svg>
         </button>
         <input type="file" id="file-input" multiple accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,audio/*" tabindex="-1" aria-hidden="true" hidden>
+        <input type="file" id="camera-input" accept="image/*" capture="environment" tabindex="-1" aria-hidden="true" hidden>
+        <div id="attach-menu" class="attach-menu" role="menu" aria-label="Anhängen" hidden>
+          <button type="button" id="attach-camera" class="quiet-button" role="menuitem">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
+            <span>Foto aufnehmen</span>
+          </button>
+          <button type="button" id="attach-file" class="quiet-button" role="menuitem">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21.4 11.1l-9.2 9.2a6 6 0 01-8.5-8.5l9.2-9.2a4 4 0 015.7 5.7l-9.2 9.2a2 2 0 01-2.8-2.8l8.5-8.5"/></svg>
+            <span>Datei wählen</span>
+          </button>
+        </div>
         <textarea id="input" rows="1" placeholder="Nachricht an {{brand.name}}" aria-label="Nachricht" autocomplete="off" aria-autocomplete="list" aria-controls="command-list"></textarea>
         <div id="recorder" class="recorder" role="group" aria-label="Sprachaufnahme läuft" hidden>
           <span class="recorder-dot" aria-hidden="true"></span>

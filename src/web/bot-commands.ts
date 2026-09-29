@@ -63,6 +63,7 @@ import {
   createWebSink,
   MIRROR_FAILED_TEXT,
   mirrorChunks,
+  mirrorsToTelegram,
   replyInfoFrom,
   resolveTelegramTarget,
   TELEGRAM_UNAVAILABLE_TEXT,
@@ -81,7 +82,7 @@ export interface BotCommandDeps {
   registry: CommandRegistry;
   /** Dieselben Funktionen wie in Telegram (src/bot.ts commandServices) */
   services: CommandServices;
-  /** TELEGRAM_USER_ID */
+  /** Chat des Direktchats: TELEGRAM_USER_ID, ohne Telegram "web" (Issue #227) */
   userId?: string;
   groupId(): string | null;
   agentForTopic(topicId: number, chatId: string): string | undefined;
@@ -150,6 +151,8 @@ interface CommandTarget {
   agent: string;
   /** Nur Telegram-Gespräche: Ziel für sendAndRecord (topicId 1 ist General) */
   outbox?: { topicId?: number };
+  /** Spiegeln und Antworten nach Telegram; nicht im Web-Direktchat ohne Telegram (Issue #227) */
+  telegram: boolean;
 }
 
 export function createBotCommands(deps: BotCommandDeps): CommandPort {
@@ -188,11 +191,11 @@ export function createBotCommands(deps: BotCommandDeps): CommandPort {
     if (ref) {
       const resolved = resolveTelegramTarget(conversationId, deps);
       if (!resolved) return { failed: TELEGRAM_UNAVAILABLE_TEXT };
-      target = { ...resolved, outbox: ref.kind === "topic" ? { topicId: ref.topicId } : {} };
+      target = { ...resolved, outbox: ref.kind === "topic" ? { topicId: ref.topicId } : {}, telegram: mirrorsToTelegram(resolved.chatId) };
       metaBase.topicId = resolved.topicId ?? null;
     } else {
       const chatId = webChatId(conversationId);
-      target = { chatId, sessionKey: sessionKeyFor(chatId), agent: req.agent };
+      target = { chatId, sessionKey: sessionKeyFor(chatId), agent: req.agent, telegram: false };
     }
 
     // Wie in Telegram (handleUpdateScope in src/bot.ts) läuft der ganze Ablauf
@@ -222,21 +225,25 @@ export function createBotCommands(deps: BotCommandDeps): CommandPort {
         await req.notice(buttons ? buttonsAsText(text, buttons) : text);
         return;
       }
+      // Web-Direktchat ohne Telegram (Issue #227): festgehalten ohne Knöpfe, deren Beschriftungen als Text
+      const telegramButtons = buttons && target.telegram;
       const input: SendAndRecordInput = {
-        text,
+        text: buttons && !target.telegram ? buttonsAsText(text, buttons) : text,
         ...target.outbox,
+        ...(target.telegram ? {} : { chatId: target.chatId }),
         source: COMMAND_NOTICE_SOURCE,
         format: options.format === "markdown" ? "markdown" : "plain",
-        ...(buttons ? { buttons: buttons.map(row => row.map(b => ({ text: b.label, callback_data: b.action }))) } : {}),
+        ...(telegramButtons ? { buttons: buttons.map(row => row.map(b => ({ text: b.label, callback_data: b.action }))) } : {}),
       };
-      let result: { sent: boolean; recorded: boolean };
+      let result: { sent: boolean; recorded: boolean; error?: unknown };
       try {
         result = await deps.sendAndRecord(input);
       } catch (e) {
         log(`Befehlsantwort (${conversationId}) nicht gesendet (${errorName(e)})`);
         result = { sent: false, recorded: false };
       }
-      if (!result.sent) {
+      // Zugestellt heißt auch: ohne Telegram für die WebUI festgehalten (Issue #227)
+      if (!result.sent && !(result.recorded && !result.error)) {
         replyFailed = true;
         // Wenigstens im offenen Browser zeigen, ohne Speichern
         await req.notice(text).catch(() => {});
@@ -323,7 +330,7 @@ export function createBotCommands(deps: BotCommandDeps): CommandPort {
       // Live in Browser und Terminal mit der ID aus dem Verlauf; der Nachrichten-Feed
       // meldet Web-Einträge (channel "web") nur als Aktivität, also genau einmal
       await req.answer(response, info, replyId);
-      if (target.outbox) {
+      if (target.outbox && target.telegram) {
         const visible = stripControlTags(response);
         if (visible.trim()) {
           try {
@@ -357,7 +364,7 @@ export function createBotCommands(deps: BotCommandDeps): CommandPort {
           () => {},
           e => log(`${what} (${conversationId}) nicht gesendet (${errorName(e)})`)
         );
-      const telegram = target.outbox
+      const telegram = target.outbox && target.telegram
         ? createTelegramBoardOutput(
             {
               sendAsAgent: (agent, id, text, threadId) => deps.sendAsAgent(agent, id, text, threadId),
@@ -502,7 +509,7 @@ export function createBotCommands(deps: BotCommandDeps): CommandPort {
       }
     }
 
-    const voiceMessage: VoiceMessagePort | undefined = target.outbox
+    const voiceMessage: VoiceMessagePort | undefined = target.outbox && target.telegram
       ? { enabled: () => deps.voice?.enabled() ?? false, send: sendVoiceMessage }
       : undefined;
 
@@ -530,7 +537,7 @@ export function createBotCommands(deps: BotCommandDeps): CommandPort {
 
     async function execute(): Promise<CommandOutcome | undefined> {
       // 1. Spiegeln; scheitert das oder kommt ein Stopp dazwischen, keine Wirkung
-      if (target.outbox) {
+      if (target.outbox && target.telegram) {
         try {
           for (const chunk of mirrorChunks(req.text, source)) {
             if (isAborted()) return { aborted: true };

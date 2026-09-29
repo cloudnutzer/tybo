@@ -153,12 +153,15 @@ describe("Bearer von Loopback", () => {
     expect(ctx.chat.turns.map(t => t.source)).toEqual(["terminal"]);
   });
 
-  test("Forwarded-Kopfzeilen ändern nichts an der Verbindungsadresse", async () => {
+  // Seit Issue #231: eine weitergeleitete Anfrage (etwa über `tailscale serve`, das von
+  // 127.0.0.1 verbindet) ist nie lokal; Kopfzeilen können lokale Rechte nur nehmen, nie geben
+  test("Forwarded-Kopfzeilen machen eine Loopback-Verbindung nicht lokal: Schlüssel gilt dann nicht", async () => {
     const ctx = await start();
-    const res = await fetch(`${ctx.url}/api/me`, {
-      headers: { ...bearer(ctx.token), "x-forwarded-for": "203.0.113.9", forwarded: "for=203.0.113.9" },
-    });
-    expect(res.status).toBe(200);
+    for (const extra of [{ "x-forwarded-for": "203.0.113.9" }, { forwarded: "for=203.0.113.9" }]) {
+      const res = await fetch(`${ctx.url}/api/me`, { headers: { ...bearer(ctx.token), ...extra } });
+      expect(res.status).toBe(401);
+    }
+    expect((await fetch(`${ctx.url}/api/me`, { headers: bearer(ctx.token) })).status).toBe(200);
   });
 
   test("falscher Schlüssel: 401, auch bei POST ohne Origin (statt 403)", async () => {

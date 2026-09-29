@@ -15,6 +15,7 @@
  * Issue #118 ueber das Rueckfragen-Register (src/lib/goal-choices.ts).
  */
 
+import type { UserNotifier } from "./user-notify";
 import {
   clearGoal,
   extendGoal,
@@ -100,10 +101,16 @@ export function goalKeyboard(rows: GoalButton[][]): { inline_keyboard: { text: s
  * und haelt sie selbst fest, deshalb hier weder send noch record, sonst stuende
  * sie doppelt im Verlauf. Kam sie nicht ins Register (ask false), geht sie wie
  * die anderen Meldungen raus, ohne Knoepfe und mit dem Hinweis auf die Befehle.
+ *
+ * Mit notify (Issue #227, gemeinsamer Meldeweg aus src/lib/user-notify.ts)
+ * ersetzt ein einziger Aufruf send und record: mit Telegram gesendet und
+ * genau einmal festgehalten, ohne Telegram nur festgehalten; der Zwischenstand
+ * ("turn") nur in Telegram.
  */
 export function createTelegramGoalStatus(deps: {
-  send(chatId: string, text: string, threadId?: number, keyboard?: unknown): Promise<void>;
+  send?(chatId: string, text: string, threadId?: number, keyboard?: unknown): Promise<void>;
   record?(target: GoalTarget, message: GoalStatusMessage): Promise<unknown>;
+  notify?: UserNotifier;
   ask?(target: GoalTarget, text: string): Promise<boolean>;
   /** Hinweis unter der Budget-Meldung, wenn ask fehlt oder scheitert */
   noButtonsHint?: string;
@@ -121,7 +128,17 @@ export function createTelegramGoalStatus(deps: {
       const { buttons: _none, ...rest } = message;
       message = deps.noButtonsHint ? { ...rest, text: `${rest.text}\n\n${deps.noButtonsHint}` } : rest;
     }
-    await deps.send(target.chatId, message.text, target.topicId, message.buttons ? goalKeyboard(message.buttons) : undefined);
+    if (deps.notify) {
+      await deps.notify(message.text, {
+        chatId: target.chatId,
+        ...(target.topicId !== undefined ? { topicId: target.topicId } : {}),
+        source: GOAL_NOTICE_SOURCE,
+        ...(message.buttons ? { buttons: goalKeyboard(message.buttons).inline_keyboard } : {}),
+        ...(message.kind === "turn" ? { telegramOnly: true } : {}),
+      });
+      return;
+    }
+    await deps.send?.(target.chatId, message.text, target.topicId, message.buttons ? goalKeyboard(message.buttons) : undefined);
     if (message.kind !== "turn" && deps.record) {
       try {
         await deps.record(target, message);

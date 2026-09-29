@@ -1,6 +1,6 @@
 {
   "name": "tybo",
-  "version": "2.13.0",
+  "version": "2.14.0",
   "description": "Always-on AI assistant on Telegram and in the browser, powered by Claude Code, with agents, persistent memory and background jobs",
   "homepage": "https://tybo.ai",
   "repository": {

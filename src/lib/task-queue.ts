@@ -277,22 +277,56 @@ export async function formatTaskStatus(chatId: string): Promise<string> {
 /**
  * Check for stale tasks and send reminders
  */
+/**
+ * Erinnerung über den gemeinsamen Meldeweg (Issue #227, src/lib/user-notify.ts):
+ * mit Telegram samt Knöpfen gesendet und für die WebUI festgehalten, ohne
+ * Telegram nur in der WebUI. true, wenn zugestellt.
+ */
+export type StaleTaskNotify = (
+  text: string,
+  target: { chatId: string; buttons: { text: string; callback_data: string }[][] }
+) => Promise<boolean>;
+
 export async function checkStaleTasks(
   botToken: string,
-  chatId: string,
-  thresholdMs: number = 2 * 60 * 60 * 1000
+  chatId: string | string[],
+  thresholdMs: number = 2 * 60 * 60 * 1000,
+  options: {
+    notify?: StaleTaskNotify;
+    /** Speicher-Attrappe für Tests */
+    store?: { getStaleTasks: typeof getStaleTasks; updateTask: typeof updateTask };
+  } = {}
 ): Promise<number> {
-  const stale = await getStaleTasks(thresholdMs);
+  const { notify } = options;
+  const store = options.store ?? { getStaleTasks, updateTask };
+  const stale = await store.getStaleTasks(thresholdMs);
+  const owners = Array.isArray(chatId) ? chatId : [chatId];
   let reminded = 0;
 
   for (const task of stale) {
-    if (task.chat_id !== chatId) continue;
+    if (!owners.includes(task.chat_id)) continue;
 
     const keyboard = buildTaskKeyboard(task.id, task.pending_options || []);
 
     const msg = `**Reminder:** I'm still waiting for your input on this task:\n\n${
       task.pending_question || task.original_prompt.substring(0, 200)
     }`;
+
+    if (notify) {
+      try {
+        // Nur als erinnert markieren, wenn die Meldung angekommen ist
+        const buttons = keyboard.inline_keyboard.map(row =>
+          row.flatMap(b => ("callback_data" in b && b.callback_data ? [{ text: b.text, callback_data: b.callback_data }] : []))
+        );
+        if (await notify(msg, { chatId: task.chat_id, buttons })) {
+          await store.updateTask(task.id, { reminder_sent: true });
+          reminded++;
+        }
+      } catch (err) {
+        console.error(`Failed to send reminder for task ${task.id}:`, err);
+      }
+      continue;
+    }
 
     try {
       await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {

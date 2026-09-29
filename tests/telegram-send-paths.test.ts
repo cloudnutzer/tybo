@@ -36,25 +36,34 @@ function sourceFiles(): string[] {
 /** Bot-API-Methoden, die Text oder Captions senden oder bearbeiten */
 const SEND_URL = /api\.telegram\.org\/bot\$\{[^}]+\}\/(?:send\w+|edit\w+|copyMessage|\$\{)/;
 
-describe("src/bot.ts (nur Quelltext)", () => {
+describe("src/bot.ts und src/lib/telegram-runtime.ts (nur Quelltext)", () => {
   const source = read("src/bot.ts");
+  // Issue #228: Bot, Guard und Sende-Helfer leben in der Telegram-Laufzeit
+  const runtime = read("src/lib/telegram-runtime.ts");
 
-  test("genau ein Bot, Guard direkt danach installiert", () => {
-    const creations = source.match(/new Bot\(/g) ?? [];
-    expect(creations).toHaveLength(1);
-    const afterCreation = source.slice(source.indexOf("const bot = new Bot("), source.indexOf("const bot = new Bot(") + 400);
+  test("genau ein Bot (in der Laufzeit), Guard direkt danach installiert", () => {
+    expect(source).not.toMatch(/new Bot\(/);
+    expect(source).not.toMatch(/\bbot\.api\./);
+    expect(runtime.match(/new Bot\(/g) ?? []).toHaveLength(1);
+    const created = runtime.indexOf("const bot = createBot(");
+    expect(created).toBeGreaterThan(-1);
+    const afterCreation = runtime.slice(created, created + 400);
     expect(afterCreation).toContain("installTelegramOutputGuard(bot.api);");
-    // Der Guard steht vor jeder Sendung und jeder Handler-Registrierung
-    const guardAt = source.indexOf("installTelegramOutputGuard(bot.api);");
-    for (const use of ["bot.api.", "bot.on(", "bot.command(", "new BotRegistry("]) {
-      const first = source.indexOf(use);
+    // Der Guard steht vor jeder Sendung und vor den Agenten-Bots
+    const guardAt = runtime.indexOf("installTelegramOutputGuard(bot.api);");
+    for (const use of ["bot.api.", "new BotRegistry("]) {
+      const first = runtime.indexOf(use, created + 1);
       expect({ use, afterGuard: first === -1 || first > guardAt }).toEqual({ use, afterGuard: true });
     }
+    // Die Handler hängen erst beim Start am Bot
+    expect(source.indexOf("telegramRuntime.bot?.use(telegramHandlers);")).toBeGreaterThan(source.indexOf("createTelegramRuntime({ env: process.env })"));
   });
 
   test("keine eigene Api, kein direkter fetch an Sende-Methoden", () => {
-    expect(source).not.toMatch(/new Api\(/);
-    expect(source).not.toMatch(SEND_URL);
+    for (const file of [source, runtime]) {
+      expect(file).not.toMatch(/new Api\(/);
+      expect(file).not.toMatch(SEND_URL);
+    }
     // Erlaubt sind nur Datei-Downloads und getFile
     for (const m of source.matchAll(/api\.telegram\.org\/([^`"'\s]*)/g)) {
       expect(m[1]).toMatch(/^(file\/bot|bot\$\{BOT_TOKEN\}\/getFile)/);
@@ -62,22 +71,27 @@ describe("src/bot.ts (nur Quelltext)", () => {
   });
 
   test("alle Api-Aufrufe laufen über den abgesicherten Bot oder ctx", () => {
-    for (const m of source.matchAll(/(\w+)\.api\.(send\w+|edit\w+|copyMessage)\(/g)) {
-      expect(["bot", "ctx"]).toContain(m[1]);
+    for (const file of [source, runtime]) {
+      for (const m of file.matchAll(/(\w+)\.api\.(send\w+|edit\w+|copyMessage)\(/g)) {
+        expect(["bot", "ctx"]).toContain(m[1]);
+      }
     }
   });
 
-  test("Sende-Helfer im Bot setzen die Vorschau selbst", () => {
-    for (const fn of ["sendDirectMessage", "sendStatusMessage"]) {
-      const start = source.indexOf(`async function ${fn}(`);
+  test("Sende-Helfer setzen die Vorschau selbst", () => {
+    for (const fn of ["async sendMessage(", "async sendStatus("]) {
+      const start = runtime.indexOf(fn);
       expect(start).toBeGreaterThan(-1);
-      const body = source.slice(start, source.indexOf("\n}\n", start));
+      const body = runtime.slice(start, runtime.indexOf("\n    },\n", start));
       expect(body).toContain("link_preview_options: NO_LINK_PREVIEW");
     }
+    expect(source).toContain("return telegramRuntime.sendMessage(chatId, text, threadId);");
+    expect(source).toContain("return telegramRuntime.sendStatus(chatId, text, threadId, keyboard);");
   });
 
   test("Agenten-Antworten über BotRegistry mit demselben Bot", () => {
-    expect(source).toContain("new BotRegistry(bot)");
+    expect(runtime).toContain("new BotRegistry(b, { env: e, createBot: factory })");
+    expect(source).toContain("const botRegistry = telegramRuntime.agents;");
   });
 });
 
@@ -85,7 +99,7 @@ describe("alle Versandmodule", () => {
   const files = sourceFiles();
 
   test("findet die bekannten Module", () => {
-    for (const f of ["src/bot.ts", "src/lib/telegram.ts", "src/lib/outbox.ts", "src/lib/bot-registry.ts", "src/feedback.ts"]) {
+    for (const f of ["src/bot.ts", "src/lib/telegram-runtime.ts", "src/lib/telegram.ts", "src/lib/outbox.ts", "src/lib/bot-registry.ts", "src/feedback.ts"]) {
       expect(files).toContain(f);
     }
   });

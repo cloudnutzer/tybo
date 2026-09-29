@@ -23,8 +23,8 @@ function cmd(text: string): Command {
   return parsed.command;
 }
 
-async function setup(startId = "topic-443", client?: (s: TerminalTestServer) => ApiClient) {
-  const s = await startTyboServer({ manage: true });
+async function setup(startId = "topic-443", client?: (s: TerminalTestServer) => ApiClient, options: { withoutTelegram?: boolean } = {}) {
+  const s = await startTyboServer({ manage: true, ...options });
   servers.push(s);
   const list = await s.client().listConversations();
   let current: ConversationSummary = list.find(c => c.id === (startId === "web" ? s.webConversationId : startId))!;
@@ -151,6 +151,39 @@ describe("/gespraeche und /wechsel", () => {
     expect(await t.run("/wechsel Recherche")).toBe(true);
     expect(t.out.switched).toEqual([]);
     expect(t.out.infos.pop()).toBe("Du bist schon in Recherche.");
+  });
+});
+
+describe("Issue #228: /neu ohne Forum-Gruppe (ohne Telegram)", () => {
+  test("/neu research Mein Titel: Web-Gespräch mit Agent und Titel, Meldung ohne Telegram-Satz", async () => {
+    const t = await setup("dm", undefined, { withoutTelegram: true });
+    expect(t.current.id).toBe("dm");
+    expect(await t.run("/neu research Mein Titel")).toBe(true);
+    expect(t.out.errors).toEqual([]);
+    const switched = t.out.switched[0];
+    expect(switched.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(switched.note).toBe("Neues Gespräch mit Research.");
+    expect(switched.note).not.toContain("Telegram");
+    expect(t.current).toMatchObject({ id: switched.id, kind: "web", title: "Mein Titel", agent: "research" });
+    const created = (await t.s.client().listConversations()).find(c => c.id === switched.id)!;
+    expect(created).toMatchObject({ kind: "web", title: "Mein Titel", agent: "research" });
+    // Keine Topics angelegt
+    expect(await topicCount(t.s)).toBe(0);
+  });
+
+  test("/neu ohne Argumente: Web-Gespräch mit General", async () => {
+    const t = await setup("dm", undefined, { withoutTelegram: true });
+    expect(await t.run("/neu")).toBe(true);
+    expect(t.current.kind).toBe("web");
+    expect(t.current.agent).toBe("general");
+    expect(t.out.switched[0].note).toBe("Neues Gespräch mit General.");
+  });
+
+  test("mit Forum-Gruppe bleibt es beim Topic und dem Telegram-Satz", async () => {
+    const t = await setup();
+    expect(await t.run("/neu research Plan")).toBe(true);
+    expect(t.current.kind).toBe("topic");
+    expect(t.out.switched[0].note).toBe("Neues Gespräch mit Research, auch als Topic in Telegram.");
   });
 });
 

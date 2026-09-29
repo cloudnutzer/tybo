@@ -8,6 +8,7 @@
 // Einstellungen (#38): Ansicht aus settings.js unter #/einstellungen/agenten,
 // „Agent ändern …" im Topic-Menü; Reiter Modelle und Status (#39).
 // Hinweis „Neue Version“ mit „Neu laden“, Entwürfe überstehen das Neuladen (#111).
+// Service Worker der installierbaren Web-App, Übernahme beim Neuladen (#224).
 // Reines JavaScript ohne Abhängigkeiten. Nutzertext, Fehler, Fortschritt und
 // Hinweise kommen immer über textContent in die Seite; nur das vom Server
 // gerenderte und bereinigte HTML einer Antwort (message.html) wird eingesetzt.
@@ -47,6 +48,327 @@ const CHOICE_SNAPSHOT_MAX = 200;
 /** Kennung einer Rückfrage, wie CHOICE_ID_PATTERN in src/web/store.ts */
 const CHOICE_ID_PATTERN = /^[A-Za-z0-9]{1,12}$/;
 
+// --- Anwesenheit (Issue #226) ----------------------------------------------
+
+/** PRESENCE_PATH in server.ts; der Server hält Meldungen 70 Sekunden */
+const PRESENCE_PATH = "/api/presence";
+const PRESENCE_INTERVAL_MS = 30_000;
+
+/** Direktlink auf ein Gespräch (Issue #226): #/gespraech/<id>, etwa aus einer Benachrichtigung */
+const CONVERSATION_LINK_PATTERN = /^#\/gespraech\/([^/?#]{1,80})$/;
+/** Web-Gespräch (UUID), Direktchat oder Topic, wie isConversationId und parseTelegramConversationId im Server */
+const LINK_ID_PATTERN = /^(dm|topic-[1-9][0-9]{0,9}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
+const UNKNOWN_LINK_TEXT = "Dieses Gespräch gibt es nicht mehr. Hier ist der Direktchat.";
+/** Nachricht des Service Workers nach einem Tipp auf eine Benachrichtigung (sw.js) */
+const OPEN_CONVERSATION_MESSAGE = "open-conversation";
+/** Antwort an den Service Worker: die Chat-App hat das Gespräch übernommen */
+const OPEN_CONVERSATION_ACK = "open-conversation-ack";
+
+/**
+ * Gespräch aus der Adresse: { id } bei einem gültigen Direktlink, { id: null }
+ * bei einem kaputten (dann Hinweis), null ohne Direktlink
+ */
+function conversationLink(hash) {
+  const match = CONVERSATION_LINK_PATTERN.exec(String(hash || ""));
+  if (!match) return null;
+  let id = "";
+  try {
+    id = decodeURIComponent(match[1]);
+  } catch {
+    id = "";
+  }
+  return { id: LINK_ID_PATTERN.test(id) ? id : null };
+}
+
+/** Direktlink-Adresse zu einem Gespräch */
+function conversationLinkHash(id) {
+  return "#/gespraech/" + encodeURIComponent(id);
+}
+
+/** Adresse, die die Anmeldung behalten soll: Direktlinks, Einstellungen und Teilen (Issue #229) */
+function keptHash(hash) {
+  const value = String(hash || "");
+  return CONVERSATION_LINK_PATTERN.test(value) || SHARE_HASH_PATTERN.test(value) || /^#\/einstellungen(\/[a-z-]{1,40})?$/.test(value)
+    ? value
+    : "";
+}
+
+// --- Handy: Tastatur, Zurück und Wischen (Issue #229) ------------------------
+
+/** Wie die Schublade in style.css: darunter ist die Seitenleiste eine Schublade */
+const DRAWER_QUERY = "(max-width: 55.99rem)";
+/** Schlüssel in history.state: welcher Eintrag der App das ist */
+const NAV_KEY = "tyboNav";
+/** Wischen öffnet nur, wenn es in diesem Randstreifen (Pixel) beginnt */
+const SWIPE_EDGE_PX = 20;
+/** So weit (Pixel) muss ein Wisch waagrecht gehen */
+const SWIPE_MIN_PX = 60;
+
+/**
+ * Sichtbarer Bereich bei offener Bildschirmtastatur: { height, top } in
+ * Pixeln, wenn der sichtbare Bereich (visualViewport) kleiner als das
+ * Layout ist oder verschoben (iOS schiebt die Seite beim Tippen hoch);
+ * null, wenn alles passt, bei Zoom (dann nichts anfassen) und bei
+ * unbrauchbaren Werten.
+ */
+function keyboardViewport(vv, layoutHeight) {
+  if (!vv || typeof vv.height !== "number" || !(vv.height > 0) || !(layoutHeight > 0)) return null;
+  if (typeof vv.scale === "number" && Math.abs(vv.scale - 1) > 0.01) return null;
+  const height = Math.round(vv.height);
+  const top = Math.max(0, Math.round(typeof vv.offsetTop === "number" ? vv.offsetTop : 0));
+  if (height >= Math.round(layoutHeight) - 1 && top === 0) return null;
+  // Kleiner als eine Kopfzeile samt Eingabe: eher ein Messfehler als eine Tastatur
+  if (height < 120) return null;
+  return { height, top };
+}
+
+/** Art eines Verlaufseintrags der App: "base" (Liste), "chat", "drawer" oder null (fremd, Einstellungen) */
+function navMark(historyState) {
+  const mark = historyState && typeof historyState === "object" ? historyState[NAV_KEY] : null;
+  return mark === "base" || mark === "chat" || mark === "drawer" ? mark : null;
+}
+
+/**
+ * Zurück oder Vor landet auf einem Eintrag: "open" (Schublade zeigen: die
+ * Gesprächsliste oder ein Schubladen-Eintrag), "close" (Gespräch) oder null
+ * (Einträge ohne Markierung, etwa Einstellungen: das regelt der Hash).
+ */
+function navOnPop(mark) {
+  if (mark === "base" || mark === "drawer") return "open";
+  if (mark === "chat") return "close";
+  return null;
+}
+
+/** Schublade geht auf: nur über einem Gespräch ein eigener Eintrag ("push") */
+function navOnOpen(mark) {
+  return mark === "chat" ? "push" : null;
+}
+
+/**
+ * Schublade geht ohne Zurück zu (Scrim, Schließen, Wischen, Wahl eines
+ * Gesprächs): über ihrem eigenen Eintrag einen Schritt zurück ("back"), auf
+ * der Gesprächsliste den Gesprächs-Eintrag neu anlegen ("push"), sonst nichts.
+ */
+function navOnClose(mark) {
+  if (mark === "drawer") return "back";
+  if (mark === "base") return "push";
+  return null;
+}
+
+/**
+ * Wisch am Handy: "open" (geschlossen, Start im linken Randstreifen, nach
+ * rechts), "close" (offen, nach links) oder null. Vor allem waagrecht:
+ * höchstens halb so weit senkrecht wie waagrecht.
+ */
+function swipeGesture(start, end, drawerOpen) {
+  if (!start || !end) return null;
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  if (Math.abs(dy) > Math.abs(dx) / 2) return null;
+  if (!drawerOpen && start.x <= SWIPE_EDGE_PX && dx >= SWIPE_MIN_PX) return "open";
+  if (drawerOpen && dx <= -SWIPE_MIN_PX) return "close";
+  return null;
+}
+
+// --- Teilen-Ziel (Issue #229) ------------------------------------------------
+
+/** Umleitung des Service Workers nach dem Ablegen (sw.js), mit /fehler, wenn das Ablegen scheiterte */
+const SHARE_HASH_PATTERN = /^#\/teilen(\/fehler)?$/;
+/** Wie SHARE_MAX_AGE_MS in sw.js: ältere Übergaben verwirft die App */
+const SHARE_MAX_AGE_MS = 10 * 60 * 1000;
+/** Wie SHARE_CLOCK_SKEW_MS in sw.js: so weit darf ein Zeitpunkt in der Zukunft liegen */
+const SHARE_CLOCK_SKEW_MS = 60 * 1000;
+const SHARE_ID_PATTERN = /^[0-9a-f]{32}$/;
+/** Übergabe noch im Schreiben: so oft und in diesem Abstand erneut nachsehen */
+const SHARE_RETRY_MAX = 20;
+const SHARE_RETRY_MS = 500;
+const SHARE_TEXT = {
+  failed: "Teilen hat nicht geklappt: Das Gerät konnte die Inhalte nicht zwischenspeichern. Bitte noch einmal teilen.",
+  unplaced: "Noch in keinem Gespräch.",
+  choose: "Gespräch in der Liste wählen.",
+  move: "Anderes Gespräch",
+  chooseButton: "Gespräch wählen",
+  left: n => "Höchstens " + MAX_ATTACHMENTS + " Anhänge je Nachricht: " + (n === 1 ? "1 geteilte Datei ist" : n + " geteilte Dateien sind") + " im vorherigen Gespräch geblieben.",
+  dropped: n => "Höchstens " + MAX_ATTACHMENTS + " Anhänge je Nachricht: " + (n === 1 ? "1 geteilte Datei wurde" : n + " geteilte Dateien wurden") + " nicht übernommen.",
+  expired: "Geteilter Inhalt war älter als zehn Minuten und ist verworfen. Bitte noch einmal teilen.",
+  sendingElsewhere: "Entwurf wird noch in einem anderen Fenster gesendet.",
+};
+
+/** Name des Caches, in den sw.js geteilte Inhalte legt */
+function shareCacheName(brand) {
+  return String((brand && brand.cli) || "webui") + "-teilen";
+}
+
+/** Kennung und Nummer (null bei der Beschreibung) eines Cache-Eintrags; null bei fremden */
+function shareEntry(requestUrl) {
+  let path = "";
+  try {
+    path = new URL(String(requestUrl), "http://x").pathname;
+  } catch {
+    return null;
+  }
+  const match = /^\/teilen\/([0-9a-f]{32})(?:\/([0-9]{1,2}))?$/.exec(path);
+  return match ? { id: match[1], n: match[2] === undefined ? null : Number(match[2]) } : null;
+}
+
+/** Wie shareFresh in sw.js: jünger als zehn Minuten, höchstens eine Minute in der Zukunft */
+function shareFresh(at, now) {
+  return typeof at === "number" && at - now < SHARE_CLOCK_SKEW_MS && now - at < SHARE_MAX_AGE_MS;
+}
+
+/**
+ * Liest alle vollständigen, nicht abgelaufenen Übergaben aus dem Cache des
+ * Service Workers, älteste zuerst: { id, meta, requests }. Abgelaufene und
+ * kaputte löscht es dabei. Dateien ohne Beschreibung mit junger Kennung
+ * (Zeitpunkt in den ersten zwölf Stellen, wie shareId in sw.js) schreibt der
+ * Worker gerade noch: sie bleiben liegen und zählen in pending. Ohne Cache:
+ * leere Liste.
+ */
+async function readShareHandoffs(storage, name, now) {
+  if (!storage || typeof storage.has !== "function" || !(await storage.has(name))) return { cache: null, handoffs: [], pending: 0 };
+  const cache = await storage.open(name);
+  const groups = new Map();
+  for (const request of await cache.keys()) {
+    const entry = shareEntry(request.url);
+    if (!entry) continue;
+    if (!groups.has(entry.id)) groups.set(entry.id, { meta: null, files: new Map(), all: [] });
+    const group = groups.get(entry.id);
+    group.all.push(request);
+    if (entry.n === null) group.meta = request;
+    else group.files.set(entry.n, request);
+  }
+  const handoffs = [];
+  let pending = 0;
+  for (const [id, group] of groups) {
+    const response = group.meta ? await cache.match(group.meta) : null;
+    if (!response) {
+      if (shareFresh(parseInt(id.slice(0, 12), 16), now)) pending++;
+      else await Promise.all(group.all.map(request => cache.delete(request)));
+      continue;
+    }
+    let meta = null;
+    try {
+      meta = await response.json();
+    } catch {
+      meta = null;
+    }
+    if (!(meta && meta.id === id && shareFresh(meta.at, now) && Array.isArray(meta.files))) {
+      await Promise.all(group.all.map(request => cache.delete(request)));
+      continue;
+    }
+    handoffs.push({ id, meta, metaRequest: group.meta, files: group.files, all: group.all });
+  }
+  handoffs.sort((a, b) => a.meta.at - b.meta.at);
+  return { cache, handoffs, pending };
+}
+
+/** Titel, Text und Link als ein Entwurfstext; doppelte Teile nur einmal */
+function sharedDraftText(meta) {
+  const clean = value => (typeof value === "string" ? value.trim() : "");
+  const text = clean(meta.text);
+  const url = clean(meta.url);
+  const title = clean(meta.title);
+  const parts = [];
+  if (title && !text.includes(title) && title !== url) parts.push(title);
+  if (text) parts.push(text);
+  if (url && !text.includes(url)) parts.push(url);
+  return parts.join("\n");
+}
+
+/** Entwurf mit angehängtem Text; ein vorhandener Entwurf bleibt davor stehen */
+function appendDraft(existing, text) {
+  if (!text) return existing || "";
+  const before = String(existing || "").replace(/\s+$/, "");
+  return before ? before + "\n\n" + text : text;
+}
+
+/** Entfernt einen angehängten Text wieder; null, wenn der Entwurf inzwischen anders endet */
+function removeAppendedDraft(draft, text) {
+  const value = String(draft || "");
+  if (!text) return value;
+  if (value === text) return "";
+  if (value.endsWith("\n\n" + text)) return value.slice(0, value.length - text.length - 2);
+  return null;
+}
+
+/** Entfernt einen Text am Anfang des Entwurfs (danach Angehängtes bleibt); null, wenn er dort nicht mehr steht */
+function removeLeadingDraft(draft, text) {
+  const value = String(draft || "");
+  if (!text) return value;
+  if (value === text) return "";
+  if (value.startsWith(text + "\n\n")) return value.slice(text.length + 2);
+  return null;
+}
+
+/** „Geteilt: 1 Bild, Text" aus Dateiarten und Text */
+function shareSummary(kinds, meta) {
+  const count = { image: 0, document: 0, audio: 0 };
+  for (const kind of kinds) if (count[kind] !== undefined) count[kind]++;
+  const parts = [];
+  if (count.image) parts.push(count.image === 1 ? "1 Bild" : count.image + " Bilder");
+  if (count.document) parts.push(count.document === 1 ? "1 PDF" : count.document + " PDFs");
+  if (count.audio) parts.push(count.audio === 1 ? "1 Sprachdatei" : count.audio + " Sprachdateien");
+  const text = typeof meta.text === "string" ? meta.text.trim() : "";
+  const url = typeof meta.url === "string" ? meta.url.trim() : "";
+  if (text && text !== url) parts.push("Text");
+  else if (url || text) parts.push("Link");
+  else if (typeof meta.title === "string" && meta.title.trim()) parts.push("Text");
+  return parts.length ? "Geteilt: " + parts.join(", ") : "Geteilt";
+}
+
+/** Hinweis zu Dateien, die der Service Worker nicht übernommen hat */
+function shareRejectedText(rejected) {
+  const list = Array.isArray(rejected) ? rejected.filter(r => r && typeof r === "object") : [];
+  if (!list.length) return "";
+  const first = list[0];
+  const name = typeof first.name === "string" && first.name ? first.name + ": " : "";
+  let reason = ATTACHMENT_TEXT.type;
+  if (first.reason === "empty") reason = ATTACHMENT_TEXT.empty;
+  else if (first.reason === "count") reason = ATTACHMENT_TEXT.tooMany;
+  else if (first.reason === "size" && ATTACHMENT_LIMITS[first.kind]) {
+    reason = ATTACHMENT_KIND_LABEL[first.kind] + " ist zu groß (höchstens " + ATTACHMENT_LIMITS[first.kind] / MB + " MB).";
+  }
+  const more = list.length > 1 ? " " + (list.length - 1 === 1 ? "1 weitere Datei" : list.length - 1 + " weitere Dateien") + " ebenfalls nicht übernommen." : "";
+  return name + reason + more;
+}
+
+/**
+ * Entwürfe samt nicht gesendeten Anhängen, solange die Seite verborgen oder
+ * verlassen ist (Issue #229): Teilen aus einer anderen App lädt das Fenster
+ * neu oder öffnet ein neues. Je Tab und Sicherung (fortlaufende Nummer) eine
+ * Beschreibung /entwurf/<tab>/<stand> und die Dateien
+ * /entwurf/<tab>/<stand>/<n>, im Cache des Geräts, also für alle Fenster.
+ * Ein vollständiger Stand bleibt liegen, bis der nächste vollständig ist.
+ */
+const DRAFT_STASH_PATH = "/entwurf/";
+
+function draftCacheName(brand) {
+  return String((brand && brand.cli) || "webui") + "-entwuerfe";
+}
+
+/** Tab, Stand und Nummer (null bei der Beschreibung) eines Entwurfs-Eintrags; null bei fremden */
+function draftEntry(requestUrl) {
+  let path = "";
+  try {
+    path = new URL(String(requestUrl), "http://x").pathname;
+  } catch {
+    return null;
+  }
+  const match = /^\/entwurf\/([0-9a-f]{32})\/([0-9]{1,9})(?:\/([0-9]{1,2}))?$/.exec(path);
+  return match ? { tab: match[1], gen: Number(match[2]), n: match[3] === undefined ? null : Number(match[3]) } : null;
+}
+
+/** Zufällige Kennung dieses Tabs, nur für die Anwesenheit; neu bei jedem Laden */
+function randomTabId(win) {
+  const bytes = new Uint8Array(16);
+  try {
+    win.crypto.getRandomValues(bytes);
+  } catch {
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+}
+
 // --- Neue Version (Issue #111) ----------------------------------------------
 
 /** Oberflächen-Version des Servers (src/web/ui-version.ts) */
@@ -58,6 +380,29 @@ const VERSION_CHECK_MIN_MS = 60_000;
 const DRAFTS_LOST_TEXT = "Entwürfe ließen sich nicht sichern und gehen verloren.";
 /** Entwürfe über das Neuladen per Hinweis-Knopf, nur in diesem Tab (sessionStorage) */
 const RELOAD_DRAFTS_KEY = "tybo-reload-drafts";
+
+// --- Service Worker (Issue #224) ---------------------------------------------
+
+const SERVICE_WORKER_PATH = "/sw.js";
+/** Wie SKIP_WAITING in sw.js: ein wartender Worker übernimmt */
+const SKIP_WAITING_MESSAGE = { type: "skip-waiting" };
+/** So lange wartet „Neu laden" höchstens auf die Übernahme durch den neuen Worker */
+const WORKER_TAKEOVER_MAX_MS = 3000;
+
+/**
+ * Service Worker nur im sicheren Kontext (HTTPS, localhost); über
+ * http://<LAN-IP> bleibt die WebUI eine normale Webseite. null ohne.
+ */
+function serviceWorkerContainer(win) {
+  try {
+    const nav = win ? win.navigator : null;
+    return win.isSecureContext && nav && nav.serviceWorker && typeof nav.serviceWorker.register === "function"
+      ? nav.serviceWorker
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 /** Version aus dem Meta-Tag der geladenen Seite; null, wenn keine da ist */
 function pageUiVersion(meta) {
@@ -347,6 +692,8 @@ function setServerHtml(body, message) {
 /** Anzeigenamen der Absender; unbekannte Kennungen erscheinen, wie sie sind */
 const NOTICE_SOURCES = {
   pipeline: "Pipeline",
+  // Hintergrund-Jobs (docs/hintergrund-jobs.md); ohne Telegram auch in Web-Gesprächen (Issue #227)
+  job: "Job",
   briefing: "Briefing",
   checkin: "Check-in",
   watchdog: "Watchdog",
@@ -358,6 +705,8 @@ const NOTICE_SOURCES = {
   freigabe: "Freigabe",
   review: "Vorschlag",
   topic: "Topic",
+  // Bot-interne Meldungen ohne Telegram (Issue #227): Neustart, Credit-Guard
+  system: "System",
 };
 
 /**
@@ -1507,8 +1856,17 @@ function init() {
     commandList: document.getElementById("command-list"),
     attach: document.getElementById("attach"),
     fileInput: document.getElementById("file-input"),
+    /** Kamera am Handy (Issue #229): zweites Feld mit capture, kleines Menü an der Büroklammer */
+    cameraInput: document.getElementById("camera-input"),
+    attachMenu: document.getElementById("attach-menu"),
+    attachCamera: document.getElementById("attach-camera"),
+    attachFile: document.getElementById("attach-file"),
     attachments: document.getElementById("attachments"),
     attachNote: document.getElementById("attach-note"),
+    /** Zeile „Geteilt: …" über den Anhängen (Issue #229) */
+    shareNote: document.getElementById("share-note"),
+    shareText: document.getElementById("share-text"),
+    shareMove: document.getElementById("share-move"),
     record: document.getElementById("record"),
     recorder: document.getElementById("recorder"),
     recorderTime: document.getElementById("recorder-time"),
@@ -1520,6 +1878,12 @@ function init() {
 
   const state = {
     conversation: null,
+    /** Anwesenheit (Issue #226): Tab-Kennung, laufende Nummer, Zeitgeber; gone nach dem Verlassen */
+    presence: { tab: randomTabId(window), seq: 0, timer: null, gone: false },
+    /** Hinweis nach einem Direktlink auf ein unbekanntes Gespräch; weg beim nächsten Gesprächswechsel */
+    linkNotice: "",
+    /** Gespräch, das openLinked gerade öffnet: übersteht eine Umleitung zur Anmeldung; sonst null */
+    linkTarget: null,
     /** Status-Karte des Ziels im offenen Gespräch (Issue #76), null ohne Ziel */
     goal: null,
     /** Ein Knopf der Karte wartet auf den Server */
@@ -1666,21 +2030,85 @@ function init() {
       lastCheck: -Infinity,
       deferTimer: null,
       risks: null,
+      /** Registrierung des Service Workers (Issue #224) oder null */
+      registration: null,
     },
     /** Die Live-Verbindung des Gesprächs war weg: beim nächsten open die Version prüfen */
     eventsLost: false,
+    /**
+     * Geteilter Inhalt aus dem Teilen-Menü (Issue #229), bis er gesendet ist:
+     * { id, meta, files, text, conversationId (null: noch in keinem
+     * Gespräch), itemKeys (Anhänge daraus), textAdded (an den Entwurf
+     * gehängt), moving („Anderes Gespräch" gewählt), summary, release }
+     */
+    shared: null,
+    /** Menü der Büroklammer (Kamera, Datei) offen, nur auf Touch-Geräten (Issue #229) */
+    attachMenu: false,
+    /** Beginn einer Berührung für das Wischen (Issue #229): { x, y } oder null */
+    touch: null,
+    /** Der Verlauf stand zuletzt ganz unten: bleibt es, wenn die Tastatur den Platz verkleinert */
+    pinnedBottom: true,
+    /** Abmelden läuft: beim Verlassen keine Entwürfe sichern */
+    loggingOut: false,
+    /** Übernahmen laufen nacheinander */
+    shareQueue: Promise.resolve(),
+    /** Schon übernommene Übergaben: nie ein zweites Mal */
+    shareTaken: new Set(),
+    /** Nachsehen, solange der Worker noch schreibt (scheduleShareRetry) */
+    shareRetryTimer: null,
+    shareRetries: 0,
+    /** Sichern und Verwerfen der Entwürfe im Gerät laufen nacheinander */
+    draftStashQueue: Promise.resolve(),
+    /** Nummer der letzten eigenen Sicherung im Gerät */
+    draftStashGen: 0,
+    /** Was zuletzt vollständig im Gerät liegt; gleicher Stand wird nicht neu geschrieben */
+    draftStashSig: null,
+    /** Beschreibung des eigenen Stands im Gerät; fehlt sie, hat ein anderes Fenster ihn übernommen */
+    draftStashMeta: null,
+    /** Gespräche im eigenen Stand im Gerät */
+    draftStashConversations: new Set(),
+    /**
+     * Gespräche, deren Stand ein anderes Fenster übernommen hat: der Inhalt
+     * lebt dort weiter. Bis zum Sichtbarwerden sichert dieses Fenster nur noch
+     * die übrigen (etwa ein Gespräch, dessen Senden inzwischen zu Ende ist).
+     */
+    draftStashGone: new Set(),
+    /** Übernommener Stand nannte ein Gespräch, das ein anderes Fenster gerade sendet */
+    draftsSendingElsewhere: false,
+    /** Übernahme gesicherter Entwürfe beim Laden; Start und Teilen warten darauf */
+    draftRestore: Promise.resolve(),
+    /** Senden läuft: { conversation, text }; dieses Gespräch kommt nicht in die Sicherung */
+    sendingNow: null,
   };
 
   const touchInput = window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
+  /**
+   * Zurück am Handy (Issue #229): unter 56rem bekommen Gesprächsliste,
+   * Gespräch und offene Schublade eigene Verlaufseinträge, damit Zurück
+   * erst die Schublade schließt, dann zur Liste führt und erst danach die
+   * App verlässt. Am Rechner bleibt der Verlauf wie er ist.
+   */
+  const nav = !!(
+    window.history &&
+    typeof window.history.pushState === "function" &&
+    typeof window.history.replaceState === "function" &&
+    typeof window.history.back === "function" &&
+    window.matchMedia &&
+    window.matchMedia(DRAWER_QUERY).matches
+  );
   // Mikrofon nur im sicheren Kontext (Issue #109); einmal beim Laden geprüft
   const canRecord = recordingSupported(window);
 
   function goToLogin() {
+    reportPresence({ gone: true });
     state.leaving = true;
     discardRecording();
     closeEvents();
     closeActivity();
-    window.location.href = "/login";
+    // Direktlink (Issue #226) übersteht die Anmeldung, auch einer, der gerade
+    // geöffnet wird (Adresse schon geleert oder aus einer Benachrichtigung)
+    const hash = state.linkTarget ? conversationLinkHash(state.linkTarget) : window.location.hash;
+    window.location.href = "/login" + keptHash(hash);
   }
 
   async function api(method, path, body) {
@@ -2031,9 +2459,16 @@ function init() {
     if (stick) scrollToBottom();
   }
 
+  /** Verbindungsbalken; ohne Text bleibt ein Hinweis zum Direktlink (Issue #226) stehen, bis das Gespräch wechselt */
   function showConnection(text) {
-    el.connection.textContent = text || "";
-    el.connection.hidden = !text;
+    const shown = text || state.linkNotice || "";
+    el.connection.textContent = shown;
+    el.connection.hidden = !shown;
+  }
+
+  function showLinkNotice() {
+    state.linkNotice = UNKNOWN_LINK_TEXT;
+    showConnection("");
   }
 
   function autosize() {
@@ -2284,6 +2719,7 @@ function init() {
     button.addEventListener("click", () => {
       closeSidebar();
       if (!state.conversation || state.conversation.id !== c.id) openConversation(c);
+      else stopShareMove();
     });
     li.appendChild(button);
     // Menü für Web-Gespräche und Topics außer General (Direktchat und General nicht)
@@ -2356,7 +2792,7 @@ function init() {
 
     const web = state.conversations.filter(match);
     fillList(el.list, web, false);
-    // Nur, wenn es (passende) ältere Web-Gespräche gibt; neue entstehen nicht mehr (Entscheidung 0005)
+    // Nur, wenn es (passende) Web-Gespräche gibt; neue entstehen nur ohne Forum-Gruppe (Nachtrag zu 0005, Issue #227)
     el.webGroup.hidden = web.length === 0;
 
     el.filterEmpty.hidden = !filtering || dm.length + recentShown.length + olderShown.length + web.length > 0;
@@ -2506,20 +2942,156 @@ function init() {
     );
   }
 
-  function openSidebar() {
+  function sidebarOpen() {
+    return el.sidebar.getAttribute("data-open") === "true";
+  }
+
+  /** Schublade zeigen, ohne den Verlauf anzufassen (auch nach Zurück) */
+  function showSidebar() {
     el.sidebar.setAttribute("data-open", "true");
     el.scrim.hidden = false;
     el.menu.setAttribute("aria-expanded", "true");
     el.newChat.focus();
   }
 
-  function closeSidebar() {
-    const wasOpen = el.sidebar.getAttribute("data-open") === "true";
+  /** Schublade schließen, ohne den Verlauf anzufassen */
+  function hideSidebar() {
+    const wasOpen = sidebarOpen();
     el.sidebar.setAttribute("data-open", "false");
     el.scrim.hidden = true;
     el.menu.setAttribute("aria-expanded", "false");
     // Fokus zurück zum Menü-Knopf, aber nur, wenn die Schublade offen war
     if (wasOpen) el.menu.focus();
+  }
+
+  /** Volle Adresse der Seite für einen Verlaufseintrag */
+  function currentUrl() {
+    const loc = window.location;
+    return String(loc.pathname || "/") + String(loc.search || "") + String(loc.hash || "");
+  }
+
+  function openSidebar() {
+    const wasOpen = sidebarOpen();
+    showSidebar();
+    if (!wasOpen && nav && navOnOpen(navMark(window.history.state)) === "push") {
+      window.history.pushState({ [NAV_KEY]: "drawer" }, "", currentUrl());
+    }
+  }
+
+  function closeSidebar() {
+    const wasOpen = sidebarOpen();
+    hideSidebar();
+    if (!wasOpen || !nav) return;
+    const action = navOnClose(navMark(window.history.state));
+    if (action === "back") window.history.back();
+    else if (action === "push") window.history.pushState({ [NAV_KEY]: "chat" }, "", currentUrl());
+  }
+
+  /**
+   * Einträge beim Laden anlegen: darunter die Gesprächsliste (ohne
+   * Direktlink in der Adresse, damit Zurück ihn nicht noch einmal öffnet),
+   * darüber das Gespräch. Nach Neuladen stehen sie schon.
+   */
+  function setupNav() {
+    if (!nav) return;
+    const mark = navMark(window.history.state);
+    if (mark === "chat") return;
+    if (mark === "drawer") {
+      showSidebar();
+      return;
+    }
+    const loc = window.location;
+    const plain = String(loc.pathname || "/") + String(loc.search || "");
+    // Vor dem Ersetzen merken: danach steht die Liste ohne Hash in der Adresse
+    const hash = String(loc.hash || "");
+    if (mark !== "base") window.history.replaceState({ [NAV_KEY]: "base" }, "", plain);
+    window.history.pushState({ [NAV_KEY]: "chat" }, "", plain + hash);
+  }
+
+  /** Zurück oder Vor innerhalb der App: Schublade passend zum Eintrag */
+  function onPopState(event) {
+    const action = navOnPop(navMark(event && "state" in event ? event.state : window.history.state));
+    if (action === "open") {
+      if (!sidebarOpen()) showSidebar();
+    } else if (action === "close") {
+      stopShareMove();
+      hideSidebar();
+    }
+  }
+
+  /** Wischen beginnt nicht auf Code-Blöcken, Tabellen und Eingaben: die scrollen oder markieren selbst */
+  function swipeBlocked(target) {
+    return !!(target && typeof target.closest === "function" && target.closest("pre, table, input, textarea, .attach-menu"));
+  }
+
+  function onTouchStart(event) {
+    const t = event && event.touches && event.touches.length === 1 ? event.touches[0] : null;
+    state.touch = t && !swipeBlocked(event.target) ? { x: t.clientX, y: t.clientY } : null;
+  }
+
+  function onTouchEnd(event) {
+    const start = state.touch;
+    state.touch = null;
+    const t = event && event.changedTouches ? event.changedTouches[0] : null;
+    if (!start || !t || el.main.getAttribute("data-view") === "settings") return;
+    const gesture = swipeGesture(start, { x: t.clientX, y: t.clientY }, sidebarOpen());
+    if (gesture === "open") openSidebar();
+    else if (gesture === "close") {
+      stopShareMove();
+      closeSidebar();
+    }
+  }
+
+  /**
+   * Bildschirmtastatur (Issue #229): Chrome auf Android verkleinert das
+   * Layout selbst (interactive-widget=resizes-content). iOS nicht: dort
+   * begrenzen --app-height und --app-top den App-Rahmen auf den sichtbaren
+   * Bereich, damit Eingabe und letzte Nachricht über der Tastatur bleiben.
+   * Stand der Verlauf unten, bleibt er unten; sonst bleibt die Leseposition.
+   */
+  function applyViewport() {
+    const root = document.documentElement;
+    if (!root || !root.style || typeof root.style.setProperty !== "function") return;
+    const box = keyboardViewport(window.visualViewport, root.clientHeight);
+    const stick = state.pinnedBottom;
+    if (box) {
+      root.style.setProperty("--app-height", box.height + "px");
+      root.style.setProperty("--app-top", box.top + "px");
+    } else {
+      root.style.removeProperty("--app-height");
+      root.style.removeProperty("--app-top");
+    }
+    if (stick) scrollToBottom();
+  }
+
+  // --- Kamera an der Büroklammer (Issue #229) --------------------------------
+
+  function attachMenuOpen() {
+    return state.attachMenu;
+  }
+
+  function openAttachMenu() {
+    state.attachMenu = true;
+    el.attachMenu.hidden = false;
+    el.attach.setAttribute("aria-expanded", "true");
+    el.attachCamera.focus();
+  }
+
+  function closeAttachMenu(focus) {
+    if (!attachMenuOpen()) return;
+    state.attachMenu = false;
+    el.attachMenu.hidden = true;
+    el.attach.setAttribute("aria-expanded", "false");
+    if (focus) el.attach.focus();
+  }
+
+  /** Gewählte oder aufgenommene Dateien aus einem der beiden Felder anhängen */
+  function takeInputFiles(input) {
+    const files = Array.from(input.files || []);
+    // Zurücksetzen, damit dieselbe Datei noch einmal gewählt werden kann
+    input.value = "";
+    if (files.length) addAttachments(files.map(file => ({ file })));
+    el.input.focus();
   }
 
   /** Merkt das Gespräch für den nächsten Start; gesperrter Speicher stört nicht. */
@@ -2642,12 +3214,18 @@ function init() {
     renderConversationList();
     applyMode(previousId, conversation);
     setRunning(false);
+    state.linkNotice = "";
     showConnection("");
     state.goalPending = false;
     applyGoal(null);
     connectEvents();
     void syncMessages();
     void loadGoal();
+    reportPresence();
+    void closeSettledNotifications();
+    // Geteilter Inhalt (Issue #229): noch ohne Gespräch oder „Anderes Gespräch" gewählt
+    if (state.shared && (state.shared.moving || !state.shared.conversationId)) resumeShare();
+    else renderShare();
   }
 
   // --- Ziel (/goal, Issue #76) -----------------------------------------------
@@ -2786,7 +3364,8 @@ function init() {
 
   /**
    * Legt ein Gespräch an; ohne agent nimmt der Server General. Seit Issue #29
-   * ist das ein Telegram-Topic (topic-<n>). Ergebnis: { conversation, error }.
+   * ist das ein Telegram-Topic (topic-<n>), ohne Forum-Gruppe (Issue #227) ein
+   * reines Web-Gespräch. Ergebnis: { conversation, error }.
    * conversation fehlt, wenn nichts angelegt wurde; error ist die Meldung des
    * Servers (keine Gruppe, fehlendes Recht, Telegram lehnt ab). Ein 500 mit
    * conversation heißt: Topic angelegt, aber nicht alles gespeichert.
@@ -2838,21 +3417,31 @@ function init() {
       // Zuletzt geöffnetes Gespräch, falls es noch existiert; sonst das
       // jüngste Web-Gespräch, der Direktchat oder ein Topic. Nie anlegen:
       // das wäre bei jedem Seitenaufruf ein neues Telegram-Topic (Issue #30)
-      const first = findConversation(rememberedConversation()) || firstExisting();
+      // Direktlink (Issue #226) geht vor; unbekannt oder gelöscht: Direktchat mit Hinweis
+      const link = conversationLink(window.location.hash);
+      const linked = link && link.id ? findConversation(link.id) : null;
+      if (link) replaceHash(null);
+      const first = linked || (link ? state.telegram.dm : null) || findConversation(rememberedConversation()) || firstExisting();
+      // Entwürfe und Anhänge von vor dem Teilen (Issue #229) vor dem ersten Öffnen
+      await state.draftRestore;
       // Vor dem Gespräch: dessen Strom bleibt der zuletzt geöffnete
       connectActivity();
       if (!first) {
         showNoConversation();
+        if (link) showLinkNotice();
         return;
       }
       // Liegt es unter „Ältere Topics", die Gruppe aufklappen, damit die Markierung zu sehen ist
       if (splitTopics(state.telegram.topics, undefined, state.pinned).older.some(t => t.id === first.id)) state.olderOpen = true;
       openConversation(first);
+      if (link && !linked) showLinkNotice();
     } catch {
       if (!state.leaving) showConnection("Server nicht erreichbar. Bitte die Seite neu laden.");
     } finally {
       state.busy = false;
       updateControls();
+      // Geteilte Inhalte (Issue #229): nach #/teilen und auch sonst, falls eine Übergabe liegt
+      if (!state.leaving && !routeShareLink()) void takeShares();
     }
   }
 
@@ -2872,7 +3461,11 @@ function init() {
       try {
         const { ok, data } = await api("GET", UI_VERSION_PATH);
         const version = ok && data ? data.version : null;
-        if (typeof version === "string" && UI_VERSION_PATTERN.test(version) && version !== u.loaded) showUpdate();
+        if (typeof version === "string" && UI_VERSION_PATTERN.test(version) && version !== u.loaded) {
+          showUpdate();
+          // Neuen Worker gleich holen, damit er beim Knopf „Neu laden" bereitsteht
+          updateServiceWorker();
+        }
       } catch {
         // offline oder abgemeldet; bei 401 hat api() schon umgeleitet
       } finally {
@@ -2978,6 +3571,14 @@ function init() {
       if (el.input.value) drafts.set(id, el.input.value);
       else drafts.delete(id);
     }
+    // Was gerade gesendet wird, kann schon beim Server sein (Issue #229): lieber
+    // verworfen als nach dem Neuladen ein zweites Mal im Entwurf
+    const sending = state.sendingNow;
+    if (sending && drafts.has(sending.conversation)) {
+      const rest = removeLeadingDraft(drafts.get(sending.conversation), sending.text);
+      if (rest) drafts.set(sending.conversation, rest);
+      else drafts.delete(sending.conversation);
+    }
     const raw = serializeReloadDrafts(drafts);
     const store = sessionStore();
     try {
@@ -2990,6 +3591,16 @@ function init() {
       return store.getItem(RELOAD_DRAFTS_KEY) === raw;
     } catch {
       return raw === null;
+    }
+  }
+
+  /** Sicherung vom Verlassen verwerfen (Seite kam aus dem Zurück-Cache zurück) */
+  function clearReloadDrafts() {
+    const store = sessionStore();
+    try {
+      if (store) store.removeItem(RELOAD_DRAFTS_KEY);
+    } catch {
+      // gesperrt: nichts zu verwerfen
     }
   }
 
@@ -3007,6 +3618,310 @@ function init() {
     for (const [id, text] of parseReloadDrafts(raw)) {
       if (!state.drafts.has(id)) state.drafts.set(id, text);
     }
+  }
+
+  // --- Entwürfe über den Seitenwechsel beim Teilen (Issue #229) --------------
+
+  /** Sichern und Verwerfen nacheinander, Fehler bleiben still */
+  function queueDraftStash(task) {
+    state.draftStashQueue = state.draftStashQueue.then(() => withDraftLock(task)).catch(() => {});
+    return state.draftStashQueue;
+  }
+
+  function draftStorage() {
+    const storage = window.caches;
+    return storage && typeof storage.open === "function" && typeof storage.has === "function" ? storage : null;
+  }
+
+  /**
+   * Eine Sperre für alle Fenster (Web Locks): Schreiben, Verwerfen und
+   * Übernehmen der Stände im Gerät laufen nie gleichzeitig. Wer übernimmt,
+   * wartet also, bis ein anderes Fenster fertig geschrieben hat; stirbt es
+   * dabei, gibt der Browser die Sperre frei. task bekommt true, wenn die
+   * Sperre gilt. Ohne Web Locks läuft task gleich.
+   */
+  function withDraftLock(task, waitMs) {
+    const nav = window.navigator;
+    const locks = nav && nav.locks && typeof nav.locks.request === "function" ? nav.locks : null;
+    if (!locks) return task(false);
+    const name = draftCacheName(window.TYBO_BRAND);
+    // Übernahme beim Laden: nicht endlos auf ein eingefrorenes Fenster warten
+    if (!waitMs || typeof AbortController !== "function") return locks.request(name, () => task(true));
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), waitMs);
+    let started = false;
+    return Promise.resolve(
+      locks.request(name, { signal: abort.signal }, () => {
+        started = true;
+        clearTimeout(timer);
+        return task(true);
+      })
+    ).catch(error => {
+      clearTimeout(timer);
+      if (started) throw error;
+      return task(false);
+    });
+  }
+
+  /** Einträge des Caches nach Tab und Stand: tab -> gen -> { meta, files } */
+  async function draftGroups(cache) {
+    const tabs = new Map();
+    for (const request of await cache.keys()) {
+      const entry = draftEntry(request.url);
+      if (!entry) continue;
+      if (!tabs.has(entry.tab)) tabs.set(entry.tab, new Map());
+      const gens = tabs.get(entry.tab);
+      if (!gens.has(entry.gen)) gens.set(entry.gen, { meta: null, files: new Map() });
+      const group = gens.get(entry.gen);
+      if (entry.n === null) group.meta = request;
+      else group.files.set(entry.n, request);
+    }
+    return tabs;
+  }
+
+  /** Einen Stand löschen, die Beschreibung zuerst (ohne sie gilt der Rest als unfertig) */
+  async function deleteDraftGen(cache, group) {
+    if (group.meta) await cache.delete(group.meta);
+    for (const request of group.files.values()) await cache.delete(request);
+  }
+
+  /** Eigene Stände löschen, bis auf keep */
+  async function deleteDraftStash(cache, tab, keep) {
+    const gens = (await draftGroups(cache)).get(tab);
+    if (!gens) return;
+    for (const [gen, group] of gens) if (gen !== keep) await deleteDraftGen(cache, group);
+  }
+
+  /** Kennung je Datei, damit ein unveränderter Stand erkennbar ist */
+  const draftFileIds = new WeakMap();
+  let draftFileCount = 0;
+  function draftFileId(file) {
+    if (!draftFileIds.has(file)) draftFileIds.set(file, ++draftFileCount);
+    return draftFileIds.get(file);
+  }
+
+  /** Gespräche, in denen gerade gesendet oder hochgeladen wird */
+  function sendingConversations() {
+    const busy = new Set();
+    if (state.sendingNow) busy.add(state.sendingNow.conversation);
+    for (const [conversation, list] of state.attachments) {
+      if (list.some(item => item.status === "uploading")) busy.add(conversation);
+    }
+    return busy;
+  }
+
+  /**
+   * Was in die Sicherung kommt: Entwürfe samt aktueller Eingabe und nicht
+   * gesendete Anhänge aller ruhenden Gespräche. Ein Gespräch, in dem gerade
+   * gesendet oder hochgeladen wird, bleibt in diesem Fenster (Issue #229): ob
+   * sein Inhalt beim Server ankommt, weiß nur dieses Fenster. Die Sicherung
+   * nennt es nur (busy), damit das übernehmende Fenster darauf hinweist.
+   * Gespräche, deren Stand schon ein anderes Fenster übernommen hat, fehlen.
+   */
+  function collectDraftStash() {
+    const busy = sendingConversations();
+    const skip = id => busy.has(id) || state.draftStashGone.has(id);
+    const drafts = {};
+    for (const [id, text] of state.drafts) {
+      if (typeof id === "string" && typeof text === "string" && text && !skip(id)) drafts[id] = text;
+    }
+    const current = state.conversation ? state.conversation.id : null;
+    if (current) {
+      delete drafts[current];
+      if (el.input.value && !skip(current)) drafts[current] = el.input.value;
+    }
+    const items = [];
+    for (const [conversation, list] of state.attachments) {
+      if (skip(conversation)) continue;
+      for (const item of list) {
+        if (item.file) items.push({ conversation, item });
+      }
+    }
+    const conversations = new Set([...Object.keys(drafts), ...items.map(({ conversation }) => conversation)]);
+    const held = [...busy].sort();
+    const sig = JSON.stringify([drafts, items.map(({ conversation, item }) => [conversation, draftFileId(item.file), item.name, item.kind, item.duration]), held]);
+    return { drafts, items, held, conversations, sig, empty: !conversations.size && !held.length };
+  }
+
+  /**
+   * Seite wird verborgen (Wechsel in die App, aus der geteilt wird) oder
+   * verlassen: Entwürfe und Anhänge ruhender Gespräche im Gerät ablegen
+   * (collectDraftStash). Ein neu geladenes oder neues Fenster übernimmt sie
+   * (restoreDraftStash). Unveränderter Stand (pagehide gleich nach dem
+   * Verbergen): nichts tun. Sonst ein neuer Stand, die Beschreibung zuletzt;
+   * erst danach fällt der vorige weg. Bricht das Schreiben ab (Seite ist weg),
+   * bleibt der vorige vollständig liegen.
+   */
+  function stashDrafts() {
+    return queueDraftStash(async () => {
+      const storage = draftStorage();
+      if (!storage || state.loggingOut) return;
+      let stash = collectDraftStash();
+      if (stash.sig === state.draftStashSig) return;
+      const tab = state.presence.tab;
+      const name = draftCacheName(window.TYBO_BRAND);
+      // Ein anderes Fenster hat den eigenen Stand übernommen: dessen Gespräche
+      // leben dort weiter und kommen nicht noch einmal in die Sicherung (sonst
+      // käme Übernommenes doppelt an). Gesichert wird nur noch der Rest, etwa
+      // ein Gespräch, dessen Senden inzwischen zu Ende ist
+      if (state.draftStashMeta) {
+        const taken = !(await storage.has(name)) || !(await (await storage.open(name)).match(state.draftStashMeta));
+        if (taken) {
+          for (const id of state.draftStashConversations) state.draftStashGone.add(id);
+          state.draftStashMeta = null;
+          state.draftStashConversations = new Set();
+          stash = collectDraftStash();
+        }
+      }
+      if (stash.empty && !(await storage.has(name))) {
+        state.draftStashSig = stash.sig;
+        return;
+      }
+      const cache = await storage.open(name);
+      if (stash.empty) {
+        await deleteDraftStash(cache, tab, null);
+        state.draftStashSig = stash.sig;
+        state.draftStashMeta = null;
+        state.draftStashConversations = new Set();
+        return;
+      }
+      const { items } = stash;
+      const gen = ++state.draftStashGen;
+      const base = DRAFT_STASH_PATH + tab + "/" + gen;
+      const meta = { v: 1, tab, gen, drafts: stash.drafts, files: [], busy: stash.held };
+      for (let n = 0; n < items.length; n++) {
+        const { conversation, item } = items[n];
+        await cache.put(base + "/" + n, new Response(item.file, { headers: { "Content-Type": item.file.type || "application/octet-stream" } }));
+        meta.files.push({ n, conversation, name: item.name, type: item.file.type || "", kind: item.kind, duration: item.duration });
+      }
+      await cache.put(base, new Response(JSON.stringify(meta), { headers: { "Content-Type": "application/json" } }));
+      state.draftStashSig = stash.sig;
+      state.draftStashMeta = base;
+      state.draftStashConversations = stash.conversations;
+      await deleteDraftStash(cache, tab, gen);
+    });
+  }
+
+  /** Eigener Stand im Gerät vergessen: die nächste Sicherung umfasst wieder alles */
+  function resetDraftStashState() {
+    state.draftStashSig = null;
+    state.draftStashMeta = null;
+    state.draftStashConversations = new Set();
+    state.draftStashGone = new Set();
+  }
+
+  /** Seite wieder sichtbar oder aus dem Zurück-Cache: der eigene Stand im Gerät gilt nicht mehr */
+  function dropDraftStash() {
+    return queueDraftStash(async () => {
+      resetDraftStashState();
+      const storage = draftStorage();
+      const name = draftCacheName(window.TYBO_BRAND);
+      if (!storage || !(await storage.has(name))) return;
+      await deleteDraftStash(await storage.open(name), state.presence.tab, null);
+    });
+  }
+
+  /** Abmelden: alle Stände im Gerät verwerfen, auch die anderer Fenster */
+  function clearDraftStashes() {
+    return queueDraftStash(async () => {
+      resetDraftStashState();
+      const storage = draftStorage();
+      if (storage && typeof storage.delete === "function") await storage.delete(draftCacheName(window.TYBO_BRAND));
+    });
+  }
+
+  /** Ohne Web Locks: so oft und so lange auf unfertige Stände warten */
+  const DRAFT_RESTORE_TRIES = 8;
+  const DRAFT_RESTORE_PAUSE_MS = 250;
+  /** Mit Web Locks: so lange höchstens auf ein schreibendes Fenster warten */
+  const DRAFT_RESTORE_LOCK_MS = 3000;
+
+  /**
+   * Beim Laden: gesicherte Stände übernehmen (vor dem ersten Öffnen eines
+   * Gesprächs). Texte hinter einen eigenen Entwurf, außer er enthält sie
+   * schon, Anhänge bis zur Grenze je Gespräch. Je Tab zählt der jüngste vollständige Stand; wer
+   * dessen Beschreibung löscht, hat ihn: laden zwei Fenster gleichzeitig,
+   * bekommt ihn nur eines. Mit Web Locks wartet die Übernahme, bis kein
+   * Fenster mehr schreibt; unfertige Stände sind dann abgebrochen und fallen
+   * weg. Ohne wartet sie kurz auf Tabs, von denen nur Unfertiges da ist,
+   * und räumt es danach als abgebrochen weg.
+   */
+  async function restoreDraftStash() {
+    for (let attempt = 1; ; attempt++) {
+      const last = attempt >= DRAFT_RESTORE_TRIES;
+      const waiting = await withDraftLock(locked => restoreDraftStashOnce(locked, last), DRAFT_RESTORE_LOCK_MS);
+      if (!waiting || last) return;
+      await new Promise(resolve => setTimeout(resolve, DRAFT_RESTORE_PAUSE_MS));
+    }
+  }
+
+  /**
+   * Ein Durchgang; true, wenn ohne Sperre noch ein Stand im Schreiben sein
+   * kann. final: nicht mehr warten, Unfertiges gilt als abgebrochen.
+   */
+  async function restoreDraftStashOnce(locked, final) {
+    const storage = draftStorage();
+    const name = draftCacheName(window.TYBO_BRAND);
+    if (!storage || !(await storage.has(name))) return false;
+    const cache = await storage.open(name);
+    let waiting = false;
+    for (const [tab, gens] of await draftGroups(cache)) {
+      // Den eigenen Stand (dieses Fenster) übernimmt es nicht
+      if (tab === state.presence.tab) continue;
+      const complete = [...gens.keys()].filter(gen => gens.get(gen).meta).sort((a, b) => b - a);
+      if (!complete.length) {
+        // Unter der Sperre schreibt niemand mehr: abgebrochene Reste
+        if (locked || final) for (const group of gens.values()) await deleteDraftGen(cache, group);
+        else waiting = true;
+        continue;
+      }
+      const newest = complete[0];
+      const group = gens.get(newest);
+      let meta = null;
+      try {
+        const response = await cache.match(group.meta);
+        meta = response ? await response.json() : null;
+      } catch {
+        meta = null;
+      }
+      if (!(await cache.delete(group.meta))) continue;
+      // Ältere Stände sind abgelöst; jüngere unfertige nur unter der Sperre sicher tot
+      for (const [gen, other] of gens) {
+        if (gen !== newest && (gen < newest || locked)) await deleteDraftGen(cache, other);
+      }
+      const drafts = meta && meta.drafts && typeof meta.drafts === "object" && !Array.isArray(meta.drafts) ? meta.drafts : {};
+      // Ein Gespräch, das jenes Fenster gerade sendete, blieb dort: Hinweis beim Teilen
+      if (meta && Array.isArray(meta.busy) && meta.busy.length) state.draftsSendingElsewhere = true;
+      for (const [id, value] of Object.entries(drafts)) {
+        if (typeof value !== "string" || !value) continue;
+        const own = state.drafts.get(id);
+        // Derselbe Text (etwa auch im Tab gesichert) oder ein Teil davon kommt
+        // nicht doppelt; ein anderer (Stand eines anderen Fensters) kommt dahinter
+        if (!own) state.drafts.set(id, value);
+        else if (!own.includes(value) && !value.includes(own)) state.drafts.set(id, appendDraft(own, value));
+      }
+      for (const f of meta && Array.isArray(meta.files) ? meta.files : []) {
+        const request = f && typeof f.n === "number" ? group.files.get(f.n) : null;
+        if (!request || typeof f.conversation !== "string" || !f.conversation) continue;
+        try {
+          const response = await cache.match(request);
+          if (!response) continue;
+          const blob = await response.blob();
+          const file = new File([blob], typeof f.name === "string" && f.name ? f.name : "datei", { type: typeof f.type === "string" ? f.type : blob.type });
+          const kind = f.kind === "audio" || f.kind === "document" || f.kind === "image" ? f.kind : attachmentKind(file);
+          if (attachmentProblem(file, kind)) continue;
+          const list = attachmentsOf(f.conversation).slice();
+          if (list.length >= MAX_ATTACHMENTS) continue;
+          list.push(attachmentItem({ file, name: f.name, duration: f.duration }, kind));
+          state.attachments.set(f.conversation, list);
+          if (kind === "image") void loadPreview(list[list.length - 1]);
+        } catch {
+          // fehlt oder unlesbar: diese Datei fällt weg
+        }
+      }
+      for (const request of group.files.values()) await cache.delete(request);
+    }
+    return waiting;
   }
 
   /** Was beim Neuladen verloren ginge; leer heißt ohne Rückfrage neu laden */
@@ -3074,11 +3989,531 @@ function init() {
   }
 
   function reloadPage() {
-    state.leaving = true;
     discardRecording();
+    const container = serviceWorkerContainer(window);
+    const registration = state.update.registration;
+    const waiting = container && registration ? registration.waiting : null;
+    if (!waiting) {
+      leavePage();
+      return;
+    }
+    // Wartender Worker (Issue #224): erst übernehmen lassen, dann laden, damit
+    // die neue Seite nicht unter dem alten Worker läuft; höchstens kurz warten.
+    // Solange ist die Seite gesperrt; direkt vor dem Laden werden die Entwürfe
+    // erneut gesichert, ein neues Verlustrisiko fragt statt zu laden.
+    const confirmed = state.update.risks || [];
+    let done = false;
+    let timer = null;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      lockForReload(false);
+      const risks = reloadRisks(saveReloadDrafts());
+      if (risks.some(risk => !confirmed.includes(risk))) {
+        state.update.risks = risks;
+        renderUpdateNotes(true);
+        return;
+      }
+      leavePage();
+    };
+    lockForReload(true);
+    container.addEventListener("controllerchange", finish);
+    timer = setTimeout(finish, WORKER_TAKEOVER_MAX_MS);
+    try {
+      waiting.postMessage(SKIP_WAITING_MESSAGE);
+    } catch {
+      finish();
+    }
+  }
+
+  function leavePage() {
+    state.leaving = true;
     closeEvents();
     closeActivity();
     window.location.reload();
+  }
+
+  /** Während der Übernahme durch den neuen Worker keine Eingaben (Issue #224) */
+  function lockForReload(locked) {
+    for (const part of [el.main, el.sidebar]) {
+      if (part) part.inert = locked;
+    }
+    el.input.readOnly = locked;
+  }
+
+  // --- Service Worker (Issue #224) -------------------------------------------
+
+  /** Registriert sw.js; Fehler bleiben still, die WebUI geht auch ohne */
+  function registerServiceWorker() {
+    const container = serviceWorkerContainer(window);
+    if (!container) return;
+    try {
+      container.register(SERVICE_WORKER_PATH, { scope: "/", updateViaCache: "none" }).then(
+        (registration) => {
+          state.update.registration = registration || null;
+          void closeSettledNotifications();
+        },
+        () => {}
+      );
+    } catch {
+      // etwa gesperrt in Datenschutz-Einstellungen
+    }
+  }
+
+  /** Nach dem Hinweis „Neue Version": neuen Worker jetzt prüfen lassen */
+  function updateServiceWorker() {
+    const registration = state.update.registration;
+    if (!registration || typeof registration.update !== "function") return;
+    try {
+      Promise.resolve(registration.update()).catch(() => {});
+    } catch {
+      // nichts zu tun, der Browser prüft beim nächsten Laden selbst
+    }
+  }
+
+  // --- Direktlink und Benachrichtigungen (Issue #226) --------------------------
+
+  /**
+   * Öffnet das Gespräch aus einem Direktlink oder einer Benachrichtigung. Aus
+   * den Einstellungen zurück in den Chat; fehlt es in der Liste, erst die Liste
+   * neu holen (etwa ein eben angelegtes Topic), sonst Direktchat mit Hinweis.
+   * Bis zum Öffnen steht das Ziel in state.linkTarget: leitet das Neuholen zur
+   * Anmeldung um (Sitzung abgelaufen), nimmt goToLogin es mit, und hier
+   * überschreibt danach nichts mehr den Zustand.
+   */
+  async function openLinked(id) {
+    if (state.leaving) return;
+    if (id) state.linkTarget = id;
+    try {
+      if (settingsView && settingsView.isOpen()) {
+        replaceHash(null);
+        routeFromHash();
+      }
+      closeSidebar();
+      let target = id ? findConversation(id) : null;
+      if (!target && id) {
+        await refreshConversations();
+        if (state.leaving) return;
+        target = findConversation(id);
+      }
+      if (target) {
+        if (splitTopics(state.telegram.topics, undefined, state.pinned).older.some(t => t.id === target.id)) state.olderOpen = true;
+        if (!state.conversation || state.conversation.id !== target.id) openConversation(target);
+        return;
+      }
+      const fallback = state.telegram.dm || firstExisting();
+      if (fallback && (!state.conversation || state.conversation.id !== fallback.id)) openConversation(fallback);
+      showLinkNotice();
+    } finally {
+      // Ein neuerer Link hat übernommen oder die Seite geht zur Anmeldung: dann bleibt es stehen
+      if (id && state.linkTarget === id && !state.leaving) state.linkTarget = null;
+    }
+  }
+
+  /** Adresse #/gespraech/<id> nach dem Laden (hashchange): öffnen und die Adresse wieder leeren */
+  function routeConversationLink() {
+    const link = conversationLink(window.location.hash);
+    if (!link || state.busy) return;
+    replaceHash(null);
+    void openLinked(link.id);
+  }
+
+  /** Tipp auf eine Benachrichtigung bei offenem Fenster: der Service Worker schickt das Gespräch */
+  function listenToServiceWorker() {
+    const container = serviceWorkerContainer(window);
+    if (!container || typeof container.addEventListener !== "function") return;
+    container.addEventListener("message", event => {
+      const data = event && event.data;
+      if (!data || data.type !== OPEN_CONVERSATION_MESSAGE || typeof data.conversationId !== "string") return;
+      // Bestätigen, sonst lädt der Worker das Fenster mit dem Gesprächslink neu
+      const port = event.ports && event.ports[0];
+      if (port && typeof port.postMessage === "function") {
+        try {
+          port.postMessage({ type: OPEN_CONVERSATION_ACK });
+        } catch {
+          // Kanal schon zu: der Worker lädt neu
+        }
+      }
+      if (!LINK_ID_PATTERN.test(data.conversationId)) return;
+      void openLinked(data.conversationId);
+    });
+    // Mit addEventListener stellt der Browser Nachrichten erst danach zu
+    try {
+      if (typeof container.startMessages === "function") container.startMessages();
+    } catch {
+      // ältere Browser liefern ohne
+    }
+  }
+
+  // --- Teilen-Ziel (Issue #229) -----------------------------------------------
+
+  /**
+   * Adresse #/teilen (Umleitung des Service Workers nach dem Teilen): leeren,
+   * bei #/teilen/fehler den Hinweis zeigen und die Übergaben übernehmen.
+   * true, wenn die Adresse eine Teilen-Adresse war.
+   */
+  function routeShareLink() {
+    const match = SHARE_HASH_PATTERN.exec(String(window.location.hash || ""));
+    if (!match) return false;
+    replaceHash(null);
+    if (match[1]) showAttachNote(SHARE_TEXT.failed);
+    void takeShares();
+    return true;
+  }
+
+  /** Nachsehen, ob eine gerade geschriebene Übergabe fertig ist; begrenzt, falls der Worker abbrach */
+  function scheduleShareRetry() {
+    if (state.shareRetryTimer || state.shareRetries >= SHARE_RETRY_MAX) return;
+    state.shareRetries++;
+    state.shareRetryTimer = setTimeout(() => {
+      state.shareRetryTimer = null;
+      void takeShares();
+    }, SHARE_RETRY_MS);
+  }
+
+  /** Übergaben aus dem Cache des Service Workers holen, nacheinander, nie doppelt */
+  function takeShares() {
+    state.shareQueue = state.shareQueue.then(takeSharesOnce).catch(() => {});
+    return state.shareQueue;
+  }
+
+  /**
+   * Übergabe für dieses Fenster sichern, damit ein zweites Fenster sie nicht
+   * auch übernimmt. Mit Web Locks: eine Sperre je Übergabe, gehalten bis sie
+   * untergebracht und gelöscht ist (schließt das Fenster vorher, gibt der
+   * Browser sie frei und die Übergabe bleibt für das nächste liegen). Ohne:
+   * wer die Beschreibung löscht, hat sie. Ergebnis: Freigabe oder null.
+   */
+  async function claimShare(cache, handoff) {
+    const nav = window.navigator;
+    const locks = nav && nav.locks && typeof nav.locks.request === "function" ? nav.locks : null;
+    if (!locks) return (await cache.delete(handoff.metaRequest)) ? () => {} : null;
+    let granted;
+    const answer = new Promise(resolve => (granted = resolve));
+    let free;
+    const held = new Promise(resolve => (free = resolve));
+    try {
+      Promise.resolve(
+        locks.request(shareCacheName(window.TYBO_BRAND) + "/" + handoff.id, { ifAvailable: true }, lock => {
+          granted(!!lock);
+          return lock ? held : undefined;
+        })
+      ).catch(() => granted(false));
+    } catch {
+      granted(false);
+    }
+    if (!(await answer)) return null;
+    // Ein anderes Fenster kann sie inzwischen untergebracht und gelöscht haben
+    if (!(await cache.match(handoff.metaRequest))) {
+      free();
+      return null;
+    }
+    return free;
+  }
+
+  async function takeSharesOnce() {
+    if (state.leaving) return;
+    await state.draftRestore;
+    // Erst die vorige Übergabe in einem Gespräch unterbringen
+    if (state.shared && !state.shared.conversationId) return;
+    let read;
+    try {
+      read = await readShareHandoffs(window.caches, shareCacheName(window.TYBO_BRAND), Date.now());
+    } catch {
+      return;
+    }
+    // Der Worker schreibt noch eine Übergabe: gleich noch einmal nachsehen
+    if (read.pending) scheduleShareRetry();
+    else state.shareRetries = 0;
+    const cache = read.cache;
+    // Beschreibung zuerst: ohne sie gilt der Rest überall als halbe Übergabe
+    const remove = handoff => cache.delete(handoff.metaRequest)
+      .then(() => Promise.all(handoff.all.map(request => cache.delete(request))))
+      .catch(() => {});
+    for (const handoff of read.handoffs) {
+      if (state.shareTaken.has(handoff.id)) {
+        await remove(handoff);
+        continue;
+      }
+      if (state.shared && !state.shared.conversationId) break;
+      const free = await claimShare(cache, handoff);
+      if (!free) continue;
+      const drop = () => remove(handoff).then(free);
+      const files = [];
+      for (const f of handoff.meta.files) {
+        const request = f && typeof f.n === "number" ? handoff.files.get(f.n) : null;
+        if (!request) continue;
+        try {
+          const response = await cache.match(request);
+          if (!response) continue;
+          const blob = await response.blob();
+          files.push(new File([blob], typeof f.name === "string" && f.name ? f.name : "datei", { type: typeof f.type === "string" ? f.type : blob.type }));
+        } catch {
+          // fehlt oder unlesbar: diese Datei fällt weg
+        }
+      }
+      if (state.leaving) {
+        free();
+        return;
+      }
+      state.shareTaken.add(handoff.id);
+      const meta = handoff.meta;
+      state.shared = {
+        id: handoff.id,
+        meta,
+        files,
+        text: sharedDraftText(meta),
+        conversationId: null,
+        itemKeys: [],
+        textAdded: "",
+        moving: false,
+        summary: shareSummary(files.map(attachmentKind), meta),
+        release: drop,
+      };
+      placeShared();
+      // Kein Gespräch frei (keins offen, geschlossen, Senden läuft): später weiter
+      if (!state.shared || !state.shared.conversationId) break;
+    }
+  }
+
+  /** Noch nicht untergebrachter oder zu verschiebender Inhalt: jetzt ins offene Gespräch */
+  function resumeShare() {
+    const waiting = !!state.shared && !state.shared.conversationId;
+    placeShared();
+    if (waiting && state.shared && state.shared.conversationId) void takeShares();
+  }
+
+  /**
+   * Bringt den geteilten Inhalt im offenen Gespräch unter: Text an den
+   * Entwurf, Dateien als Anhänge, nie senden. Lag er schon in einem anderen
+   * Gespräch („Anderes Gespräch"), wandert nur der geteilte Anteil: Anhänge,
+   * die dort noch nicht hochgeladen sind, und der angehängte Text, solange er
+   * unverändert am Ende des Entwurfs steht (sonst bleibt er dort, hier kommt
+   * eine Kopie hin). Was über fünf Anhänge ginge, bleibt im alten Gespräch.
+   */
+  function placeShared() {
+    const shared = state.shared;
+    const target = state.conversation;
+    // Wartete er zu lange (kein Gespräch frei, Senden lief): wie im Gerät nach zehn Minuten verwerfen
+    if (shared && !shared.conversationId && !(Date.now() - shared.meta.at < SHARE_MAX_AGE_MS)) {
+      expireShared();
+      return;
+    }
+    if (!shared || !target) {
+      renderShare();
+      return;
+    }
+    if (shared.conversationId === target.id) {
+      shared.moving = false;
+      renderShare();
+      return;
+    }
+    const refusal = attachRefusal() || (state.sending ? ATTACHMENT_TEXT.sending : null);
+    if (refusal) {
+      shared.moving = false;
+      renderShare();
+      showAttachNote(refusal);
+      return;
+    }
+    const fromId = shared.conversationId;
+    const notes = [];
+    let oldItems = [];
+    let entries;
+    if (fromId) {
+      oldItems = attachmentsOf(fromId).filter(item => shared.itemKeys.includes(item.key) && !item.id && item.status !== "uploading");
+      entries = oldItems.map(item => ({ file: item.file, name: item.name, kind: item.kind, preview: item.preview, duration: item.duration }));
+    } else {
+      notes.push(shareRejectedText(shared.meta.rejected));
+      entries = shared.files.map(file => ({ file }));
+      // Ein Gespräch sendete beim Wechsel noch und blieb im anderen Fenster (Issue #229)
+      if (state.draftsSendingElsewhere) notes.push(SHARE_TEXT.sendingElsewhere);
+      state.draftsSendingElsewhere = false;
+    }
+    const before = currentAttachments().length;
+    const added = entries.length ? addAttachments(entries) : 0;
+    const placed = currentAttachments().slice(before);
+    if (fromId) {
+      const moved = oldItems.slice(0, added);
+      moved.forEach(releaseAudio);
+      const rest = attachmentsOf(fromId).filter(item => !moved.includes(item));
+      if (rest.length) state.attachments.set(fromId, rest);
+      else state.attachments.delete(fromId);
+      if (oldItems.length > added) notes.push(SHARE_TEXT.left(oldItems.length - added));
+    } else if (entries.length > added) {
+      notes.push(SHARE_TEXT.dropped(entries.length - added));
+    }
+    let text = shared.text;
+    if (fromId) {
+      text = shared.textAdded;
+      const stripped = text ? removeAppendedDraft(state.drafts.get(fromId) || "", text) : null;
+      if (stripped !== null) {
+        if (stripped) state.drafts.set(fromId, stripped);
+        else state.drafts.delete(fromId);
+      }
+    }
+    if (text) el.input.value = appendDraft(el.input.value, text);
+    shared.conversationId = target.id;
+    shared.itemKeys = placed.map(item => item.key);
+    shared.textAdded = text;
+    shared.moving = false;
+    shared.files = [];
+    shared.summary = shareSummary(placed.map(item => item.kind), text ? shared.meta : {});
+    if (shared.release) {
+      void shared.release();
+      shared.release = null;
+    }
+    showAttachNote(notes.filter(Boolean).join(" "));
+    autosize();
+    renderAttachments();
+    updateControls();
+    renderShare();
+  }
+
+  /** Abgelaufener, noch nicht untergebrachter Inhalt: aus Zustand und Gerät entfernen, Hinweis */
+  function expireShared() {
+    const shared = state.shared;
+    state.shared = null;
+    if (shared.release) {
+      void shared.release();
+      shared.release = null;
+    }
+    renderShare();
+    showAttachNote(SHARE_TEXT.expired);
+    // Eine jüngere Übergabe kann noch liegen
+    void takeShares();
+  }
+
+  /** Zeile „Geteilt: …" im Gespräch mit dem geteilten Inhalt, ohne Gespräch immer */
+  function renderShare() {
+    const shared = state.shared;
+    const here = !!shared && (!shared.conversationId || (!!state.conversation && state.conversation.id === shared.conversationId));
+    el.shareNote.hidden = !here;
+    if (!here) return;
+    const hint = shared.moving ? SHARE_TEXT.choose : shared.conversationId ? "" : SHARE_TEXT.unplaced;
+    el.shareText.textContent = shared.summary + (hint ? ". " + hint : "");
+    el.shareMove.textContent = shared.conversationId ? SHARE_TEXT.move : SHARE_TEXT.chooseButton;
+    el.shareMove.setAttribute("aria-expanded", shared.moving ? "true" : "false");
+  }
+
+  /** „Anderes Gespräch": Liste öffnen; das nächste gewählte Gespräch nimmt den geteilten Inhalt mit */
+  function startShareMove() {
+    if (!state.shared) return;
+    state.shared.moving = true;
+    renderShare();
+    openSidebar();
+  }
+
+  /** Liste ohne Wahl geschlossen: der geteilte Inhalt bleibt, wo er ist */
+  function stopShareMove() {
+    if (!state.shared || !state.shared.moving) return;
+    state.shared.moving = false;
+    renderShare();
+  }
+
+  /**
+   * Beim Öffnen der App und beim Zurückkehren: Benachrichtigungen des gerade
+   * sichtbaren Gesprächs schließen, dazu die zu Rückfragen, die inzwischen
+   * entschieden oder abgelaufen sind (Kategorie und Frage-Kennung stehen in
+   * der Benachrichtigung; der tag allein kann inzwischen eine neuere Antwort
+   * bezeichnen). Fehler bleiben still.
+   */
+  async function closeSettledNotifications() {
+    const registration = state.update.registration;
+    if (!registration || typeof registration.getNotifications !== "function") return;
+    if (typeof document.visibilityState === "string" && document.visibilityState !== "visible") return;
+    let list = [];
+    try {
+      list = (await registration.getNotifications()) || [];
+    } catch {
+      return;
+    }
+    const open = state.conversation && el.main.getAttribute("data-view") !== "settings" ? state.conversation.id : null;
+    const choices = new Map();
+    for (const n of list) {
+      const data = n && n.data;
+      if (!data || typeof data.conversationId !== "string") continue;
+      if (data.conversationId === open) {
+        n.close();
+        continue;
+      }
+      if (data.category !== "choice" || typeof data.choiceId !== "string" || !LINK_ID_PATTERN.test(data.conversationId)) continue;
+      const entry = choices.get(data.conversationId) || [];
+      entry.push(n);
+      choices.set(data.conversationId, entry);
+    }
+    for (const [conversationId, notes] of choices) {
+      try {
+        const ids = notes.map(n => n.data.choiceId).join(",");
+        const { ok, data } = await api("GET", "/api/conversations/" + conversationId + "/choices?ids=" + encodeURIComponent(ids));
+        if (!ok || !data || !Array.isArray(data.choices)) continue;
+        for (const n of notes) {
+          const choice = data.choices.find(c => c && c.id === n.data.choiceId);
+          if (choice && choice.state !== "open") n.close();
+        }
+      } catch {
+        // offline; beim nächsten Öffnen wieder
+      }
+    }
+  }
+
+  // --- Anwesenheit (Issue #226) ----------------------------------------------
+
+  /**
+   * Meldet dem Server, welches Gespräch dieser Tab gerade sichtbar offen hat
+   * (in den Einstellungen: keines). Sichtbar heißt: Seite im Vordergrund und
+   * mit Fokus. Für ein sichtbares Gespräch schickt der Server keinen Push.
+   * Jede Meldung trägt eine steigende Nummer, damit eine verspätete einen
+   * neueren Wechsel nicht überschreibt. gone: Seite wird verlassen (per
+   * sendBeacon, das auch beim Schließen noch rausgeht).
+   */
+  function reportPresence(options) {
+    const gone = !!(options && options.gone);
+    if (state.presence.gone || (state.leaving && !gone)) return;
+    if (gone) state.presence.gone = true;
+    const settingsOpen = el.main.getAttribute("data-view") === "settings";
+    const hidden = typeof document.visibilityState === "string" && document.visibilityState !== "visible";
+    let focused = true;
+    try {
+      if (typeof document.hasFocus === "function") focused = document.hasFocus();
+    } catch {
+      // ohne Auskunft zählt nur die Sichtbarkeit
+    }
+    const body = JSON.stringify({
+      tab: state.presence.tab,
+      seq: ++state.presence.seq,
+      conversation: !gone && !settingsOpen && state.conversation ? state.conversation.id : null,
+      visible: !gone && !hidden && focused,
+      ...(gone ? { gone: true } : {}),
+    });
+    const nav = window.navigator;
+    if (gone && nav && typeof nav.sendBeacon === "function") {
+      try {
+        if (nav.sendBeacon(PRESENCE_PATH, new Blob([body], { type: "text/plain" }))) return;
+      } catch {
+        // dann wie sonst per fetch
+      }
+    }
+    try {
+      Promise.resolve(
+        fetch(PRESENCE_PATH, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body,
+          keepalive: gone,
+        })
+      ).catch(() => {});
+    } catch {
+      // offline; die nächste Meldung kommt spätestens in 30 Sekunden
+    }
+  }
+
+  /** Erste Meldung und danach alle 30 Sekunden, solange die Seite offen ist */
+  function startPresence() {
+    reportPresence();
+    if (state.presence.timer) clearInterval(state.presence.timer);
+    state.presence.timer = setInterval(() => reportPresence(), PRESENCE_INTERVAL_MS);
   }
 
   // --- Live-Ereignisse -------------------------------------------------------
@@ -3535,21 +4970,7 @@ function init() {
         problems.push(ATTACHMENT_TEXT.tooMany);
         break;
       }
-      const item = {
-        key: "a" + ++state.attachmentSeq,
-        file,
-        name: attachmentName(entry.name || file.name, kind, file.type),
-        size: file.size,
-        kind,
-        preview: entry.preview || null,
-        // Aufnahme aus dem Browser (Issue #109): Dauer und lokale Wiedergabe
-        duration: typeof entry.duration === "number" ? entry.duration : null,
-        audioUrl: null,
-        player: null,
-        status: "ready",
-        id: null,
-        error: "",
-      };
+      const item = attachmentItem(entry, kind);
       list.push(item);
       added++;
       if (!item.preview && kind === "image") void loadPreview(item);
@@ -3559,6 +4980,26 @@ function init() {
     renderAttachments();
     updateControls();
     return added;
+  }
+
+  /** Neuer Anhang aus einem geprüften Eintrag { file, name?, preview?, duration? } */
+  function attachmentItem(entry, kind) {
+    const file = entry.file;
+    return {
+      key: "a" + ++state.attachmentSeq,
+      file,
+      name: attachmentName(entry.name || file.name, kind, file.type),
+      size: file.size,
+      kind,
+      preview: entry.preview || null,
+      // Aufnahme aus dem Browser (Issue #109): Dauer und lokale Wiedergabe
+      duration: typeof entry.duration === "number" ? entry.duration : null,
+      audioUrl: null,
+      player: null,
+      status: "ready",
+      id: null,
+      error: "",
+    };
   }
 
   /** Vorschau aus den Bytes, nur für erkannte Bildtypen (nie der angegebene Typ) */
@@ -4092,6 +5533,8 @@ function init() {
       return;
     }
     state.sending = true;
+    // Dieses Gespräch bleibt bis zum Ende in diesem Fenster, nicht in der Sicherung im Gerät
+    state.sendingNow = { conversation: conversation.id, text };
     updateControls();
     if (withAttachments) renderAttachments();
     const generation = state.generation;
@@ -4140,8 +5583,14 @@ function init() {
       if (!state.leaving) addLocalError("Server nicht erreichbar, Nachricht nicht gesendet.");
     } finally {
       state.sending = false;
+      state.sendingNow = null;
       updateControls();
       renderAttachments();
+      // Verborgen gesendet (Issue #229): das Gespräch ruht jetzt; was davon
+      // nicht gesendet ist, kommt in die Sicherung
+      if (document.visibilityState === "hidden") void stashDrafts();
+      // Geteilter Inhalt wartete auf das Ende des Sendens (Issue #229)
+      if (state.shared && !state.shared.conversationId) resumeShare();
     }
   }
 
@@ -4151,6 +5600,11 @@ function init() {
    * oder ein neuer Entwurf bleibt stehen.
    */
   function forgetSent(id, text, pending) {
+    // Gesendet: die Zeile „Geteilt: …" hat ihren Zweck erfüllt (Issue #229)
+    if (state.shared && state.shared.conversationId === id) {
+      state.shared = null;
+      renderShare();
+    }
     if (pending) {
       for (const item of pending) releaseAudio(item);
       const rest = attachmentsOf(id).filter(item => !pending.includes(item));
@@ -5015,7 +6469,8 @@ function init() {
   function replaceHash(hash) {
     const loc = window.location;
     if (!window.history || typeof window.history.replaceState !== "function") return;
-    window.history.replaceState(null, "", String(loc.pathname || "/") + String(loc.search || "") + (hash || ""));
+    // Markierung des Eintrags (Zurück am Handy, Issue #229) bleibt erhalten
+    window.history.replaceState(window.history.state === undefined ? null : window.history.state, "", String(loc.pathname || "/") + String(loc.search || "") + (hash || ""));
   }
 
   /**
@@ -5046,6 +6501,7 @@ function init() {
       el.openSettings.setAttribute("aria-current", "page");
       settingsView.show(tab);
       if (!wasOpen) el.settingsTitle.focus();
+      if (!wasOpen) reportPresence();
       return;
     }
     state.settingsPushed = false;
@@ -5054,6 +6510,7 @@ function init() {
     el.main.setAttribute("data-view", "chat");
     el.openSettings.removeAttribute("aria-current");
     if (!el.input.disabled) el.input.focus();
+    reportPresence();
   }
 
   function openSettings() {
@@ -5081,15 +6538,20 @@ function init() {
   }
 
   async function logout() {
+    // Nach dem Abmelden keine Entwürfe für die nächste Anmeldung in diesem Tab
+    state.loggingOut = true;
+    reportPresence({ gone: true });
     discardRecording();
     closeEvents();
     closeActivity();
     state.leaving = true;
+    const cleared = clearDraftStashes();
     try {
       await fetch("/api/logout", { method: "POST", credentials: "same-origin" });
     } catch {
       // Umleiten auch ohne Antwort
     }
+    await cleared;
     window.location.href = "/login";
   }
 
@@ -5116,8 +6578,24 @@ function init() {
   el.input.addEventListener("paste", onPaste);
   // Anhänge (Issue #73): Büroklammer öffnet die Dateiauswahl, Ziehen auf den Chat
   el.attach.addEventListener("click", () => {
-    if (!state.sending) el.fileInput.click();
+    if (state.sending) return;
+    // Am Handy (Issue #229): kleines Menü mit Kamera und Dateiwahl; am Rechner direkt die Dateiwahl
+    if (touchInput) {
+      if (attachMenuOpen()) closeAttachMenu(true);
+      else openAttachMenu();
+      return;
+    }
+    el.fileInput.click();
   });
+  el.attachCamera.addEventListener("click", () => {
+    closeAttachMenu(false);
+    el.cameraInput.click();
+  });
+  el.attachFile.addEventListener("click", () => {
+    closeAttachMenu(false);
+    el.fileInput.click();
+  });
+  el.cameraInput.addEventListener("change", () => takeInputFiles(el.cameraInput));
   // Sprachaufnahme (Issue #109)
   el.record.addEventListener("click", () => void startRecording());
   el.recorderStop.addEventListener("click", () => stopRecording(state.recording));
@@ -5125,13 +6603,7 @@ function init() {
     discardRecording();
     el.input.focus();
   });
-  el.fileInput.addEventListener("change", () => {
-    const files = Array.from(el.fileInput.files || []);
-    // Zurücksetzen, damit dieselbe Datei noch einmal gewählt werden kann
-    el.fileInput.value = "";
-    if (files.length) addAttachments(files.map(file => ({ file })));
-    el.input.focus();
-  });
+  el.fileInput.addEventListener("change", () => takeInputFiles(el.fileInput));
   el.main.addEventListener("dragenter", event => {
     if (!draggingFiles(event) || el.main.getAttribute("data-view") === "settings") return;
     event.preventDefault();
@@ -5169,14 +6641,25 @@ function init() {
   el.commandList.addEventListener("mousedown", event => event.preventDefault());
   el.stop.addEventListener("click", () => void stopTurn());
   el.menu.addEventListener("click", () => openSidebar());
-  el.sidebarClose.addEventListener("click", () => closeSidebar());
-  el.scrim.addEventListener("click", () => closeSidebar());
+  el.sidebarClose.addEventListener("click", () => {
+    stopShareMove();
+    closeSidebar();
+  });
+  el.scrim.addEventListener("click", () => {
+    stopShareMove();
+    closeSidebar();
+  });
+  el.shareMove.addEventListener("click", () => startShareMove());
   window.addEventListener("keydown", event => {
     if (event.key !== "Escape") return;
-    // Erst das Innerste schließen: Menü, dann Agentenauswahl, dann Schublade
-    if (state.menu) closeMenu(true);
+    // Erst das Innerste schließen: Menüs, dann Agentenauswahl, dann Schublade
+    if (attachMenuOpen()) closeAttachMenu(true);
+    else if (state.menu) closeMenu(true);
     else if (state.pickerOpen) closePicker(true);
-    else if (el.sidebar.getAttribute("data-open") === "true") closeSidebar();
+    else if (el.sidebar.getAttribute("data-open") === "true") {
+      stopShareMove();
+      closeSidebar();
+    }
   });
   el.activityToggle.addEventListener("click", () => {
     const open = el.progress.hidden;
@@ -5217,6 +6700,13 @@ function init() {
   el.titleInput.addEventListener("blur", () => {
     if (!state.renaming) cancelRename(false);
   });
+  // Klick außerhalb schließt das Menü der Büroklammer
+  window.addEventListener("click", event => {
+    if (!attachMenuOpen()) return;
+    const target = event.target;
+    if (target && typeof target.closest === "function" && target.closest("#attach-menu, #attach")) return;
+    closeAttachMenu(false);
+  });
   // Klick außerhalb schließt ein offenes Menü
   window.addEventListener("click", event => {
     if (!state.menu) return;
@@ -5240,30 +6730,100 @@ function init() {
     el.openSettings.hidden = true;
   }
   window.addEventListener("pagehide", () => {
+    reportPresence({ gone: true });
     closeEvents();
     closeActivity();
     // Seite verlassen (Issue #109): Aufnahme verwerfen, Mikrofon und Objekt-URLs frei
     discardRecording();
     for (const list of state.attachments.values()) list.forEach(releaseAudio);
+    // Entwürfe sichern (Issue #229): das Teilen aus einer anderen App lädt
+    // das App-Fenster neu oder öffnet ein neues, die Anmeldung nach Ablauf
+    // lädt auch neu. Text sofort im Tab, dazu alles samt Anhängen im Gerät.
+    if (!state.loggingOut) {
+      saveReloadDrafts();
+      void stashDrafts();
+    }
   });
   // Aus dem Zurück-Cache: Wiedergabe der Aufnahmen neu aufbauen
-  window.addEventListener("pageshow", () => renderAttachments());
+  window.addEventListener("pageshow", event => {
+    // Die Seite lebt weiter: die Sicherung vom Verlassen gilt nicht mehr
+    if (event && event.persisted) {
+      clearReloadDrafts();
+      void dropDraftStash();
+    }
+    renderAttachments();
+    // Aus dem Zurück-Cache: der Server hat den Tab beim Verlassen vergessen
+    if (state.presence.gone && !state.leaving) {
+      state.presence.gone = false;
+      reportPresence();
+    }
+  });
+  // Fokuswechsel (anderes Fenster, andere App) meldet visibilitychange nicht
+  window.addEventListener("focus", () => reportPresence());
+  window.addEventListener("blur", () => reportPresence());
   // Neue Version (Issue #111): beim Zurückkehren in den Tab prüfen
   if (typeof document.addEventListener === "function") {
     document.addEventListener("visibilitychange", () => {
+      // Wechsel in eine andere App (etwa zum Teilen, Issue #229): Entwürfe
+      // und Anhänge im Gerät ablegen; wieder da: der Stand gilt nicht mehr
+      if (document.visibilityState === "hidden") void stashDrafts();
+      else if (document.visibilityState === "visible") void dropDraftStash();
+      reportPresence();
+      if (document.visibilityState === "visible") void closeSettledNotifications();
       onVisible();
       if (document.visibilityState !== "hidden") refreshDay();
     });
   }
 
-  if (touchInput) el.input.setAttribute("enterkeyhint", "enter");
+  if (touchInput) {
+    el.input.setAttribute("enterkeyhint", "enter");
+    el.attach.setAttribute("aria-haspopup", "menu");
+    el.attach.setAttribute("aria-controls", "attach-menu");
+    el.attach.setAttribute("aria-expanded", "false");
+  }
+  // Handy (Issue #229): Verlaufseinträge, Zurück, Wischen, Tastatur
+  setupNav();
+  if (nav) {
+    window.addEventListener("popstate", onPopState);
+    window.addEventListener("touchstart", onTouchStart, { passive: true });
+    window.addEventListener("touchend", onTouchEnd, { passive: true });
+    window.addEventListener("touchcancel", () => { state.touch = null; }, { passive: true });
+  }
+  el.log.addEventListener("scroll", () => {
+    state.pinnedBottom = nearBottom();
+  });
+  if (window.visualViewport && typeof window.visualViewport.addEventListener === "function") {
+    window.visualViewport.addEventListener("resize", applyViewport);
+    window.visualViewport.addEventListener("scroll", applyViewport);
+  }
+  window.addEventListener("resize", applyViewport);
+  applyViewport();
   initThemeSwitch(window.WebTheme);
   autosize();
   updateControls();
   // Vor start(): das erste applyMode setzt den gesicherten Entwurf ein
   restoreReloadDrafts();
+  // Dazu, was vor dem Teilen im Gerät abgelegt wurde (auch von einem anderen Fenster)
+  state.draftRestore = restoreDraftStash().catch(() => {});
+  registerServiceWorker();
+  // Push-Abo dieses Geräts nach dem Laden (auch nach neuer Anmeldung) mit dem Server abgleichen (Issue #225)
+  if (typeof syncPushSubscription === "function") {
+    let storage = null;
+    try {
+      storage = window.localStorage;
+    } catch {
+      // ohne localStorage kennt die Seite ihr Gerät nicht, dann gibt es nichts abzugleichen
+    }
+    void syncPushSubscription({ api, win: window, storage });
+  }
+  window.addEventListener("hashchange", () => routeConversationLink());
+  window.addEventListener("hashchange", () => {
+    if (!state.busy) routeShareLink();
+  });
+  listenToServiceWorker();
   void start();
   routeFromHash();
+  startPresence();
 }
 
 if (typeof document !== "undefined" && document.getElementById("chat-log")) init();

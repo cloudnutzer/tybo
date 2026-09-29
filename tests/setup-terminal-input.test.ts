@@ -337,7 +337,8 @@ describe("Abbrechen mit Strg+C", () => {
         },
       },
     });
-    const prompter = scripted(["", FAKE.token, FAKE.userId, ""]);
+    // "j": Telegram ist seit Issue #228 optional und fragt „Jetzt einrichten?“
+    const prompter = scripted(["", "j", FAKE.token, FAKE.userId, ""]);
     const r = await runWith({ mode: "all" }, ctx, prompter, {
       onInterrupt: handler => {
         fire = handler;
@@ -351,7 +352,7 @@ describe("Abbrechen mit Strg+C", () => {
     expect(env.TELEGRAM_BOT_TOKEN).toBe(FAKE.token);
     expect(env.TELEGRAM_USER_ID).toBe(FAKE.userId);
     expect(r.out).not.toContain("Forum-Gruppe (optional)\n  Optional");
-    expect(prompter.asked.length).toBe(4);
+    expect(prompter.asked.length).toBe(5);
   });
 
   test("Profil: .env geschrieben, profile.md scheitert, dann Strg+C: meldet den Teil", async () => {
@@ -431,7 +432,7 @@ describe("Abbrechen mit Strg+C", () => {
   test("bisher Gespeichertes bleibt nach Abbruch im nächsten Schritt", async () => {
     const ctx = await linuxCtx();
     // Telegram speichern, Gruppe überspringen, Strg+C bei der Datenbank
-    const r = await runWith({ mode: "all" }, ctx, scripted(["", FAKE.token, FAKE.userId, "", "n", CTRL_C]));
+    const r = await runWith({ mode: "all" }, ctx, scripted(["", "j", FAKE.token, FAKE.userId, "", "n", CTRL_C]));
     expect(r.code).toBe(130);
     expect(parseEnvContent(await readFile(ctx.envPath, "utf8")).TELEGRAM_USER_ID).toBe(FAKE.userId);
   });

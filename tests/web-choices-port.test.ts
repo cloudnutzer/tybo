@@ -159,7 +159,7 @@ describe("Änderungen", () => {
     stop();
   });
 
-  test("Frist läuft ab oder Eintrag verschwindet: Abgleich meldet expired; neue offene Frage bleibt still", async () => {
+  test("Frist läuft ab oder Eintrag verschwindet: Abgleich meldet expired; neue offene Frage nur als neu (Issue #226)", async () => {
     const soon = await t.create({ conversation: { type: "telegram", chatId: USER }, expiresAt: Date.now() + 40 });
     const gone = await t.create({ conversation: { type: "telegram", chatId: GROUP, topicId: 8 } });
     const { changes, stop } = listen();
@@ -168,14 +168,39 @@ describe("Änderungen", () => {
     await t.editFile(choices => {
       delete choices[gone.id];
     });
-    await t.create({ conversation: { type: "telegram", chatId: USER } });
+    const fresh = await t.create({ conversation: { type: "telegram", chatId: USER } });
     await t.tick();
-    expect(changes.map(c => [c.conversationId, c.choice.id, c.choice.state]).sort()).toEqual(
+    expect(changes.filter(c => !c.created).map(c => [c.conversationId, c.choice.id, c.choice.state]).sort()).toEqual(
       [
         ["dm", soon.id, "expired"],
         ["topic-8", gone.id, "expired"],
       ].sort()
     );
+    expect(changes.filter(c => c.created).map(c => [c.conversationId, c.choice.id, c.choice.state])).toEqual([["dm", fresh.id, "open"]]);
+    stop();
+  });
+
+  test("neue Frage (Issue #226): dieser Prozess sofort genau einmal mit Art, anderer Prozess per Abgleich genau einmal; Startstand nicht", async () => {
+    const before = await t.create({ conversation: { type: "telegram", chatId: USER } });
+    const { changes, stop } = listen();
+    await t.tick();
+    expect(changes).toEqual([]);
+    const own = await t.create({ conversation: { type: "web", conversationId: WEB } });
+    await t.tick();
+    await t.tick();
+    const created = () => changes.filter(c => c.created);
+    expect(created()).toEqual([{ conversationId: WEB, choice: toApiChoice(own), copyInDm: true, created: true, kind: "tool" }]);
+    // Ein anderer Prozess legt eine Frage an (Datei direkt geschrieben, kein Zuhörer hier)
+    await t.editFile(choices => {
+      choices.Fremd1 = { ...choices[before.id], id: "Fremd1", kind: "goal", conversation: { type: "telegram", chatId: GROUP, topicId: 9 } };
+    });
+    await t.tick();
+    await t.tick();
+    expect(created().map(c => [c.conversationId, c.choice.id, c.kind])).toEqual([
+      [WEB, own.id, "tool"],
+      ["topic-9", "Fremd1", "goal"],
+    ]);
+    expect(created().some(c => c.choice.id === before.id)).toBe(false);
     stop();
   });
 

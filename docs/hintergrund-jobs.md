@@ -41,9 +41,11 @@ die Liste in Telegram, im Browser und im Terminal-Chat.
   `--text` nimmt ihn direkt. Genau eins von beiden.
 - `--topic` legt fest, wohin die Rückmeldung geht (1 ist General). Ohne
   `--topic` gilt das Gespräch, aus dem der Job gestartet wurde
-  (`TYBO_TOPIC_ID`/`TYBO_CHAT_ID`, setzt tybo seinen Claude-Subprozessen),
+  (`TYBO_CONVERSATION_ID` für ein reines Web-Gespräch, sonst
+  `TYBO_TOPIC_ID`/`TYBO_CHAT_ID`, setzt tybo seinen Claude-Subprozessen),
   sonst der Direktchat. Ungültige Werte dort oder ein Topic ohne Forum-Gruppe
   brechen den Start ab (Exit 2), statt still in den Direktchat zu melden.
+  Ohne Telegram geht die Rückmeldung nur in die WebUI (Issue #227).
 - `--max-hours`: Zeitlimit, Standard 6, höchstens 72, auch Bruchteile (0.5).
 - `--model` und `--effort`: ohne Angabe wie der Bot (`MODEL_IDS.opus` aus
   `src/lib/model-router.ts`, Effort wie `defaultEffort` in `src/lib/claude.ts`).
@@ -76,7 +78,8 @@ Ein Job läuft ohne Rückfragen. Deshalb gilt:
    zu starten. Der Auftrag geht über stdin, mit dem Zusatz „Schreibe am Ende
    einen kurzen Bericht nach data/jobs/<id>/report.md". Claude bekommt die
    Umgebung ohne Geheimnisse (`subprocessEnv()`), dazu
-   `TYBO_CHAT_ID`/`TYBO_TOPIC_ID` des gespeicherten Ziels und
+   `TYBO_CHAT_ID`/`TYBO_TOPIC_ID` bzw. `TYBO_CONVERSATION_ID` des
+   gespeicherten Ziels und
    `TYBO_JOB_ID`. Ausgabe von Claude landet maskiert in `job.log` (siehe
    Geheimnisse), die des Wächters in `watcher.log`.
 3. Am Ende meldet der Wächter über `sendAndRecord` (Telegram und WebUI, Absender

@@ -39,6 +39,13 @@
  * Nachrichten mit Knöpfen werden gemerkt, jeder Knopf entscheidet also, und
  * beim Nachziehen verschwinden die Knöpfe überall. Scheitert eine
  * Folge-Nachricht, gilt die Frage trotzdem als gesendet (ins Log).
+ *
+ * Ohne Telegram (Issue #227, deps.telegram, in bot.ts telegramConfigured): sendChoice
+ * hält die Frage nur über die Outbox fest (metadata.choiceId, ohne Knöpfe und
+ * ohne Folge-Nachrichten, nichts zum Nachziehen); die WebUI zeigt die Knöpfe
+ * aus dem Register, das Terminal die nummerierte Auswahl. Fragen aus reinen
+ * Web-Gesprächen bekommen keine Kopie im Direktchat: das Gespräch zeigt sie
+ * selbst (postWeb bzw. laufender Turn), Push meldet sie.
  */
 
 import type { Composer, Context, MiddlewareFn } from "grammy";
@@ -58,6 +65,7 @@ import {
   type ChoiceKind,
   type ChoiceTelegramRef,
 } from "./choices";
+import { outboxDelivered } from "./channels";
 import { sendAndRecord, textChunks, type InlineButton, type SendAndRecordInput, type SendAndRecordResult } from "./outbox";
 import { NO_LINK_PREVIEW } from "./telegram";
 
@@ -211,12 +219,15 @@ export async function refreshChoiceMessages(
 export interface SendChoiceDeps {
   /** Standard sendAndRecord mit den Abhängigkeiten aus der Umgebung */
   send?: (input: SendAndRecordInput) => Promise<SendAndRecordResult>;
+  /** Telegram eingerichtet? Ohne Angabe wie vor Issue #227: ja (bot.ts übergibt telegramConfigured) */
+  telegram?: () => boolean;
   /** Zieht die eigene Nachricht nach, wenn die Frage während des Sendens erledigt wurde */
   refresh: (choice: Choice, refs: ChoiceTelegramRef[]) => Promise<unknown>;
   log?: Log;
 }
 
 export interface SendChoiceResult {
+  /** Zugestellt: an Telegram gesendet oder, ohne Telegram, für die WebUI festgehalten (Issue #227) */
   sent: boolean;
   recorded: boolean;
   /** Gemerkte Nachrichten mit den Knöpfen */
@@ -241,6 +252,7 @@ export async function sendChoice(choice: Choice, deps: SendChoiceDeps): Promise<
     return { sent: false, recorded: false, messages: [], error: "Frage ist nicht mehr offen" };
   }
   const send = deps.send ?? (input => sendAndRecord(input));
+  if (deps.telegram && !deps.telegram()) return recordChoiceForWeb(choice, send, log);
   const pages = choiceButtonPages(choice);
   const withButtons = (r: SendAndRecordResult) =>
     (r.messages ?? []).filter(m => m.buttons).map(m => ({ chatId: m.chatId, messageId: m.messageId }));
@@ -307,15 +319,40 @@ export async function sendChoice(choice: Choice, deps: SendChoiceDeps): Promise<
   return { sent: true, recorded: result.recorded, messages: refs };
 }
 
+/** Ohne Telegram: Frage nur festhalten (siehe oben); Web-Gespräche zeigen sie selbst */
+async function recordChoiceForWeb(
+  choice: Choice,
+  send: (input: SendAndRecordInput) => Promise<SendAndRecordResult>,
+  log: Log
+): Promise<SendChoiceResult> {
+  const c = choice.conversation;
+  if (c.type === "web") return { sent: false, recorded: false, messages: [], error: "Ohne Telegram keine Kopie im Direktchat" };
+  // Nur Web-Ziele: eine Telegram-Chat-ID aus der Zeit mit Telegram lehnt die Outbox ab
+  let result: SendAndRecordResult;
+  try {
+    result = await send({ chatId: c.chatId, text: choice.text, format: "plain", source: CHOICE_SOURCES[choice.kind], choiceId: choice.id });
+  } catch (e) {
+    log(`[choices] Frage ${choice.id} nicht festgehalten (${errorName(e)})`);
+    return { sent: false, recorded: false, messages: [], error: "Festhalten gescheitert" };
+  }
+  if (!outboxDelivered(result)) {
+    return { sent: false, recorded: false, messages: [], error: result.error?.message ?? "Festhalten gescheitert" };
+  }
+  return { sent: true, recorded: true, messages: [] };
+}
+
 // ---------------------------------------------------------------------------
 // Callback, Zuhörer, Ablauf
 // ---------------------------------------------------------------------------
 
 export interface TelegramChoicesDeps {
-  api: ChoiceEditApi;
-  /** TELEGRAM_USER_ID */
-  owner: string;
+  /** Ohne api (kein Telegram, Issue #228): Register, Ablauf und Speichern ohne Nachziehen */
+  api?: ChoiceEditApi;
+  /** TELEGRAM_USER_ID; ohne Besitzer nimmt die Callback-Middleware nichts an */
+  owner?: string;
   send?: (input: SendAndRecordInput) => Promise<SendAndRecordResult>;
+  /** Telegram eingerichtet? In bot.ts telegramConfigured (Issue #227); ohne Angabe ja */
+  telegram?: () => boolean;
   log?: Log;
 }
 
@@ -342,6 +379,7 @@ export function createTelegramChoices(deps: TelegramChoicesDeps): TelegramChoice
     while (refreshed.size > REFRESHED_MAX) refreshed.delete(refreshed.values().next().value as string);
   };
   const refresh = async (choice: Choice, refs?: ChoiceTelegramRef[]) => {
+    if (!deps.api) return;
     markRefreshed(await refreshChoiceMessages(choice, deps.api, log, refs));
   };
 
@@ -355,7 +393,7 @@ export function createTelegramChoices(deps: TelegramChoicesDeps): TelegramChoice
     const data = query?.data;
     if (typeof data !== "string" || !data.startsWith("ch|")) return next();
     // Doppelt zur Besitzerprüfung in bot.ts: fremde Absender kommen nie durch
-    if (String(ctx.from?.id ?? "") !== deps.owner) return;
+    if (!deps.owner || !deps.api || String(ctx.from?.id ?? "") !== deps.owner) return;
     const answer = (text?: string) => ctx.answerCallbackQuery(text ? { text } : undefined).catch(() => {});
 
     const parsed = parseChoiceCallbackData(data);
@@ -369,7 +407,7 @@ export function createTelegramChoices(deps: TelegramChoicesDeps): TelegramChoice
     const stripClicked = async () => {
       if (!chatId || messageId === undefined || refreshed.has(refKey(chatId, messageId))) return;
       try {
-        await deps.api.editMessageReplyMarkup(chatId, messageId, { reply_markup: { inline_keyboard: [] } });
+        await deps.api!.editMessageReplyMarkup(chatId, messageId, { reply_markup: { inline_keyboard: [] } });
         markRefreshed([{ chatId, messageId }]);
       } catch (e) {
         log(`[choices] Knöpfe an Nachricht ${messageId} nicht entfernt (${errorName(e)})`);
@@ -436,7 +474,7 @@ export function createTelegramChoices(deps: TelegramChoicesDeps): TelegramChoice
   };
 
   return {
-    sendChoice: choice => sendChoice(choice, { send: deps.send, refresh, log }),
+    sendChoice: choice => sendChoice(choice, { send: deps.send, refresh, log, ...(deps.telegram ? { telegram: deps.telegram } : {}) }),
     middleware,
     listener,
     sweep: () => expireLapsedChoices(),

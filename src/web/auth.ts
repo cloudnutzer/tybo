@@ -13,6 +13,7 @@ import { isIP } from "node:net";
 import { networkInterfaces } from "node:os";
 import { dirname, join } from "node:path";
 import { isLoopbackAddress } from "./cli-token";
+import type { RemoteKind } from "./config";
 
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 export const LOGIN_MAX_FAILURES = 10;
@@ -248,66 +249,135 @@ export function isSameOrigin(request: Request): boolean {
 export const TUNNEL_CLIENT_IP_HEADER = "cf-connecting-ip";
 /** Besucher-IP, wenn cloudflared eine leere, doppelte oder ungültige Angabe schickt */
 export const TUNNEL_UNKNOWN_CLIENT = "tunnel-unbekannt";
+/** Kopfzeile, die `tailscale serve` mit der Tailnet-Adresse des Besuchers setzt (ersetzt einen mitgeschickten Wert) */
+export const TAILSCALE_CLIENT_IP_HEADER = "x-forwarded-for";
 
 export interface RequestOrigin {
-  /** Über den Cloudflare Tunnel: Loopback-Verbindung mit CF-Connecting-IP und gesetztem WEB_PUBLIC_ORIGIN */
-  tunneled: boolean;
   /**
-   * Echte lokale Anfrage: Loopback-Verbindung, die nicht getunnelt ist. Nur
-   * sie darf lokale Sonderrechte bekommen (Terminal-Schlüssel). Ohne
-   * WEB_PUBLIC_ORIGIN bleibt es beim bisherigen Verhalten: jede
-   * Loopback-Verbindung ist lokal, auch mit CF-Connecting-IP (Entscheidung 0014).
+   * Von unterwegs: über den Cloudflare Tunnel (Loopback-Verbindung mit
+   * CF-Connecting-IP) oder über `tailscale serve` (Loopback-Verbindung mit
+   * Weiterleitungs-Kopfzeilen oder dem öffentlichen Host), jeweils nur mit
+   * gesetztem WEB_PUBLIC_ORIGIN
+   */
+  tunneled: boolean;
+  /** Welcher Weg; null, wenn nicht getunnelt */
+  via: RemoteKind | null;
+  /**
+   * Echte lokale Anfrage: Loopback-Verbindung ohne Kopfzeilen einer
+   * Weiterleitung (Cloudflare, Tailscale, X-Forwarded-*). Nur sie darf lokale
+   * Sonderrechte bekommen (Terminal-Schlüssel, Demo). Seit Issue #231 auch
+   * ohne WEB_PUBLIC_ORIGIN: eine weitergeleitete Anfrage ist nie lokal.
    */
   local: boolean;
   /** Für Login-Bremse und Log; nie Grundlage für Sonderrechte */
   clientIp: string;
 }
 
-/**
- * Woher eine Anfrage kommt (Issue #98), an genau einer Stelle. cloudflared
- * verbindet sich von 127.0.0.1 und setzt CF-Connecting-IP. Der Kopfzeile wird
- * nur bei einer Loopback-Verbindung und gesetztem WEB_PUBLIC_ORIGIN geglaubt;
- * von jeder anderen Adresse wird sie ignoriert. Als Besucher-IP gilt nur eine
- * einzelne gültige IP-Adresse, sonst ein fester Platzhalter, damit beliebige
- * Texte weder ins Log gelangen noch die Login-Bremse umgehen.
- */
-export function requestOrigin(req: Request, peerIp: string, publicOrigin: string | null | undefined): RequestOrigin {
-  const loopback = isLoopbackAddress(peerIp);
-  const hasHeader = req.headers.has(TUNNEL_CLIENT_IP_HEADER);
-  // Ohne öffentliche Adresse wie bisher: Kopfzeile egal, Loopback ist lokal
-  if (!loopback || !hasHeader || !publicOrigin) return { tunneled: false, local: loopback, clientIp: peerIp };
-  // Loopback mit Tunnel-Kopfzeile und öffentlicher Adresse: getunnelt, nie lokal
-  const raw = (req.headers.get(TUNNEL_CLIENT_IP_HEADER) ?? "").trim();
-  const clientIp = isIP(raw) ? raw.toLowerCase() : TUNNEL_UNKNOWN_CLIENT;
-  return { tunneled: true, local: false, clientIp };
+/** Einzelne gültige IP-Adresse aus einer Kopfzeile, sonst der feste Platzhalter */
+function headerIp(req: Request, name: string): string {
+  const raw = (req.headers.get(name) ?? "").trim();
+  return isIP(raw) ? raw.toLowerCase() : TUNNEL_UNKNOWN_CLIENT;
 }
 
 /**
- * Kopfzeilen, die cloudflared bzw. Cloudflare an weitergeleitete Anfragen
- * hängt. Ein Browser auf diesem Rechner schickt keine davon.
+ * Woher eine Anfrage kommt (Issue #98, Tailscale seit Issue #231), an genau
+ * einer Stelle. cloudflared und `tailscale serve` verbinden sich beide von
+ * 127.0.0.1. Kopfzeilen wird nur bei einer Loopback-Verbindung geglaubt; von
+ * jeder anderen Adresse werden sie ignoriert. Als Besucher-IP gilt nur eine
+ * einzelne gültige IP-Adresse, sonst ein fester Platzhalter, damit beliebige
+ * Texte weder ins Log gelangen noch die Login-Bremse umgehen.
+ *
+ * kind (remoteKind aus ./config) sagt, welcher Weg eingerichtet ist:
+ * - cloudflare: getunnelt ist, was CF-Connecting-IP trägt, auch mit
+ *   zusätzlichen Tailscale-Kopfzeilen (dann gilt trotzdem Access)
+ * - tailscale: getunnelt ist jede weitergeleitete Anfrage und jede mit dem
+ *   öffentlichen Host, auch ohne Identitäts-Kopfzeilen (die fehlen bei
+ *   getaggten Geräten). Trägt sie Cloudflare-Kopfzeilen, gilt sie als
+ *   Cloudflare und scheitert am fehlenden Access
  */
-export const TUNNEL_MARKER_HEADERS = [
+export function requestOrigin(
+  req: Request,
+  peerIp: string,
+  publicOrigin: string | null | undefined,
+  kind: RemoteKind = "cloudflare",
+): RequestOrigin {
+  const loopback = isLoopbackAddress(peerIp);
+  if (!loopback) return { tunneled: false, via: null, local: false, clientIp: peerIp };
+  const proxied = hasTunnelHeaders(req);
+  const plain: RequestOrigin = { tunneled: false, via: null, local: !proxied, clientIp: peerIp };
+  if (!publicOrigin) return plain;
+  const fromCloudflare = CLOUDFLARE_HEADERS.some(h => req.headers.has(h));
+  if (kind === "cloudflare") {
+    if (!req.headers.has(TUNNEL_CLIENT_IP_HEADER)) return plain;
+    return { tunneled: true, via: "cloudflare", local: false, clientIp: headerIp(req, TUNNEL_CLIENT_IP_HEADER) };
+  }
+  if (fromCloudflare) return { tunneled: true, via: "cloudflare", local: false, clientIp: headerIp(req, TUNNEL_CLIENT_IP_HEADER) };
+  if (!proxied && !isPublicHost(req.headers.get("host"), publicOrigin)) return plain;
+  return { tunneled: true, via: "tailscale", local: false, clientIp: headerIp(req, TAILSCALE_CLIENT_IP_HEADER) };
+}
+
+/** Kopfzeilen, die nur Cloudflare bzw. cloudflared setzen */
+export const CLOUDFLARE_HEADERS = [
   TUNNEL_CLIENT_IP_HEADER,
   "cf-ray",
   "cf-visitor",
   "cf-ipcountry",
   "cf-warp-tag-id",
   "cf-access-jwt-assertion",
-  "x-forwarded-for",
 ] as const;
 
 /**
- * Sieht nach Tunnel aus, unabhängig von WEB_PUBLIC_ORIGIN (Issue #99). Für
- * Server, die nur lokal gelten dürfen (Einrichtungsmodus): lieber eine
- * seltsame lokale Anfrage ablehnen als eine getunnelte durchlassen.
+ * Kopfzeilen, die `tailscale serve` an weitergeleitete Anfragen hängt
+ * (Identität nur bei Geräten mit Nutzer, nicht bei getaggten; Funnel setzt
+ * Tailscale-Funnel-Request). Dazu immer X-Forwarded-Host und -For.
+ */
+export const TAILSCALE_HEADERS = [
+  "tailscale-user-login",
+  "tailscale-user-name",
+  "tailscale-user-profile-pic",
+  "tailscale-headers-info",
+  "tailscale-funnel-request",
+  "tailscale-app-capabilities",
+] as const;
+
+/**
+ * Kopfzeilen einer Weiterleitung (Cloudflare, Tailscale, allgemeine
+ * Proxys). Ein Browser auf diesem Rechner schickt keine davon.
+ */
+export const TUNNEL_MARKER_HEADERS = [
+  ...CLOUDFLARE_HEADERS,
+  ...TAILSCALE_HEADERS,
+  "x-forwarded-for",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+  "forwarded",
+] as const;
+
+/**
+ * Sieht nach Weiterleitung aus, unabhängig von WEB_PUBLIC_ORIGIN (Issue #99,
+ * Tailscale seit #231). Für Server, die nur lokal gelten dürfen
+ * (Einrichtungsmodus): lieber eine seltsame lokale Anfrage ablehnen als eine
+ * weitergeleitete durchlassen.
  */
 export function hasTunnelHeaders(req: Request): boolean {
   return TUNNEL_MARKER_HEADERS.some(h => req.headers.has(h));
 }
 
 /**
+ * Von unterwegs im Sinne der Fernzugriffssperre (Schlüssel nur lesen), unabhängig
+ * von WEB_PUBLIC_ORIGIN und dem eingerichteten Weg (Issue #231): getunnelt oder
+ * eine Loopback-Verbindung mit Weiterleitungs-Kopfzeilen. Etwa `tailscale serve`,
+ * das schon läuft, bevor tybo die Adresse kennt oder nachdem der Weg zu
+ * Cloudflare gewechselt ist; es übernimmt den Host des Browsers, eine
+ * Weiterleitung auf localhost besteht also die Heimnetz-Prüfungen.
+ */
+export function isRemoteRequest(req: Request, peerIp: string, origin: RequestOrigin): boolean {
+  return origin.tunneled || (isLoopbackAddress(peerIp) && hasTunnelHeaders(req));
+}
+
+/**
  * Host-Prüfung für getunnelte Anfragen: genau der Host aus WEB_PUBLIC_ORIGIN,
- * ohne Port. WEB_ALLOWED_HOSTS und die Adressen des Rechners gelten hier nicht.
+ * ohne Port (beide Wege lassen den Host des Browsers stehen). WEB_ALLOWED_HOSTS und die Adressen des Rechners gelten hier nicht.
  */
 export function isPublicHost(host: string | null | undefined, publicOrigin: string): boolean {
   if (!host) return false;

@@ -22,6 +22,11 @@
  * sie macht, und über einen Abgleich alle 15 Sekunden, wenn ein anderer
  * Prozess (Sprach-Brücke) entschieden hat oder eine Frist abgelaufen ist.
  *
+ * Neue offene Fragen (Issue #226, für Push) meldet der Port genau einmal mit
+ * created: true und ihrer Art (kind), gleich ob dieser Prozess sie angelegt
+ * hat oder der Abgleich sie in einem anderen Prozess findet. Der erste
+ * Abgleich ist nur Startstand: was da schon offen ist, gilt nicht als neu.
+ *
  * Nur Typen und reine Funktionen, nichts aus src/lib.
  */
 
@@ -34,6 +39,8 @@ export type ChoiceVia = "telegram" | "web" | "terminal";
 /** Wie Choice in src/lib/choices.ts, nur die Felder, die die WebUI braucht */
 export interface RegisterChoice {
   id: string;
+  /** Art wie ChoiceKind in src/lib/choices.ts (tool, review, goal, topicmap) */
+  kind?: string;
   conversation: { type: "telegram"; chatId: string; topicId?: number } | { type: "web"; conversationId: string };
   options: { key: string; label: string }[];
   state: ChoiceState;
@@ -77,7 +84,17 @@ export interface ChoiceChange {
   choice: ApiChoice;
   /** Frage aus einem reinen Web-Gespräch: ihre Kopie steht im Direktchat (#114) */
   copyInDm: boolean;
+  /** Neue offene Frage (Issue #226): genau einmal je Frage */
+  created?: boolean;
+  /** Art der Frage, nur bei created */
+  kind?: ChoiceKindName;
 }
+
+/** Arten aus src/lib/choices.ts; andere Werte fallen weg */
+export type ChoiceKindName = "tool" | "review" | "goal" | "topicmap";
+const CHOICE_KIND_NAMES: readonly ChoiceKindName[] = ["tool", "review", "goal", "topicmap"];
+/** Höchstens so viele gemerkte neue Fragen (gegen doppelte Meldung aus Zuhörer und Abgleich) */
+const ANNOUNCED_LIMIT = 500;
 
 export type ChoiceDecideResult =
   | { status: "decided"; choice: ApiChoice }
@@ -113,7 +130,8 @@ export { CHOICE_ID_PATTERN, isChoiceId };
 export const CHOICE_KEY_PATTERN = /^[A-Za-z0-9_-]{1,32}$/;
 export const CHOICE_SYNC_MS = 15_000;
 const CHANNELS: readonly ChoiceVia[] = ["telegram", "web", "terminal"];
-const USER_ID_PATTERN = /^\d{1,20}$/;
+/** Direktchat: Telegram-Nutzer-ID oder, ohne Telegram, "web" (wie WEB_DM_CHAT_ID in src/lib/channels.ts, Issue #227) */
+const USER_ID_PATTERN = /^(\d{1,20}|web)$/;
 const GROUP_ID_PATTERN = /^-\d{1,20}$/;
 
 /** API-Format im eigenen Gespräch: Knöpfe, Zustand, Ergebnis */
@@ -143,7 +161,7 @@ export function choiceViewFor(choice: ApiChoice, owner: string | null, viewer: s
 
 export interface ChoicePortDeps {
   register: ChoiceRegister;
-  /** TELEGRAM_USER_ID */
+  /** Chat des Direktchats: TELEGRAM_USER_ID, ohne Telegram "web" */
   userId?: string;
   /** Chat-ID der Forum-Gruppe, bei jedem Aufruf neu; null ohne Gruppe */
   groupId(): string | null;
@@ -190,6 +208,18 @@ export function createChoicePort(deps: ChoicePortDeps): ChoicePort {
 
   function change(c: RegisterChoice): ChoiceChange {
     return { conversationId: ownerOf(c), choice: toApiChoice(c), copyInDm: c.conversation.type === "web" };
+  }
+
+  /** Schon als neu gemeldete Fragen, älteste zuerst */
+  const announced = new Set<string>();
+
+  /** Neue offene Frage einmal melden; schon gemeldete bleiben still */
+  function announceCreated(c: RegisterChoice): void {
+    if (c.state !== "open" || announced.has(c.id)) return;
+    announced.add(c.id);
+    if (announced.size > ANNOUNCED_LIMIT) announced.delete(announced.values().next().value!);
+    const kind = CHOICE_KIND_NAMES.find(k => k === c.kind);
+    broadcast({ ...change(c), created: true, ...(kind ? { kind } : {}) });
   }
 
   async function view(choiceId: string, conversationId: string): Promise<ApiChoice> {
@@ -266,8 +296,11 @@ export function createChoicePort(deps: ChoicePortDeps): ChoicePort {
     for (const [id, entry] of next) {
       const old = before.get(id);
       if (old?.sig === entry.sig) continue;
-      // Neu und offen: die Nachricht dazu bringt die Knöpfe selbst
-      if (!old && entry.last.state === "open") continue;
+      // Neu und offen: die Nachricht dazu bringt die Knöpfe selbst; nur als neu melden
+      if (!old && entry.last.state === "open") {
+        announceCreated(entry.last);
+        continue;
+      }
       broadcast(change(entry.last));
     }
     // Aus dem Register verschwunden, vorher offen: gilt jetzt als abgelaufen
@@ -298,6 +331,11 @@ export function createChoicePort(deps: ChoicePortDeps): ChoicePort {
 
   function start(): void {
     stopHook = deps.register.onChange(({ type, choice }) => {
+      if (type === "created") {
+        remember(choice);
+        announceCreated(choice);
+        return;
+      }
       if (type !== "decided" && type !== "expired") return;
       remember(choice);
       broadcast(change(choice));
@@ -320,6 +358,7 @@ export function createChoicePort(deps: ChoicePortDeps): ChoicePort {
     stopTimer = null;
     known = undefined;
     failing = false;
+    announced.clear();
   }
 
   function subscribe(listener: (change: ChoiceChange) => void): () => void {

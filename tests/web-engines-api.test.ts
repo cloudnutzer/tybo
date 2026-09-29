@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EngineId, EngineStatus } from "../src/lib/engines";
 import { setTopicEngine } from "../src/lib/engine-choice";
-import { setSettingsPath } from "../src/lib/settings";
+import { getSettings, setSettingsPath } from "../src/lib/settings";
 import { createBotEngines } from "../src/web/bot-engines";
 import { botSettings } from "../src/web/bot-settings";
 import { conversationSessionKey } from "../src/web/bot-turn";
@@ -425,6 +425,37 @@ describe("POST /api/engines/reset („Auf Standard\")", () => {
   });
 });
 
+describe("Web-Direktchat ohne Telegram: Schlüssel dm:web (Issue #227)", () => {
+  const WEB_DM_KEY = "dm:web";
+  const webPort = () => createBotEngines({ userId: "web", groupId: () => null, agentForTopic: () => "general", inspect });
+  const webOnly: TelegramSource = {
+    listConversations: async () => ({ dm: conv("dm", "Direktchat"), topics: [] }),
+    groupChatId: () => null,
+    getConversation: async () => null,
+    history: async () => null,
+  };
+
+  test("Motor setzen, Einstellung neu laden, in der Übersicht dem Direktchat zugeordnet, Auf Standard entfernt ihn", async () => {
+    const engines = webPort();
+    expect(engines.sessionKey("dm")).toBe(WEB_DM_KEY);
+    await setTopicEngine(WEB_DM_KEY, "codex");
+    expect(await readJson()).toEqual({ engine: { topics: { [WEB_DM_KEY]: "codex" } } });
+    // Neu laden: dieselbe Datei frisch eingelesen, der Schlüssel wird nicht verworfen
+    setSettingsPath();
+    setSettingsPath(file);
+    expect(getSettings().engine?.topics).toEqual({ [WEB_DM_KEY]: "codex" });
+
+    const ctx = await server({ engines, telegram: webOnly });
+    const body = await (await ctx.api("/api/engines")).json();
+    expect(body.overrides).toEqual([{ key: WEB_DM_KEY, engine: "codex", label: "Codex", conversationId: "dm", title: "Direktchat" }]);
+
+    const res = await ctx.api("/api/engines/reset", "POST", { key: WEB_DM_KEY });
+    expect(res.status).toBe(200);
+    expect(ctx.calls).toEqual([{ id: "dm" }]);
+    expect(await readJson()).toEqual({});
+  });
+});
+
 describe("Live: SSE-Ereignis engine im Sammelstrom", () => {
   async function listen(ctx: { origin: string; cookie: string }) {
     const controller = new AbortController();
@@ -539,7 +570,8 @@ describe("Verdrahtung (nur als Text bzw. mit Attrappen)", () => {
     const args = call.slice(0, call.indexOf("\n});"));
     expect(args).toContain("engines: createBotEngines({");
     const engines = args.slice(args.indexOf("engines: createBotEngines({"));
-    expect(engines).toContain("userId: process.env.TELEGRAM_USER_ID,");
+    // Direktchat ohne Telegram: "web" (Issue #227)
+    expect(engines).toContain("userId: dmChatId(process.env),");
     expect(engines).toContain("groupId: () => botGroupId(process.env),");
     expect(engines).toContain("agentForTopic: (topicId, chatId) => getAgentByTopicId(topicId, chatId),");
   });

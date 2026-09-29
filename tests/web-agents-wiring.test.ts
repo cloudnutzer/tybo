@@ -58,8 +58,11 @@ describe("Agentenlisten aus dem Katalog", () => {
     });
     expect((await ctx.api("/api/conversations", "POST", { agent: "projekt-planer" })).status).toBe(400);
     expect((await ctx.api("/api/agents", "POST", planer)).status).toBe(201);
-    expect((await ctx.api("/api/conversations", "POST", { agent: "projekt-planer" })).status).toBe(201);
-    expect(created).toEqual(["projekt-planer"]);
+    // Ohne Forum-Gruppe ein Web-Gespräch mit dem neuen Agenten (Issue #227), kein Topic
+    const res = await ctx.api("/api/conversations", "POST", { agent: "projekt-planer" });
+    expect(res.status).toBe(201);
+    expect((await res.json()).conversation.agent).toBe("projekt-planer");
+    expect(created).toEqual([]);
     expect((await (await ctx.api("/api/settings")).json()).agents).toContain("projekt-planer");
     expect((await ctx.api("/api/agents/projekt-planer/instructions")).status).toBe(200);
 

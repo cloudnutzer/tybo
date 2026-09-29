@@ -173,8 +173,27 @@ describe("Befehle im Vollmodus", () => {
     expect(stdout.text).toContain("Meldung von befehl");
     expect(s.commandRuns.map(r => [r.conversationId, r.text, r.source])).toEqual([["topic-443", "/new", "terminal"]]);
     expect(s.telegramChat.calls).toHaveLength(0);
-    // Nichts läuft danach weiter: die nächste Nachricht geht sofort raus
+    // Nichts läuft danach weiter: die nächste Nachricht geht raus. Die Meldung kommt über die
+    // Live-Verbindung, unter Last oft vor der Antwort auf den Befehl; solange er läuft, gilt das
+    // Gespräch als beschäftigt und der Text bleibt stehen (gewollt), dann sendet ein weiteres Enter
+    // ihn. Je Sperr-Hinweis genau ein Enter
+    const blocked = "Text bleibt stehen";
+    const count = () => stdout.text.split(blocked).length - 1;
+    let seen = 0;
     stdin.type("Weiter\r");
+    await waitFor(
+      () => {
+        if (s.telegramChat.calls.length > 0) return true;
+        if (count() > seen) {
+          seen = count();
+          stdin.type("\r");
+        }
+        return false;
+      },
+      10_000,
+      "Nachricht gesendet",
+    );
+    expect(s.telegramChat.calls.map(c => c.text)).toEqual(["Weiter"]);
     await s.telegramChat.turn("topic-443");
     s.telegramChat.finish("topic-443", "ok");
     // Die Attrappe des Telegram-Verlaufs speichert nichts: der Verlauf ist unverändert

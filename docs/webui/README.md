@@ -40,9 +40,9 @@ Alle Einstellungen:
 | `WEB_HOST` | `127.0.0.1` | nur dieser Rechner; `0.0.0.0` für das Heimnetz |
 | `WEB_PORT` | `3100` | Port der WebUI (nicht der Health-Port) |
 | `WEB_ALLOWED_HOSTS` | leer | weitere Host-Namen, z. B. `mein-mac.local` |
-| `WEB_PUBLIC_ORIGIN` | leer | öffentliche Adresse hinter dem Cloudflare Tunnel, genau `https://<domain>` ohne Port und Pfad, z. B. `https://app.tybo.ai` (Entscheidung 0014). Getunnelt ist eine Anfrage nur, wenn sie von 127.0.0.1/::1 kommt und `CF-Connecting-IP` trägt; dann braucht sie einen gültigen Cloudflare-Access-Nachweis, es gelten nur dieser Host und dieser Origin, die Login-Bremse zählt pro Besucher-IP, das Cookie bekommt `Secure`, der Terminal-Schlüssel gilt nicht und Schlüssel sind nur lesbar. Ohne Einstellung bleibt alles wie im Heimnetz. Einrichtung: [fernzugang.md](fernzugang.md) |
+| `WEB_PUBLIC_ORIGIN` | leer | Adresse von unterwegs, genau `https://<domain>` ohne Port und Pfad: im Tailnet `https://<gerät>.<tailnet>.ts.net` (über `tailscale serve`) oder eine eigene Domain hinter dem Cloudflare Tunnel, z. B. `https://tybo.example.org` (Entscheidungen 0014, 0022). Eine `ts.net`-Adresse ohne Access-Werte gilt als Tailscale, alles andere als Cloudflare. Über den Tunnel (Loopback mit `CF-Connecting-IP`) braucht eine Anfrage einen gültigen Cloudflare-Access-Nachweis; über Tailscale (Loopback mit Weiterleitungs-Kopfzeilen oder genau diesem Host) nur das WebUI-Passwort. Auf beiden Wegen gelten nur dieser Host und dieser Origin, die Login-Bremse zählt pro Besucher-IP, das Cookie bekommt `Secure`, Terminal-Schlüssel und Demo-Anmeldung gelten nicht und Schlüssel sind nur lesbar. Ohne Einstellung bleibt alles wie im Heimnetz; eine weitergeleitete Anfrage gilt trotzdem nie als lokal. Einrichtung: `tybo setup zugang`, [fernzugang.md](fernzugang.md) |
 | `WEB_ACCESS_TEAM` | leer | Team-Name von Cloudflare Zero Trust (`meinteam` für `meinteam.cloudflareaccess.com`), nur zusammen mit `WEB_ACCESS_AUD`. Fehlen beide bei gesetztem `WEB_PUBLIC_ORIGIN`, werden getunnelte Anfragen immer abgelehnt |
-| `WEB_ACCESS_AUD` | leer | Application Audience (AUD) Tag der Access-Anwendung für app.tybo.ai |
+| `WEB_ACCESS_AUD` | leer | Application Audience (AUD) Tag der Access-Anwendung für die eigene Domain |
 | `WEB_ALLOW_KEY_EDIT` | aus | `true` erlaubt, Schlüssel in der WebUI zu setzen und zu löschen (`PUT`/`DELETE /api/keys/<name>`); einschalten wirkt nach einem Neustart, ausschalten sofort. `WEB_*`, `TELEGRAM_BOT_TOKEN` und `TELEGRAM_USER_ID` bleiben immer gesperrt. Vor jeder Änderung liegt eine Sicherung in `data/backups/env-<zeit>` |
 | `TELEGRAM_GROUP_ID` | aus `config/topics.json` | Chat-ID der Forum-Gruppe (`-100…`), deren Topics die WebUI zeigt; ohne Angabe die erste Chat-ID mit `-` aus `config/topics.json`, ohne Gruppe nur der Direktchat |
 
@@ -57,6 +57,53 @@ Namen aufruft (`http://mein-mac.local:3100`), trägt diesen Namen in
 
 macOS fragt beim ersten Start eventuell, ob `bun` eingehende Verbindungen
 annehmen darf. Ohne „Erlauben" kommt das Handy nicht durch.
+
+### Als App installieren (W2, Issue #224)
+
+Die WebUI ist eine installierbare Web-App (Entscheidung 0021): Wer sie am
+Handy über HTTPS öffnet, kann sie auf den Home-Bildschirm legen und bekommt ein
+eigenes Symbol und Vollbild ohne Browserleiste. Die Anleitung für Nutzer,
+Schritt für Schritt für iPhone und Android samt Benachrichtigungen, Teilen und
+Grenzen: [../handy-app.md](../handy-app.md).
+
+- **Nur im sicheren Kontext:** über HTTPS (die Adresse aus
+  `WEB_PUBLIC_ORIGIN`, eingerichtet mit `tybo setup zugang`, siehe
+  [fernzugang.md](fernzugang.md)) oder am Rechner selbst über
+  `http://localhost:3100`. Über `http://<LAN-IP>` im Heimnetz bleibt es eine
+  normale Webseite: kein Service Worker, keine Installation.
+- **iPhone (Safari):** Teilen-Knopf, „Zum Home-Bildschirm". **Android
+  (Chrome):** Menü, „App installieren" bzw. „Zum Startbildschirm hinzufügen".
+- **tybo nicht erreichbar:** Ist der Rechner aus, schläft er oder ist der
+  Tunnel weg, zeigt die App statt einer Fehlerseite die Seite „tybo nicht
+  erreichbar" mit „Erneut versuchen". Der Service Worker (`/sw.js`) greift nur
+  beim Öffnen oder Neuladen einer Seite, bei Netzfehlern und bei den Status
+  502, 503, 504 und 520 bis 530 (530: Cloudflare-Tunnel weg). Eine schon offene
+  Chat-Seite zeigt Verbindungsverluste wie bisher im Verbindungsbalken.
+- **Kein Offline-Speicher:** Der Service Worker speichert nur die Offline-Seite
+  und was sie braucht (`offline.js`, `style.css`, `theme.js`, `favicon.svg`),
+  nie Gespräche, Antworten, Dateien oder API-Antworten. `/api/…` fasst er nicht an.
+- **Hinter Cloudflare Access:** Manifest, Symbole, `sw.js` und
+  `offline.html` sind ohne WebUI-Anmeldung erreichbar (sie verraten nichts über
+  den Nutzer), über den Tunnel aber nur mit gültigem Access-Nachweis. Das
+  Manifest holt der Browser mit Cookie (`crossorigin="use-credentials"`).
+- **Neue Version:** Jede Änderung an der Oberfläche ergibt einen neuen Service
+  Worker. Er übernimmt erst nach „Neu laden" beim Hinweis „Neue Version" (oder
+  wenn keine Seite mehr offen ist).
+- **Teilen-Ziel (Issue #229, nur Android):** Das Manifest meldet `/teilen`
+  als Ziel im Teilen-Menü. Den POST fängt der Service Worker ab, legt Text und
+  Dateien in einem eigenen Cache ab (höchstens 5 Dateien, Grenzen wie die
+  Büroklammer, nach 10 Minuten verworfen) und leitet auf `/#/teilen` um; die
+  App übernimmt alles als Entwurf und Anhänge ins zuletzt offene Gespräch,
+  gesendet wird erst nach einem Tipp. Kommt der POST doch beim Server an
+  (Worker noch nicht aktiv), verwirft der Server ihn und leitet auf `/` um.
+- **Am Handy (Issue #229):** Büroklammer mit „Foto aufnehmen" (Kamera) und
+  „Datei wählen", Eingabe über der Tastatur (`visualViewport`), Zurück schließt
+  erst die Schublade und führt aus einem Gespräch in die Liste, Wischen vom
+  linken Rand öffnet die Liste.
+- **Symbole:** `icon-192.png`, `icon-512.png`, `icon-maskable-512.png` in
+  `src/web/public`, erzeugt mit `bun run scripts/web-icons.ts` aus der
+  Geometrie von `favicon.svg`; ein Test prüft, dass die Dateien im Repo dieser
+  Berechnung entsprechen.
 
 ### Sicherheit
 
@@ -391,6 +438,66 @@ geht das auch mit `tybo setup --web`, dann ohne laufenden Bot.
   Browser; dort wirkt zusätzlich „ja“ als Text.
 - Nachrichten, die direkt in Telegram geschrieben werden, erscheinen im
   Browser erst nach dem Neuladen des Gesprächs (Live-Übertragung folgt).
+
+### Ohne Telegram (Issue #227, Entscheidung 0021)
+
+tybo läuft auch nur mit der WebUI. Ob Telegram eingerichtet ist, entscheidet
+eine Stelle (`telegramConfigured` in `src/lib/channels.ts`): `TELEGRAM_BOT_TOKEN`
+gesetzt und `TELEGRAM_USER_ID` eine gültige Nutzer-ID. Mit Telegram ändert sich
+nichts. Ohne Telegram (den Start ohne Token bringt erst Issue #228):
+
+- **Direktchat:** Die WebUI zeigt weiter „Direktchat" (Agent General). Er liegt
+  im Nachrichtenspeicher unter der festen Chat-ID `web`, Session `dm:web`,
+  mit Gedächtnis und Verlauf wie der Telegram-Direktchat. Nichts wird
+  gespiegelt, Antworten gehen nicht an einen Agenten-Bot. Claude-Subprozesse
+  bekommen `TYBO_CHAT_ID=web`.
+- **Neues Gespräch:** Ohne Forum-Gruppe (mit oder ohne Telegram) legt „Neues
+  Gespräch" ein reines Web-Gespräch mit dem gewählten Agenten an
+  (Nachtrag zu `decisions/0005-neue-gespraeche-als-topics.md`); mit Gruppe
+  bleibt es beim Topic. Ohne Telegram gibt es keine Topics, auch wenn in
+  `config/topics.json` oder `TELEGRAM_GROUP_ID` noch eine Gruppe steht.
+- **Meldungen und Dateien:** `sendAndRecord` (`src/lib/outbox.ts`) hält nur
+  fest und sendet nichts (kein Aufruf an `api.telegram.org`); Ziel ohne
+  Angabe ist der Web-Direktchat, `--topic` ist ein Fehler. Dateien kommen wie
+  bisher nach `data/outbox/`. Scheitert das Festhalten oder die Ablage, ist
+  die Meldung nicht zugestellt (`bun run notify` endet mit 1). Check-in,
+  Briefing und Watchdog laufen durch; die Check-in-Knöpfe fallen weg, der Text
+  bleibt.
+- **Web-Gespräch als Rückmeldeziel:** In einem reinen Web-Gespräch bekommen
+  Claude-Subprozesse `TYBO_CONVERSATION_ID=<Gesprächs-ID>` (auch mit
+  Telegram). `bun run notify` und `bun run job start` nehmen es als Ziel
+  (Vorrang vor `TYBO_CHAT_ID`/`TYBO_TOPIC_ID`, `--topic` geht vor). Die
+  Meldung liegt dann unter `web:<Gesprächs-ID>`; der Bot übernimmt sie
+  höchstens einmal in das Web-Gespräch (Nachrichten-ID = `msgId`), mit Datei
+  und Rückfrage, und holt nach einem Neustart nach, was während der
+  Ausfallzeit kam (Zeitpunkt in `data/web/notice-cursor.json`). Dateien
+  solcher Meldungen gibt es zum Download, solange das Gespräch besteht.
+- **Rückfragen:** Goal „Weiter?", Werkzeug-Freigaben und Merk-Vorschläge
+  werden nur festgehalten (mit `choiceId`, ohne Telegram-Nachricht und ohne
+  Nachziehen). Der Browser zeigt die Knöpfe, das Terminal die nummerierte
+  Auswahl; entscheidbar nur im eigenen Gespräch. Fragen aus reinen
+  Web-Gesprächen bekommen keine Kopie im Direktchat, Push meldet sie. Die
+  Topic-Zuordnung entfällt ohne Gruppe.
+- **Bot-interne Meldungen** (Neustart, Credit-Guard, Erinnerungen an
+  liegengebliebene `ask_user`-Aufgaben, Goal-Status) gehen über einen
+  gemeinsamen Weg (`src/lib/user-notify.ts`) durch die Outbox: mit Telegram
+  wie bisher dorthin (Knöpfe der Erinnerungen und Goal-Meldungen bleiben,
+  der Credit-Guard als Klartext) und genau einmal für die WebUI festgehalten,
+  ohne Telegram nur als Meldung „System" bzw. „Ziel" in der WebUI. Der
+  Goal-Zwischenstand je Turn bleibt nur in Telegram (die Karte zeigt ihn).
+  Lehnt die Outbox ein Telegram-Ziel ab, geht die Meldung wie früher direkt
+  über den Haupt-Bot. Eine Erinnerung gilt erst als verschickt, wenn sie
+  zugestellt ist.
+- **Motor:** `/motor` und die Motor-Seite kennen den Schlüssel `dm:web` des
+  Web-Direktchats.
+- **Grenzen:** Meldungen setzen Supabase voraus; unter Convex hält
+  `saveDisplayOnlyMessage` nichts fest (wie bisher), ohne Telegram ist eine
+  Meldung dann nicht zugestellt. Sprachausgabe (`/voice`) bleibt Telegram.
+- **Browser-Durchlauf:** `bun run scripts/web-ohne-telegram-check.ts
+  --screenshots` prüft Direktchat, neues Gespräch mit Agentenwahl, Meldungen
+  von `bun run notify` und eine Goal-Rückfrage mit einer isolierten Attrappe
+  (gemeinsamer Nachrichtenspeicher, echte Outbox ohne Token, kein
+  `src/bot.ts`, keine `.env`). Bilder: `screenshots/ohne-telegram-*.png`.
 
 ### Grenzen (Stand M1)
 

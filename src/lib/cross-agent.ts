@@ -108,7 +108,7 @@ export async function executeInvocation(
  * runs after the answer went out, e.g. to store it for the WebUI.
  */
 export async function executeVisibleInvocation(
-  registry: BotRegistry,
+  registry: Pick<BotRegistry, "sendAsAgent" | "sendTypingAsAgent">,
   sourceAgent: string,
   invocation: Invocation,
   chatId: string | number,

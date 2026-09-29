@@ -87,6 +87,9 @@ const ROWS: Record<KeyGroup, Row[]> = {
     ["WEB_PORT", "Port der WebUI"],
     ["WEB_ALLOWED_HOSTS", "Zusätzliche Host-Namen der WebUI"],
     ["WEB_ALLOW_KEY_EDIT", "Erlaubt, Schlüssel in der WebUI zu ändern"],
+    ["WEB_PUSH_PUBLIC_KEY", "Öffentlicher Schlüssel für Benachrichtigungen (Web Push), legt tybo selbst an"],
+    ["WEB_PUSH_PRIVATE_KEY", "Privater Schlüssel für Benachrichtigungen (Web Push), legt tybo selbst an"],
+    ["WEB_PUSH_SUBJECT", "Kontakt für die Push-Dienste (mailto: oder https:), Standard ist die Adresse von tybo"],
   ],
   Datenbank: [
     ["SUPABASE_URL", "Adresse des Supabase-Projekts"],

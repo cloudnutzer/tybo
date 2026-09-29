@@ -17,8 +17,8 @@ import {
   normalizeSetupCode,
   SETUP_SESSION_TTL_MS,
 } from "../src/setup/web-server";
-import { cleanup, FAKE } from "./setup-fixture";
-import { CODE, get, login, post, rawRequest, readyOptions, startSetup, type Started } from "./setup-web-fixture";
+import { cleanup, FAKE, FULL_ENV } from "./setup-fixture";
+import { CODE, get, login, post, PROFILE, rawRequest, readyOptions, startSetup, type Started } from "./setup-web-fixture";
 
 const running: Started[] = [];
 async function start(options: Parameters<typeof startSetup>[0] = {}) {
@@ -208,6 +208,75 @@ describe("Zugang", () => {
       body: JSON.stringify({ code: "x".repeat(70 * 1024) }),
     });
     expect(res.status).toBe(413);
+  });
+});
+
+describe("Issue #228: Kanalregel bei „Fertig“", () => {
+  const without = (prefix: string[]) => FULL_ENV.split("\n").filter(l => !prefix.some(p => l.startsWith(p))).join("\n");
+
+  test("WebUI eingerichtet, Telegram übersprungen: „Fertig“ schließt ab", async () => {
+    const s = await start({ env: without(["TELEGRAM_"]), profile: PROFILE });
+    const cookie = await login(s);
+    const overview = await (await get(s, "/api/setup/overview", cookie)).json();
+    expect(overview.ready).toBe(true);
+    expect(overview.channels).toEqual({ ready: true, message: "WebUI eingerichtet, Telegram nicht.", telegram: false, webui: true, webAddress: "http://127.0.0.1:3100" });
+    const done = await post(s, "/api/setup/finish", {}, cookie);
+    expect(done.status).toBe(200);
+    expect(s.server.isFinished()).toBe(true);
+  });
+
+  test("Abschlussadresse aus Host und Port der Konfiguration: feste LAN-IP und ::1", async () => {
+    const cases: [string, string][] = [
+      ["WEB_HOST=192.168.1.20\nWEB_PORT=3177", "http://192.168.1.20:3177"],
+      ["WEB_HOST=::1\nWEB_PORT=3178", "http://[::1]:3178"],
+    ];
+    for (const [extra, url] of cases) {
+      const s = await start({ env: `${without(["TELEGRAM_", "WEB_HOST=", "WEB_PORT="])}\n${extra}\n`, profile: PROFILE });
+      const cookie = await login(s);
+      const overview = await (await get(s, "/api/setup/overview", cookie)).json();
+      expect(overview.channels.webAddress).toBe(url);
+    }
+  });
+
+  test("weder Telegram noch WebUI: 409 mit dem Kanal-Satz", async () => {
+    const s = await start({ env: without(["TELEGRAM_", "WEB_"]), profile: PROFILE });
+    const cookie = await login(s);
+    const res = await post(s, "/api/setup/finish", {}, cookie);
+    expect(res.status).toBe(409);
+    const data = await res.json();
+    expect(data.error).toBe("Richte Telegram oder die WebUI ein, sonst erreicht dich tybo nirgends.");
+    expect(data.missing).toEqual([]);
+    expect(s.server.isFinished()).toBe(false);
+  });
+
+  test("halbes Telegram, auch mit gültiger WebUI: 409 mit dem Grund", async () => {
+    for (const drop of ["TELEGRAM_USER_ID=", "TELEGRAM_BOT_TOKEN="]) {
+      const s = await start({ env: without([drop]), profile: PROFILE });
+      const cookie = await login(s);
+      const res = await post(s, "/api/setup/finish", {}, cookie);
+      expect(res.status).toBe(409);
+      expect((await res.json()).error).toStartWith("Telegram halb eingerichtet: ");
+      expect(s.server.isFinished()).toBe(false);
+    }
+  });
+
+  test("ungültige Nutzer-ID mit WebUI: 409", async () => {
+    const env = FULL_ENV.replace(`TELEGRAM_USER_ID=${FAKE.userId}`, "TELEGRAM_USER_ID=alex");
+    const s = await start({ env, profile: PROFILE });
+    const cookie = await login(s);
+    const res = await post(s, "/api/setup/finish", {}, cookie);
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe("Telegram halb eingerichtet: TELEGRAM_USER_ID ist keine Zahl. Beide Werte setzen oder beide entfernen.");
+  });
+
+  test("Neustart unter dem Supervisor nur mit WebUI: Meldung nennt die WebUI, nicht Telegram", async () => {
+    const s = await start({ env: without(["TELEGRAM_"]), profile: PROFILE, supervisorFn: async () => "launchd" });
+    const cookie = await login(s);
+    const res = await post(s, "/api/setup/finish", {}, cookie);
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.message).toContain("in der WebUI erreichbar");
+    expect(data.message).not.toContain("Telegram");
   });
 });
 

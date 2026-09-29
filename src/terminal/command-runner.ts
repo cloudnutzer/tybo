@@ -154,8 +154,9 @@ export class CommandRunner {
 
   /**
    * /neu [agent] [titel]: erst alles prüfen, dann genau einmal anlegen. Klappt
-   * danach etwas nicht (Zuordnung, Titel), meldet tybo das angelegte Topic
-   * und wechselt trotzdem hinein, statt ein zweites anzulegen.
+   * danach etwas nicht (Zuordnung, Titel), meldet tybo das angelegte Gespräch
+   * und wechselt trotzdem hinein, statt ein zweites anzulegen. Mit
+   * Forum-Gruppe ein Telegram-Topic, ohne ein Web-Gespräch (Issue #228).
    */
   private async create(args: string): Promise<boolean> {
     const { ctx } = this;
@@ -188,12 +189,13 @@ export class CommandRunner {
       }
     }
     const label = agentLabel(split.agent);
+    const topic = conversation.kind === "topic";
     if (problems.length) {
-      ctx.error(`Topic ${conversationName(conversation)} (${conversation.id}) ist angelegt, aber: ${problems.join("; ")}. Nicht noch einmal anlegen, im Browser nachbessern.`);
+      ctx.error(`${topic ? "Topic" : "Gespräch"} ${conversationName(conversation)} (${conversation.id}) ist angelegt, aber: ${problems.join("; ")}. Nicht noch einmal anlegen, im Browser nachbessern.`);
     }
-    // Das neue Topic auch für die Tab-Ergänzung
+    // Das neue Gespräch auch für die Tab-Ergänzung
     void this.loadConversations().catch(() => {});
-    await ctx.switchTo(conversation, `Neues Gespräch mit ${label}, auch als Topic in Telegram.`);
+    await ctx.switchTo(conversation, topic ? `Neues Gespräch mit ${label}, auch als Topic in Telegram.` : `Neues Gespräch mit ${label}.`);
     return problems.length === 0;
   }
 
@@ -205,7 +207,7 @@ export class CommandRunner {
       return false;
     }
     if (current.kind === "web") {
-      ctx.error("Ältere Web-Gespräche haben einen festen Agenten. /neu <Agent> legt ein neues Gespräch an.");
+      ctx.error("Web-Gespräche haben einen festen Agenten. /neu <Agent> legt ein neues Gespräch an.");
       return false;
     }
     const agents = await this.loadAgents();

@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { startDemoServer, DEMO_REPLY } from "../src/web/demo";
 import { createFakeChat } from "../src/web/fake-chat";
 import { createWebServer } from "../src/web/server";
+import { DEFAULT_PUSH_SUBJECT, generateVapidKeys } from "../src/web/push";
 
 const PASSWORD = "test-passwort-lang";
 const root = resolve(import.meta.dir, "..");
@@ -182,8 +183,36 @@ test("Demo mit Telegram-Attrappe (web:dev): Schreiben in ein Topic antwortet die
 
 test("web:dev gibt der Demo eine Telegram-Attrappe, nie einen echten Turn", async () => {
   const script = await readFile(join(root, "scripts", "web-dev.ts"), "utf8");
-  expect(script).toContain("startDemoServer(result.config, { chat: createFakeChat(), telegramChat: createFakeChat() })");
+  expect(script).toContain("startDemoServer(result.config, { chat: createFakeChat(), telegramChat: createFakeChat(), push: await devPush() })");
   expect(script).not.toContain("createTelegramChat");
+});
+
+test("web:dev (Issue #225): Push nur mit WEB_DEV_PUSH=1, Schlüssel nur im Speicher, eigene Abo-Datei", async () => {
+  const script = await readFile(join(root, "scripts", "web-dev.ts"), "utf8");
+  expect(script).toContain('if (process.env.WEB_DEV_PUSH !== "1") return undefined;');
+  expect(script).toContain("keys: await generateVapidKeys()");
+  expect(script).toContain('push: await devPush(join(dataRoot, "web-dev", "push-subscriptions.json"))');
+  // nie die .env des Checkouts: weder env-file noch der Bot-Adapter
+  expect(script).not.toContain("env-file");
+  expect(script).not.toContain("bot-push");
+  expect(script).not.toContain("WEB_PUSH_PRIVATE_KEY");
+});
+
+test("Demo mit Push (Issue #225): Abos im temporären Verzeichnis, ohne Push meldet der Reiter „nicht eingerichtet“", async () => {
+  const keys = await generateVapidKeys();
+  const withPush = await startDemoServer(config("127.0.0.1"), { log: () => {}, push: { keys, subject: DEFAULT_PUSH_SUBJECT, fetch: (async () => new Response(null, { status: 201 })) as unknown as typeof fetch } });
+  const without = await startDemoServer(config("127.0.0.1"), { log: () => {} });
+  try {
+    const on = await (await fetch(`${withPush.server.url}/api/push`)).json();
+    expect(on.available).toBe(true);
+    expect(on.publicKey).toBe(keys.publicKey);
+    expect(JSON.stringify(on)).not.toContain(keys.privateKey);
+    const off = await (await fetch(`${without.server.url}/api/push`)).json();
+    expect(off.available).toBe(false);
+  } finally {
+    await withPush.stop();
+    await without.stop();
+  }
 });
 
 test("Demo mit Anhängen (Issue #73): Upload im Topic, Nachricht mit ID, nach dem Neuladen im Verlauf mit Vorschau", async () => {

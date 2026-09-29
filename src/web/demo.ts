@@ -52,6 +52,7 @@ import { keyStatus, type StatusPort, type Supervisor } from "./status";
 import type { EngineAvailability, EnginePort } from "./engines";
 import { UploadStore } from "./uploads";
 import type { KeysPort } from "./keys";
+import type { PushDeps } from "./push-api";
 import { ConversationStore, type ReplyInfo } from "./store";
 import type { ConversationSessionReset } from "./session-reset";
 import { createTopicManager, TopicAgentGone, type TelegramTopicApi, type TopicManager, type TopicRights, type TopicStatePort } from "./topics";
@@ -850,6 +851,11 @@ export async function startDemoServer(
     commands?: CommandPort;
     /** Schlüssel (Issue #62), Standard: createDemoKeys() im Speicher */
     keys?: KeysPort;
+    /**
+     * Web Push (Issue #225): Schlüssel nur im Speicher, Abos im temporären
+     * Verzeichnis der Demo. Ohne: Reiter „Benachrichtigungen" meldet „nicht eingerichtet".
+     */
+    push?: PushDeps;
     /** Feste Oberflächen-Version (Issue #111), für den Versionswechsel im Browser-Durchlauf */
     uiVersion?: string;
     log?: (message: string) => void;
@@ -935,6 +941,7 @@ export async function startDemoServer(
       commands: deps.commands ?? createDemoCommands(),
       // Schlüssel nur im Speicher, nie die echte .env (Issue #62)
       keys: deps.keys ?? createDemoKeys(),
+      push: deps.push,
       uiVersion: deps.uiVersion,
       log: deps.log,
     });

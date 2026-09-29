@@ -79,9 +79,10 @@ async function defaultProbe(root: string, env: SearchCommandDeps["env"], config:
 async function defaultNotify(root: string, text: string): Promise<boolean> {
   const { loadEnv } = await import("../lib/env");
   await loadEnv(join(root, ".env"));
-  const { defaultOutboxDeps, sendAndRecord } = await import("../lib/outbox");
+  const { defaultOutboxDeps, outboxDelivered, sendAndRecord } = await import("../lib/outbox");
   const result = await sendAndRecord({ source: NOTIFY_SOURCE, text, format: "plain" }, defaultOutboxDeps(process.env));
-  return result.sent;
+  // Ohne Telegram nur für die WebUI festgehalten (Issue #227)
+  return outboxDelivered(result);
 }
 
 function progressLine(p: ReindexProgress): string {

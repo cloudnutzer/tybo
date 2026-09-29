@@ -50,6 +50,16 @@
  * - record false (Issue #119): nur senden, nichts festhalten (recorded
  *   false). Für Folge-Nachrichten einer Rückfrage mit mehr Knöpfen, als an
  *   eine Nachricht passen; der Verlauf hat die Frage schon.
+ * - Ohne Telegram (Issue #227, telegramConfigured aus channels.ts: Token und
+ *   gültige Nutzer-ID): nur festhalten, nie senden, kein Aufruf an
+ *   api.telegram.org. Ziel ohne Angabe ist der Web-Direktchat (Chat-ID
+ *   "web"); topicId und Telegram-Chat-IDs werden abgelehnt, auch wenn noch
+ *   eine Forum-Gruppe konfiguriert ist. Web-Ziele (chatId "web" oder
+ *   web:<uuid>) werden auch mit Telegram nur festgehalten. Ergebnis dann
+ *   sent false, recorded true ohne error; scheitert das Festhalten oder die
+ *   Ablage der Datei, error kind "record" (nichts ist irgendwo angekommen).
+ *   buttons fallen dort weg (die WebUI zeigt Rückfragen über choiceId),
+ *   record false bewirkt nichts. Zugestellt heißt: outboxDelivered.
  * - Telegram geht vor: Scheitert das Festhalten, bleibt der Versand gültig;
  *   ins Log kommt nur, dass es scheiterte, nie Inhalt oder Zugangsdaten.
  *   Festgehaltenes content ist der Text, bei Dateien die caption oder,
@@ -61,6 +71,8 @@ import { copyFile, mkdir, rm, stat } from "fs/promises";
 import { join, resolve, sep } from "path";
 import { getTopicConfigChatIds } from "../agents/base";
 import { resolveGroupId } from "../web/bot-telegram";
+import { isWebChatId, telegramConfigured, WEB_DM_CHAT_ID } from "./channels";
+export { outboxDelivered } from "./channels";
 import { PROJECT_ROOT } from "./env";
 import {
   chunkForTelegram,
@@ -123,7 +135,9 @@ export interface InlineButton {
 }
 
 /** Absender, der wie sendAndRecord sendet; übergebbar, damit Dienste ohne Netz testbar sind */
-export type OutboxSender = (input: SendAndRecordInput) => Promise<Pick<SendAndRecordResult, "sent">>;
+export type OutboxSender = (
+  input: SendAndRecordInput
+) => Promise<Pick<SendAndRecordResult, "sent"> & Partial<Pick<SendAndRecordResult, "recorded" | "error">>>;
 
 export interface OutboxFile {
   id: string;
@@ -133,15 +147,16 @@ export interface OutboxFile {
 }
 
 export interface SendAndRecordResult {
-  /** Alles an Telegram gesendet */
+  /** Alles an Telegram gesendet; bei Web-Zielen und ohne Telegram immer false */
   sent: boolean;
-  /** Alles Gesendete festgehalten */
+  /** Alles Gesendete festgehalten (Web-Ziel: alles festgehalten) */
   recorded: boolean;
   /**
    * "invalid": Eingabe abgelehnt, nichts gesendet (Ausnahme: die Datei riss
-   * erst nach dem Textversand das Limit); "send": Telegram scheiterte
+   * erst nach dem Textversand das Limit); "send": Telegram scheiterte;
+   * "record": Web-Ziel, Festhalten oder Ablage scheiterte (Issue #227)
    */
-  error?: { kind: "invalid" | "send"; message: string };
+  error?: { kind: "invalid" | "send" | "record"; message: string };
   /** Ablage der Datei, wenn sie kopiert und gesendet wurde */
   file?: OutboxFile & { path: string };
   /** Angenommene Nachrichten mit message_id, siehe Vertrag oben; fehlt, wenn leer */
@@ -200,20 +215,39 @@ function invalid(message: string): SendAndRecordResult {
 
 interface Target {
   chatId: string;
+  /** Nur festhalten, nie an Telegram (Web-Direktchat oder Web-Gespräch, Issue #227) */
+  web?: true;
   /** message_thread_id, fehlt bei Direktchat und General */
   threadId?: number;
   /** metadata.topicId, fehlt bei Direktchat und General */
   topicId?: number;
 }
 
-function resolveTarget(input: SendAndRecordInput, deps: OutboxDeps): Target | string {
-  const group = deps.groupId && GROUP_ID_PATTERN.test(deps.groupId) ? deps.groupId : null;
+/** Telegram eingerichtet, gemessen an den Outbox-Abhängigkeiten (wie telegramConfigured) */
+function telegramOf(deps: Pick<OutboxDeps, "botToken" | "userId">): boolean {
+  return telegramConfigured({ TELEGRAM_BOT_TOKEN: deps.botToken, TELEGRAM_USER_ID: deps.userId });
+}
+
+function resolveTarget(input: SendAndRecordInput, deps: Pick<OutboxDeps, "botToken" | "userId" | "groupId">): Target | string {
+  const telegram = telegramOf(deps);
+  // Web-Ziele: auch mit Telegram nur festhalten, nie mit Topic
+  if (input.chatId !== undefined && isWebChatId(input.chatId)) {
+    if (input.topicId !== undefined) return "Topic nur in der Forum-Gruppe, nicht in einem Web-Gespräch";
+    return { chatId: input.chatId, web: true };
+  }
+  // Ohne Telegram zählt eine übrig gebliebene Gruppen-Konfiguration nicht
+  const group = telegram && deps.groupId && GROUP_ID_PATTERN.test(deps.groupId) ? deps.groupId : null;
   if (input.topicId !== undefined) {
     if (!Number.isSafeInteger(input.topicId) || input.topicId < 1) return "Topic-ID muss eine positive ganze Zahl sein";
+    if (!telegram) return "Telegram ist nicht eingerichtet, Topics gibt es nur in der Forum-Gruppe";
     if (!group) return "Keine Forum-Gruppe eingerichtet (TELEGRAM_GROUP_ID oder config/topics.json)";
     if (input.chatId !== undefined && input.chatId !== group) return "Topic nur in der Forum-Gruppe";
     if (input.topicId === GENERAL_TOPIC_ID) return { chatId: group };
     return { chatId: group, threadId: input.topicId, topicId: input.topicId };
+  }
+  if (!telegram) {
+    if (input.chatId === undefined) return { chatId: WEB_DM_CHAT_ID, web: true };
+    return "Telegram ist nicht eingerichtet, Ziel ist nur die WebUI (Chat-ID web oder web:<Gesprächs-ID>)";
   }
   const user = USER_ID_PATTERN.test(deps.userId) ? deps.userId : null;
   if (input.chatId === undefined) return user ? { chatId: user } : "TELEGRAM_USER_ID fehlt";
@@ -223,10 +257,15 @@ function resolveTarget(input: SendAndRecordInput, deps: OutboxDeps): Target | st
 
 /**
  * Prüft ein Ziel wie sendAndRecord, ohne zu senden (Issue #103: Jobs prüfen
- * ihr Rückmeldeziel schon beim Start). null: gültig, sonst der Grund.
+ * ihr Rückmeldeziel schon beim Start). null: gültig, sonst der Grund. Ohne
+ * botToken-Angabe gilt Telegram als eingerichtet, sobald die Nutzer-ID
+ * gültig ist (Aufrufer vor Issue #227 kannten nur Telegram).
  */
-export function checkOutboxTarget(input: Pick<SendAndRecordInput, "chatId" | "topicId">, deps: Pick<OutboxDeps, "groupId" | "userId">): string | null {
-  const target = resolveTarget({ ...input, source: "check" }, deps as OutboxDeps);
+export function checkOutboxTarget(
+  input: Pick<SendAndRecordInput, "chatId" | "topicId">,
+  deps: Pick<OutboxDeps, "groupId" | "userId"> & Partial<Pick<OutboxDeps, "botToken">>
+): string | null {
+  const target = resolveTarget({ ...input, source: "check" }, { ...deps, botToken: deps.botToken ?? "check" });
   return typeof target === "string" ? target : null;
 }
 
@@ -374,15 +413,67 @@ async function sendDocument(
 async function record(deps: OutboxDeps, target: Target, content: string, meta: Record<string, unknown>): Promise<boolean> {
   const metadata: Record<string, unknown> = { display_only: true, ...meta };
   if (target.topicId !== undefined) metadata.topicId = target.topicId;
+  const what = target.web ? "[outbox] Nicht für die WebUI festgehalten" : "[outbox] Gesendet, aber nicht festgehalten";
   try {
     const ok = await deps.record({ chat_id: target.chatId, role: "assistant", content, metadata });
     if (ok === true) return true;
-    deps.log("[outbox] Gesendet, aber nicht festgehalten");
+    deps.log(what);
     return false;
   } catch (e) {
-    deps.log(`[outbox] Gesendet, aber nicht festgehalten (${errorName(e)})`);
+    deps.log(`${what} (${errorName(e)})`);
     return false;
   }
+}
+
+interface WebContent {
+  text?: string;
+  filePath?: string;
+  /** Bereinigter Dateiname und geprüfte Größe aus sendAndRecord */
+  name: string;
+  size: number;
+  caption?: string;
+  source: string;
+  choiceId?: string;
+}
+
+function recordFailed(message: string): SendAndRecordResult {
+  return { sent: false, recorded: false, error: { kind: "record", message } };
+}
+
+/**
+ * Web-Ziel (Issue #227): nur festhalten, erst Text, dann Datei. Die Datei
+ * muss in die Ablage, sonst gäbe es sie nirgends; scheitert das oder das
+ * Festhalten, ist das ein Fehler (kind "record") und die Kopie wird entfernt.
+ */
+async function recordForWeb(deps: OutboxDeps, target: Target, c: WebContent): Promise<SendAndRecordResult> {
+  if (c.text) {
+    const meta: Record<string, unknown> = { source: c.source };
+    if (c.choiceId !== undefined) meta.choiceId = c.choiceId;
+    if (!(await record(deps, target, c.text, meta))) return recordFailed("Meldung nicht für die WebUI festgehalten");
+  }
+  if (!c.filePath) return { sent: false, recorded: true };
+  let stored: OutboxFile & { path: string };
+  let dir = "";
+  try {
+    const id = deps.newId();
+    const path = outboxPath(deps.outboxDir, id, c.name);
+    dir = resolve(deps.outboxDir, id);
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    await copyFile(c.filePath, path);
+    const copied = await stat(path);
+    if (copied.size === 0 || copied.size > MAX_FILE_BYTES || copied.size !== c.size) throw new Error("Kopie unvollständig");
+    stored = { id, name: c.name, size: c.size, mime: mimeOf(path), path };
+  } catch (e) {
+    if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
+    deps.log(`[outbox] Datei nicht abgelegt (${errorName(e)})`);
+    return recordFailed("Datei nicht abgelegt, nicht für die WebUI festgehalten");
+  }
+  const file = { id: stored.id, name: stored.name, size: stored.size, mime: stored.mime };
+  if (!(await record(deps, target, c.caption ?? c.name, { source: c.source, file }))) {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    return recordFailed("Datei nicht für die WebUI festgehalten");
+  }
+  return { sent: false, recorded: true, file: stored };
 }
 
 function mimeOf(path: string): string {
@@ -426,7 +517,6 @@ export async function sendAndRecord(
   if (input.record !== undefined && input.record !== false) return invalid("record darf nur false sein");
   if (caption && !filePath) return invalid("caption nur zusammen mit einer Datei");
   if (caption && caption.length > MAX_CAPTION_CHARS) return invalid(`caption länger als ${MAX_CAPTION_CHARS} Zeichen`);
-  if (!deps.botToken) return invalid("TELEGRAM_BOT_TOKEN fehlt");
   const target = resolveTarget(input, deps);
   if (typeof target === "string") return invalid(target);
 
@@ -446,6 +536,10 @@ export async function sendAndRecord(
   }
 
   const keep = input.record !== false;
+  if (target.web) {
+    if (!keep) return { sent: false, recorded: false };
+    return recordForWeb(deps, target, { text, filePath, name, size, caption, source, choiceId: input.choiceId });
+  }
   const result: SendAndRecordResult = { sent: true, recorded: keep };
   const sent: SentMessage[] = [];
   const done = (r: SendAndRecordResult): SendAndRecordResult => (sent.length > 0 ? { ...r, messages: sent } : r);

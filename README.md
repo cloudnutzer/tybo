@@ -1,10 +1,12 @@
 # tybo
 
-tybo is an always-on AI assistant that you talk to on Telegram and in the
-browser, with Claude Code doing the actual work on your own machine.
+tybo is an always-on AI assistant that you talk to on Telegram, in the
+browser or both, with Claude Code doing the actual work on your own machine.
 
 - **Telegram and WebUI:** chat from your phone via Telegram, or in the
-  browser with the built-in WebUI; both share the same conversations.
+  browser with the built-in WebUI (installable as an app on your phone);
+  both share the same conversations. Telegram is optional: with the WebUI
+  alone tybo runs without Telegram, and you need at least one of the two.
 - **Claude Code as the engine:** every message runs through the Claude Code
   CLI, so your MCP servers, skills, hooks and `CLAUDE.md` are available.
 - **Agents with topics:** specialised agents (research, content, finance,
@@ -34,7 +36,7 @@ browser, with Claude Code doing the actual work on your own machine.
 - Autostart: nothing extra on macOS and on Linux with systemd (such as
   Raspberry Pi OS); Windows and Linux without systemd need
   [PM2](https://pm2.keymetrics.io) (`npm install -g pm2`)
-- A Telegram account
+- A Telegram account, unless you only use the WebUI
 
 ## Installation
 
@@ -62,9 +64,10 @@ bun link          # puts the tybo command into ~/.bun/bin
 tybo setup
 ```
 
-`tybo setup` asks for your Telegram bot token, your database, your name and
-timezone, tests every entry right away and only writes `.env` after you
-confirm. For the database the default is Supabase in the cloud: you only
+`tybo setup` asks for your Telegram bot token (optional, skip it to use only
+the WebUI), your database, your name and timezone, tests every entry right
+away and only writes `.env` after you confirm. You need Telegram or the
+WebUI; skip Telegram and the assistant offers the WebUI next. For the database the default is Supabase in the cloud: you only
 create a free account and a personal access token, and the assistant sets
 up the project, tables, storage and keys (the token is used once and stored
 nowhere). Right after the database, an optional step sets up semantic search
@@ -113,6 +116,18 @@ programmatic use draws from that plan's monthly Agent SDK credit; `/credit`
 shows how much is left. If you set your own `ANTHROPIC_API_KEY`, you pay
 per token instead and the subscription limit no longer applies.
 
+## tybo on your phone
+
+tybo has no app in the App Store or on Google Play. Instead, the WebUI
+installs like an app on iPhone and Android: its own icon, full screen,
+notifications, and on Android it shows up in the share menu. This needs an
+HTTPS address for the WebUI that your phone can reach. `tybo setup zugang`
+sets one up: Tailscale (recommended, private network for your own devices),
+a Cloudflare Tunnel with your own domain and Cloudflare Access, or none
+(this computer only). Details: [Access from anywhere](docs/webui/fernzugang.md)
+(German). Step-by-step guide:
+[tybo as an app on your phone](docs/handy-app.md) (German).
+
 ## Further reading
 
 - [Setup guide](docs/einrichtung.md) (German)
@@ -122,6 +137,7 @@ per token instead and the subscription limit no longer applies.
 - [Troubleshooting](docs/troubleshooting.md)
 - [Background jobs](docs/hintergrund-jobs.md) (German)
 - [WebUI](docs/webui/README.md)
+- [tybo as an app on your phone](docs/handy-app.md) (German)
 - [tybo.ai](https://tybo.ai): product overview and guide
 
 ## License

@@ -3,13 +3,17 @@
  * Terminal (`tybo setup`) und Browser (Einrichtungsmodus) zeigen genau
  * diese Liste; das Modell steht in src/setup/model.ts.
  *
- * Pflicht: voraussetzungen, telegram, datenbank, profil, autostart.
- * Optional (überspringbar): gruppe, suche, modelle, webui. „pruefung“ fasst am Ende
- * zusammen und schreibt nichts.
+ * Pflicht: voraussetzungen, datenbank, profil, autostart.
+ * Optional (überspringbar): telegram, gruppe, suche, modelle, webui, zugang. „pruefung“ fasst am Ende
+ * zusammen und schreibt nichts. Seit Issue #228 (Entscheidung 0021) gilt dazu
+ * die Kanalregel aus ./channels.ts: Telegram oder WebUI muss eingerichtet
+ * sein, halbes Telegram nie.
  */
 
+import { overallChannels } from "./channels";
 import { readSetupEnv, type SetupContext } from "./context";
-import { overallStatus, presentValue, registerTransientFields, type SetupStep, type SetupValues, type StatusItem, type StepId, type StepState } from "./model";
+import { overallStatus, presentValue, registerTransientFields, type OverallStatus, type SetupStep, type SetupValues, type StatusItem, type StepId, type StepState } from "./model";
+import { accessPathValues, accessStep } from "./steps/access";
 import { autostartStep } from "./steps/autostart";
 import { databaseStep, setupPath } from "./steps/database";
 import { modelsStep } from "./steps/models";
@@ -28,6 +32,7 @@ const STEPS_BEFORE_CHECK: SetupStep[] = [
   profileStep,
   modelsStep,
   webuiStep,
+  accessStep,
   autostartStep,
 ];
 
@@ -39,7 +44,17 @@ async function allStates(ctx: SetupContext, skipped: Iterable<StepId>) {
     states[step.id] = status.state;
     items.push({ label: step.title, ok: status.state === "erledigt", detail: status.detail });
   }
-  return { states, items, overall: overallStatus(STEPS_BEFORE_CHECK, states, skipped) };
+  const channels = overallChannels(await readSetupEnv(ctx));
+  if (!channels.ready) items.push({ label: "Kanal", ok: false, detail: channels.message });
+  return { states, items, overall: overallStatus(STEPS_BEFORE_CHECK, states, skipped, channels) };
+}
+
+/** Was vor „fertig“ noch fehlt: Pflichtschritte und die Kanalregel, als Sätze */
+export function openParts(overall: OverallStatus, titleOf: (id: StepId) => string): string[] {
+  const parts: string[] = [];
+  if (overall.missing.length) parts.push(`Es fehlt noch: ${overall.missing.map(titleOf).join(", ")}.`);
+  if (overall.channels && !overall.channels.ready) parts.push(overall.channels.message);
+  return parts;
 }
 
 function titleOf(id: StepId): string {
@@ -58,9 +73,7 @@ export const checkStep: SetupStep = {
     const { overall, items } = await allStates(ctx, []);
     return {
       state: overall.complete ? "erledigt" : "fehlt",
-      detail: overall.complete
-        ? "Alle Pflichtschritte sind erledigt."
-        : `Es fehlt noch: ${overall.missing.map(titleOf).join(", ")}.`,
+      detail: overall.complete ? "Alle Pflichtschritte sind erledigt." : openParts(overall, titleOf).join(" "),
       fields: [],
       items,
     };
@@ -72,6 +85,11 @@ export const checkStep: SetupStep = {
     const items: StatusItem[] = [];
     for (const step of STEPS_BEFORE_CHECK) {
       if (!step.test || states[step.id] !== "erledigt") continue;
+      // Übrig gebliebene Forum-Gruppe ohne Telegram (Issue #228): nichts zu prüfen, kein Fehler
+      if (step.id === "gruppe" && overall.channels && !overall.channels.telegram) {
+        items.push({ label: step.title, ok: true, detail: "Übersprungen: ohne Telegram gibt es keine Forum-Gruppe." });
+        continue;
+      }
       if (signal?.aborted) break;
       const result = await step.test({}, ctx, signal);
       items.push({ label: step.title, ok: result.ok, detail: result.message });
@@ -79,7 +97,7 @@ export const checkStep: SetupStep = {
     const failed = items.filter(i => !i.ok);
     const ok = overall.complete && failed.length === 0;
     const parts: string[] = [];
-    if (!overall.complete) parts.push(`Es fehlt noch: ${overall.missing.map(titleOf).join(", ")}.`);
+    if (!overall.complete) parts.push(...openParts(overall, titleOf));
     if (failed.length) parts.push(`Fehlgeschlagen: ${failed.map(i => i.label).join(", ")}.`);
     return { ok, message: ok ? "Alles eingerichtet und erreichbar." : parts.join(" "), items };
   },
@@ -117,6 +135,8 @@ export async function existingFieldValues(step: SetupStep, ctx: SetupContext): P
   }
   // Semantische Suche: Sichtbarkeit und Plan hängen am Weg der Datenbank (Issue #166)
   if (step.id === "suche") Object.assign(out, await searchPathValues(ctx));
+  // Zugang vom Handy: eingerichteter Weg als Vorauswahl, Wechsel nur mit Bestätigung (Issue #231)
+  if (step.id === "zugang") Object.assign(out, await accessPathValues(ctx));
   return out;
 }
 

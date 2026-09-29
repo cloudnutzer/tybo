@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.14.0: tybo as an app on your phone, Telegram optional
+
+- **Install the WebUI as an app:** on iPhone (Safari, "Add to Home Screen")
+  and Android, tybo gets its own icon and opens full screen. When the
+  computer running tybo is asleep, the app says so and offers a retry.
+- **Notifications:** Web Push per device for finished answers, questions
+  that need your decision and reports, never for the conversation you are
+  looking at. Switch it on under Settings, "Notifications".
+- **Share and camera:** on Android tybo appears in the share menu (photos,
+  links, text); on both platforms you can take a photo straight from the
+  chat.
+- **Telegram is optional:** conversations, reports and approval buttons
+  work in the WebUI alone. `tybo setup`, the terminal chat and the health
+  check handle a setup without a bot token.
+- **Access from your phone for everyone:** `tybo setup zugang` sets up
+  Tailscale (recommended), your own domain via Cloudflare Tunnel with
+  Access, or local only. Guide: `docs/handy-app.md`.
+
 ## 2.13.0: choose your engine, guided search, Raspberry Pi
 
 - **Choose the engine:** besides Claude Code, tybo can now run on **Codex**

@@ -81,9 +81,14 @@ export function goalIdOf(ref: unknown): number | null {
   return Number.isSafeInteger(id) ? id : null;
 }
 
-const TELEGRAM_CHAT = /^-?\d{1,20}$/;
+/** Telegram-Chat oder, ohne Telegram, der Web-Direktchat "web" (Issue #227, Session dm:web) */
+const TELEGRAM_CHAT = /^(-?\d{1,20}|web)$/;
 
-/** Gespräch der Frage: Chat und Topic des Ziels; null bei allem anderen (Ziele gibt es nur in Telegram-Gesprächen) */
+/**
+ * Gespräch der Frage: Chat und Topic des Ziels; null bei allem anderen (Ziele
+ * gibt es nur im Direktchat und in Telegram-Topics; ohne Telegram ist der
+ * Direktchat "web", der als type "telegram" wie der Telegram-Direktchat läuft)
+ */
 export function goalConversation(chatId: string, topicId?: number): ChoiceConversation | null {
   if (!TELEGRAM_CHAT.test(chatId)) return null;
   return Number.isInteger(topicId) ? { type: "telegram", chatId, topicId } : { type: "telegram", chatId };

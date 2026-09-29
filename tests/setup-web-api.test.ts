@@ -44,13 +44,15 @@ describe("Übersicht und Schritte", () => {
     expect(res.headers.get("cache-control")).toBe("no-store");
     const { text, data } = await body(res);
     expect(data.steps.map((x: any) => x.id)).toEqual([
-      "voraussetzungen", "telegram", "gruppe", "datenbank", "suche", "profil", "modelle", "webui", "autostart", "pruefung",
+      "voraussetzungen", "telegram", "gruppe", "datenbank", "suche", "profil", "modelle", "webui", "zugang", "autostart", "pruefung",
     ]);
     expect(data.steps.find((x: any) => x.id === "telegram")).toEqual({
-      id: "telegram", title: "Telegram", optional: false, state: "erledigt", detail: "Token und Nutzer-ID sind gesetzt.",
+      id: "telegram", title: "Telegram", optional: true, state: "erledigt", detail: "Token und Nutzer-ID sind gesetzt.",
     });
     expect(data.ready).toBe(true);
     expect(data.missing).toEqual([]);
+    // Issue #228: nur ok oder nicht je Kanal, keine Geheimnisse; dazu die WebUI-Adresse aus der geprüften Konfiguration
+    expect(data.channels).toEqual({ ready: true, message: "Telegram und WebUI eingerichtet.", telegram: true, webui: true, webAddress: "http://127.0.0.1:3100" });
     expect(data.supervisor).toBeNull();
     expect(data.startCommand).toBe(`cd ${s.ctx.root} && bun run start`);
     expect(leakedSecrets(text)).toEqual([]);
@@ -228,9 +230,12 @@ describe("nur bekannte Felder", () => {
     const res = await post(s, "/api/setup/steps/webui/apply", { values: { WEB_ENABLED: "true", WEB_PASSWORD: "ganz-neues-test-passwort-2", WEB_PORT: "3155" } }, cookie);
     const { text, data } = await body(res);
     expect(data.ok).toBe(true);
-    expect(data.changed).toEqual(["WEB_PASSWORD", "WEB_PORT"]);
+    // Push-Schlüssel (Issue #225) legt der Schritt beim ersten Speichern mit eingeschalteter WebUI an
+    expect(data.changed).toEqual(["WEB_PASSWORD", "WEB_PORT", "WEB_PUSH_PUBLIC_KEY", "WEB_PUSH_PRIVATE_KEY"]);
     expect(text).not.toContain("ganz-neues-test-passwort-2");
     expect((await envOf(s)).WEB_PASSWORD).toBe("ganz-neues-test-passwort-2");
+    // Der Schlüssel selbst nie in der Antwort
+    expect(text).not.toContain((await envOf(s)).WEB_PUSH_PRIVATE_KEY);
   });
 
   test("die normale Schlüssel-API der WebUI sperrt TELEGRAM_BOT_TOKEN, TELEGRAM_USER_ID und WEB_* weiter", async () => {
@@ -288,8 +293,8 @@ describe("kein Claude-Aufruf, kein Autostart über „Speichern“", () => {
     expect(summary.items.find((i: any) => i.label === "Autostart")).toEqual({
       label: "Autostart", ok: false, optional: true, detail: "Noch kein Autostart über launchd. Kann bei „Fertig“ eingerichtet werden.",
     });
-    // Convex: Semantische Suche gilt nur für Supabase, optional und offen (Issue #166)
-    expect(summary.items.filter((i: any) => !i.ok).map((i: any) => i.label)).toEqual(["Semantische Suche", "Autostart"]);
+    // Convex: Semantische Suche gilt nur für Supabase, optional und offen (Issue #166); Zugang vom Handy optional und offen (Issue #231)
+    expect(summary.items.filter((i: any) => !i.ok).map((i: any) => i.label)).toEqual(["Semantische Suche", "Zugang vom Handy", "Autostart"]);
     expect(summary.items.find((i: any) => i.label === "Semantische Suche")).toMatchObject({ ok: false, optional: true });
     expect(summary.items.find((i: any) => i.label === "Telegram")).toMatchObject({ ok: true, optional: false });
     expect(s.ctx.providers.calls.some(c => c.method === "claudeProbe")).toBe(false);

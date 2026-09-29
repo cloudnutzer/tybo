@@ -32,6 +32,7 @@
 
 import { readFile } from "node:fs/promises";
 import { Parser } from "htmlparser2";
+import { outboxDelivered } from "../channels";
 import type { SendAndRecordInput, SendAndRecordResult } from "../outbox";
 import { markdownToTelegramHTML, sanitizeTelegramText, stripHtmlTags } from "../telegram";
 import { createStyle, renderTerminalMarkdown } from "../../terminal/render";
@@ -380,12 +381,14 @@ export async function deliverNotice(id: string, token: string, deps: NoticeDeps)
       result = { sent: false, recorded: false, error: { kind: "send", message: e instanceof Error ? e.name : "Fehler" } };
     }
 
-    const retry = !result.sent && result.error?.kind !== "invalid" && attempt < maxAttempts;
+    // Zugestellt heißt auch: ohne Telegram bzw. im Web-Gespräch festgehalten (Issue #227)
+    const delivered = outboxDelivered(result);
+    const retry = !delivered && result.error?.kind !== "invalid" && attempt < maxAttempts;
     await updateStatus(root, id, s => {
       const n = s.notice;
       if (!n || n.owner?.token !== token) return null;
       n.at = deps.now().toISOString();
-      if (result.sent) {
+      if (delivered) {
         n.state = "sent";
         n.recorded = result.recorded;
         delete n.error;
@@ -395,7 +398,7 @@ export async function deliverNotice(id: string, token: string, deps: NoticeDeps)
       }
       return s;
     });
-    if (result.sent) {
+    if (delivered) {
       if (!result.recorded) logSafe(deps, `[job] ${id}: Meldung gesendet, aber nicht für die WebUI festgehalten`);
       return "sent";
     }

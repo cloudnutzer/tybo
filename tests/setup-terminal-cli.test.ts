@@ -38,8 +38,9 @@ describe("tybo setup --liste", () => {
     expect(r.code).toBe(0);
     expect(r.err).toBe("");
     expect(prompter.asked).toEqual([]);
-    expect(r.out).toMatch(/2\. Telegram\s+erledigt\s+Token und Nutzer-ID sind gesetzt\./);
-    expect(r.out).toMatch(/9\. Autostart\s+fehlt/);
+    expect(r.out).toMatch(/2\. Telegram \(optional\)\s+erledigt\s+Token und Nutzer-ID sind gesetzt\./);
+    expect(r.out).toMatch(/9\. Zugang vom Handy \(optional\)\s+fehlt/);
+    expect(r.out).toMatch(/10\. Autostart\s+fehlt/);
     // Keine Verbindungstests: weder Telegram noch Datenbank noch Claude-Probeaufruf
     const probes = ctx.providers.calls.map(c => c.method);
     expect(probes).not.toContain("telegramGetMe");

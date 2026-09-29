@@ -110,7 +110,7 @@ export const ENGINE_TEXT = {
 } as const;
 
 /** Wie CONVERSATION_KEY_PATTERN in src/lib/settings.ts */
-const SESSION_KEY_PATTERN = /^(topic:-?\d{1,20}:\d{1,12}|group:-\d{1,20}|dm:-?\d{1,20}|web:[A-Za-z0-9-]{1,64})$/;
+const SESSION_KEY_PATTERN = /^(topic:-?\d{1,20}:\d{1,12}|group:-\d{1,20}|dm:(?:-?\d{1,20}|web)|web:[A-Za-z0-9-]{1,64})$/;
 
 function errorName(e: unknown): string {
   return e instanceof Error ? e.name : typeof e;

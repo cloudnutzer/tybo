@@ -88,7 +88,9 @@ Claude Code will ask for permission before running commands or editing files. Wh
 > secret via the Management API in the cloud or `supabase/functions/.env` locally, test with
 > a probe message; skippable, then text search only), Phase 3 (name, timezone, optional profession, `config/profile.md`;
 > no interview about work style), the forum group from Phase 4 (group ID only), fallback
-> models from Phase 8 (default model, effort, OpenRouter, Ollama), the WebUI, and Phase 7
+> models from Phase 8 (default model, effort, OpenRouter, Ollama), the WebUI, access from
+> the phone (`tybo setup zugang`: Tailscale, Cloudflare Tunnel with your own domain, or this
+> computer only; `docs/webui/fernzugang.md`), and Phase 7
 > for the bot itself (`telegram-relay` via launchd or PM2; no check-in, briefing or
 > watchdog services, and on Linux `pm2 startup` stays a manual step).
 >
@@ -190,7 +192,16 @@ Based on the scan, tell the user which phases are already done and which remain.
 
 ---
 
-## Phase 1: Telegram Bot (Required, ~5 min)
+## Phase 1: Telegram Bot (optional if you only use the web app, ~5 min)
+
+Telegram is optional (decision 0021): tybo needs at least one channel,
+Telegram or the WebUI. Without `TELEGRAM_BOT_TOKEN` and `TELEGRAM_USER_ID`
+and with a valid WebUI (`WEB_ENABLED=true`, `WEB_PASSWORD`) the bot starts
+without Telegram polling, logs "Telegram nicht eingerichtet: nur WebUI", and
+everything goes to the WebUI (and push). Only one of the two values set is
+"Telegram halb eingerichtet" and starts the setup mode instead. `tybo setup`
+skips the step on "n" and then offers the WebUI. The channel check is
+`checkChannels` in `src/setup/channels.ts`.
 
 ### What you need to do:
 1. Open Telegram and message [@BotFather](https://t.me/BotFather)
@@ -897,8 +908,9 @@ bun run vps
 bun run restart:request "WebUI aktivieren"
 
 # Datei an den Nutzer schicken (statt curl sendDocument): landet in Telegram und in der WebUI.
-# Im Gespraech setzt tybo TYBO_CHAT_ID/TYBO_TOPIC_ID, die Datei kommt damit
-# automatisch im richtigen Topic an; ohne diese Variablen in den Direktchat
+# Im Gespraech setzt tybo TYBO_CHAT_ID/TYBO_TOPIC_ID (reine Web-Gespraeche: TYBO_CONVERSATION_ID),
+# die Datei kommt damit automatisch im richtigen Gespraech an; ohne diese Variablen in den Direktchat.
+# Ohne Telegram nur in die WebUI (docs/webui/README.md, "Ohne Telegram")
 bun run notify --source datei --file <pfad> [--caption <text>]
 # Meldung (Markdown) bzw. gezielt in ein Topic (1 = General): --text <text>, --topic <id>
 

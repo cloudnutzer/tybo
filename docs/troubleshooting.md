@@ -209,6 +209,36 @@ export PATH="$BUN_INSTALL/bin:$PATH"
 
 ## Common Issues and Fixes
 
+### Startmeldung „Telegram nicht eingerichtet: nur WebUI"
+
+**Was es heißt:** In der `.env` stehen weder `TELEGRAM_BOT_TOKEN` noch
+`TELEGRAM_USER_ID`, die WebUI ist eingerichtet. tybo läuft dann absichtlich
+ohne Telegram (Entscheidung 0021): kein Polling, keine Agenten-Bots,
+Antworten, Meldungen und Rückfragen nur in der WebUI und per Push. Die
+Startübersicht zeigt `Telegram: nicht eingerichtet (nur WebUI)`.
+
+**Wenn du Telegram willst:** `tybo setup telegram`, danach tybo neu starten
+(in der WebUI: Neustart anfordern). Übrig gebliebene `TELEGRAM_GROUP_ID` oder
+`TELEGRAM_BOT_TOKEN_<AGENT>` stören ohne Telegram nicht; `bun run setup:verify`
+meldet sie als übersprungen.
+
+### Startmeldung „Telegram halb eingerichtet"
+
+**Symptom:** Der Bot startet nicht normal, sondern im Einrichtungsmodus; im
+Log steht etwa `Einrichtungsmodus: Telegram halb eingerichtet:
+TELEGRAM_BOT_TOKEN ist gesetzt, TELEGRAM_USER_ID fehlt. Beide Werte setzen
+oder beide entfernen.`
+
+**Ursache:** Nur einer der beiden Telegram-Werte steht in der `.env` (oder
+noch der Platzhalter aus `.env.example`), oder die Nutzer-ID ist keine Zahl.
+Das gilt auch mit gültiger WebUI als Fehler, damit ein Tippfehler nicht still
+zu einem Bot ohne Telegram führt.
+
+**Lösung:** Beide Werte setzen (`tybo setup telegram`) oder beide aus der
+`.env` entfernen, wenn du nur die WebUI nutzt. launchd bzw. PM2 starten den
+Bot nach „Fertig“ im Einrichtungsmodus neu. `bun run setup:verify` zeigt den
+Grund unter „Channels“.
+
 ### Bot Not Responding
 
 **Symptoms:** You send a message on Telegram and get no reply.

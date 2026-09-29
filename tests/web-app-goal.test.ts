@@ -120,6 +120,8 @@ function setup(options: { goals?: Record<string, Card>; stored?: string; message
     heldGets: [] as { id: string; resolve(): void }[],
   };
   const fetch = async (path: string, init?: { method?: string; body?: string }) => {
+    // Anwesenheit (Issue #226) läuft nebenher und zählt hier nicht mit
+    if (path === "/api/presence") return { ok: true, status: 204, json: async () => ({}) } as any;
     const method = init?.method ?? "GET";
     server.calls.push(`${method} ${path}`);
     if (path === "/api/conversations" && method === "GET") {

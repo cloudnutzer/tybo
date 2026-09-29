@@ -53,6 +53,13 @@ describe("Fehlerabbildung", () => {
 });
 
 describe("GET /api/telegram/rights", () => {
+  test("Issue #228: ohne Topic-Verwaltung (kein Telegram) keine Gruppe, keine Rechte, 200", async () => {
+    const ctx = await topicServer(root, servers, null);
+    const res = await ctx.api("/api/telegram/rights");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ manageTopics: false, deleteMessages: false, group: false });
+  });
+
   test("Administrator mit beiden Rechten", async () => {
     const env = await topicEnv(root);
     const ctx = await topicServer(root, servers, env);
@@ -129,13 +136,6 @@ describe("GET /api/telegram/rights", () => {
     env.now.t += 1;
     expect((await (await ctx.api("/api/telegram/rights")).json()).deleteMessages).toBe(false);
     expect(env.api.callsOf("getMyRights")).toHaveLength(3);
-  });
-
-  test("ohne Topic-Verwaltung: 503", async () => {
-    const ctx = await topicServer(root, servers, null);
-    const res = await ctx.api("/api/telegram/rights");
-    expect(res.status).toBe(503);
-    expect((await res.json()).error).toBe("Topics verwalten ist nicht eingerichtet");
   });
 
   test("nur GET; ohne Anmeldung 401", async () => {

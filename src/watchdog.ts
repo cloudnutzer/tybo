@@ -9,7 +9,7 @@
 import { existsSync, statSync, readFileSync } from "fs";
 import { join } from "path";
 import { parseEnvContent } from "./lib/env-file";
-import { sendViaOutbox, type OutboxSender } from "./lib/outbox";
+import { outboxDelivered, sendViaOutbox, type OutboxSender } from "./lib/outbox";
 
 const DEFAULT_SCHEDULE = {
   quiet_hours: { start: 21, end: 8 },
@@ -24,8 +24,6 @@ let LOG_FILE = "";
 let WATCHDOG_LOG = "";
 let schedule = DEFAULT_SCHEDULE;
 let MAX_AGE_MINUTES = 90;
-let TELEGRAM_BOT_TOKEN: string | undefined;
-let TELEGRAM_CHAT_ID: string | undefined;
 
 function init(): void {
   // Load .env
@@ -48,9 +46,6 @@ function init(): void {
   } catch {}
 
   MAX_AGE_MINUTES = schedule.minimum_gap_minutes || 90;
-
-  TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-  TELEGRAM_CHAT_ID = process.env.TELEGRAM_USER_ID;
 }
 
 function log(message: string) {
@@ -70,36 +65,36 @@ function log(message: string) {
 
 /**
  * Senden und festhalten (Entscheidung 0006): Direktchat, Quelle watchdog;
- * Markdown als HTML, bei 400 einmal als Klartext wie bisher
+ * Markdown als HTML, bei 400 einmal als Klartext wie bisher. Ohne Telegram
+ * (Issue #227) hält die Outbox die Warnung nur für die WebUI fest.
  */
 export const defaultSend: OutboxSender = sendViaOutbox;
 
 export interface AlertDeps {
   send: OutboxSender;
   log(message: string): void;
-  /** TELEGRAM_BOT_TOKEN und TELEGRAM_USER_ID gesetzt */
-  hasCredentials: boolean;
+  /**
+   * Veraltet seit Issue #227: die Warnung geht auch ohne Telegram über die
+   * Outbox (dann nur in die WebUI); die Angabe ändert nichts mehr
+   */
+  hasCredentials?: boolean;
 }
 
 export function defaultAlertDeps(): AlertDeps {
-  return { send: defaultSend, log, hasCredentials: !!TELEGRAM_BOT_TOKEN && !!TELEGRAM_CHAT_ID };
+  return { send: defaultSend, log };
 }
 
-/** Schickt eine Warnung an den Direktchat; true, wenn gesendet. */
+/** Schickt eine Warnung an den Direktchat; true, wenn zugestellt (Telegram oder, ohne Telegram, WebUI). */
 export async function sendAlert(message: string, deps: AlertDeps = defaultAlertDeps()): Promise<boolean> {
-  if (!deps.hasCredentials) {
-    deps.log("Missing Telegram credentials");
-    return false;
-  }
-
   try {
-    const { sent } = await deps.send({ text: message, source: "watchdog" });
-    if (sent) {
-      deps.log("✅ Alert sent");
+    const result = await deps.send({ text: message, source: "watchdog" });
+    const delivered = outboxDelivered(result);
+    if (delivered) {
+      deps.log(result.sent ? "✅ Alert sent" : "✅ Alert für die WebUI festgehalten");
     } else {
       deps.log("❌ Alert failed");
     }
-    return sent;
+    return delivered;
   } catch (error) {
     deps.log(`❌ Alert error: ${error}`);
     return false;

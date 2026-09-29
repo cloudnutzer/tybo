@@ -120,12 +120,11 @@ describe("Watchdog", () => {
     expect(logs).toEqual(["✅ Alert sent"]);
   });
 
-  test("ohne Zugangsdaten nichts gesendet", async () => {
+  test("ohne Zugangsdaten trotzdem an die Outbox (Issue #227: dann nur WebUI)", async () => {
     const r = recorder();
     const logs: string[] = [];
-    expect(await watchdog.sendAlert("x", { send: r.send, log: l => void logs.push(l), hasCredentials: false })).toBe(false);
-    expect(r.calls).toEqual([]);
-    expect(logs).toEqual(["Missing Telegram credentials"]);
+    expect(await watchdog.sendAlert("x", { send: r.send, log: l => void logs.push(l), hasCredentials: false })).toBe(true);
+    expect(r.calls).toEqual([{ text: "x", source: "watchdog" }]);
   });
 
   test("Fehler des Senders werden geloggt, nicht geworfen", async () => {

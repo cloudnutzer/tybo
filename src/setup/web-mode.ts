@@ -3,8 +3,9 @@
  * Server aus ./web-server.ts.
  *
  * Wer startet ihn:
- * - src/bot.ts, wenn TELEGRAM_BOT_TOKEN oder TELEGRAM_USER_ID fehlt
- *   (./start-mode.ts), vor jeder Bot-Initialisierung: kein Telegram-Polling,
+ * - src/bot.ts, wenn kein Kanal bereit ist (./start-mode.ts, ./channels.ts:
+ *   weder Telegram noch WebUI, halbes Telegram, WebUI ohne Telegram
+ *   ungültig), vor jeder Bot-Initialisierung: kein Telegram-Polling,
  *   keine Claude-Aufrufe, kein bot.lock.
  * - `tybo setup --web` (scripts/tybo.ts), bewusst auch bei vollständiger .env.
  *
@@ -105,7 +106,7 @@ function defaultInterrupt(handler: () => void): () => void {
 
 function reasonLine(startMode: SetupModeOptions["startMode"]): string {
   if (startMode.reason === "forced") return `${BRAND.name} setup --web: Einrichtung im Browser.`;
-  return `Einrichtungsmodus: in der .env fehlt ${startMode.missing.join(" und ")}. ${BRAND.name} startet deshalb nur den Assistenten, ohne Telegram.`;
+  return `Einrichtungsmodus: ${startMode.message} ${BRAND.name} startet deshalb nur den Assistenten, ohne Telegram.`;
 }
 
 export async function runSetupMode(options: SetupModeOptions): Promise<number> {

@@ -24,12 +24,22 @@
  *
  * Schlüssel (Issue #62) ebenfalls nur im Speicher (createDemoKeys), nie .env.
  *
+ * Web Push (Issue #225) nur mit WEB_DEV_PUSH=1: frische VAPID-Schlüssel bei
+ * jedem Start, nur im Speicher (nie .env, nie data/). Abos in der Demo im
+ * temporären Verzeichnis, sonst in data/web-dev/push-subscriptions.json. Nach
+ * einem Neustart passen alte Abos nicht mehr zum Schlüssel: Benachrichtigungen
+ * dann aus- und wieder einschalten. Versand geht echt an den Push-Dienst des
+ * Browsers, nur so kommt „Test senden" an. Push braucht einen sicheren
+ * Kontext: im Browser http://127.0.0.1:<Port> oder http://localhost:<Port>.
+ *
  * Beenden mit Ctrl+C oder: pkill -f scripts/web-dev.ts
  * Importiert src/bot.ts nicht, auch nicht über Umwege.
  */
 
 import { join } from "node:path";
 import { loadWebConfig } from "../src/web/config";
+import { DEFAULT_PUSH_SUBJECT, generateVapidKeys } from "../src/web/push";
+import type { PushDeps } from "../src/web/push-api";
 import {
   createDemoAgents,
   createDemoInstructions,
@@ -57,11 +67,18 @@ if (result.status === "invalid") {
   process.exit(1);
 }
 
+/** Push nur auf Wunsch, Schlüssel nur im Speicher; file fehlt: Demo legt die Abos im eigenen temporären Verzeichnis ab */
+async function devPush(file?: string): Promise<PushDeps | undefined> {
+  if (process.env.WEB_DEV_PUSH !== "1") return undefined;
+  console.log("[web] Push an: Schlüssel nur für diesen Lauf");
+  return { keys: await generateVapidKeys(), subject: DEFAULT_PUSH_SUBJECT, ...(file ? { file } : {}) };
+}
+
 let stop: () => Promise<void>;
 if (process.env.WEB_DEV_DEMO === "1") {
   let demo;
   try {
-    demo = await startDemoServer(result.config, { chat: createFakeChat(), telegramChat: createFakeChat() });
+    demo = await startDemoServer(result.config, { chat: createFakeChat(), telegramChat: createFakeChat(), push: await devPush() });
   } catch (e) {
     console.error(`[web] Demo startet nicht: ${e instanceof Error ? e.message : String(e)}`);
     process.exit(1);
@@ -113,6 +130,8 @@ if (process.env.WEB_DEV_DEMO === "1") {
     keys: createDemoKeys(),
     // Anhänge (Issue #72): eigene Ablage im Checkout, nie data/uploads des Bots
     uploads: new UploadStore({ dir: join(dataRoot, "web-dev", "uploads") }),
+    // Web Push (Issue #225): nur mit WEB_DEV_PUSH=1, eigene Abo-Datei, nie data/web des Bots
+    push: await devPush(join(dataRoot, "web-dev", "push-subscriptions.json")),
   });
   console.log(`[web] WebUI läuft auf ${server.url}`);
   stop = () => server.stop();

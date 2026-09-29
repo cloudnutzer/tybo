@@ -95,7 +95,7 @@ afterAll(cleanup);
 
 interface Sent { method: string; path: string; body: any }
 
-async function openApp(options: { env?: string; profile?: string; ctx?: TestCtx } = {}) {
+async function openApp(options: { env?: string; profile?: string; ctx?: TestCtx; location?: { port: string } } = {}) {
   reset();
   const s = await startSetup(options);
   running.push(s);
@@ -112,7 +112,7 @@ async function openApp(options: { env?: string; profile?: string; ctx?: TestCtx 
     });
     return { status: res.status, ok: res.ok, data: await res.json().catch(() => null) };
   };
-  const view = new Function("document", "window", `${setupSource}\nreturn createSetupView;`)(doc, { TYBO_BRAND })({
+  const view = new Function("document", "window", `${setupSource}\nreturn createSetupView;`)(doc, { TYBO_BRAND, location: options.location })({
     api,
     navigate: (path: string) => navigations.push(path),
     scrollTop: () => {},
@@ -157,14 +157,14 @@ describe("Aufbau", () => {
     const app = await openApp({ env: "" });
     const buttons = app.stepButtons();
     expect(buttons.map(b => b.attributes["data-step"])).toEqual([
-      "voraussetzungen", "telegram", "gruppe", "datenbank", "suche", "profil", "modelle", "webui", "autostart", "pruefung",
+      "voraussetzungen", "telegram", "gruppe", "datenbank", "suche", "profil", "modelle", "webui", "zugang", "autostart", "pruefung",
     ]);
     expect(buttons[0].attributes["data-state"]).toBe("erledigt");
     expect(buttons[1].attributes["data-state"]).toBe("fehlt");
     expect(all(buttons[2]).map(n => n.textContent)).toContain("fehlt, optional");
     expect(buttons.filter(b => b.attributes["aria-current"] === "step").map(b => b.attributes["data-step"])).toEqual(["telegram"]);
     expect(app.view.state().current).toBe("telegram");
-    expect(app.text()).toContain("Schritt 2 von 10");
+    expect(app.text()).toContain("Schritt 2 von 11");
     expect(app.text()).toContain("Noch kein Telegram-Bot eingerichtet.");
     expect(htmlWrites).toEqual([]);
   });
@@ -225,10 +225,48 @@ describe("Testen und Speichern", () => {
   });
 
   test("Weiter öffnet den nächsten Schritt", async () => {
-    const app = await openApp({ env: "" });
+    const app = await openApp({ env: FULL_ENV, profile: PROFILE });
+    await app.openStep("telegram");
     await app.click("next");
     expect(app.view.state().current).toBe("gruppe");
     expect(app.text()).toContain("optional");
+  });
+
+  test("Issue #228: Weiter bei Telegram ohne WebUI öffnet die WebUI, danach die übrigen Schritte (ohne Forum-Gruppe)", async () => {
+    const app = await openApp({ env: "" });
+    expect(app.view.state().current).toBe("telegram");
+    await app.click("next");
+    expect(app.view.state().current).toBe("webui");
+    await app.click("next");
+    // Zurück zu den ausgelassenen offenen Schritten, nicht direkt zum Autostart
+    expect(app.view.state().current).toBe("datenbank");
+    const order: string[] = [];
+    for (let i = 0; i < 5 && app.button("next"); i++) {
+      await app.click("next");
+      order.push(app.view.state().current);
+    }
+    expect(order).toEqual(["suche", "profil", "modelle", "autostart", "pruefung"]);
+  });
+
+  test("Issue #231: nach der WebUI kommt der Zugang vom Handy, ohne WebUI wird er übersprungen", async () => {
+    const on = await openApp({ env: `WEB_ENABLED=true\nWEB_PASSWORD=${FAKE.webPassword}\n` });
+    await on.openStep("webui");
+    await on.click("next");
+    expect(on.view.state().current).toBe("zugang");
+    expect(on.text()).toContain("Tailscale, privates Netz nur für deine Geräte (empfohlen)");
+    const off = await openApp({ env: FULL_ENV.replace("WEB_ENABLED=true", "WEB_ENABLED=false"), profile: PROFILE });
+    await off.openStep("webui");
+    await off.click("next");
+    expect(off.view.state().current).toBe("autostart");
+  });
+
+  test("Issue #228: WebUI schon eingerichtet: Weiter bei Telegram geht normal weiter", async () => {
+    const app = await openApp({ env: `WEB_ENABLED=true\nWEB_PASSWORD=${FAKE.webPassword}\n` });
+    // Kanal bereit: erster offener Pflichtschritt, nicht Telegram
+    expect(app.view.state().current).toBe("datenbank");
+    await app.openStep("telegram");
+    await app.click("next");
+    expect(app.view.state().current).toBe("datenbank");
   });
 
   test("Sichtbarkeit: Auswahl der Datenbank blendet Felder um; geheime Felder gehen nur als Name hin", async () => {
@@ -268,7 +306,7 @@ describe("Fertig", () => {
     const app = await openApp({ env: "" });
     await app.openStep("pruefung");
     expect(app.button("finish")!.disabled).toBe(true);
-    expect(app.text()).toContain("Vor „Fertig“ fehlt noch: Telegram, Datenbank, Profil.");
+    expect(app.text()).toContain("Vor „Fertig“ fehlt noch: Datenbank, Profil. Richte Telegram oder die WebUI ein, sonst erreicht dich tybo nirgends.");
   });
 
   test("alles erledigt: Fertig zeigt den Startbefehl, sperrt die Schritte; der Code gilt nicht mehr", async () => {
@@ -293,6 +331,57 @@ describe("Fertig", () => {
     expect(app.navigations).toEqual([]);
     const again = await fetch(`${app.s.base}/api/setup/code`, { method: "POST", headers: { Origin: app.s.origin }, body: JSON.stringify({ code: CODE }) });
     expect(again.status).toBe(401);
+  });
+
+  test("Issue #228: nur WebUI, Telegram übersprungen: Fertig geht, Endtext nennt die WebUI, nicht Telegram", async () => {
+    const env = FULL_ENV.split("\n").filter(l => !l.startsWith("TELEGRAM_")).join("\n");
+    const app = await openApp({ env, profile: PROFILE });
+    await app.openStep("pruefung");
+    expect(app.button("finish")!.disabled).toBe(false);
+    expect(app.text()).toContain("Ohne Autostart steht nach „Fertig“ der Befehl zum Starten da.");
+    await app.click("finish");
+    expect(app.text()).toContain("Einrichtung abgeschlossen");
+    expect(app.text()).toContain("Nach dem Start: Öffne die WebUI unter http://127.0.0.1:3100.");
+    expect(app.text()).not.toContain("Telegram");
+  });
+
+  test("Issue #228: Assistent auf 3100, WEB_PORT auf 3456 geändert: Endtext nennt 3456", async () => {
+    const env = FULL_ENV.split("\n").filter(l => !l.startsWith("TELEGRAM_")).join("\n");
+    const app = await openApp({ env, profile: PROFILE, location: { port: "3100" } });
+    await app.openStep("webui");
+    app.input("WEB_PORT")!.value = "3456";
+    await app.click("apply");
+    expect(parseEnvContent(await readFile(app.s.ctx.envPath, "utf8")).WEB_PORT).toBe("3456");
+    await app.openStep("pruefung");
+    await app.click("finish");
+    expect(app.text()).toContain("Nach dem Start: Öffne die WebUI unter http://127.0.0.1:3456.");
+    expect(app.text()).not.toContain("127.0.0.1:3100");
+  });
+
+  test("Issue #228: Telegram und WebUI: Endtext nennt beides", async () => {
+    const app = await openApp({ env: FULL_ENV, profile: PROFILE });
+    await app.openStep("pruefung");
+    await app.click("finish");
+    expect(app.text()).toContain("Nach dem Start: Schreib deinem Bot in Telegram oder öffne die WebUI unter http://127.0.0.1:3100.");
+  });
+
+  test("Issue #228: nur Telegram: Endtext nennt Telegram", async () => {
+    const env = FULL_ENV.split("\n").filter(l => !l.startsWith("WEB_")).join("\n");
+    const app = await openApp({ env, profile: PROFILE });
+    await app.openStep("pruefung");
+    await app.click("finish");
+    expect(app.text()).toContain("Nach dem Start: Schreib deinem Bot in Telegram.");
+    expect(app.text()).not.toContain("WebUI unter");
+  });
+
+  test("Issue #228: halbes Telegram mit WebUI: Fertig gesperrt mit Grund", async () => {
+    const env = FULL_ENV.split("\n").filter(l => !l.startsWith("TELEGRAM_USER_ID=")).join("\n");
+    const app = await openApp({ env, profile: PROFILE });
+    // Kanal nicht bereit: Telegram ist der erste offene Schritt
+    expect(app.view.state().current).toBe("telegram");
+    await app.openStep("pruefung");
+    expect(app.button("finish")!.disabled).toBe(true);
+    expect(app.text()).toContain("Telegram halb eingerichtet: TELEGRAM_BOT_TOKEN ist gesetzt, TELEGRAM_USER_ID fehlt. Beide Werte setzen oder beide entfernen.");
   });
 
   test("Linux mit systemd: Auswahl systemd/PM2 erst mit Häkchen, gewählter Weg geht mit „Fertig“ mit (Issue #207)", async () => {

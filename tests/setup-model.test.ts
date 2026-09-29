@@ -17,6 +17,7 @@ import {
   type SetupField,
 } from "../src/setup/model";
 import { checkStep, getStep, SETUP_STEPS, setupOverview } from "../src/setup/steps";
+import { overallChannels } from "../src/setup/channels";
 import { backupsOf, cleanup, FAKE, FULL_ENV, fakeRun, leakedSecrets, makeCtx } from "./setup-fixture";
 
 afterAll(cleanup);
@@ -44,13 +45,15 @@ describe("Schrittliste", () => {
       "profil",
       "modelle",
       "webui",
+      "zugang",
       "autostart",
       "pruefung",
     ]);
   });
 
-  test("optional sind genau gruppe, suche, modelle und webui", () => {
-    expect(SETUP_STEPS.filter(s => s.optional).map(s => s.id)).toEqual(["gruppe", "suche", "modelle", "webui"]);
+  test("optional sind genau telegram, gruppe, suche, modelle, webui und zugang (Telegram seit Issue #228, zugang seit #231)", () => {
+    expect(SETUP_STEPS.filter(s => s.optional).map(s => s.id)).toEqual(["telegram", "gruppe", "suche", "modelle", "webui", "zugang"]);
+    expect(getStep("telegram")!.description).toContain("Ohne Telegram erreichst du tybo über die WebUI");
   });
 
   test("jeder Schritt hat Titel, Beschreibung und Felder mit Hilfetext", () => {
@@ -153,24 +156,46 @@ describe("Gesamtstatus", () => {
   test("leer: alle Pflichtschritte fehlen, optionale offen", () => {
     const o = overallStatus(steps, {});
     expect(o.complete).toBe(false);
-    expect(o.missing).toEqual(["voraussetzungen", "telegram", "datenbank", "profil", "autostart"]);
-    expect(o.open).toEqual(["gruppe", "suche", "modelle", "webui"]);
+    expect(o.missing).toEqual(["voraussetzungen", "datenbank", "profil", "autostart"]);
+    expect(o.open).toEqual(["telegram", "gruppe", "suche", "modelle", "webui", "zugang"]);
   });
 
   test("Pflicht erledigt, optionale übersprungen: fertig", () => {
     const o = overallStatus(
       steps,
       { voraussetzungen: "erledigt", telegram: "erledigt", datenbank: "erledigt", profil: "erledigt", autostart: "erledigt" },
-      ["gruppe", "suche", "modelle", "webui"],
+      ["gruppe", "suche", "modelle", "webui", "zugang"],
     );
-    expect(o).toEqual({ complete: true, missing: [], open: [], skipped: ["gruppe", "suche", "modelle", "webui"] });
+    expect(o).toEqual({ complete: true, missing: [], open: [], skipped: ["gruppe", "suche", "modelle", "webui", "zugang"], channels: null });
   });
 
   test("Pflichtschritt lässt sich nicht überspringen, teilweise zählt nicht", () => {
-    const o = overallStatus(steps, { voraussetzungen: "erledigt", telegram: "teilweise" }, ["telegram", "datenbank"]);
-    expect(o.missing).toContain("telegram");
+    const o = overallStatus(steps, { voraussetzungen: "erledigt", datenbank: "teilweise" }, ["datenbank"]);
     expect(o.missing).toContain("datenbank");
     expect(o.skipped).toEqual([]);
+  });
+
+  const done = { voraussetzungen: "erledigt", datenbank: "erledigt", profil: "erledigt", autostart: "erledigt" } as const;
+  const channel = (env: Record<string, string>) => overallChannels(env);
+  const WEB = { WEB_ENABLED: "true", WEB_PASSWORD: FAKE.webPassword };
+
+  test("Issue #228: WebUI erledigt und Telegram übersprungen: fertig", () => {
+    const o = overallStatus(steps, { ...done, webui: "erledigt" }, ["telegram", "gruppe", "suche", "modelle"], channel(WEB));
+    expect(o.complete).toBe(true);
+    expect(o.skipped).toContain("telegram");
+  });
+
+  test("Issue #228: beides fehlt: offen mit dem Kanal-Satz", () => {
+    const o = overallStatus(steps, done, ["telegram", "gruppe", "suche", "modelle", "webui"], channel({}));
+    expect(o.complete).toBe(false);
+    expect(o.missing).toEqual([]);
+    expect(o.channels?.message).toBe("Richte Telegram oder die WebUI ein, sonst erreicht dich tybo nirgends.");
+  });
+
+  test("Issue #228: Telegram teilweise und übersprungen: offen, auch mit WebUI", () => {
+    const o = overallStatus(steps, { ...done, telegram: "teilweise", webui: "erledigt" }, ["telegram"], channel({ ...WEB, TELEGRAM_BOT_TOKEN: FAKE.token }));
+    expect(o.complete).toBe(false);
+    expect(o.channels?.message).toStartWith("Telegram halb eingerichtet: ");
   });
 
   test("pruefung zählt nicht mit", () => {
@@ -184,10 +209,11 @@ describe("Status auf leerer und fertiger Konfiguration", () => {
     const ctx = await makeCtx();
     const overview = await setupOverview(ctx);
     expect(overview.complete).toBe(false);
-    expect(overview.missing).toEqual(["telegram", "datenbank", "profil", "autostart"]);
+    expect(overview.missing).toEqual(["datenbank", "profil", "autostart"]);
+    expect(overview.channels?.ready).toBe(false);
     const status = await checkStep.status(ctx);
     expect(status.state).toBe("fehlt");
-    expect(status.detail).toContain("Telegram");
+    expect(status.detail).toContain("Richte Telegram oder die WebUI ein, sonst erreicht dich tybo nirgends.");
     expect(await Bun.file(ctx.envPath).exists()).toBe(false);
     expect(await backupsOf(ctx)).toEqual([]);
   });
@@ -211,6 +237,8 @@ describe("Status auf leerer und fertiger Konfiguration", () => {
       profil: "erledigt",
       modelle: "erledigt",
       webui: "erledigt",
+      // Ohne HTTPS-Adresse (Issue #231): optional, offen
+      zugang: "fehlt",
       autostart: "erledigt",
       pruefung: "erledigt",
     });

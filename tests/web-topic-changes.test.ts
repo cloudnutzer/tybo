@@ -394,7 +394,7 @@ describe("Verdrahtung", () => {
   test("src/bot.ts registriert den Handler hinter der Nutzer-Prüfung, mit Gruppe, Speicher und topicChanges (ohne bot.ts zu importieren)", async () => {
     const bot = await Bun.file(join(import.meta.dir, "..", "src", "bot.ts")).text();
     const auth = bot.indexOf("if (userId !== ALLOWED_USER_ID)");
-    const handler = bot.indexOf('bot.on(["message:forum_topic_created", "message:forum_topic_edited"]');
+    const handler = bot.indexOf('telegramHandlers.on(["message:forum_topic_created", "message:forum_topic_edited"]');
     expect(auth).toBeGreaterThan(0);
     expect(handler).toBeGreaterThan(auth);
     const body = bot.slice(handler, bot.indexOf("});", handler));

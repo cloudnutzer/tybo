@@ -244,3 +244,20 @@ targetRules = [
   "yandex-aws-access-token",
   "zendesk-secret-key",
 ]
+
+# Öffentliche Testvektoren aus RFC 8291 Anhang A (Web Push) und die
+# Beispiel-AUD 0123…cdef in den Zugangs-Tests. Die Werte lassen sich nicht
+# markieren, ohne die Kryptografie der Tests zu brechen; deshalb exakt
+# aufgezählt und nur unter tests/ für die Regel generic-api-key.
+[[allowlists]]
+description = "RFC-8291-Testvektoren und Beispiel-AUD unter tests/"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^tests/''']
+regexes = [
+  '''^q1dXpw3UpT5VOmu_cf_v6ih07Aems3njxI-JWgLcM94$''',
+  '''^BTBZMqHH6r4Tts7J_aSIgg$''',
+  '''^kyrL1jIIOHEzg3sM2ZWRHDRB62YACZhhSlknJ672kSs$''',
+  '''^(?:0123456789abcdef){2}$''',
+]
+targetRules = ["generic-api-key"]

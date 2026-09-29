@@ -25,6 +25,7 @@ import type { CommandPort } from "./commands";
 import type { GoalPort } from "./goals";
 import type { ChoicePort } from "./choices";
 import type { KeysPort } from "./keys";
+import type { PushDeps } from "./push-api";
 
 type Env = Record<string, string | undefined>;
 
@@ -71,6 +72,10 @@ export interface StartWebUiOptions {
   choices?: ChoicePort;
   /** Schlüssel in .env lesen und schreiben (Issue #62); in bot.ts createBotKeys */
   keys?: KeysPort;
+  /** Web Push (Issue #225): Schlüssel und Kontakt; in bot.ts prepareBotPush aus ./bot-push */
+  push?: PushDeps;
+  /** Meldungen für reine Web-Gespräche (Issue #227); in bot.ts getDisplayOnlyPage und onMessageSaved */
+  webNotices?: WebServerDeps["webNotices"];
   /**
    * Schlüsseldatei für den Terminal-Zugang (Issue #59). Standard:
    * data/cli-token im Projekt (GO_PROJECT_ROOT oder Arbeitsverzeichnis).
@@ -142,6 +147,8 @@ export async function startWebUi(options: StartWebUiOptions): Promise<WebServer 
       goals: options.goals,
       choices: options.choices,
       keys: options.keys,
+      push: options.push,
+      webNotices: options.webNotices,
       cliTokenFile: options.cliTokenFile ?? defaultCliTokenFile(),
       log,
     });

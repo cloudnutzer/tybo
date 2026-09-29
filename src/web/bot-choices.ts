@@ -8,6 +8,7 @@
 
 import { decideChoice, getChoiceChecked, listChoices, onChoiceChange } from "../lib/choices";
 import { createChoicePort, type ChoicePort } from "./choices";
+import { dmChatId } from "../lib/channels";
 import { botGroupId } from "./bot-telegram";
 
 type Env = Record<string, string | undefined>;
@@ -15,7 +16,7 @@ type Env = Record<string, string | undefined>;
 export function createBotChoices(env: Env, log?: (message: string) => void): ChoicePort {
   return createChoicePort({
     register: { get: getChoiceChecked, list: listChoices, decide: decideChoice, onChange: onChoiceChange },
-    userId: env.TELEGRAM_USER_ID,
+    userId: dmChatId(env),
     groupId: () => botGroupId(env),
     log,
   });

@@ -14,3 +14,10 @@ Datum: 25.09.2026. Entschieden von: Maintainer.
 - **Schlüssel ändern nur im Heimnetz** (Empfehlung der Plan-Session, vom Maintainer
   nicht widersprochen); von unterwegs sind Schlüssel nur lesbar.
 - Bis zu diesem Meilenstein gilt Entscheidung 0002 (nur Heimnetz) weiter.
+
+## Nachtrag 28.09.2026 (Issue #231, Entscheidung 0022)
+
+Der Zugang von unterwegs ist nicht mehr an eine feste Adresse gebunden:
+`tybo setup zugang` richtet ihn für jeden Nutzer ein, über Tailscale, über
+einen Cloudflare Tunnel mit eigener Domain (Regeln wie oben) oder gar nicht.
+Details in Entscheidung 0022 und `docs/webui/fernzugang.md`.

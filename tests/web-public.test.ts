@@ -25,7 +25,8 @@ const publicDir = join(root, "src", "web", "public");
 
 test("keine HTML-Datei in src/web/public hat Inline-Skripte, on...-Attribute oder Inline-Styles", async () => {
   const files = (await readdir(publicDir)).filter(f => f.endsWith(".html"));
-  expect(files.sort()).toEqual(["index.html", "login.html"]);
+  // offline.html (Issue #224): Seite „nicht erreichbar" aus dem Service Worker
+  expect(files.sort()).toEqual(["index.html", "login.html", "offline.html"]);
   for (const f of files) {
     const html = await readFile(join(publicDir, f), "utf8");
     expect(html).not.toMatch(/<script(?![^>]*\bsrc=)[^>]*>/i);
@@ -33,6 +34,14 @@ test("keine HTML-Datei in src/web/public hat Inline-Skripte, on...-Attribute ode
     expect(html).not.toMatch(/\sstyle\s*=|<style/i);
     expect(html).not.toMatch(/https?:\/\//i); // kein CDN, keine fremden Quellen
   }
+});
+
+test("offline.html lädt nur theme.js und offline.js, beide als externe Datei (Issue #224)", async () => {
+  const html = await readFile(join(publicDir, "offline.html"), "utf8");
+  const scripts = [...html.matchAll(/<script\b[^>]*>/gi)].map(m => m[0]);
+  expect(scripts).toEqual(['<script src="/theme.js">', '<script src="/offline.js" defer>']);
+  // Nichts, was nur mit Sitzung erreichbar ist: kein app.js, kein brand.js, keine API
+  expect(html).not.toMatch(/app\.js|settings\.js|brand\.js|\/api\//);
 });
 
 test("Login-Seite wird ausgeliefert", async () => {
@@ -249,4 +258,16 @@ test("Web-Server lädt zur Laufzeit nichts außerhalb von src/web", async () => 
   expect(files).toContain("src/web/chat.ts");
   expect(files).toContain("src/brand.ts");
   expect([...(await localImports(join(root, "src", "brand.ts")))]).toEqual([join(root, "src", "brand.ts")]);
+});
+
+test("offline.js: „Erneut versuchen\" lädt die Startseite neu (Issue #224)", async () => {
+  const source = await readFile(join(publicDir, "offline.js"), "utf8");
+  const listeners: Record<string, () => void> = {};
+  const button = { disabled: false, addEventListener: (type: string, fn: () => void) => { listeners[type] = fn; } };
+  const window = { location: { href: "/offline.html" } };
+  new Function("document", "window", source)({ getElementById: (id: string) => (id === "retry" ? button : null) }, window);
+  expect(window.location.href).toBe("/offline.html");
+  listeners.click();
+  expect(window.location.href).toBe("/");
+  expect(button.disabled).toBe(true);
 });

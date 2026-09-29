@@ -1,7 +1,7 @@
 # tybo einrichten
 
 Diese Anleitung führt auf einem frischen Rechner bis zur ersten Antwort in
-Telegram. Du brauchst dafür weder Claude Code als Gesprächspartner noch die
+Telegram oder in der WebUI. Du brauchst dafür weder Claude Code als Gesprächspartner noch die
 `CLAUDE.md`. Der Assistent `tybo setup` fragt alles ab, prüft jede Angabe
 gleich mit einem Verbindungstest und schreibt die `.env` erst nach deiner
 Bestätigung.
@@ -170,7 +170,7 @@ Weitere Aufrufe:
 
 Die Namen der Schritte für `tybo setup <schritt>`: `voraussetzungen`,
 `telegram`, `gruppe`, `datenbank`, `suche`, `profil`, `modelle`, `webui`,
-`autostart`, `pruefung`.
+`zugang`, `autostart`, `pruefung`.
 
 Abbrechen geht jederzeit mit Strg+C. Schon gespeicherte Schritte bleiben, der
 laufende Schritt wird nicht halb geschrieben. Weiter geht es später mit
@@ -187,9 +187,15 @@ Enter nimmt nur die offenen Schritte. Mit Nummern oder Namen (etwa `2,5` oder
 `telegram`) kommen erledigte Schritte dazu, zum Beispiel um ein Token zu
 ersetzen.
 
-**Optionale Schritte** (Forum-Gruppe, Modelle und Fallback, WebUI) beginnen
-mit der Frage „Jetzt einrichten? [J/n]“. Mit `n` wird der Schritt
-übersprungen; die Einrichtung ist trotzdem vollständig.
+**Optionale Schritte** (Telegram, Forum-Gruppe, Semantische Suche, Modelle
+und Fallback, WebUI, Zugang vom Handy) beginnen mit der Frage „Jetzt einrichten? [J/n]“. Mit
+`n` wird der Schritt übersprungen; die Einrichtung ist trotzdem vollständig,
+solange Telegram oder die WebUI eingerichtet ist. Überspringst du Telegram
+und die WebUI ist noch aus, kommt die WebUI als nächster Schritt; sie lässt
+sich dann nur nach der Rückfrage „Richte Telegram oder die WebUI ein, sonst
+erreicht dich tybo nirgends. Trotzdem überspringen? [j/N]“ auslassen. Ohne
+Telegram überspringt der Assistent die Forum-Gruppe von selbst, ohne WebUI
+den Zugang vom Handy.
 
 **Felder.** Zu jedem Feld stehen Titel, Hilfetext und oft ein Link, wo es den
 Wert gibt. Geheime Felder (Tokens, Schlüssel, Passwort) bleiben beim Tippen
@@ -259,7 +265,8 @@ Zusammenfassung und der nächste Schritt da.
 ## Die Schritte
 
 Die Reihenfolge ist die des Assistenten. Pflicht sind Voraussetzungen,
-Telegram, Datenbank, Profil und Autostart.
+Datenbank, Profil und Autostart, dazu mindestens ein Kanal: Telegram oder die
+WebUI (siehe [Telegram, WebUI oder beides](#telegram-webui-oder-beides)).
 
 ### 1. Voraussetzungen
 
@@ -269,9 +276,34 @@ wieder vor. Dort startet der Assistent zusätzlich einen kurzen Probeaufruf
 der Claude CLI, um die Anmeldung zu prüfen. Fehlt etwas, steht der Befehl zum
 Nachholen daneben; nach dem Installieren „Nochmal prüfen“.
 
-### 2. Telegram
+### Telegram, WebUI oder beides
 
-Der Bot, über den tybo mit dir spricht.
+tybo braucht mindestens einen Weg zu dir: Telegram oder die WebUI (Chat im
+Browser, auch als App auf dem Handy). Welchen du nimmst, entscheidest du in
+der Einrichtung:
+
+- **Nur die Web-App:** Schritt Telegram überspringen, Schritt WebUI
+  einrichten. tybo startet dann ohne Telegram; Antworten, Meldungen und
+  Rückfragen kommen in die WebUI (und per Push aufs Handy). Beim Start steht
+  im Log „Telegram nicht eingerichtet: nur WebUI“.
+- **Nur Telegram:** Schritt Telegram einrichten, WebUI überspringen. Den
+  Terminal-Chat `tybo` gibt es dann nicht, er braucht die WebUI.
+- **Beides:** beide Schritte einrichten. Gespräche aus Telegram siehst du
+  auch im Browser und umgekehrt.
+
+Telegram lässt sich jederzeit nachholen (`tybo setup telegram`); Gespräche,
+die bis dahin nur in der WebUI liefen, bleiben Web-Gespräche.
+
+**Halb eingerichtetes Telegram** zählt nicht: stehen nur Token oder nur
+Nutzer-ID in der `.env` (oder ist die Nutzer-ID keine Zahl), meldet der
+Assistent „Telegram halb eingerichtet: … Beide Werte setzen oder beide
+entfernen.“ und die Einrichtung ist nicht fertig, auch nicht mit WebUI. Der
+Bot startet dann im Einrichtungsmodus statt normal.
+
+### 2. Telegram (optional)
+
+Der Bot, über den tybo in Telegram mit dir spricht. Ohne Telegram erreichst
+du tybo über die WebUI (siehe oben).
 
 - **Bot-Token:** In Telegram [@BotFather](https://t.me/BotFather) öffnen,
   `/newbot` senden, Namen vergeben und das Token kopieren (Zahl, Doppelpunkt,
@@ -1023,7 +1055,8 @@ Modell geladen ist.
 ### 8. WebUI (optional)
 
 Mit dem Bot im Browser chatten, auch vom Handy im Heimnetz. Der
-Terminal-Chat `tybo` braucht sie ebenfalls.
+Terminal-Chat `tybo` braucht sie ebenfalls. Ohne Telegram ist sie der
+einzige Weg zu tybo und damit nicht mehr optional.
 
 - **WebUI einschalten:** Ja oder Nein. Nur bei Ja folgen die weiteren
   Felder.
@@ -1032,7 +1065,95 @@ Terminal-Chat `tybo` braucht sie ebenfalls.
   (Handy im selben WLAN).
 - **Port (optional):** Standard 3100.
 
-### 9. Autostart
+tybo als App auf dem Handy (installieren, Benachrichtigungen, Teilen aus
+anderen Apps) braucht zusätzlich eine HTTPS-Adresse, die richtet der nächste
+Schritt ein. Mehr zur App: [handy-app.md](handy-app.md).
+
+### 9. Zugang vom Handy (optional)
+
+Die Web-App lässt sich nur über HTTPS aufs Handy legen und nur dann
+Benachrichtigungen schicken; über `http://<IP des Rechners>` im Heimnetz geht
+das in keinem Browser. Dieser Schritt macht die WebUI über eine
+HTTPS-Adresse erreichbar. Er installiert nichts und kommt nur, wenn die WebUI
+eingeschaltet ist. Hintergrund und Sicherheit:
+[webui/fernzugang.md](webui/fernzugang.md).
+
+- **Weg vom Handy:** eine von drei Auswahlen, Standard ist Tailscale.
+  - „Tailscale, privates Netz nur für deine Geräte (empfohlen)“: läuft als
+    Ablauf, siehe unten.
+  - „Cloudflare Tunnel mit eigener Domain und Cloudflare Access“: für wen
+    schon eine Domain bei Cloudflare hat, siehe unten.
+  - „Nur auf diesem Rechner, keinen zusätzlichen Zugang einrichten“: ändert
+    nichts. Die WebUI bleibt auf diesem Rechner bzw. im Heimnetz, die App
+    auf dem Handy und Benachrichtigungen gehen dann nicht. Ein schon
+    eingerichteter Zugang bleibt, wie er ist.
+- **Vorhandenen Zugang ersetzen:** kommt nur, wenn schon ein anderer Weg
+  eingerichtet ist. Ja ersetzt dessen Werte in der `.env`, Nein ändert
+  nichts. Den Tunnel oder die Tailscale-Einstellung selbst rührt der
+  Assistent nicht an.
+
+#### Weg Tailscale
+
+Tailscale ist ein privates Netz nur für deine Geräte: das Handy erreicht den
+Rechner unter einer Adresse wie `https://<gerät>.<tailnet>.ts.net`, niemand
+sonst. Vorher selbst erledigen:
+
+1. Tailscale auf diesem Rechner installieren (macOS: Mac App Store oder
+   [tailscale.com/download](https://tailscale.com/download); Linux:
+   `curl -fsSL https://tailscale.com/install.sh | sh`) und anmelden.
+2. Die Tailscale-App auf dem Handy installieren und mit demselben Konto
+   anmelden.
+3. In der Admin-Konsole unter [DNS](https://login.tailscale.com/admin/dns)
+   MagicDNS und „HTTPS Certificates“ einschalten.
+
+Der Assistent zeigt dann unter „Das passiert jetzt:“ den Ablauf und fragt
+„Jetzt ausführen? [J/n]“. Er prüft Installation, Anmeldung, MagicDNS und
+HTTPS-Zertifikate (`tailscale status --json`), sieht nach, ob Port 443 in
+Tailscale frei ist (`tailscale serve status --json`), richtet die
+Weiterleitung ein
+([`tailscale serve --bg --https=443 http://127.0.0.1:<WEB_PORT>`](https://tailscale.com/docs/reference/tailscale-cli/serve)),
+schreibt die Adresse als `WEB_PUBLIC_ORIGIN` in die `.env` und testet über
+HTTPS. Fehlt etwas, steht statt eines Fehlers die Anleitung da, etwa
+„Tailscale ist nicht angemeldet. …“ oder „HTTPS-Zertifikate sind im Tailnet
+aus. …“. Ist Port 443 schon für etwas anderes eingerichtet oder Tailscale
+Funnel an (dann wäre die WebUI öffentlich), bricht er ab und ändert nichts.
+Unter Linux braucht Serve Administratorrechte; die Meldung nennt dann
+einmalig `sudo tailscale set --operator=$USER`.
+
+#### Weg Cloudflare mit eigener Domain
+
+Für wen schon eine Domain bei Cloudflare hat. Tunnel-Eintrag und
+Access-Anwendung legst du vorher selbst an, wie in
+[webui/fernzugang.md](webui/fernzugang.md) beschrieben. Dann fragt der
+Assistent:
+
+- **Adresse von unterwegs (eigene Domain):** etwa `tybo.example.org`, ohne
+  Pfad und Port.
+- **Cloudflare-Team-Name:** der erste Teil der Team domain
+  (`meinteam` aus `meinteam.cloudflareaccess.com`).
+- **Application Audience (AUD) Tag:** aus der Access-Anwendung.
+
+Der Test prüft, ob Cloudflare das Team kennt und ob die Adresse zur
+Anmeldung dieses Teams weiterleitet (Access davor). Gespeichert werden
+`WEB_PUBLIC_ORIGIN`, `WEB_ACCESS_TEAM`, `WEB_ACCESS_AUD` und `WEB_PORT`.
+
+#### Nach dem Einrichten
+
+Die neuen Werte liest tybo erst nach einem Neustart (läuft tybo schon: in
+der WebUI unter Einstellungen, Status „Neustart anfordern“). Solange tybo
+noch nicht mit ihnen läuft, meldet der Test über HTTPS „ausstehend“ statt
+eines Fehlers; im Browser-Assistenten (`tybo setup --web`) ist er immer
+ausstehend, weil der Assistent dann den Port der WebUI belegt. Nachholen mit
+`tybo setup zugang`, in der Gesamtprüfung oder von Hand:
+
+```bash
+curl -s https://<gerät>.<tailnet>.ts.net/manifest.webmanifest
+# erwartet: eine Antwort mit "name":"tybo" und "display":"standalone"
+curl -sI https://tybo.example.org/manifest.webmanifest
+# Cloudflare, erwartet: Status 302, location auf <team>.cloudflareaccess.com
+```
+
+### 10. Autostart
 
 tybo startet mit dem Rechner und nach Abstürzen von selbst. Keine Felder,
 nur die Frage „Autostart jetzt einrichten? [j/N]“. Eingerichtet wird nur der
@@ -1135,18 +1256,25 @@ Datei und lädt systemd neu. Linger bleibt an, weil andere Benutzerdienste es
 brauchen können; ausschalten mit `loginctl disable-linger $USER` (ohne
 Berechtigung mit `sudo` davor).
 
-### 10. Gesamtprüfung
+### 11. Gesamtprüfung
 
 Fasst zusammen, was eingerichtet ist und was noch fehlt, und testet jeden
 eingerichteten Schritt mit den gespeicherten Werten. „Alles eingerichtet und
-erreichbar.“ heißt: fertig.
+erreichbar.“ heißt: fertig. Fehlt ein Kanal, steht dort „Richte Telegram
+oder die WebUI ein, sonst erreicht dich tybo nirgends.“ Eine übrig
+gebliebene Forum-Gruppe ohne Telegram wird nicht geprüft.
+
+Am Ende nennt der Assistent, wie du tybo erreichst: „Öffne die WebUI unter
+http://127.0.0.1:3100.“ (nur WebUI), „Schreib deinem Bot in Telegram.“ (nur
+Telegram) oder beides.
 
 ## Die erste Antwort
 
 Schreib deinem Bot in Telegram eine normale Nachricht, etwa „Hallo, bist du
-da?“. Nach einigen Sekunden antwortet tybo über Claude. Die Testnachricht
-aus der Einrichtung zählt nicht; erst eine Antwort auf deine eigene
-Nachricht zeigt, dass alles läuft.
+da?“, oder öffne die WebUI (Standard `http://127.0.0.1:3100`), melde dich mit
+dem Passwort an und schreib dort in den Direktchat. Nach einigen Sekunden
+antwortet tybo über Claude. Die Testnachricht aus der Einrichtung zählt
+nicht; erst eine Antwort auf deine eigene Nachricht zeigt, dass alles läuft.
 
 Kommt keine Antwort: Läuft tybo (Autostart oder `bun run start`)? Dann
 `logs/telegram-relay.log` und `logs/telegram-relay.error.log` im
@@ -1167,8 +1295,15 @@ geschlossen ist. Unter Linux mit systemd steht darunter die Auswahl „Art des
 Autostarts“ (systemd-Benutzerdienst oder PM2). Fehlt danach nur noch der
 Start ohne Anmeldung, steht der `sudo`-Befehl dafür im Terminal.
 
-Fehlen beim Start des Bots Token oder Nutzer-ID, startet er von selbst in
-diesem Einrichtungsmodus, ohne Telegram; Adresse und Code stehen dann im Log.
+Ist beim Start des Bots kein Kanal eingerichtet (weder Telegram noch eine
+gültige WebUI) oder Telegram nur halb, startet er von selbst in diesem
+Einrichtungsmodus, ohne Telegram; Grund, Adresse und Code stehen dann im Log.
+Mit gültiger WebUI und ohne Telegram startet er normal, nur mit der WebUI.
+
+Überspringst du im Browser Telegram („Weiter“) und die WebUI ist noch aus,
+öffnet der Assistent als Nächstes die WebUI; danach geht es mit den übrigen
+Schritten weiter. „Fertig“ bleibt gesperrt, bis Telegram oder die WebUI
+eingerichtet ist. Nach „Fertig“ steht da, wo du tybo erreichst.
 
 Zwei Dinge macht der Browser-Weg nicht, die musst du selbst erledigen:
 

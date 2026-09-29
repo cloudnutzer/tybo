@@ -97,7 +97,7 @@ const opencodeVariant = z.string().regex(OPENCODE_VARIANT_PATTERN, "1 bis 20 Zei
  * Session-Schlüssel eines Gesprächs (sessionKeyFor in supabase.ts):
  * topic:<chat>:<topic>, group:<chat>, dm:<chat>, web:<id>
  */
-export const CONVERSATION_KEY_PATTERN = /^(topic:-?\d{1,20}:\d{1,12}|group:-\d{1,20}|dm:-?\d{1,20}|web:[A-Za-z0-9-]{1,64})$/;
+export const CONVERSATION_KEY_PATTERN = /^(topic:-?\d{1,20}:\d{1,12}|group:-\d{1,20}|dm:(?:-?\d{1,20}|web)|web:[A-Za-z0-9-]{1,64})$/;
 
 export const settingsSchema = z.object({
   defaults: modelAndEffort.optional(),

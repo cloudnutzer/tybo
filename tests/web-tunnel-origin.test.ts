@@ -17,8 +17,8 @@ function req(headers: Record<string, string> = {}): Request {
 describe("requestOrigin", () => {
   test("Loopback ohne Kopfzeile: lokal, nicht getunnelt, IP aus der Verbindung", () => {
     for (const peer of ["127.0.0.1", "::1", "::ffff:127.0.0.1"]) {
-      expect(requestOrigin(req(), peer, PUBLIC)).toEqual({ tunneled: false, local: true, clientIp: peer });
-      expect(requestOrigin(req(), peer, null)).toEqual({ tunneled: false, local: true, clientIp: peer });
+      expect(requestOrigin(req(), peer, PUBLIC)).toEqual({ tunneled: false, via: null, local: true, clientIp: peer });
+      expect(requestOrigin(req(), peer, null)).toEqual({ tunneled: false, via: null, local: true, clientIp: peer });
     }
   });
 
@@ -26,6 +26,7 @@ describe("requestOrigin", () => {
     for (const peer of ["127.0.0.1", "::1", "::ffff:127.0.0.1"]) {
       expect(requestOrigin(req({ "CF-Connecting-IP": "203.0.113.7" }), peer, PUBLIC)).toEqual({
         tunneled: true,
+        via: "cloudflare",
         local: false,
         clientIp: "203.0.113.7",
       });
@@ -37,19 +38,24 @@ describe("requestOrigin", () => {
     for (const peer of ["192.168.1.20", "10.0.0.5", "fe80::1", "127.0.0.2"]) {
       expect(requestOrigin(req({ "CF-Connecting-IP": "127.0.0.1" }), peer, PUBLIC)).toEqual({
         tunneled: false,
+        via: null,
         local: false,
         clientIp: peer,
       });
     }
   });
 
-  test("ohne WEB_PUBLIC_ORIGIN: nie getunnelt, IP aus der Verbindung, lokal wie bisher", () => {
+  // Seit Issue #231: eine weitergeleitete Anfrage ist auch ohne WEB_PUBLIC_ORIGIN nie
+  // lokal (etwa `tailscale serve`, eingerichtet, bevor tybo neu gestartet ist)
+  test("ohne WEB_PUBLIC_ORIGIN: nie getunnelt, IP aus der Verbindung, mit Weiterleitungs-Kopfzeile nicht lokal", () => {
     for (const origin of [null, undefined, ""]) {
       expect(requestOrigin(req({ "CF-Connecting-IP": "203.0.113.7" }), "127.0.0.1", origin)).toEqual({
         tunneled: false,
-        local: true,
+        via: null,
+        local: false,
         clientIp: "127.0.0.1",
       });
+      expect(requestOrigin(req(), "127.0.0.1", origin).local).toBe(true);
     }
   });
 
@@ -58,6 +64,7 @@ describe("requestOrigin", () => {
     for (const value of bad) {
       expect(requestOrigin(req({ "CF-Connecting-IP": value }), "127.0.0.1", PUBLIC)).toEqual({
         tunneled: true,
+        via: "cloudflare",
         local: false,
         clientIp: TUNNEL_UNKNOWN_CLIENT,
       });
@@ -72,7 +79,7 @@ describe("requestOrigin", () => {
 
   test("Besucher-IP 127.0.0.1 in der Kopfzeile macht die Anfrage nicht lokal", () => {
     const r = requestOrigin(req({ "CF-Connecting-IP": "127.0.0.1" }), "127.0.0.1", PUBLIC);
-    expect(r).toEqual({ tunneled: true, local: false, clientIp: "127.0.0.1" });
+    expect(r).toEqual({ tunneled: true, via: "cloudflare", local: false, clientIp: "127.0.0.1" });
   });
 });
 

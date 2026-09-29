@@ -53,6 +53,8 @@ export interface HttpRequest {
   timeoutMs?: number;
   /** Abbruch zusätzlich zum Zeitlimit */
   signal?: AbortSignal;
+  /** manual: Weiterleitungen nicht folgen (Issue #231: prüfen, ob Cloudflare Access davor liegt) */
+  redirect?: "manual" | "follow";
 }
 
 export type HttpFetch = (url: string, request?: HttpRequest) => Promise<Response>;
@@ -94,6 +96,11 @@ export interface SetupContext {
    * prüft „voraussetzungen“ die Anmeldung der Claude CLI nicht und sagt das.
    */
   noModelCalls?: boolean;
+  /**
+   * Einrichtung läuft im Browser (Issue #231): der Assistent belegt dann den
+   * Port der WebUI, ein Test über HTTPS träfe ihn statt tybo.
+   */
+  browserSetup?: boolean;
   /** Nur für Tests: Dateioperationen beim Schreiben der .env */
   envIo?: Partial<EnvFileIo>;
   /**
@@ -235,6 +242,7 @@ export const defaultFetch: HttpFetch = (url, request = {}) => {
     method: request.method ?? "GET",
     headers: request.headers,
     body: request.body,
+    redirect: request.redirect ?? "follow",
     signal: request.signal ? AbortSignal.any([timeout, request.signal]) : timeout,
   });
 };

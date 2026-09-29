@@ -4,11 +4,17 @@
  * Unicode-Codepoints, Standard nur dieser Rechner). WEB_* darf nur hier und
  * im Terminal gesetzt werden (Entscheidung 0011); die Schlüssel-Seite der
  * WebUI sperrt sie weiter.
+ *
+ * Mit eingeschalteter WebUI legt der Schritt auch die Push-Schlüssel an
+ * (Issue #225, ./../../web/bot-push), wenn beide fehlen; vorhandene bleiben.
  */
 
 import { DEFAULT_WEB_HOST, loadWebConfig, MIN_PASSWORD_LENGTH } from "../../web/config";
 import { fieldStates, mergeValues, type SetupField, type SetupStep, type SetupValues } from "../model";
 import { enteredChanges, envValues, invalid, writeEnv } from "./common";
+import { ensurePushKeys, PUSH_KEY_TEXT } from "../../web/bot-push";
+import type { ApplyResult } from "../model";
+import type { SetupContext } from "../context";
 
 const enabled = (v: SetupValues) => v.WEB_ENABLED === "true";
 
@@ -75,6 +81,21 @@ export const webuiStep: SetupStep = {
     const merged = mergeValues(existing, values);
     const config = loadWebConfig(merged);
     if (config.status === "invalid") return { ok: false, message: config.reason, changed: [] };
-    return writeEnv(ctx, enteredChanges(WEBUI_FIELDS, values, merged));
+    const result = await writeEnv(ctx, enteredChanges(WEBUI_FIELDS, values, merged));
+    if (!result.ok || merged.WEB_ENABLED !== "true") return result;
+    return withPushKeys(result, ctx);
   },
 };
+
+/** Push-Schlüssel wie beim Start des Bots; ein Fehler dabei macht den Schritt nicht ungültig */
+async function withPushKeys(result: ApplyResult, ctx: SetupContext): Promise<ApplyResult> {
+  const ensure = () => ensurePushKeys({ envPath: ctx.envPath, backupDir: ctx.backupDir, io: ctx.envIo, now: () => ctx.now() });
+  const push = await (ctx.writeLock ? ctx.writeLock(ensure) : ensure());
+  if (push.status !== "ok") return { ...result, message: `${result.message} ${push.reason}.` };
+  if (!push.created) return result;
+  return {
+    ...result,
+    message: result.changed.length ? `${result.message} ${PUSH_KEY_TEXT.created}.` : `${PUSH_KEY_TEXT.created}.`,
+    changed: [...result.changed, "WEB_PUSH_PUBLIC_KEY", "WEB_PUSH_PRIVATE_KEY"],
+  };
+}

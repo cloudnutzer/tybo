@@ -192,6 +192,8 @@ function setup(options: Options = {}) {
   }
 
   const fetch = async (path: string, init?: { method?: string; body?: string }) => {
+    // Anwesenheit (Issue #226) läuft nebenher und zählt hier nicht mit
+    if (path === "/api/presence") return { ok: true, status: 204, json: async () => ({}) } as any;
     const method = init?.method ?? "GET";
     const raw = init?.body ?? "";
     server.requests.push({ method, path, body: raw ? JSON.parse(raw) : undefined });

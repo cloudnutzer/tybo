@@ -1,8 +1,16 @@
 /**
- * Go Telegram Bot - Full Health Check
+ * Full Health Check
  *
  * Verifies environment variables, API connectivity,
  * launchd services, and optional integrations.
+ *
+ * Kanäle (Issue #228, Entscheidung 0021): Pflicht ist Telegram oder die
+ * WebUI, geprüft mit checkChannels (src/setup/channels.ts) wie beim Start und
+ * in der Einrichtung. Ohne Telegram, aber mit bereitem Kanal, sind Telegram,
+ * getMe und die Agenten-Tokens „übersprungen“ (kein Aufruf an
+ * api.telegram.org, auch bei übrig gebliebenen Agenten-Tokens). Halbes
+ * Telegram oder kein Kanal ist ein Fehler. verifyChannels ist mit Env und
+ * fetch testbar.
  *
  * Usage: bun run setup/verify.ts
  */
@@ -10,7 +18,9 @@
 import { existsSync, readFileSync } from "fs";
 import { userInfo } from "os";
 import { join, dirname } from "path";
+import { BRAND } from "../src/brand";
 import { loadEnv } from "../src/lib/env";
+import { checkChannels } from "../src/setup/channels";
 import { supabaseHeaders } from "../src/lib/supabase-keys";
 import { findLaunchctlLine, pm2Name, SUPABASE_SERVICE, SUPABASE_START_STATE } from "../src/lib/service-names";
 import { DB_CONTAINER, isLocalSupabaseUrl, PROJECT_LABEL } from "../src/setup/local-supabase";
@@ -38,13 +48,17 @@ const FAIL = red("\u2717");
 const WARN = yellow("~");
 const SKIP = dim("-");
 
-interface CheckResult {
+export interface CheckResult {
   name: string;
   status: "pass" | "fail" | "warn" | "skip";
   message: string;
 }
 
 const results: CheckResult[] = [];
+
+export type Recorder = (name: string, status: CheckResult["status"], message: string) => void;
+type Env = Record<string, string | undefined>;
+type FetchFn = (input: string) => Promise<Response>;
 
 function record(name: string, status: CheckResult["status"], message: string) {
   results.push({ name, status, message });
@@ -75,66 +89,66 @@ async function runCommand(
 // Checks
 // ---------------------------------------------------------------------------
 
-function checkRequiredEnv() {
+const masked = (value: string) => (value.length > 8 ? value.slice(0, 4) + "..." + value.slice(-4) : "***");
+
+function checkRequiredEnv(env: Env, rec: Recorder) {
   console.log(`\n${cyan("  [1/6] Required Environment Variables")}`);
 
-  const required: [string, string][] = [
-    ["TELEGRAM_BOT_TOKEN", "Telegram bot token"],
-    ["TELEGRAM_USER_ID", "Telegram user ID"],
-  ];
-
-  for (const [key, label] of required) {
-    const value = process.env[key];
-    if (!value || value.includes("your_") || value.includes("_here")) {
-      record(label, "fail", `${key} is not set or still has placeholder value`);
-    } else {
-      // Mask sensitive values
-      const masked = value.length > 8 ? value.slice(0, 4) + "..." + value.slice(-4) : "***";
-      record(label, "pass", `${key} = ${masked}`);
-    }
+  // Kanäle (Issue #228): Telegram oder WebUI, halbes Telegram nie
+  const channels = checkChannels(env);
+  rec("Channels", channels.ready ? "pass" : "fail", channels.message);
+  if (channels.telegram.state === "ok") {
+    rec("Telegram bot token", "pass", `TELEGRAM_BOT_TOKEN = ${masked(env.TELEGRAM_BOT_TOKEN!.trim())}`);
+    rec("Telegram user ID", "pass", `TELEGRAM_USER_ID = ${masked(env.TELEGRAM_USER_ID!.trim())}`);
+  } else if (channels.telegram.state === "halb") {
+    rec("Telegram", "fail", `${channels.telegram.reason}. Beide Werte setzen oder beide entfernen.`);
+  } else {
+    rec("Telegram", "skip", channels.ready ? `Übersprungen: nicht eingerichtet, ${BRAND.name} läuft über die WebUI` : "Nicht eingerichtet");
   }
+  if (channels.webui.state === "ok") rec("WebUI", "pass", "WEB_ENABLED=true, Passwort gesetzt");
+  else if (channels.webui.state === "aus") rec("WebUI", "skip", "Aus (WEB_ENABLED ist nicht true)");
+  else rec("WebUI", channels.ready ? "warn" : "fail", `Startet nicht: ${channels.webui.reason}`);
 
   // Database backend check (Convex or Supabase)
-  const convexUrl = process.env.CONVEX_URL;
-  const supabaseUrl = process.env.SUPABASE_URL;
+  const convexUrl = env.CONVEX_URL;
+  const supabaseUrl = env.SUPABASE_URL;
   const hasConvex = convexUrl && !convexUrl.includes("your_");
   const hasSupabase = supabaseUrl && !supabaseUrl.includes("your_");
 
   if (hasConvex) {
-    const masked = convexUrl!.length > 8 ? convexUrl!.slice(0, 4) + "..." + convexUrl!.slice(-4) : "***";
-    record("Database backend", "pass", `Convex: ${masked}`);
+    rec("Database backend", "pass", `Convex: ${masked(convexUrl!)}`);
   } else if (hasSupabase) {
-    const masked = supabaseUrl!.length > 8 ? supabaseUrl!.slice(0, 4) + "..." + supabaseUrl!.slice(-4) : "***";
-    record("Database backend", "pass", `Supabase: ${masked}`);
+    rec("Database backend", "pass", `Supabase: ${masked(supabaseUrl!)}`);
   } else {
-    record("Database backend", "fail", "No database configured (set CONVEX_URL or SUPABASE_URL in .env)");
+    rec("Database backend", "fail", "No database configured (set CONVEX_URL or SUPABASE_URL in .env)");
   }
 }
 
-async function checkTelegram() {
+async function checkTelegram(env: Env, fetchFn: FetchFn, rec: Recorder) {
   console.log(`\n${cyan("  [2/6] Telegram Connectivity")}`);
 
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!token || token.includes("your_")) {
-    record("Telegram API", "skip", "No valid token configured");
+  // Nur mit eingerichtetem Telegram (Issue #228): sonst kein Aufruf an api.telegram.org
+  if (checkChannels(env).telegram.state !== "ok") {
+    rec("Telegram API", "skip", "Übersprungen: Telegram ist nicht eingerichtet");
     return;
   }
+  const token = env.TELEGRAM_BOT_TOKEN!.trim();
 
   try {
-    const response = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+    const response = await fetchFn(`https://api.telegram.org/bot${token}/getMe`);
     const data = (await response.json()) as { ok: boolean; result?: { username: string; id: number } };
 
     if (data.ok && data.result) {
-      record(
+      rec(
         "Telegram API",
         "pass",
         `Bot: @${data.result.username} (ID: ${data.result.id})`
       );
     } else {
-      record("Telegram API", "fail", "getMe returned ok=false - check token");
+      rec("Telegram API", "fail", "getMe returned ok=false - check token");
     }
   } catch (err: any) {
-    record("Telegram API", "fail", `Connection error: ${err.message}`);
+    rec("Telegram API", "fail", `Connection error: ${err.message}`);
   }
 }
 
@@ -430,7 +444,7 @@ export async function checkPm2Services(
   }
 }
 
-async function checkAgentBots() {
+async function checkAgentBots(env: Env, fetchFn: FetchFn, rec: Recorder) {
   console.log(`\n${cyan("  [5/6] Multi-Bot Agent Identities (Optional)")}`);
 
   const agentTokens: [string, string][] = [
@@ -441,25 +455,31 @@ async function checkAgentBots() {
     ["TELEGRAM_BOT_TOKEN_CRITIC", "Critic agent bot"],
   ];
 
+  // Ohne Telegram gibt es keine Agenten-Bots (Issue #228), auch bei übrig gebliebenen Tokens: kein getMe
+  if (checkChannels(env).telegram.state !== "ok") {
+    for (const [, label] of agentTokens) rec(label, "skip", "Übersprungen: Telegram ist nicht eingerichtet");
+    return;
+  }
+
   let configured = 0;
   for (const [key, label] of agentTokens) {
-    const value = process.env[key];
+    const value = env[key];
     if (!value || value.includes("your_")) {
-      record(label, "skip", "Not configured (will use main bot)");
+      rec(label, "skip", "Not configured (will use main bot)");
       continue;
     }
 
     configured++;
     try {
-      const response = await fetch(`https://api.telegram.org/bot${value}/getMe`);
+      const response = await fetchFn(`https://api.telegram.org/bot${value}/getMe`);
       const data = (await response.json()) as { ok: boolean; result?: { username: string; id: number } };
       if (data.ok && data.result) {
-        record(label, "pass", `@${data.result.username} (ID: ${data.result.id})`);
+        rec(label, "pass", `@${data.result.username} (ID: ${data.result.id})`);
       } else {
-        record(label, "fail", `${key} token invalid — getMe returned ok=false`);
+        rec(label, "fail", `${key} token invalid — getMe returned ok=false`);
       }
     } catch (err: any) {
-      record(label, "fail", `${key} connection error: ${err.message}`);
+      rec(label, "fail", `${key} connection error: ${err.message}`);
     }
   }
 
@@ -469,6 +489,16 @@ async function checkAgentBots() {
   } else {
     console.log(dim(`        ${configured}/5 agent bots configured. Missing ones fall back to main bot.`));
   }
+}
+
+/**
+ * Kanäle, Telegram und Agenten-Bots (Issue #228) mit übergebener Umgebung,
+ * fetch und Aufzeichnung; main() ruft sie mit process.env und fetch.
+ */
+export async function verifyChannels(env: Env, fetchFn: FetchFn, rec: Recorder): Promise<void> {
+  checkRequiredEnv(env, rec);
+  await checkTelegram(env, fetchFn, rec);
+  await checkAgentBots(env, fetchFn, rec);
 }
 
 function checkOptionalIntegrations() {
@@ -496,18 +526,19 @@ function checkOptionalIntegrations() {
 
 async function main() {
   console.log("");
-  console.log(bold("  Go Telegram Bot - Health Check"));
+  console.log(bold(`  ${BRAND.name} - Health Check`));
   console.log(dim("  =============================="));
 
   // Load environment
   await loadEnv(join(PROJECT_ROOT, ".env"));
 
   // Run all checks
-  checkRequiredEnv();
-  await checkTelegram();
+  const fetchFn: FetchFn = input => fetch(input);
+  checkRequiredEnv(process.env, record);
+  await checkTelegram(process.env, fetchFn, record);
   await checkDatabase();
   await checkServices();
-  await checkAgentBots();
+  await checkAgentBots(process.env, fetchFn, record);
   checkOptionalIntegrations();
 
   // Summary

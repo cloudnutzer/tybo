@@ -800,9 +800,15 @@ describe("Budget-Frage und Karte verbunden (Issue #118)", () => {
         expect(res.status).toBe(200);
         expect((await goalsOnDisk())[KEY]).toBeUndefined();
         expect(answers(ctx)).toEqual(["Schon erledigt: Beenden im Browser"]);
-      } else {
-        expect(res.status).toBe(409);
+      } else if (res.status === 409) {
         expect((await goalsOnDisk())[KEY]).toMatchObject({ status: "active", maxTurns: 7 });
+      } else {
+        // Auf einem langsamen Rechner (CI) liest die Karte das Ziel erst, als
+        // Telegrams Weiter schon ganz durchgelaufen ist: dann stoppt sie das
+        // wieder aktive Ziel, nacheinander statt gleichzeitig
+        expect(res.status).toBe(200);
+        expect((await goalsOnDisk())[KEY]).toBeUndefined();
+        expect(answers(ctx)).toEqual(["✓ Weiter (+5)"]);
       }
       expect(edits(ctx)).toHaveLength(1);
       await clearGoal(KEY);

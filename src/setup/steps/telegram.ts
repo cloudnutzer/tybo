@@ -37,13 +37,19 @@ const TELEGRAM_NAMES = TELEGRAM_FIELDS.map(f => f.name);
 export const telegramStep: SetupStep = {
   id: "telegram",
   title: "Telegram",
-  description: `Der Bot, über den ${BRAND.name} mit dir spricht.`,
-  optional: false,
+  description: `Optional: der Bot, über den ${BRAND.name} in Telegram mit dir spricht. Ohne Telegram erreichst du ${BRAND.name} über die WebUI.`,
+  // Issue #228 (Entscheidung 0021): Pflicht ist nur ein Kanal, Telegram oder WebUI (Kanalregel in ../channels.ts)
+  optional: true,
   fields: TELEGRAM_FIELDS,
 
   async status(ctx) {
     const existing = await envValues(ctx, TELEGRAM_NAMES);
     const done = TELEGRAM_NAMES.filter(n => existing[n]).length;
+    const fields = fieldStates(TELEGRAM_FIELDS, existing);
+    // Ungültige Nutzer-ID zählt wie beim Start als halb eingerichtet (Issue #228)
+    if (done === TELEGRAM_NAMES.length && !USER_ID_PATTERN.test(existing.TELEGRAM_USER_ID)) {
+      return { state: "teilweise", detail: "Token gesetzt, aber die Nutzer-ID ist keine Zahl.", fields };
+    }
     const state = stateFromCount(done, TELEGRAM_NAMES.length);
     const detail =
       state === "erledigt"
@@ -52,8 +58,8 @@ export const telegramStep: SetupStep = {
           ? existing.TELEGRAM_BOT_TOKEN
             ? "Token gesetzt, Nutzer-ID fehlt."
             : "Nutzer-ID gesetzt, Token fehlt."
-          : "Noch kein Telegram-Bot eingerichtet.";
-    return { state, detail, fields: fieldStates(TELEGRAM_FIELDS, existing) };
+          : `Noch kein Telegram-Bot eingerichtet. Ohne Telegram erreichst du ${BRAND.name} über die WebUI.`;
+    return { state, detail, fields };
   },
 
   async test(values, ctx) {

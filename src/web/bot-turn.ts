@@ -20,6 +20,7 @@ import {
 import { acceptedCreatedAt, sessionKeyFor } from "../lib/convex";
 import { currentExecution, isAbortError, isRestartPendingError, RESTART_PENDING_REPLY, runCancelable, runExecution } from "../lib/execution-context";
 import { createQueueNotifier } from "../lib/queue-notice";
+import { WEB_DM_CHAT_ID } from "../lib/channels";
 import { chunkForTelegram } from "../lib/telegram";
 import type { TurnTools } from "../lib/turn-tools";
 import { decideChoice } from "../lib/choices";
@@ -460,13 +461,23 @@ export const MIRROR_FAILED_TEXT =
   "Die Nachricht konnte nicht nach Telegram gesendet werden. Nichts wurde verarbeitet, bitte noch einmal versuchen.";
 export const TELEGRAM_UNAVAILABLE_TEXT = "Dieses Telegram-Gespräch ist gerade nicht erreichbar (Chat-ID fehlt).";
 
-const TELEGRAM_USER_ID_PATTERN = /^\d{1,20}$/;
+/** Direktchat: Telegram-Nutzer-ID oder, ohne Telegram, "web" (WEB_DM_CHAT_ID, Issue #227) */
+const TELEGRAM_USER_ID_PATTERN = /^(\d{1,20}|web)$/;
+
+/**
+ * Ohne Telegram ist der Direktchat ein Web-Gespräch unter der Chat-ID "web"
+ * (Issue #227): nichts spiegeln, keine Antwort vom Agenten-Bot, keine
+ * Tippt-Anzeige. Alle Telegram-Aufrufe dieser Datei fragen hier.
+ */
+export function mirrorsToTelegram(chatId: string): boolean {
+  return chatId !== WEB_DM_CHAT_ID;
+}
 const TELEGRAM_GROUP_ID_PATTERN = /^-\d{1,20}$/;
 /** Forum-Thema General: in der Bot-API ohne Thread-ID, Session group:<chatId> */
 const GENERAL_TOPIC = 1;
 
 export interface TelegramChatDeps extends BotChatDeps {
-  /** TELEGRAM_USER_ID, Chat des Direktchats */
+  /** Chat des Direktchats: TELEGRAM_USER_ID, ohne Telegram "web" (dmChatId, Issue #227) */
   userId?: string;
   /** Chat-ID der Forum-Gruppe (wie in bot-telegram.ts); null: keine */
   groupId(): string | null;
@@ -585,6 +596,7 @@ export async function runWebInvocations(
       await executeInvocation(turn.sourceAgent, invocation, {
         typing: async target => {
           await output.notice(`${agentLabel(target)} denkt nach …`);
+          if (!mirrorsToTelegram(chatId)) return;
           try {
             await deps.sendTypingAsAgent?.(target, chatId, topicId);
           } catch {
@@ -628,7 +640,7 @@ export async function runWebInvocations(
           });
           await output.answer(text, replyInfo, messageId);
           const visible = stripControlTags(text);
-          if (visible.trim()) {
+          if (visible.trim() && mirrorsToTelegram(chatId)) {
             try {
               await deps.sendAsAgent(target, chatId, visible, topicId);
             } catch (e) {
@@ -828,6 +840,8 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
       return { text: TELEGRAM_UNAVAILABLE_TEXT, failed: true };
     }
     const { chatId, topicId, sessionKey, agent } = target;
+    // Web-Direktchat ohne Telegram (Issue #227): kein Spiegeln, keine Antwort in Telegram
+    const mirror = mirrorsToTelegram(chatId);
     const entry: OpenTurn = { sessionKey, committed: false };
     open.set(conversationId, entry);
     // Die Frage selbst kommt über sendChoice in den Verlauf, hier nur der Status
@@ -847,7 +861,9 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
         // etwas nach Telegram geht; scheitert das, bleibt Telegram unberührt
         const files: { attachment: MessageAttachment; bytes: Uint8Array }[] = [];
         if (attachments.length) {
-          if (!deps.uploads || !deps.sendFile) return { text: ATTACHMENTS_UNAVAILABLE_TEXT, failed: true };
+          if (!deps.uploads || (mirror && !deps.sendFile)) {
+            return { text: mirror ? ATTACHMENTS_UNAVAILABLE_TEXT : WEB_ATTACHMENTS_UNAVAILABLE_TEXT, failed: true };
+          }
           const mediaDeps: Partial<MediaDeps> = {
             ...deps.media,
             uploadsDir: webMediaDir(deps.media?.uploadsDir),
@@ -875,17 +891,22 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
             }
           } catch (e) {
             if (wasAborted()) return aborted();
-            if (e instanceof MediaRejectedError) return { text: `Anhang abgelehnt: ${e.reason} Nichts wurde nach Telegram gesendet.`, failed: true };
+            if (e instanceof MediaRejectedError) {
+              return { text: `Anhang abgelehnt: ${e.reason}${mirror ? " Nichts wurde nach Telegram gesendet." : ""}`, failed: true };
+            }
             log(`Anhang in ${conversationId} nicht verarbeitet (${errorName(e)})`);
-            return { text: ATTACHMENT_FAILED_TEXT, failed: true };
+            return { text: mirror ? ATTACHMENT_FAILED_TEXT : WEB_ATTACHMENT_FAILED_TEXT, failed: true };
           }
           if (wasAborted()) return aborted();
         }
 
-        // Anhänge zuerst (der erste trägt den Text, wenn er passt), dann Text in Teilen
-        const plan = files.length
-          ? attachmentMirrorPlan(text, source, files.map(f => f.attachment))
-          : { files: [], textChunks: mirrorChunks(text, source) };
+        // Anhänge zuerst (der erste trägt den Text, wenn er passt), dann Text in Teilen;
+        // ohne Telegram gibt es nichts zu spiegeln
+        const plan: MirrorPlan = !mirror
+          ? { files: [], textChunks: [] }
+          : files.length
+            ? attachmentMirrorPlan(text, source, files.map(f => f.attachment))
+            : { files: [], textChunks: mirrorChunks(text, source) };
         let sentParts = 0;
         try {
           // Zwischen den Teilen prüfen: nach angenommenem Stopp geht kein weiterer Teil raus
@@ -992,7 +1013,7 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
         );
         // Telegram bekommt die Antwort ohne Steuer-Tags; [INVOKE:] läuft danach (followUp)
         const visible = stripControlTags(response);
-        if (visible.trim()) {
+        if (visible.trim() && mirror) {
           try {
             await deps.sendAsAgent(agent, chatId, visible, topicId);
           } catch (e) {

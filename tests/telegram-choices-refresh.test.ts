@@ -322,8 +322,11 @@ describe("Ablauf", () => {
     const source = readFileSync(join(import.meta.dir, "..", "src", "bot.ts"), "utf8");
     const sweep = source.indexOf("const sweepChoices = () => telegramChoices.sweep()");
     expect(sweep).toBeGreaterThan(-1);
-    const block = source.slice(sweep, source.indexOf("bot.start({", sweep));
-    expect(block).toContain("void sweepChoices();");
+    const start = source.indexOf("void startAfterFirstSweep(telegramRuntime, firstSweep, resumeGoalsOnStart);", sweep);
+    expect(start).toBeGreaterThan(sweep);
+    const block = source.slice(sweep, start);
+    // Erste Prüfung sofort; der Start wartet sie ab (Issue #228)
+    expect(block).toContain("const firstSweep = sweepChoices();");
     expect(block).toMatch(/setInterval\(\(\) => \{ void sweepChoices\(\); \}, 60_000\)\.unref\(\);/);
   });
 });

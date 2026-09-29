@@ -86,7 +86,7 @@ describe("Laden", () => {
     const full: Settings = {
       engine: {
         default: "codex",
-        topics: { "topic:-1001:7": "claude", "group:-1001": "codex", "dm:42": "codex", "web:0b3c6a2e-1f00-4c1a-9d0e-2a4b6c8d0e1f": "claude" },
+        topics: { "topic:-1001:7": "claude", "group:-1001": "codex", "dm:42": "codex", "dm:web": "claude", "web:0b3c6a2e-1f00-4c1a-9d0e-2a4b6c8d0e1f": "claude" },
         codex: { model: "gpt-5.6-sol", effort: "max", sandbox: "workspace-write" },
       },
     };
@@ -105,6 +105,7 @@ describe("Laden", () => {
       { engine: { topics: { "topic:-1001:7": "gemini" } } },
       { engine: { topics: { "irgendwas": "codex" } } },
       { engine: { topics: { "topic:1:2:../x": "codex" } } },
+      { engine: { topics: { "dm:webx": "codex" } } },
       { engine: { codex: { effort: "ultra" } } },
       { engine: { codex: { model: "" } } },
       { engine: { codex: { model: "-c evil" } } },

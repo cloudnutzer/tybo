@@ -16,7 +16,7 @@ import { readFile, writeFile, readdir } from "fs/promises";
 import { join } from "path";
 import { loadEnv } from "./lib/env";
 import { runClaudeWithTimeout } from "./lib/claude";
-import { sendViaOutbox, type OutboxSender } from "./lib/outbox";
+import { outboxDelivered, sendViaOutbox, type OutboxSender } from "./lib/outbox";
 import { truncateBeforeSanitize } from "./lib/telegram";
 import { supabaseHeaders } from "./lib/supabase-keys";
 
@@ -325,7 +325,7 @@ export interface DeliveryDeps {
   now(): Date;
 }
 
-/** Senden und festhalten (Entscheidung 0006): Direktchat, Quelle checkin */
+/** Senden und festhalten (Entscheidung 0006): Direktchat, Quelle checkin; ohne Telegram nur in der WebUI (Issue #227) */
 export const defaultSend: OutboxSender = sendViaOutbox;
 
 export function defaultDeliveryDeps(): DeliveryDeps {
@@ -345,7 +345,8 @@ export async function deliverCheckin(
   if (action === "text" && message && message.toLowerCase() !== "none") {
     console.log(`📤 Sending: ${message.substring(0, 80)}...`);
 
-    const { sent } = await deps.send({ text: message, source: "checkin", buttons: CHECKIN_BUTTONS });
+    // Ohne Telegram (Issue #227) nur für die WebUI festgehalten, die Knöpfe fallen dort weg
+    const sent = outboxDelivered(await deps.send({ text: message, source: "checkin", buttons: CHECKIN_BUTTONS }));
 
     if (sent) {
       state.lastCheckinTime = deps.now().toISOString();
@@ -362,7 +363,7 @@ export async function deliverCheckin(
     // nur die Telegram-Ausgabe (Issue #52)
     const askMessage = `📞 I'd like to call you about:\n\n${truncateBeforeSanitize(message, 500)}`;
 
-    const { sent } = await deps.send({ text: askMessage, source: "checkin", format: "plain", buttons: CALL_BUTTONS });
+    const sent = outboxDelivered(await deps.send({ text: askMessage, source: "checkin", format: "plain", buttons: CALL_BUTTONS }));
 
     // Issue #46: Zustand nur nach erfolgreichem Versand speichern (vorher immer)
     if (sent) {

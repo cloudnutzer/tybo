@@ -10,10 +10,11 @@
  * Startet einen eigenen Web-Server mit Attrappe auf einem freien Port in
  * einem temporären Verzeichnis. Importiert src/bot.ts nicht.
  *
- * Seit Issue #29 legt „Neues Gespräch" ein Telegram-Topic an; der eigene
- * Server hat keine Topic-Verwaltung und lehnt das mit einer Meldung ab.
- * Ältere Web-Gespräche für die Prüfungen legt das Skript direkt im
- * Gesprächsspeicher an (plainStore).
+ * Seit Issue #29 legt „Neues Gespräch" ein Telegram-Topic an, ohne
+ * Forum-Gruppe seit Issue #227 ein reines Web-Gespräch; der eigene Server hat
+ * keine Gruppe. Weitere Web-Gespräche legt das Skript direkt im
+ * Gesprächsspeicher an (plainStore). Den Betrieb ganz ohne Telegram prüft
+ * scripts/web-ohne-telegram-check.ts.
  *
  * Chrome spricht über einen kleinen TCP-Proxy auf [::1] mit demselben Port
  * (der Host-Header muss den Port des Servers tragen). Der Proxy kann alle
@@ -26,6 +27,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BRAND } from "../src/brand";
 import { createFakeChat } from "../src/web/fake-chat";
+import { DEFAULT_PUSH_SUBJECT, generateVapidKeys, toBase64Url } from "../src/web/push";
 import { createDemoKeys, createDemoSettings, createDemoStatus, DEMO_CHOICES, DEMO_GROUP_ID, DEMO_REPLY, startDemoServer } from "../src/web/demo";
 import { decideChoice, getChoiceChecked, listChoices, onChoiceChange, onChoiceDecided, setChoicesFileForTests } from "../src/lib/choices";
 import { abortExecutions } from "../src/lib/execution-context";
@@ -276,17 +278,16 @@ async function manageChecks(cookie: string) {
   check("Auswahl: Pfeil runter markiert Research",
     await waitFor(`document.activeElement?.dataset.agentOption === "research" && document.activeElement.getAttribute("aria-selected") === "true"`));
   await pressKey("Enter", "Enter", 13, "\r");
-  // Seit Issue #29 wäre das ein Telegram-Topic; dieser Server hat keine Topic-Verwaltung.
-  // Seit Issue #30 zeigt die Oberfläche die Meldung des Servers
-  check("Enter mit Research: ohne Topic-Verwaltung Meldung des Servers, kein Web-Gespräch",
-    (await waitFor(`[...document.querySelectorAll(".msg-error")].some(m => m.textContent.includes("Topics verwalten ist nicht eingerichtet"))`)) &&
-    (await serverConversations(cookie)).length === before.length);
-  // Älteres Web-Gespräch mit Research, direkt im Speicher angelegt
-  const created = await plainStore.createConversation("research");
+  // Ohne Forum-Gruppe seit Issue #227 (Nachtrag zu 0005): reines Web-Gespräch mit dem gewählten Agenten
+  check("Enter mit Research: ohne Forum-Gruppe neues Web-Gespräch geöffnet",
+    await waitFor(`document.getElementById("agent-name").textContent === "Research" && !${shown("agent-picker")}`));
+  const afterCreate = await serverConversations(cookie);
+  const created = afterCreate.find(c => !before.some(b => b.id === c.id))!;
+  check("Server: genau ein neues Web-Gespräch mit Research", afterCreate.length === before.length + 1 && created?.agent === "research");
   await goto(`${base}/`);
   await waitFor(`document.querySelector('.conversation[data-id="${created.id}"]')`);
   await clickEntry(created.id);
-  check("älteres Web-Gespräch mit Research geöffnet",
+  check("Web-Gespräch mit Research wieder geöffnet",
     await waitFor(`document.getElementById("agent-name").textContent === "Research" && !${shown("agent-picker")}`));
   check("Server: Gespräch mit Agent research", (await serverConversations(cookie)).some(c => c.id === created.id && c.agent === "research" && c.title === "Neues Gespräch"));
   check("Seitenleiste: Eintrag mit Research-Punkt oben",
@@ -1746,9 +1747,9 @@ async function settingsChecks() {
               (await js<string>(`document.getElementById("sidebar").dataset.open`)) === "false" &&
               (await js<boolean>(`(() => { const r = document.getElementById("settings").getBoundingClientRect(); return r.left === 0 && Math.round(r.width) === ${size.width}; })()`)));
           }
-          check(`${label}: Reiter Agenten gewählt, Modelle, Schlüssel und Status frei (Issue #39, #63)`,
+          check(`${label}: Reiter Agenten gewählt, Modelle, Schlüssel, Status und Benachrichtigungen frei (Issue #39, #63, #225)`,
             JSON.stringify(await js<string[]>(`[...document.querySelectorAll("#settings-tabs [role=tab]")].map(t => t.textContent + ":" + t.getAttribute("aria-selected") + ":" + t.disabled)`)) ===
-              JSON.stringify(["Agenten:true:false", "Modelle:false:false", "Schlüssel:false:false", "Status:false:false"]));
+              JSON.stringify(["Agenten:true:false", "Modelle:false:false", "Schlüssel:false:false", "Status:false:false", "Benachrichtigungen:false:false"]));
           check(`${label}: acht Agenten mit Farbpunkt`,
             (await count(".settings-agent-head .agent-dot")) === 8 &&
               (await js<string>(`getComputedStyle(document.querySelector('.settings-agent-name[data-agent="research"] .agent-dot')).backgroundColor`)) !==
@@ -2605,9 +2606,11 @@ async function keysChecks() {
           await waitFor(`!!document.getElementById("open-settings")`);
           await goto(`${url}#/einstellungen/schluessel`);
           await waitFor(`document.querySelectorAll("li[data-key]").length > 10`);
-          check(`${label}: vier Reiter nebeneinander, Schlüssel gewählt`,
-            JSON.stringify(await js<string[]>(`[...document.querySelectorAll(".settings-tab")].map(t => t.textContent)`)) === JSON.stringify(["Agenten", "Modelle", "Schlüssel", "Status"]) &&
-              (await js<boolean>(`(() => { const t = [...document.querySelectorAll(".settings-tab")].map(t => t.getBoundingClientRect().top); return t.every(x => Math.abs(x - t[0]) < 1); })()`)) &&
+          // Fünf Reiter (Issue #225): breit in einer Zeile, am Handy drei je Zeile, keiner ragt über den Rand
+          check(`${label}: fünf Reiter (${size.mobile ? "zwei Zeilen" : "eine Zeile"}), Schlüssel gewählt`,
+            JSON.stringify(await js<string[]>(`[...document.querySelectorAll(".settings-tab")].map(t => t.textContent)`)) === JSON.stringify(["Agenten", "Modelle", "Schlüssel", "Status", "Benachrichtigungen"]) &&
+              (await js<number>(`new Set([...document.querySelectorAll(".settings-tab")].map(t => Math.round(t.getBoundingClientRect().top))).size`)) === (size.mobile ? 2 : 1) &&
+              (await js<boolean>(`[...document.querySelectorAll(".settings-tab")].every(t => t.scrollWidth <= t.clientWidth + 1 && t.getBoundingClientRect().right <= innerWidth)`)) &&
               (await js<string>(`document.querySelector(".settings-tab[aria-selected=true]").textContent`)) === "Schlüssel");
           check(`${label}: Gruppen, gesetzt ••••c3d4, gesperrte ohne Knöpfe, kein seitliches Scrollen`,
             (await js<string>(`document.querySelector("#settings-panel h3").textContent`)) === "LLM-Anbieter" &&
@@ -3476,6 +3479,615 @@ async function screenshots() {
   await cdp("Emulation.setEmulatedMedia", { features: [] });
 }
 
+
+/**
+ * Attrappe von Cloudflare Access vor einer echten WebUI (Issue #224) auf
+ * 127.0.0.1:port: Ohne Cookie CF_Authorization leitet sie jede Anfrage auf
+ * /cdn-cgi/access/login um. Das Formular dort setzt das Cookie (ein mit einem
+ * Test-Schlüssel signierter Access-Nachweis) und leitet zurück. Mit Cookie
+ * reicht sie die Anfrage wie cloudflared weiter (Host und Origin der
+ * öffentlichen Adresse, CF-Connecting-IP, cf-access-jwt-assertion) an einen
+ * WebUI-Server mit Passwort und Access-Prüfung. Secure fällt aus Set-Cookie
+ * heraus, weil der Browser hier http spricht.
+ */
+async function startAccessGate(port: number) {
+  const PUBLIC = "https://app.tybo.ai";
+  const team = "browsercheck";
+  const aud = "c".repeat(64);
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const jwk = { ...publicKey.export({ format: "jwk" }), kid: "browsercheck" };
+  const part = (v: unknown) => Buffer.from(JSON.stringify(v)).toString("base64url");
+  const s = Math.floor(Date.now() / 1000);
+  const data = `${part({ alg: "RS256", kid: "browsercheck" })}.${part({ aud: [aud], iss: accessIssuer(team), exp: s + 3600, nbf: s, iat: s })}`;
+  const jwt = `${data}.${sign("RSA-SHA256", Buffer.from(data), privateKey).toString("base64url")}`;
+  const tmp = await mkdtemp(join(tmpdir(), "tybo-web-access-"));
+  const store = new ConversationStore({ dir: join(tmp, "web") });
+  await store.load();
+  await store.createConversation("general");
+  const server = await createWebServer(
+    { host: "127.0.0.1", port: 0, password: PASSWORD, allowedHosts: [], publicOrigin: PUBLIC, access: { team, aud } },
+    {
+      sessionFile: join(tmp, "sessions.json"),
+      conversationStore: store,
+      chat: createFakeChat({ delayMs: 300, stepMs: 100 }),
+      accessCerts: async () => ({ keys: [jwk] }),
+      log: () => {},
+    }
+  );
+  const counts = { granted: 0, tunneled: 0, denied: 0 };
+  const cookieValue = (req: Request, name: string) => {
+    for (const piece of (req.headers.get("cookie") ?? "").split(";")) {
+      const i = piece.indexOf("=");
+      if (i > 0 && piece.slice(0, i).trim() === name) return piece.slice(i + 1).trim();
+    }
+    return null;
+  };
+  const gate = Bun.serve({
+    hostname: "127.0.0.1",
+    port,
+    idleTimeout: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      const back = url.searchParams.get("redirect_url") ?? "/";
+      const safeBack = back.startsWith("/") && !back.startsWith("//") ? back : "/";
+      if (url.pathname === "/cdn-cgi/access/login") {
+        return new Response(
+          `<!doctype html><title>Access</title><form id="access-login" method="get" action="/cdn-cgi/access/callback">` +
+            `<input type="hidden" name="redirect_url" value="${safeBack.replace(/[&"<>]/g, "")}"><button>Code bestätigen</button></form>`,
+          { headers: { "Content-Type": "text/html; charset=utf-8" } }
+        );
+      }
+      if (url.pathname === "/cdn-cgi/access/callback") {
+        counts.granted++;
+        return new Response(null, {
+          status: 302,
+          headers: { Location: safeBack, "Set-Cookie": `CF_Authorization=${jwt}; Path=/; HttpOnly; SameSite=Lax` },
+        });
+      }
+      if (cookieValue(req, "CF_Authorization") !== jwt) {
+        return new Response(null, {
+          status: 302,
+          headers: { Location: `/cdn-cgi/access/login?redirect_url=${encodeURIComponent(url.pathname + url.search)}` },
+        });
+      }
+      const headers = new Headers(req.headers);
+      headers.set("host", "app.tybo.ai");
+      if (headers.has("origin")) headers.set("origin", PUBLIC);
+      headers.set("cf-connecting-ip", "203.0.113.7");
+      headers.set("cf-access-jwt-assertion", jwt);
+      const body = req.method === "GET" || req.method === "HEAD" ? undefined : await req.arrayBuffer();
+      const res = await fetch(`${server.url}${url.pathname}${url.search}`, { method: req.method, headers, body, redirect: "manual" });
+      counts.tunneled++;
+      if (res.status === 403) counts.denied++;
+      const out = new Headers(res.headers);
+      const cookie = out.get("set-cookie");
+      if (cookie) out.set("set-cookie", cookie.replace(/;\s*Secure/i, ""));
+      const location = out.get("location");
+      if (location?.startsWith(PUBLIC)) out.set("location", location.slice(PUBLIC.length) || "/");
+      return new Response(res.body, { status: res.status, headers: out });
+    },
+  });
+  return {
+    granted: () => counts.granted,
+    tunneled: () => counts.tunneled,
+    denied: () => counts.denied,
+    async stop() {
+      gate.stop(true);
+      await server.stop();
+      await rm(tmp, { recursive: true, force: true });
+    },
+  };
+}
+
+/**
+ * Installierbare Web-App (Issue #224) über http://127.0.0.1 (sicherer
+ * Kontext wie localhost): Manifest ohne Fehler, Chrome meldet die Seite als
+ * installierbar, der Service Worker ist aktiv und hat nur die Offline-Dateien
+ * im Cache. Danach „tybo nicht erreichbar": Server aus (Netzfehler) und eine
+ * Attrappe auf demselben Port, die mit 502/503/504/520 bis 530 antwortet
+ * (Cloudflare-Tunnel weg), zeigen offline.html mit Gestaltung und gespeicherter
+ * Hell/Dunkel-Wahl; „Erneut versuchen" holt die WebUI zurück, sobald der Server
+ * wieder läuft. Abgelaufenes Access (startAccessGate): die Weiterleitung kommt
+ * unverändert an, nach der Anmeldung bei Access führt der Weg durch das
+ * WebUI-Login zurück in den Chat, alles unter dem aktiven Worker. Screenshots (mit --screenshots)
+ * von Login, Chat und Offline-Seite je 390/1280, hell und dunkel.
+ */
+async function installChecks() {
+  const out = join(import.meta.dir, "..", "docs", "webui", "screenshots");
+  const shots = process.argv.includes("--screenshots");
+  async function shoot(name: string) {
+    if (!shots) return;
+    await Bun.sleep(300);
+    const { data } = await cdp("Page.captureScreenshot", { format: "png" });
+    await Bun.write(join(out, `${name}.png`), Buffer.from(data, "base64"));
+    console.log(`Bild ${name}.png`);
+  }
+  const start = (port: number) =>
+    startDemoServer(
+      { host: "127.0.0.1", port, password: PASSWORD, allowedHosts: [] },
+      { chat: createFakeChat({ delayMs: 300, stepMs: 100 }), telegramChat: createFakeChat({ delayMs: 300, stepMs: 100 }), log: () => {} }
+    );
+  /** Attrappe auf demselben Port: Navigationen bekommen einen Status wie von Cloudflare */
+  const stub = (port: number, respond: (path: string) => Response) =>
+    Bun.serve({ hostname: "127.0.0.1", port, fetch: req => respond(new URL(req.url).pathname) });
+  const offlineShown = () => waitFor(`document.querySelector("body.offline") && document.getElementById("retry")`, 8000);
+  const sizes = [{ width: 1280, height: 800, mobile: false }, { width: 390, height: 844, mobile: true }];
+
+  let current = await start(0);
+  const port = Number(new URL(current.server.url).port);
+  const origin = `http://127.0.0.1:${port}`;
+  try {
+    await cdp("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, mobile: true, deviceScaleFactor: 2 });
+    await goto(`${origin}/`);
+    await waitFor(`document.querySelectorAll(".msg").length > 0`);
+    check("Web-App: sicherer Kontext über 127.0.0.1", await js<boolean>(`window.isSecureContext`));
+    let active = false;
+    for (let i = 0; i < 100 && !active; i++) {
+      active = await js<boolean>(`navigator.serviceWorker.getRegistration().then(r => !!(r && r.active && r.active.state === "activated" && r.scope === location.origin + "/"))`);
+      if (!active) await Bun.sleep(100);
+    }
+    check("Web-App: Service Worker aktiv, Scope /", active);
+    const script = await js<string>(`navigator.serviceWorker.getRegistration().then(r => r.active.scriptURL)`);
+    check("Web-App: Worker ist /sw.js", script === `${origin}/sw.js`, script);
+    const manifest = await cdp("Page.getAppManifest");
+    check("Web-App: Manifest ohne Fehler", manifest.url === `${origin}/manifest.webmanifest` && (manifest.errors ?? []).length === 0,
+      JSON.stringify(manifest.errors ?? []));
+    const parsed = JSON.parse(manifest.data || "{}");
+    check("Web-App: Manifest-Name aus BRAND, standalone", parsed.name === BRAND.name && parsed.short_name === BRAND.name && parsed.display === "standalone");
+    let installErrors: any[] = ["nicht geprüft"];
+    for (let i = 0; i < 20; i++) {
+      installErrors = (await cdp("Page.getInstallabilityErrors")).installabilityErrors ?? [];
+      if (!installErrors.length) break;
+      await Bun.sleep(250);
+    }
+    check("Web-App: Chrome meldet die Seite als installierbar", installErrors.length === 0, JSON.stringify(installErrors));
+    const cached = await js<{ names: string[]; urls: string[] }>(`caches.keys().then(async names => ({ names, urls: (await Promise.all(names.map(n => caches.open(n).then(c => c.keys())))).flat().map(r => new URL(r.url).pathname).sort() }))`);
+    const version = await js<string>(`document.getElementById("ui-version").content`);
+    check("Web-App: ein Cache mit der Oberflächen-Version, nur Offline-Dateien",
+      JSON.stringify(cached.names) === JSON.stringify([`${BRAND.cli}-offline-${version}`])
+        && JSON.stringify(cached.urls) === JSON.stringify(["/favicon.svg", "/offline.html", "/offline.js", "/style.css", "/theme.js"]),
+      JSON.stringify(cached));
+
+    // --- Chat-Screenshots (installierbare Seite) -----------------------------
+    for (const scheme of ["light", "dark"] as const) {
+      await emulateScheme(scheme);
+      for (const size of sizes) {
+        await cdp("Emulation.setDeviceMetricsOverride", { ...size, deviceScaleFactor: 2 });
+        await goto(`${origin}/`);
+        await waitFor(`document.querySelectorAll(".msg").length > 0`);
+        await shoot(`web-app-chat-${size.width}${scheme === "dark" ? "-dunkel" : ""}`);
+      }
+    }
+
+    // --- Server aus: Netzfehler ---------------------------------------------
+    await current.stop();
+    for (const scheme of ["light", "dark"] as const) {
+      await emulateScheme(scheme);
+      for (const size of sizes) {
+        const label = `Offline ${size.width} px ${scheme === "dark" ? "dunkel" : "hell"}`;
+        await cdp("Emulation.setDeviceMetricsOverride", { ...size, deviceScaleFactor: 2 });
+        await goto(`${origin}/`);
+        const shown = await offlineShown();
+        check(`${label}: Netzfehler zeigt „nicht erreichbar"`, shown && (await js<string>(`document.querySelector("h1").textContent`)) === `${BRAND.name} nicht erreichbar`);
+        check(`${label}: Gestaltung aus dem Cache`, (await bodyBg()) === (scheme === "dark" ? DARK_BG : LIGHT_BG)
+          && (await js<string>(`getComputedStyle(document.getElementById("retry")).borderRadius`)) !== "0px", await bodyBg());
+        check(`${label}: kein waagrechtes Scrollen`, await js<boolean>(`document.documentElement.scrollWidth <= ${size.width}`));
+        await shoot(`web-app-offline-${size.width}${scheme === "dark" ? "-dunkel" : ""}`);
+      }
+    }
+    // Gespeicherte Wahl gilt auch offline (theme.js aus dem Cache)
+    await emulateScheme("light");
+    await js(`localStorage.setItem("tybo-theme", "dark")`);
+    await goto(`${origin}/`);
+    await offlineShown();
+    check("Offline: gespeicherte Wahl Dunkel bei hellem System", (await bodyBg()) === DARK_BG && (await themeAttr()) === "dark");
+    await js(`localStorage.removeItem("tybo-theme")`);
+
+    // --- Tunnel weg: Status wie von Cloudflare -------------------------------
+    const statuses = [502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527, 528, 529, 530];
+    const wrong: number[] = [];
+    for (const status of statuses) {
+      const fake = stub(port, () => new Response(`error code: ${status === 530 ? 1033 : status}`, { status }));
+      try {
+        await goto(`${origin}/`);
+        if (!(await offlineShown())) wrong.push(status);
+      } finally {
+        fake.stop(true);
+      }
+    }
+    check(`Offline: Status ${statuses[0]} bis ${statuses.at(-1)} zeigen die Offline-Seite`, wrong.length === 0, wrong.join(", "));
+    const other = stub(port, () => new Response("Interner Fehler", { status: 500 }));
+    try {
+      await goto(`${origin}/`);
+      await Bun.sleep(300);
+      check("Offline: 500 geht unverändert durch", !(await js<boolean>(`!!document.querySelector("body.offline")`)) && (await js<string>(`document.body.textContent`)).includes("Interner Fehler"));
+    } finally {
+      other.stop(true);
+    }
+
+    // --- Access abgelaufen: Anmeldung bei Access, dann WebUI-Login -------------
+    const access = await startAccessGate(port);
+    try {
+      await goto(`${origin}/`);
+      const landed = await waitFor(`location.pathname === "/cdn-cgi/access/login" && document.getElementById("access-login")`);
+      check("Access: Weiterleitung kommt unverändert beim Browser an", landed, await js<string>(`location.href`));
+      check("Access: die Anmeldeseite läuft unter dem aktiven Worker",
+        await js<boolean>(`!!navigator.serviceWorker.controller && navigator.serviceWorker.controller.scriptURL === location.origin + "/sw.js"`));
+      await js(`document.getElementById("access-login").requestSubmit()`);
+      const toLogin = await waitFor(`location.pathname === "/login" && document.getElementById("login-form")`, 10000);
+      check("Access: nach der Anmeldung zurück zur WebUI, dort das WebUI-Login", toLogin && access.granted() === 1, await js<string>(`location.href`));
+      check("Access: WebUI-Login unter dem aktiven Worker, nicht die Offline-Seite",
+        !!(await js<boolean>(`!!navigator.serviceWorker.controller && !document.querySelector("body.offline")`)));
+      await js(`document.getElementById("password").value = ${JSON.stringify(PASSWORD)}`);
+      await js(`document.getElementById("login-form").requestSubmit()`);
+      const chat = await waitFor(`location.pathname === "/" && document.getElementById("chat-log") && document.getElementById("input") && !document.querySelector("body.offline")`, 10000);
+      check("Access: nach dem WebUI-Login ist der Chat da", chat, await js<string>(`location.href`));
+      check("Access: Chat mit Access-Nachweis über den Tunnel geladen", access.tunneled() > 0 && access.denied() === 0,
+        JSON.stringify({ tunneled: access.tunneled(), denied: access.denied() }));
+      check("Access: Chat läuft weiter unter dem aktiven Worker", await js<boolean>(`!!navigator.serviceWorker.controller`));
+    } finally {
+      await access.stop();
+    }
+
+    // --- Erneut versuchen / erneute Anmeldung: Server wieder da --------------
+    await goto(`${origin}/`);
+    await offlineShown();
+    current = await start(port);
+    await Bun.sleep(200);
+    await js(`document.getElementById("retry").click()`);
+    const back = await waitFor(`location.pathname === "/" && document.getElementById("chat-log") && document.querySelectorAll(".msg").length > 0`, 10000);
+    check("Offline: „Erneut versuchen\" holt die WebUI zurück", back);
+  } finally {
+    await current.stop().catch(() => {});
+    await cdp("Emulation.setEmulatedMedia", { features: [] });
+  }
+
+  // --- Login-Screenshots (Server mit Passwort, [::1]) ----------------------
+  if (shots) {
+    // Angemeldet leitet /login auf / um: Cookies kurz beiseite, danach zurück
+    const { cookies } = await cdp("Network.getAllCookies");
+    await cdp("Network.clearBrowserCookies");
+    for (const scheme of ["light", "dark"] as const) {
+      await emulateScheme(scheme);
+      for (const size of sizes) {
+        await cdp("Emulation.setDeviceMetricsOverride", { ...size, deviceScaleFactor: 2 });
+        await goto(`${base}/login`);
+        await waitFor(`document.getElementById("login-form")`);
+        await shoot(`web-app-login-${size.width}${scheme === "dark" ? "-dunkel" : ""}`);
+      }
+    }
+    await cdp("Network.setCookies", { cookies });
+    await cdp("Emulation.setEmulatedMedia", { features: [] });
+  }
+}
+
+/**
+ * Benachrichtigungen (Issue #225) über http://127.0.0.1 (sicherer Kontext)
+ * gegen eine Demo mit Push-Schlüsseln und einer fetch-Attrappe statt der
+ * Push-Dienste. Notification, PushManager und das Abo des Browsers sind
+ * Attrappen (pushMock), gesetzt vor jedem Laden und danach wieder entfernt.
+ * Geprüft: Laden fragt keine Berechtigung, „An" fragt genau einmal und
+ * abonniert mit dem öffentlichen Schlüssel des Servers, „Test senden" geht
+ * mit vapid-Kopfzeile und aes128gcm an den Endpunkt, Umbenennen, andere
+ * Geräte entfernen, „Aus" meldet beim Browser und beim Server ab, ein
+ * anderswo entferntes Gerät wird beim nächsten Laden nicht wieder aktiv.
+ * Erklärungen statt Schalter: Server ohne Schlüssel, kein sicherer Kontext,
+ * iPhone im Browser, Browser ohne Push, Berechtigung blockiert. Screenshots
+ * (mit --screenshots) aller Zustände je 390/1280, hell und dunkel.
+ */
+async function pushChecks() {
+  const out = join(import.meta.dir, "..", "docs", "webui", "screenshots");
+  const shots = process.argv.includes("--screenshots");
+  async function shoot(name: string) {
+    if (!shots) return;
+    await Bun.sleep(300);
+    const { data } = await cdp("Page.captureScreenshot", { format: "png" });
+    await Bun.write(join(out, `${name}.png`), Buffer.from(data, "base64"));
+    console.log(`Bild ${name}.png`);
+  }
+  const sent: { url: string; headers: Record<string, string>; bytes: number }[] = [];
+  let pushStatus = 201;
+  const fakeFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    const body = init?.body as Uint8Array | undefined;
+    sent.push({ url: String(url), headers: Object.fromEntries(Object.entries((init?.headers ?? {}) as Record<string, string>).map(([k, v]) => [k.toLowerCase(), v])), bytes: body?.length ?? 0 });
+    return new Response(null, { status: pushStatus });
+  }) as typeof fetch;
+  const vapid = await generateVapidKeys();
+  const pushDemo = await startDemoServer(
+    { host: "127.0.0.1", port: 0, password: PASSWORD, allowedHosts: [] },
+    { chat: createFakeChat(), telegramChat: createFakeChat(), log: () => {}, push: { keys: vapid, subject: DEFAULT_PUSH_SUBJECT, fetch: fakeFetch } }
+  );
+  const origin = pushDemo.server.url.replace(/\/$/, "");
+  const tab = "#/einstellungen/benachrichtigungen";
+  /** Abo-Schlüssel wie aus einem echten Browser: P-256-Punkt und 16 Bytes */
+  async function browserKeys() {
+    const pair = (await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"])) as CryptoKeyPair;
+    return { p256dh: toBase64Url(await crypto.subtle.exportKey("raw", pair.publicKey)), auth: toBase64Url(crypto.getRandomValues(new Uint8Array(16))) };
+  }
+  const own = { endpoint: "https://fcm.googleapis.com/fcm/send/browser-check-dieses-geraet", ...(await browserKeys()) };
+  type Mock = { secure?: boolean; ios?: boolean; noPush?: boolean; permission?: "default" | "granted" | "denied" };
+  async function pushMock(mock: Mock): Promise<string> {
+    const cfg = JSON.stringify({ ...mock, endpoint: own.endpoint, p256dh: own.p256dh, auth: own.auth });
+    const { identifier } = await cdp("Page.addScriptToEvaluateOnNewDocument", { source: `(() => {
+      const cfg = ${cfg};
+      window.__push = { requested: 0, subscribed: [], unsubscribed: 0 };
+      if (cfg.secure === false) Object.defineProperty(window, "isSecureContext", { get: () => false });
+      if (cfg.ios) Object.defineProperty(Navigator.prototype, "userAgent", { get: () => "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1" });
+      if (cfg.noPush) delete window.PushManager;
+      let permission = cfg.permission || "default";
+      function FakeNotification() {}
+      Object.defineProperty(FakeNotification, "permission", { get: () => permission });
+      FakeNotification.requestPermission = async () => { window.__push.requested++; permission = "granted"; return permission; };
+      window.Notification = FakeNotification;
+      const KEY = "browser-check-push-abo";
+      const sub = () => ({
+        endpoint: cfg.endpoint,
+        toJSON: () => ({ endpoint: cfg.endpoint, expirationTime: null, keys: { p256dh: cfg.p256dh, auth: cfg.auth } }),
+        unsubscribe: async () => { window.__push.unsubscribed++; sessionStorage.removeItem(KEY); return true; },
+      });
+      const pushManager = {
+        getSubscription: async () => (sessionStorage.getItem(KEY) ? sub() : null),
+        subscribe: async options => { window.__push.subscribed.push(Array.from(new Uint8Array(options.applicationServerKey))); sessionStorage.setItem(KEY, "1"); return sub(); },
+      };
+      const registration = { scope: location.origin + "/", pushManager };
+      if (navigator.serviceWorker && !cfg.noPush) {
+        navigator.serviceWorker.getRegistration = async () => registration;
+        Object.defineProperty(navigator.serviceWorker, "ready", { get: () => Promise.resolve(registration) });
+      }
+    })()` });
+    return identifier;
+  }
+  const unmock = (identifier: string) => cdp("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+  const pushState = () => js<string | null>(`document.querySelector("#settings [data-push-state]")?.dataset.pushState ?? null`);
+  const panelText = () => js<string>(`document.getElementById("settings").innerText`);
+  async function openPush(base: string) {
+    // Erst weg von der Seite: sonst wäre es nur ein Wechsel des Ankers, ohne die Attrappe neu zu laden
+    await goto("about:blank");
+    await goto(`${base}/${tab}`);
+    return waitFor(`document.querySelector("#settings [data-push-state]")`);
+  }
+  const serverPush = () => js<any>(`fetch("/api/push").then(r => r.json())`);
+  const sizes = [{ width: 1280, height: 800, mobile: false }, { width: 390, height: 844, mobile: true }];
+  /** prepare: nach dem Laden, vor dem Bild (etwa die Rückfrage beim Entfernen öffnen) */
+  async function shootAll(name: string, base: string, ready: string, prepare?: () => Promise<unknown>) {
+    for (const scheme of ["light", "dark"] as const) {
+      await emulateScheme(scheme);
+      for (const size of sizes) {
+        await cdp("Emulation.setDeviceMetricsOverride", { ...size, deviceScaleFactor: 2 });
+        await openPush(base);
+        await waitFor(ready);
+        if (prepare) await prepare();
+        check(`Benachrichtigungen ${name} ${size.width} px ${scheme === "dark" ? "dunkel" : "hell"}: kein waagrechtes Scrollen`,
+          await js<boolean>(`document.documentElement.scrollWidth <= ${size.width}`));
+        await shoot(`einstellungen-benachrichtigungen-${name}-${size.width}${scheme === "dark" ? "-dunkel" : ""}`);
+      }
+    }
+    await emulateScheme("light");
+    await cdp("Emulation.setDeviceMetricsOverride", { width: 1280, height: 800, mobile: false, deviceScaleFactor: 1 });
+  }
+  const clickText = (text: string, scope = "#settings") =>
+    js<boolean>(`(() => { const b = [...document.querySelectorAll(${JSON.stringify(scope + " button")})].find(b => b.textContent.trim() === ${JSON.stringify(text)} && !b.disabled); if (b) b.click(); return !!b; })()`);
+
+  try {
+    await cdp("Emulation.setDeviceMetricsOverride", { width: 1280, height: 800, mobile: false, deviceScaleFactor: 1 });
+    await emulateScheme("light");
+
+    // --- Server ohne Push-Schlüssel (Standard-Demo) -----------------------------
+    let id = await pushMock({});
+    check("Push: Reiter erreichbar unter #/einstellungen/benachrichtigungen", await openPush(demo.server.url.replace(/\/$/, "")));
+    check("Push: Reiter „Benachrichtigungen“ ausgewählt",
+      await js<boolean>(`[...document.querySelectorAll(".settings-tab")].some(t => t.textContent === "Benachrichtigungen" && t.getAttribute("aria-selected") === "true")`));
+    check("Push ohne Schlüssel: Erklärung des Servers, kein Schalter, keine Geräteliste",
+      (await pushState()) === "server-off" && !(await js<boolean>(`!!document.querySelector("#settings [role=radiogroup][aria-labelledby=push-switch-label]")`))
+        && !(await panelText()).includes("Andere Geräte"), await panelText());
+    await shootAll("nicht-eingerichtet", demo.server.url.replace(/\/$/, ""), `document.querySelector("#settings [data-push-state]")`);
+    await unmock(id);
+
+    // --- Erklärungen statt Schalter ---------------------------------------------
+    const explained: [string, Mock, string, string][] = [
+      ["insecure", { secure: false }, "unsicher", "https://"],
+      ["ios-install", { ios: true }, "iphone", "Zum Home-Bildschirm"],
+      ["unsupported", { noPush: true }, "nicht-moeglich", "keine Benachrichtigungen empfangen"],
+      ["denied", { permission: "denied" }, "blockiert", "Danach diese Seite neu laden"],
+    ];
+    for (const [state, mock, name, text] of explained) {
+      id = await pushMock(mock);
+      await openPush(origin);
+      check(`Push ${state}: Erklärung statt Schalter`,
+        (await pushState()) === state && (await panelText()).includes(text) && !(await js<boolean>(`!!document.querySelector("[aria-labelledby=push-switch-label]")`)),
+        `${await pushState()}: ${await panelText()}`);
+      check(`Push ${state}: Laden fragt keine Berechtigung`, (await js<number>(`window.__push.requested`)) === 0);
+      await shootAll(name, origin, `document.querySelector("#settings [data-push-state]")`);
+      await unmock(id);
+    }
+
+    // --- Aus, Einschalten, Test, Umbenennen, andere Geräte, Ausschalten ---------
+    id = await pushMock({});
+    await openPush(origin);
+    check("Push aus: Schalter An / Aus, Zustand „Aus“ in Klartext",
+      (await pushState()) === "off" && (await panelText()).includes("Aus: Dieses Gerät bekommt keine Benachrichtigungen."));
+    check("Push aus: Laden fragt keine Berechtigung", (await js<number>(`window.__push.requested`)) === 0);
+    await shootAll("aus", origin, `document.querySelector("#settings [data-push-state=off]")`);
+
+    await openPush(origin);
+    await clickText("An");
+    check("Push an: nach dem Tipp an", await waitFor(`document.querySelector("#settings [data-push-state=on]")`));
+    check("Push an: Berechtigung genau einmal gefragt", (await js<number>(`window.__push.requested`)) === 1);
+    const subscribedKey = await js<number[][]>(`window.__push.subscribed`);
+    check("Push an: abonniert mit dem öffentlichen Schlüssel des Servers",
+      subscribedKey.length === 1 && toBase64Url(new Uint8Array(subscribedKey[0])) === vapid.publicKey);
+    const afterOn = await serverPush();
+    const deviceId = await js<string | null>(`localStorage.getItem("tybo-push-device")`);
+    check("Push an: Server kennt das Gerät, Browser merkt sich seine Kennung",
+      afterOn.devices.length === 1 && afterOn.devices[0].id === deviceId && afterOn.devices[0].name === "Mac · Chrome", JSON.stringify(afterOn.devices));
+    check("Push an: Antwort ohne Endpunkt und privaten Schlüssel",
+      !JSON.stringify(afterOn).includes(own.endpoint) && !JSON.stringify(afterOn).includes(vapid.privateKey));
+
+    await clickText("Test senden");
+    check("Test senden: Meldung „Test gesendet“", await waitFor(`document.getElementById("settings").innerText.includes("Test gesendet.")`));
+    const request = sent.at(-1);
+    check("Test senden: an den Endpunkt mit vapid t=…, k=…, aes128gcm und TTL",
+      !!request && request.url === own.endpoint && request.headers.authorization?.startsWith("vapid t=") && request.headers.authorization.endsWith(`, k=${vapid.publicKey}`)
+        && request.headers["content-encoding"] === "aes128gcm" && /^\d+$/.test(request.headers.ttl ?? "") && request.bytes > 86,
+      JSON.stringify({ ...request, headers: { ...request?.headers, authorization: request?.headers.authorization?.slice(0, 12) } }));
+    check("Test senden: zuletzt erreicht steht da", await waitFor(`document.querySelector("#settings [data-device=this]")?.innerText.includes("zuletzt erreicht")`)
+      || (await openPush(origin) && await waitFor(`document.querySelector("#settings [data-device=this]")?.innerText.includes("zuletzt erreicht")`)));
+
+    // Umbenennen
+    await openPush(origin);
+    await waitFor(`document.querySelector("#settings [data-device=this]")`);
+    await clickText("Umbenennen");
+    await waitFor(`document.getElementById("push-device-name")`);
+    await js(`(() => { const i = document.getElementById("push-device-name"); i.value = "Büro-Rechner"; i.dispatchEvent(new Event("input")); })()`);
+    await clickText("Speichern");
+    check("Umbenennen: neuer Name sichtbar und beim Server",
+      (await waitFor(`document.querySelector("#settings [data-device=this]")?.innerText.includes("Büro-Rechner")`)) && (await serverPush()).devices[0].name === "Büro-Rechner");
+
+    // Zwei weitere Geräte (wie von einem Handy angemeldet)
+    for (const [suffix, ua] of [["handy", "iPhone"], ["tablet", "Android"]] as const) {
+      const other = { endpoint: `https://fcm.googleapis.com/fcm/send/browser-check-${suffix}`, ...(await browserKeys()) };
+      const status = await js<number>(`fetch("/api/push/subscriptions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ subscription: ${JSON.stringify({ endpoint: other.endpoint, keys: { p256dh: other.p256dh, auth: other.auth } })} }) }).then(r => r.status)`);
+      check(`anderes Gerät (${ua}) angemeldet`, status === 201, String(status));
+    }
+    // Was sich meldet (Issue #226): vier Schalter, Standard ohne Telegram-Angabe: Meldungen und Inhalt aus
+    await openPush(origin);
+    const settingChecked = () => js<Record<string, string>>(`Object.fromEntries([...document.querySelectorAll("#settings [data-push-setting]")].map(r => [r.dataset.pushSetting, r.querySelector("[role=radio][aria-checked=true]")?.textContent]))`);
+    check("Was sich meldet: vier Schalter mit Standard (Antworten, Rückfragen an; Meldungen, Inhalt aus)",
+      (await waitFor(`document.querySelectorAll("#settings [data-push-setting]").length === 4`))
+        && JSON.stringify(await settingChecked()) === JSON.stringify({ replies: "An", choices: "An", notices: "Aus", preview: "Aus" }),
+      JSON.stringify(await settingChecked()));
+    await js(`[...document.querySelectorAll("#settings [data-push-setting=notices] [role=radio]")].find(b => b.textContent === "An").click()`);
+    check("Was sich meldet: Meldungen an, sofort beim Server gespeichert",
+      (await waitFor(`document.querySelector("#settings [data-push-setting=notices] [role=radio][aria-checked=true]")?.textContent === "An"`))
+        && (await serverPush()).devices.find((d: any) => d.id === deviceId)?.settings?.notices === true);
+    await js(`[...document.querySelectorAll("#settings [data-push-setting=notices] [role=radio]")].find(b => b.textContent === "Aus").click()`);
+    await waitFor(`document.querySelector("#settings [data-push-setting=notices] [role=radio][aria-checked=true]")?.textContent === "Aus"`);
+    await shootAll("kategorien", origin, `document.querySelectorAll("#settings [data-push-setting]").length === 4`,
+      () => js(`document.querySelector("#settings .settings-push-categories").scrollIntoView({ block: "start" })`));
+
+    await openPush(origin);
+    check("Andere Geräte: zwei Einträge mit Entfernen, dieses Gerät nicht darunter",
+      await waitFor(`document.querySelectorAll("#settings [data-device]:not([data-device=this])").length === 2`));
+    await shootAll("an", origin, `document.querySelectorAll("#settings [data-device]").length === 3`);
+
+    await openPush(origin);
+    await waitFor(`document.querySelectorAll("#settings [data-device]:not([data-device=this])").length === 2`);
+    await js(`[...document.querySelectorAll("#settings [data-device]:not([data-device=this]) button")].find(b => b.textContent === "Entfernen").click()`);
+    check("Entfernen fragt nach, Fokus auf Abbrechen",
+      (await waitFor(`document.querySelector("#settings .settings-device-actions")`)) && (await js<string>(`document.activeElement.textContent`)) === "Abbrechen");
+    const askRemove = async () => {
+      await js(`[...document.querySelectorAll("#settings [data-device]:not([data-device=this]) button")].find(b => b.textContent === "Entfernen").click()`);
+      return waitFor(`document.querySelector("#settings .settings-device-actions")`);
+    };
+    await shootAll("entfernen", origin, `document.querySelectorAll("#settings [data-device]").length === 3`, askRemove);
+    await openPush(origin);
+    await waitFor(`document.querySelectorAll("#settings [data-device]").length === 3`);
+    await js(`[...document.querySelectorAll("#settings [data-device]:not([data-device=this]) button")].find(b => b.textContent === "Entfernen").click()`);
+    await waitFor(`document.querySelector("#settings .settings-device-confirm")`);
+    await js(`document.querySelector("#settings .settings-device-confirm").click()`);
+    check("Entfernen: ein anderes Gerät weniger, auch beim Server",
+      (await waitFor(`document.querySelectorAll("#settings [data-device]:not([data-device=this])").length === 1`)) && (await serverPush()).devices.length === 2);
+
+    // Ausschalten
+    const unsubscribedBefore = await js<number>(`window.__push.unsubscribed`);
+    await clickText("Aus");
+    check("Aus: Zustand aus, beim Browser abgemeldet, Server kennt das Gerät nicht mehr",
+      (await waitFor(`document.querySelector("#settings [data-push-state=off]")`)) && (await js<number>(`window.__push.unsubscribed`)) === unsubscribedBefore + 1
+        && !(await serverPush()).devices.some((d: any) => d.id === deviceId) && (await js<string | null>(`localStorage.getItem("tybo-push-device")`)) === null);
+
+    // Anderswo entfernt: beim nächsten Laden nicht still wieder aktiv
+    await clickText("An");
+    await waitFor(`document.querySelector("#settings [data-push-state=on]")`);
+    const again = await js<string>(`localStorage.getItem("tybo-push-device")`);
+    await js(`fetch("/api/push/subscriptions/${again}", { method: "DELETE" })`);
+    await openPush(origin);
+    check("anderswo entfernt: beim Laden aus, Hinweis, beim Browser abgemeldet, nicht neu angelegt",
+      (await waitFor(`document.querySelector("#settings [data-push-state=off]")`)) && (await panelText()).includes("Dieses Gerät wurde entfernt")
+        && (await js<number>(`window.__push.unsubscribed`)) >= 1 && !(await serverPush()).devices.some((d: any) => d.id === again));
+
+    // Test mit 410 vom Push-Dienst: Gerät weg, Schalter aus
+    await clickText("An");
+    await waitFor(`document.querySelector("#settings [data-push-state=on]")`);
+    pushStatus = 410;
+    await clickText("Test senden");
+    check("Test mit 410: Hinweis, Schalter aus, Gerät beim Server gelöscht",
+      (await waitFor(`document.querySelector("#settings [data-push-state=off]")`)) && (await panelText()).includes("neu einschalten")
+        && (await serverPush()).devices.length === 1);
+    pushStatus = 201;
+    await js(`localStorage.removeItem("tybo-push-device"); sessionStorage.clear()`);
+    await unmock(id);
+  } finally {
+    await emulateScheme("light");
+    await pushDemo.stop();
+  }
+}
+
+/**
+ * Direktlink #/gespraech/<id> (Issue #226), je 1280 und 390 px, hell und
+ * dunkel: bekanntes Topic öffnet genau dieses, unbekanntes Gespräch öffnet den
+ * Direktchat mit Hinweis im Verbindungsbalken (Screenshots mit --screenshots).
+ * Dazu die Anmeldung: ohne Sitzung führt der Link über /login und landet
+ * danach im verlinkten Gespräch.
+ */
+async function linkChecks() {
+  const out = join(import.meta.dir, "..", "docs", "webui", "screenshots");
+  const shots = process.argv.includes("--screenshots");
+  async function shoot(name: string) {
+    if (!shots) return;
+    await Bun.sleep(300);
+    const { data } = await cdp("Page.captureScreenshot", { format: "png" });
+    await Bun.write(join(out, `${name}.png`), Buffer.from(data, "base64"));
+    console.log(`Bild ${name}.png`);
+  }
+  const origin = demo.server.url.replace(/\/$/, "");
+  const unknown = "0b8f2a3c-1d2e-4f50-8a6b-7c8d9e0f1a2b";
+  const hint = "Dieses Gespräch gibt es nicht mehr. Hier ist der Direktchat.";
+  const current = () => js<string | null>(`document.querySelector(".conversation[aria-current=true]")?.dataset.id ?? null`);
+  const connection = () => js<string>(`(() => { const c = document.getElementById("connection"); return c.hidden ? "" : c.textContent; })()`);
+  try {
+    await goto("about:blank");
+    await goto(`${origin}/#/gespraech/topic-12`);
+    check("Direktlink: Topic „Finanzen“ offen, Adresse danach leer",
+      (await waitFor(`document.querySelector(".conversation[aria-current=true]")?.dataset.id === "topic-12"`)) && (await js<string>(`location.hash`)) === "",
+      String(await current()));
+    await js(`location.hash = "#/gespraech/topic-31"`);
+    check("Direktlink per Adresswechsel: Topic „Strategie“ offen", await waitFor(`document.querySelector(".conversation[aria-current=true]")?.dataset.id === "topic-31"`));
+    for (const scheme of ["light", "dark"] as const) {
+      await emulateScheme(scheme);
+      for (const size of [{ width: 1280, height: 800, mobile: false }, { width: 390, height: 844, mobile: true }]) {
+        await cdp("Emulation.setDeviceMetricsOverride", { ...size, deviceScaleFactor: 2 });
+        await goto("about:blank");
+        await goto(`${origin}/#/gespraech/${unknown}`);
+        const label = `Direktlink unbekannt ${size.width} px ${scheme === "dark" ? "dunkel" : "hell"}`;
+        check(`${label}: Direktchat offen, Hinweis im Verbindungsbalken`,
+          (await waitFor(`document.querySelector(".conversation[aria-current=true]")?.dataset.id === "dm"`))
+            && (await waitFor(`document.getElementById("connection").textContent === ${JSON.stringify(hint)} && !document.getElementById("connection").hidden`)),
+          `${await current()}: ${await connection()}`);
+        check(`${label}: kein waagrechtes Scrollen`, await js<boolean>(`document.documentElement.scrollWidth <= ${size.width}`));
+        await shoot(`direktlink-unbekannt-${size.width}${scheme === "dark" ? "-dunkel" : ""}`);
+      }
+    }
+  } finally {
+    await emulateScheme("light");
+    await cdp("Emulation.setDeviceMetricsOverride", { width: 1280, height: 800, mobile: false, deviceScaleFactor: 1 });
+  }
+
+  // Anmeldung dazwischen: der Link übersteht /login
+  const target = (await plainStore.listConversations())[0]?.id;
+  check("Direktlink mit Anmeldung: Web-Gespräch vorhanden", !!target);
+  if (!target) return;
+  await cdp("Network.clearBrowserCookies");
+  await goto("about:blank");
+  await goto(`${base}/#/gespraech/${target}`);
+  check("Direktlink ohne Sitzung: Umleitung auf /login, Adresse bleibt",
+    await waitFor(`location.pathname === "/login" && location.hash === ${JSON.stringify(`#/gespraech/${target}`)}`), await js<string>(`location.href`));
+  await js(`document.getElementById("password").value = ${JSON.stringify(PASSWORD)}`);
+  await js(`document.getElementById("login-form").requestSubmit()`);
+  check("Direktlink nach der Anmeldung: genau dieses Gespräch offen",
+    await waitFor(`location.pathname === "/" && document.querySelector(".conversation[aria-current=true]")?.dataset.id === ${JSON.stringify(target)}`),
+    String(await current()));
+}
+
 try {
   await cdp("Page.enable");
   await cdp("Runtime.enable");
@@ -3597,12 +4209,11 @@ try {
   check("Neues Gespräch: vor der Wahl nichts angelegt",
     (await (await fetch(`${base}/api/conversations`, { headers: { cookie } })).json()).conversations.length === 1);
   await pressKey("Enter", "Enter", 13, "\r");
-  // Seit Issue #29 legt Enter ein Telegram-Topic an; ohne Topic-Verwaltung: Meldung statt Web-Gespräch
-  check("Neues Gespräch ohne Topic-Verwaltung: Meldung, Verlauf bleibt",
-    (await waitFor(`[...document.querySelectorAll(".msg-error")].some(m => m.textContent.includes("Topics verwalten ist nicht eingerichtet"))`)) &&
-    (await count(".msg-user")) > 0);
+  // Seit Issue #29 legt Enter ein Telegram-Topic an; ohne Forum-Gruppe seit Issue #227 ein Web-Gespräch
+  check("Neues Gespräch ohne Forum-Gruppe: leeres Web-Gespräch mit General geöffnet",
+    await waitFor(`document.getElementById("agent-name").textContent === "General" && document.querySelectorAll(".msg").length === 0 && !${shown("agent-picker")}`));
   const list = await (await fetch(`${base}/api/conversations`, { headers: { cookie } })).json();
-  check("Neues Gespräch: kein Web-Gespräch auf dem Server angelegt", list.conversations.length === 1);
+  check("Neues Gespräch: Web-Gespräch auf dem Server angelegt", list.conversations.length === 2);
   // Älteres leeres Web-Gespräch, zuletzt geöffnet: bleibt nach dem Neuladen offen
   const empty = await plainStore.createConversation("general");
   await js(`localStorage.setItem(${JSON.stringify(LAST_KEY)}, ${JSON.stringify(empty.id)})`);
@@ -3694,6 +4305,9 @@ try {
   await engineChecks();
   await keysChecks();
   await updateChecks();
+  await installChecks();
+  await pushChecks();
+  await linkChecks();
 
   // --- Touch: Enter macht eine neue Zeile ------------------------------------
   // Das zuletzt geöffnete Gespräch vergessen: die Prüfung erwartet das jüngste Web-Gespräch

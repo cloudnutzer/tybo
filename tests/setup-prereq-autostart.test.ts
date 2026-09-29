@@ -665,8 +665,21 @@ describe("Schritt pruefung", () => {
     const ctx = await makeCtx();
     const r = await checkStep.test!({}, ctx);
     expect(r.ok).toBe(false);
-    expect(r.message).toBe("Es fehlt noch: Telegram, Datenbank, Profil, Autostart.");
+    expect(r.message).toBe("Es fehlt noch: Datenbank, Profil, Autostart. Richte Telegram oder die WebUI ein, sonst erreicht dich tybo nirgends.");
     expect(ctx.providers.calls.map(c => c.method)).toEqual(["claudeVersion", "claudeVersion", "claudeProbe"]);
+  });
+
+  test("Issue #228: übrig gebliebene TELEGRAM_GROUP_ID ohne Telegram: Gruppe übersprungen, kein Fehler, kein Telegram-Aufruf", async () => {
+    const run = fakeRun({ "git --version": { stdout: "git version 2.50.0" }, "launchctl list": LOADED });
+    const env = FULL_ENV.split("\n").filter(l => !l.startsWith("TELEGRAM_BOT_TOKEN=") && !l.startsWith("TELEGRAM_USER_ID=")).join("\n");
+    expect(env).toContain(`TELEGRAM_GROUP_ID=${FAKE.groupId}`);
+    const ctx = await makeCtx({ env, profile: "# Testperson\n", overrides: { run } });
+    await writePlist(ctx);
+    const r = await checkStep.test!({}, ctx);
+    expect(r.ok).toBe(true);
+    expect(r.items?.find(i => i.label === "Forum-Gruppe")).toEqual({ label: "Forum-Gruppe", ok: true, detail: "Übersprungen: ohne Telegram gibt es keine Forum-Gruppe." });
+    const methods = ctx.providers.calls.map(c => c.method);
+    expect(methods.filter(m => m.startsWith("telegram"))).toEqual([]);
   });
 
   test("fertig: testet eingerichtete Schritte mit gespeicherten Werten, schreibt nichts", async () => {

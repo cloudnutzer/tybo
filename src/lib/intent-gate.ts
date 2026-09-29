@@ -18,13 +18,15 @@ import { processIntents as applyIntents, type ProcessedIntents } from "./memory"
 import { stageMemoryReview, takePendingReview, type PendingReview } from "./session-distill";
 import type { BotSession } from "./session-manager";
 import { classifyTurnTools, type TurnTools } from "./turn-tools";
+import { dmChatId, isWebChatId } from "./channels";
 
 const PROJECT_ROOT = process.cwd();
 
 export interface IntentTarget {
   /**
    * Chat des Turns. web:<id> (reines Web-Gespraech, Issue #117): Vorschlag im
-   * Web-Gespraech, Kopie im Direktchat. Sonst ohne Telegram-ID: in den Direktchat
+   * Web-Gespraech, Kopie im Direktchat. web (Web-Direktchat ohne Telegram,
+   * Issue #227): Vorschlag dort. Sonst ohne Telegram-ID: in den Direktchat
    */
   chatId: string;
   topicId?: number;
@@ -42,7 +44,10 @@ export interface IntentGateDeps {
   stageMemoryReview: typeof stageMemoryReview;
   log(line: string): void;
   projectRoot: string;
-  /** TELEGRAM_USER_ID: Ziel fuer Vorschlaege aus Chats ohne Telegram-ID */
+  /**
+   * Direktchat fuer Vorschlaege aus Chats ohne Telegram-ID: mit Telegram die
+   * Nutzer-ID, ohne Telegram "web" (Kanal-Weiche, channels.ts)
+   */
   dmChatId(): string | undefined;
 }
 
@@ -51,12 +56,11 @@ const defaultDeps: IntentGateDeps = {
   stageMemoryReview,
   log: line => console.log(line),
   projectRoot: PROJECT_ROOT,
-  dmChatId: () => process.env.TELEGRAM_USER_ID,
+  dmChatId: () => dmChatId(process.env),
 };
 
 const INTENT_TAG = /\[(?:REMEMBER|GOAL|DONE|CANCEL|FORGET):[^\]]*\]/gi;
 const TELEGRAM_CHAT_ID = /^-?\d{1,20}$/;
-const WEB_CHAT_ID = /^web:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 /** Nur die Intent-Tags eines Texts, je Zeile einer; leer ohne Tags. */
 export function extractIntentTags(text: string): string {
@@ -87,7 +91,7 @@ export async function processTurnIntents(
 
   if (reasons.length > 0) {
     const telegramChat = TELEGRAM_CHAT_ID.test(target.chatId);
-    const webChat = WEB_CHAT_ID.test(target.chatId);
+    const webChat = isWebChatId(target.chatId);
     const chatId = telegramChat || webChat ? target.chatId : d.dmChatId() || target.chatId;
     const topicId = telegramChat ? target.topicId : undefined;
     const where = telegramChat ? "" : ` (${target.origin})`;

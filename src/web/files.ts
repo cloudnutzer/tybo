@@ -26,10 +26,11 @@ export const FILES_PATH = /^\/api\/files\/([^/]+)$/;
 export interface FileSource {
   /**
    * Geprüfte Angaben der Datei aus dem festgehaltenen Eintrag; null, wenn es
-   * keinen gibt. Darf werfen (Speicher nicht lesbar), der Server antwortet
-   * dann mit 503.
+   * keinen gibt. webConversationIds: die reinen Web-Gespräche, die es gerade
+   * gibt (Issue #227, Meldungen unter web:<uuid>). Darf werfen (Speicher
+   * nicht lesbar), der Server antwortet dann mit 503.
    */
-  find(id: string): Promise<NoticeFile | null>;
+  find(id: string, webConversationIds?: string[]): Promise<NoticeFile | null>;
 }
 
 export interface FilesDeps {

@@ -157,13 +157,23 @@ describe("ohne WEB_PUBLIC_ORIGIN unverändert", () => {
     expect(ctx.logs).toContain("Fehlgeschlagener Login von 127.0.0.1");
   });
 
-  test("Terminal-Schlüssel gilt wie bisher, mit und ohne Tunnel-Kopfzeile, GET und Schreiben ohne Origin", async () => {
-    for (const extra of [{}, { "cf-connecting-ip": VISITOR }]) {
+  test("Terminal-Schlüssel gilt wie bisher ohne Weiterleitungs-Kopfzeile, GET und Schreiben ohne Origin", async () => {
+    const ctx = await start();
+    const headers = { host: `127.0.0.1:${ctx.port}`, authorization: `Bearer ${ctx.cliToken}` };
+    expect((await fetch(`${ctx.url}/api/me`, { headers })).status).toBe(200);
+    expect((await postMessage(ctx, headers)).status).toBe(202);
+    expect(ctx.chat.turns.map(t => t.text)).toEqual(["Hallo von unterwegs"]);
+  });
+
+  // Seit Issue #231: eine weitergeleitete Anfrage ist nie lokal, auch ohne WEB_PUBLIC_ORIGIN
+  // (etwa `tailscale serve`, schon eingerichtet, aber tybo noch nicht neu gestartet)
+  test("Terminal-Schlüssel mit Weiterleitungs-Kopfzeile: abgelehnt, nichts gesendet", async () => {
+    for (const extra of [{ "cf-connecting-ip": VISITOR }, { "x-forwarded-for": "100.64.0.9" }, { "tailscale-user-login": "alex@example.org" }]) {
       const ctx = await start();
       const headers = { host: `127.0.0.1:${ctx.port}`, authorization: `Bearer ${ctx.cliToken}`, ...extra };
-      expect((await fetch(`${ctx.url}/api/me`, { headers })).status).toBe(200);
-      expect((await postMessage(ctx, headers)).status).toBe(202);
-      expect(ctx.chat.turns.map(t => t.text)).toEqual(["Hallo von unterwegs"]);
+      expect((await fetch(`${ctx.url}/api/me`, { headers })).status).toBe(401);
+      expect((await postMessage(ctx, headers)).status).toBe(401);
+      expect(ctx.chat.turns).toEqual([]);
     }
   });
 });

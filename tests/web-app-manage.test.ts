@@ -129,6 +129,8 @@ function setup(options: Options = {}) {
   };
   const topic = (id: string) => server.telegram.topics.find(t => t.id === id);
   const fetch = async (path: string, init?: { method?: string; body?: string }) => {
+    // Anwesenheit (Issue #226) läuft nebenher und zählt hier nicht mit
+    if (path === "/api/presence") return { ok: true, status: 204, json: async () => ({}) } as any;
     const method = init?.method ?? "GET";
     const body = init?.body ? JSON.parse(init.body) : undefined;
     server.requests.push({ method, path, body });

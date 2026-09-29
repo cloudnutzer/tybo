@@ -4,15 +4,16 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { writeFile } from "node:fs/promises";
-import { ApiClient, ApiError, tokenFromFile } from "../src/terminal/api";
+import { ApiClient, ApiError, kindOfId, tokenFromFile } from "../src/terminal/api";
+import { selectConversation } from "../src/terminal/select";
 import { startTyboServer, type TerminalTestServer } from "./terminal-fixture";
 
 let current: TerminalTestServer[] = [];
 afterEach(async () => {
   for (const s of current.splice(0)) await s.stop();
 });
-async function start() {
-  const s = await startTyboServer();
+async function start(options: Parameters<typeof startTyboServer>[0] = {}) {
+  const s = await startTyboServer(options);
   current.push(s);
   return s;
 }
@@ -164,5 +165,40 @@ describe("toChoice (Issue #120)", () => {
     expect(toChoice({ id: "a", state: "open", options: [{ key: "ok", label: "Ja" }, { key: 1, label: "x" }, { key: "no" }] })).toEqual({ id: "a", state: "open", options: [{ key: "ok", label: "Ja" }] });
     expect(toChoice({ id: "a", state: "done", options: [{ key: "ok", label: "Ja" }], result: { key: "ok", label: "Ja", via: "fax", at: "" } })).toEqual({ id: "a", state: "done", options: [] });
     expect(toChoice({ id: "a", state: "open", options: [], elsewhere: "dm" })).toEqual({ id: "a", state: "open", options: [], elsewhere: "dm" });
+  });
+});
+
+describe("Issue #228: ohne Telegram (ohne Forum-Gruppe)", () => {
+  test("Liste: nur der Direktchat unter der API-ID dm, die Auswahl nimmt ihn", async () => {
+    const s = await start({ withoutTelegram: true });
+    const list = await s.client().listConversations();
+    expect(list.map(c => [c.id, c.kind])).toEqual([["dm", "dm"]]);
+    const chosen = selectConversation(list, {});
+    expect(chosen.ok && chosen.conversation.id).toBe("dm");
+  });
+
+  test("createConversation mit UUID-Antwort ergibt web, updateTopic darauf bleibt web", async () => {
+    const s = await start({ withoutTelegram: true });
+    const client = s.client();
+    const created = await client.createConversation("research");
+    expect(created.warning).toBeUndefined();
+    expect(created.conversation.kind).toBe("web");
+    expect(created.conversation.agent).toBe("research");
+    const renamed = await client.updateTopic(created.conversation.id, { title: "Mein Titel" });
+    expect(renamed.conversation).toMatchObject({ id: created.conversation.id, kind: "web", title: "Mein Titel" });
+  });
+
+  test("createConversation mit topic-<n>-Antwort ergibt topic", async () => {
+    const s = await start({ manage: true });
+    const created = await s.client().createConversation("research");
+    expect(created.conversation.id).toMatch(/^topic-\d+$/);
+    expect(created.conversation.kind).toBe("topic");
+  });
+
+  test("kindOfId: dm, topic-<n>, UUID, sonst der Vorschlag", () => {
+    expect(kindOfId("dm", "topic")).toBe("dm");
+    expect(kindOfId("topic-443", "web")).toBe("topic");
+    expect(kindOfId("0f0e0d0c-0b0a-4908-8706-050403020100", "topic")).toBe("web");
+    expect(kindOfId("etwas", "topic")).toBe("topic");
   });
 });

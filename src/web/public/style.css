@@ -179,7 +179,11 @@ body.login {
   display: grid;
   place-items: center;
   padding: 1.5rem;
+  /* Sichere Bereiche (Issue #229): Statusleiste, Kamera-Aussparung im Querformat, Home-Strich */
+  padding-top: max(1.5rem, env(safe-area-inset-top));
+  padding-right: max(1.5rem, env(safe-area-inset-right));
   padding-bottom: max(1.5rem, env(safe-area-inset-bottom));
+  padding-left: max(1.5rem, env(safe-area-inset-left));
 }
 
 .login-panel { width: 100%; max-width: 21rem; }
@@ -217,13 +221,39 @@ body.login {
 
 .error { margin: 0.2rem 0 0; color: var(--error); font-size: 0.9375rem; }
 
+/* Offline-Seite (Issue #224): Aufbau wie das Login, Gründe als leise Liste */
+.offline .login-lead { margin-bottom: 0.75rem; }
+
+.offline-reasons {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0 0 1.6rem;
+  padding-left: 1.2rem;
+  color: var(--muted);
+  font-size: 0.9375rem;
+}
+
+.offline .primary-button { width: 100%; }
+
 /* ------------------------------------------------------------------------- */
 /* App-Rahmen: Seitenleiste und Hauptbereich                                 */
 /* ------------------------------------------------------------------------- */
 
+/*
+ * Der Rahmen folgt dem sichtbaren Bereich (Issue #229): --app-height und
+ * --app-top setzt app.js nur, solange auf iOS die Bildschirmtastatur offen
+ * ist (visualViewport); sonst gilt 100dvh ab oben. Fest positioniert, damit
+ * das Hochschieben der Seite durch iOS die Eingabe nicht unter die Tastatur
+ * rückt.
+ */
 body.app {
+  position: fixed;
+  top: var(--app-top, 0px);
+  left: 0;
+  right: 0;
   height: 100vh;
   height: 100dvh;
+  height: var(--app-height, 100dvh);
   overflow: hidden;
   display: flex;
 }
@@ -239,6 +269,7 @@ body.app {
   padding: 0.75rem;
   padding-top: max(0.75rem, env(safe-area-inset-top));
   padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+  padding-left: max(0.75rem, env(safe-area-inset-left));
   background: var(--sidebar);
   border-right: 1px solid var(--line);
   transform: translateX(-102%);
@@ -555,6 +586,8 @@ body.app {
   min-height: 3.25rem;
   padding: 0.35rem 0.75rem;
   padding-top: max(0.35rem, env(safe-area-inset-top));
+  padding-right: max(0.75rem, env(safe-area-inset-right));
+  padding-left: max(0.75rem, env(safe-area-inset-left));
   border-bottom: 1px solid var(--line);
 }
 
@@ -606,7 +639,7 @@ body.app {
 .actions-panel {
   position: absolute;
   top: calc(100% + 0.25rem);
-  right: 0.75rem;
+  right: max(0.75rem, env(safe-area-inset-right));
   z-index: 10;
   min-width: 12rem;
   /* Lange Erklärungen (fehlendes Recht, Issue #30) umbrechen statt die Fläche zu verbreitern */
@@ -716,6 +749,9 @@ body.app {
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
+  /* Querformat (Issue #229): Text nie unter der Kamera-Aussparung */
+  padding-right: env(safe-area-inset-right);
+  padding-left: env(safe-area-inset-left);
 }
 
 .column {
@@ -1071,10 +1107,13 @@ body.app {
 
 .composer {
   padding: 0.5rem 0.75rem;
+  padding-right: max(0.75rem, env(safe-area-inset-right));
   padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+  padding-left: max(0.75rem, env(safe-area-inset-left));
 }
 
 .composer-box {
+  position: relative;
   display: flex;
   align-items: flex-end;
   gap: 0.5rem;
@@ -1170,6 +1209,25 @@ body.app {
  */
 .attach-note { color: var(--error); }
 
+/*
+ * Geteilt (Issue #229): leise Zeile über den Anhängen, Text links, der Knopf
+ * „Anderes Gespräch" rechts, gebaut wie die Hinweise über der Eingabe.
+ */
+.share-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.1rem 0.75rem;
+  max-width: var(--column);
+  margin: 0 auto 0.4rem;
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+.share-note[hidden] { display: none; }
+.share-text { min-width: 0; overflow-wrap: anywhere; }
+.share-move { width: auto; padding: 0.3rem 0.5rem; font-size: 0.8125rem; }
+
 .attachment-list {
   display: flex;
   flex-wrap: wrap;
@@ -1219,6 +1277,26 @@ body.app {
 .attach:hover:not(:disabled) { background: var(--hover); color: var(--ink); }
 .attach:disabled { opacity: 0.5; }
 .attach svg { stroke-width: 1.9; }
+
+/*
+ * Kamera am Handy (Issue #229): kleines Menü über der Büroklammer, gebaut wie
+ * das Menü der Kopfzeile (raised, Haarlinie, kein Schatten).
+ */
+.attach-menu {
+  position: absolute;
+  bottom: calc(100% + 0.4rem);
+  left: 0;
+  z-index: 10;
+  display: grid;
+  gap: 1px;
+  min-width: 12rem;
+  padding: 0.25rem;
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  background: var(--raised);
+}
+.attach-menu[hidden] { display: none; }
+.attach-menu .quiet-button { min-height: 2.75rem; color: var(--ink); }
 
 /*
  * Sprachaufnahme (Issue #109): Mikrofon leise wie die Büroklammer, rechts vor
@@ -1328,6 +1406,10 @@ body.app {
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
+  /* Querformat (Issue #229): wie der Verlauf */
+  padding-right: env(safe-area-inset-right);
+  padding-bottom: env(safe-area-inset-bottom);
+  padding-left: env(safe-area-inset-left);
 }
 
 /* Einstieg im Seitenleisten-Fuß; offen wie das aktuelle Gespräch markiert */
@@ -1335,8 +1417,10 @@ body.app {
 
 /* Reiter: dieselbe Segment-Steuerung wie System / Hell / Dunkel */
 .settings-tabs { margin-bottom: 1.25rem; }
-/* Vier Reiter (Issue #63); der Darstellungs-Schalter behält seine drei Spalten */
-.theme-switch.settings-tabs { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+/* Fünf Reiter (Issue #63, #225); der Darstellungs-Schalter behält seine drei Spalten */
+.theme-switch.settings-tabs { grid-template-columns: repeat(5, minmax(max-content, 1fr)); }
+/* Lange Namen („Benachrichtigungen") trennen statt über den Rand zu laufen */
+.settings-tab { hyphens: auto; overflow-wrap: anywhere; }
 .settings-tab { font-size: 0.875rem; }
 .settings-tab[aria-selected="true"] { border-color: var(--line); background: var(--raised); color: var(--ink); }
 .settings-tab:disabled { opacity: 0.6; }
@@ -1507,6 +1591,31 @@ body.app {
 .settings-engine-overrides .actions-error { flex-basis: 100%; margin: 0; }
 .settings-engine-scope { margin: 0; }
 .settings-section > .settings-actions { margin-top: 0.25rem; }
+
+/* Benachrichtigungen (Issue #225): Geräte wie die abweichenden Gespräche, Name links, leiser Knopf rechts */
+.settings-devices { list-style: none; margin: 0; padding: 0; display: grid; gap: 1px; font-size: 0.9375rem; }
+.settings-devices li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.25rem 0.75rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--line);
+}
+.settings-device-name { display: grid; min-width: 0; overflow-wrap: anywhere; }
+.settings-device-meta { color: var(--muted); font-size: 0.75rem; font-variant-numeric: tabular-nums; }
+.settings-devices .quiet-button { width: auto; flex-shrink: 0; }
+.settings-device-actions { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 0.25rem; }
+.settings-device-actions .actions-question { margin: 0; font-weight: 600; }
+.settings-device-confirm { color: var(--ink); font-weight: 600; }
+.settings-devices .actions-error { flex-basis: 100%; margin: 0; }
+.settings-push-steps { margin: 0.25rem 0 0.5rem; padding-left: 1.25rem; color: var(--muted); font-size: 0.8125rem; }
+.settings-push-steps li { margin: 0.2rem 0; }
+.settings-push-test { width: auto; }
+/* Was sich meldet (Issue #226): durch eine Haarlinie vom Gerät getrennt, Schalter wie „Bei /board dabei" */
+.settings-push-categories { margin: 0.5rem 0 0; padding-top: 0.75rem; border-top: 1px solid var(--line); }
+[data-push-setting] { margin-top: 0.25rem; }
 
 /* Reiter „Schlüssel" (Issue #63): Name und Zustand oben, darunter Beschreibung und Knöpfe */
 .settings-keys-edit li { display: grid; grid-template-columns: minmax(0, 1fr); justify-content: stretch; align-items: start; gap: 0.35rem; padding: 0.6rem 0; }
@@ -1751,6 +1860,8 @@ body.setup { min-height: 100vh; min-height: 100dvh; display: flex; }
   .file-download { min-height: 2.75rem; }
   /* Anhänge (Issue #73): Entfernen als Daumen-Ziel */
   .attachment-remove { width: 2.75rem; height: 2.75rem; }
+  /* Geteilt (Issue #229): Anderes Gespräch als Daumen-Ziel */
+  .share-move { min-height: 2.75rem; }
   /* Sprachaufnahme (Issue #109): Abspielen, Stopp und Verwerfen als Daumen-Ziele */
   .attachment-play { width: 2.75rem; height: 2.75rem; }
   .recorder, .recorder-button { min-height: 2.75rem; }
@@ -1763,6 +1874,11 @@ body.setup { min-height: 100vh; min-height: 100dvh; display: flex; }
   .settings-create-open button, .settings-deleted button, .settings-agent-body .theme-option { min-height: 2.75rem; }
   .settings-facts { grid-template-columns: minmax(0, 1fr); gap: 0.1rem; }
   .settings-facts dd { margin-bottom: 0.5rem; }
+  /* Fünf Reiter (Issue #225): am Handy drei je Zeile */
+  .theme-switch.settings-tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  /* Letzter Reiter allein mit einem Nachbarn in der Zeile: nimmt die freie Spalte mit, statt zu trennen */
+  .theme-switch.settings-tabs > :last-child:nth-child(3n + 2) { grid-column: span 2; }
+  .settings-devices button { min-height: 2.75rem; }
   /* Einrichtung (Issue #66): Schritte als waagrechte Leiste über dem Schritt, sie scrollt in sich */
   body.setup { flex-direction: column; }
   .setup-nav { width: auto; padding: 0.75rem 0 0.5rem; border-right: none; border-bottom: 1px solid var(--line); }

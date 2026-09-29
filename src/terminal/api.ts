@@ -108,6 +108,26 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
+const WEB_CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Art eines Gesprächs nach seiner API-ID (Issue #228): "dm" ist der
+ * Direktchat (auch ohne Telegram, intern Chat-ID "web"), topic-<n> ein
+ * Telegram-Topic, eine UUID ein Web-Gespräch. Sonst der Vorschlag des Aufrufers.
+ */
+export function kindOfId(id: string, fallback: ConversationKind): ConversationKind {
+  if (id === "dm") return "dm";
+  if (/^topic-\d+$/.test(id)) return "topic";
+  if (WEB_CONVERSATION_ID.test(id)) return "web";
+  return fallback;
+}
+
+/** Wie summary, aber die Art aus der ID statt fest vorgegeben */
+function summaryById(value: unknown, fallback: ConversationKind): ConversationSummary | null {
+  const out = summary(value, fallback);
+  return out ? { ...out, kind: kindOfId(out.id, fallback) } : null;
+}
+
 function summary(value: unknown, kind: ConversationKind): ConversationSummary | null {
   if (!isRecord(value) || typeof value.id !== "string" || !value.id) return null;
   return {
@@ -370,26 +390,28 @@ export class ApiClient {
   }
 
   /**
-   * Neues Gespräch als Telegram-Topic wie „Neues Gespräch" im Browser
-   * (POST /api/conversations). Ist das Topic angelegt, aber die Zuordnung
-   * nicht gespeichert, kommt es mit warning zurück statt als Fehler; so legt
-   * niemand es ein zweites Mal an.
+   * Neues Gespräch wie „Neues Gespräch" im Browser (POST /api/conversations):
+   * mit Forum-Gruppe ein Telegram-Topic, ohne ein Web-Gespräch (Issue #227,
+   * #228); die Art folgt aus der ID. Ist das Topic angelegt, aber die
+   * Zuordnung nicht gespeichert, kommt es mit warning zurück statt als
+   * Fehler; so legt niemand es ein zweites Mal an.
    */
   async createConversation(agent: string): Promise<CreateResult> {
     const { status, data } = await this.json("POST", "/api/conversations", { agent });
-    const conversation = summary(data.conversation, "topic");
+    const conversation = summaryById(data.conversation, "topic");
     if (status === 201 && conversation) return { conversation };
     if (conversation) return { conversation, warning: typeof data.error === "string" ? data.error : `Status ${status}` };
     this.fail(status, data);
   }
 
   /**
-   * Topic umbenennen und/oder Agent ändern (PATCH). Bei Teilerfolg (etwa
-   * umbenannt, Agent nicht gespeichert) kommt das Gespräch mit warning zurück.
+   * Topic oder Web-Gespräch umbenennen bzw. Agent ändern (PATCH). Bei
+   * Teilerfolg (etwa umbenannt, Agent nicht gespeichert) kommt das Gespräch
+   * mit warning zurück. Die Art folgt aus der ID (Issue #228).
    */
   async updateTopic(id: string, change: { title?: string; agent?: string }): Promise<CreateResult & { note?: string }> {
     const { status, data } = await this.json("PATCH", `/api/conversations/${encodeURIComponent(id)}`, change);
-    const conversation = summary(data.conversation, "topic");
+    const conversation = summaryById(data.conversation, kindOfId(id, "topic"));
     const note = typeof data.note === "string" ? data.note : undefined;
     if (status === 200 && conversation) return { conversation, ...(note ? { note } : {}) };
     if (conversation) return { conversation, warning: typeof data.error === "string" ? data.error : `Status ${status}` };

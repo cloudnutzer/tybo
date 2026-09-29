@@ -243,6 +243,8 @@ function setup(options: Options = {}) {
   };
   let counter = 0;
   const fetch = async (path: string, init?: { method?: string; body?: unknown; headers?: Record<string, string> }) => {
+    // Anwesenheit (Issue #226) läuft nebenher und zählt hier nicht mit
+    if (path === "/api/presence") return { ok: true, status: 204, json: async () => ({}) } as any;
     const method = init?.method ?? "GET";
     server.requests.push({ method, path, headers: init?.headers ?? {}, body: init?.body });
     if (path === "/api/conversations" && method === "GET") {

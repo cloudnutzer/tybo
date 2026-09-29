@@ -63,6 +63,7 @@ import { supervisorName, type Supervisor } from "../lib/restart-request";
 import { hashToken, hasTunnelHeaders, isSameOrigin, LoginLimiter, parseHostHeader, passwordMatches } from "../web/auth";
 import { MAX_ENV_VALUE_LENGTH } from "../web/env-rules";
 import { SECURITY_HEADERS } from "../web/server";
+import { checkChannels, webLocalUrl } from "./channels";
 import { readSetupEnv, type SetupContext } from "./context";
 import {
   choicesKey,
@@ -466,7 +467,7 @@ interface LoadedList {
 // ---------------------------------------------------------------------------
 
 export async function createSetupServer(options: SetupServerOptions): Promise<SetupServer> {
-  const ctx: SetupContext = { ...options.ctx, noModelCalls: true, providers: noModelProviders(options.ctx.providers) };
+  const ctx: SetupContext = { ...options.ctx, noModelCalls: true, browserSetup: true, providers: noModelProviders(options.ctx.providers) };
   const log = options.log ?? ((line: string) => console.log(`[setup] ${line}`));
   const now = options.now ?? Date.now;
   const limiter = options.limiter ?? new LoginLimiter({ now });
@@ -480,6 +481,32 @@ export async function createSetupServer(options: SetupServerOptions): Promise<Se
   const findStep = (id: string) => catalog.find(s => s.id === id);
   /** Pflichtschritte, die vor „Fertig“ erledigt sein müssen (Autostart kommt bei Fertig) */
   const FINISH_REQUIRED = catalog.filter(s => !s.optional && s.id !== "pruefung" && s.id !== "autostart");
+  /**
+   * Kanalregel (Issue #228, ./channels.ts): gilt, sobald der Katalog Telegram
+   * oder die WebUI enthält (eigene Kataloge in Tests ohne diese Schritte bleiben, wie sie waren)
+   */
+  const CHANNEL_RULE = catalog.some(s => s.id === "telegram" || s.id === "webui");
+
+  /**
+   * Kanäle aus der aktuellen .env; null ohne Kanalregel. Nur ok oder nicht,
+   * keine Geheimnisse; dazu die Adresse der WebUI aus der gespeicherten,
+   * geprüften Konfiguration (webLocalUrl: Host und Port), nicht aus dem Port des Assistenten
+   */
+  async function channelState() {
+    if (!CHANNEL_RULE) return null;
+    const env = await readSetupEnv(ctx).catch(() => ({}) as Record<string, string>);
+    const c = checkChannels(env);
+    const webAddress = webLocalUrl(env);
+    return { ready: c.ready, message: c.message, telegram: c.telegram.state === "ok", webui: c.webui.state === "ok", webAddress };
+  }
+
+  /** „Vor Fertig fehlt noch …“ plus Kanal-Satz */
+  function notReadyText(missing: string[], channels: { ready: boolean; message: string } | null): string {
+    const parts: string[] = [];
+    if (missing.length) parts.push(`Vor „Fertig“ fehlt noch: ${missing.join(", ")}.`);
+    if (channels && !channels.ready) parts.push(channels.message);
+    return parts.join(" ");
+  }
 
   const sessions = new Map<string, number>();
   /** Geladene Auswahlen: Sitzung, Schritt, Feld → Liste mit Eingabe-Hash */
@@ -576,18 +603,28 @@ export async function createSetupServer(options: SetupServerOptions): Promise<Se
       steps.push({ id: step.id, title: step.title, optional: step.optional, state: status.state, detail: status.detail });
     }
     const missing = FINISH_REQUIRED.filter(s => states[s.id] !== "erledigt");
+    const channels = await channelState();
+    const ready = missing.length === 0 && (!channels || channels.ready);
     const check = findStep("pruefung")!;
+    const openText = [
+      ...(missing.length ? [`Es fehlt noch: ${missing.map(s => s.title).join(", ")}.`] : []),
+      ...(channels && !channels.ready ? [channels.message] : []),
+    ].join(" ");
     steps.push({
       id: check.id,
       title: check.title,
       optional: false,
-      state: missing.length ? "fehlt" : "erledigt",
-      detail: missing.length ? `Es fehlt noch: ${missing.map(s => s.title).join(", ")}.` : "Bereit für „Fertig“.",
+      state: ready ? "erledigt" : "fehlt",
+      detail: ready ? "Bereit für „Fertig“." : openText,
     });
     return {
       steps,
-      ready: missing.length === 0,
+      ready,
       missing: missing.map(s => s.title),
+      // Kanäle (Issue #228): setup.js wählt daraus Folgeschritt und Endtext; nie Werte, nur ok oder nicht
+      channels: channels
+        ? { ready: channels.ready, message: channels.message, telegram: channels.telegram, webui: channels.webui, webAddress: channels.webAddress }
+        : null,
       autostart: states.autostart ?? "fehlt",
       autostartChoice: supervisor ? null : await autostartChoice(states.autostart),
       supervisor,
@@ -616,8 +653,9 @@ export async function createSetupServer(options: SetupServerOptions): Promise<Se
           detail: later ? `${s.detail} Kann bei „Fertig“ eingerichtet werden.` : s.detail,
         };
       });
-    const detail = ov.ready ? "Alle Pflichtangaben sind da. „Fertig“ schließt die Einrichtung ab." : `Vor „Fertig“ fehlt noch: ${ov.missing.join(", ")}.`;
-    return { ready: ov.ready, missing: ov.missing, items, detail };
+    if (ov.channels && !ov.channels.ready) items.push({ label: "Kanal", ok: false, optional: false, detail: ov.channels.message });
+    const detail = ov.ready ? "Alle Pflichtangaben sind da. „Fertig“ schließt die Einrichtung ab." : notReadyText(ov.missing, ov.channels);
+    return { ready: ov.ready, missing: ov.missing, items, detail, channels: ov.channels };
   }
 
   async function stepJson(step: SetupStep) {
@@ -720,10 +758,10 @@ export async function createSetupServer(options: SetupServerOptions): Promise<Se
       let result = outcome.result;
       if (step.id === "pruefung") {
         // Wie checkSummary: Autostart fehlt vor „Fertig“ nicht
-        const { ready, missing } = await checkSummary();
-        const failed = (result.items ?? []).filter(i => !i.ok);
+        const { ready, missing, channels } = await checkSummary();
+        const failed = (result.items ?? []).filter(i => !i.ok && i.label !== "Kanal");
         const parts: string[] = [];
-        if (!ready) parts.push(`Vor „Fertig“ fehlt noch: ${missing.join(", ")}.`);
+        if (!ready) parts.push(notReadyText(missing, channels));
         if (failed.length) parts.push(`Fehlgeschlagen: ${failed.map(i => i.label).join(", ")}.`);
         const ok = ready && failed.length === 0;
         result = { ...result, ok, message: ok ? "Alles Eingerichtete ist erreichbar." : parts.join(" ") };
@@ -923,16 +961,20 @@ export async function createSetupServer(options: SetupServerOptions): Promise<Se
       for (const step of FINISH_REQUIRED) {
         if ((await step.status(ctx)).state !== "erledigt") missing.push(step.title);
       }
-      if (missing.length) {
-        return json({ error: `Vor „Fertig“ fehlt noch: ${missing.join(", ")}.`, missing }, 409);
+      // Kanalregel (Issue #228): ohne bereiten Kanal oder mit halbem Telegram kein „Fertig“
+      const channels = await channelState();
+      if (missing.length || (channels && !channels.ready)) {
+        return json({ error: notReadyText(missing, channels), missing, ...(channels && !channels.ready ? { channels: channels.message } : {}) }, 409);
       }
+      // Wo der Bot nach dem Start erreichbar ist: Telegram, WebUI oder beides
+      const where = !channels ? "in Telegram" : channels.telegram && channels.webui ? "in Telegram und in der WebUI" : channels.webui ? "in der WebUI" : "in Telegram";
       const supervisor = await options.supervisor();
       let plan: FinishPlan;
       if (supervisor) {
         plan = {
           kind: "restart",
           supervisor,
-          message: `${BRAND.name} startet jetzt neu (${supervisorName(supervisor)}) und ist in wenigen Sekunden in Telegram erreichbar.`,
+          message: `${BRAND.name} startet jetzt neu (${supervisorName(supervisor)}) und ist in wenigen Sekunden ${where} erreichbar.`,
         };
       } else if (wantAutostart && (await autostartStep.status(ctx)).state !== "erledigt") {
         const check = await autostartStep.test!(manager ? { manager } : {}, ctx);
@@ -940,7 +982,7 @@ export async function createSetupServer(options: SetupServerOptions): Promise<Se
         const how = manager && manager !== "launchd" ? ` (${MANAGER_LABEL[manager]})` : "";
         plan = {
           kind: "autostart",
-          message: `Die Einrichtung schließt jetzt, dann richtet ${BRAND.name} den Autostart${how} ein und startet. Ob es geklappt hat, steht im Terminal; danach meldet sich der Bot in Telegram.`,
+          message: `Die Einrichtung schließt jetzt, dann richtet ${BRAND.name} den Autostart${how} ein und startet. Ob es geklappt hat, steht im Terminal; danach ${where === "in Telegram" ? "meldet sich der Bot in Telegram" : `ist der Bot ${where} erreichbar`}.`,
           ...(manager ? { manager } : {}),
         };
       } else {

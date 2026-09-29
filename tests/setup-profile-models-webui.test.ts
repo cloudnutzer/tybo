@@ -415,14 +415,15 @@ describe("Schritt webui", () => {
   test("Schreiben: temporäre .env, Passwort behalten beim Wiederholen", async () => {
     const ctx = await makeCtx({ env: "" });
     const r = await webuiStep.apply!({ WEB_ENABLED: "true", WEB_PASSWORD: FAKE.webPassword, WEB_HOST: "0.0.0.0" }, ctx);
-    expect(r.changed).toEqual(["WEB_ENABLED", "WEB_PASSWORD", "WEB_HOST"]);
+    // Push-Schlüssel (Issue #225) legt der Schritt mit an, nur beim ersten Mal
+    expect(r.changed).toEqual(["WEB_ENABLED", "WEB_PASSWORD", "WEB_HOST", "WEB_PUSH_PUBLIC_KEY", "WEB_PUSH_PRIVATE_KEY"]);
     expect(leakedSecrets(r)).toEqual([]);
     const again = await webuiStep.apply!({ WEB_ENABLED: "true", WEB_PASSWORD: "", WEB_PORT: "3150" }, ctx);
     expect(again.changed).toEqual(["WEB_PORT"]);
     const content = await readFile(ctx.envPath, "utf8");
     expect(content).toContain(`WEB_PASSWORD=${FAKE.webPassword}`);
     expect(content).toContain("WEB_PORT=3150");
-    // Eine Sicherung pro Schreibvorgang
-    expect((await readdir(ctx.backupDir)).length).toBe(2);
+    // Eine Sicherung pro Schreibvorgang: WebUI, Push-Schlüssel, Port
+    expect((await readdir(ctx.backupDir)).length).toBe(3);
   });
 });

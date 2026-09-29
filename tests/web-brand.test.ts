@@ -96,7 +96,8 @@ describe("HTML-Dateien", () => {
       expect(code).not.toMatch(OLD_NAMES);
       for (const m of code.matchAll(/"(tybo-[a-z-]+)"/g)) keys.push(m[1]);
     }
-    expect(keys.sort()).toEqual(["tybo-last-conversation", "tybo-reload-drafts", "tybo-theme", "tybo-unread"]);
+    // tybo-push-device, tybo-push-off-pending: Gerät und ausstehendes Ausschalten für Web Push (Issue #225)
+    expect(keys.sort()).toEqual(["tybo-last-conversation", "tybo-push-device", "tybo-push-off-pending", "tybo-reload-drafts", "tybo-theme", "tybo-unread"]);
   });
 });
 

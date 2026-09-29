@@ -1,6 +1,7 @@
 /**
  * Issue #29, Checkbox 4: POST /api/conversations legt ein Telegram-Topic an
- * (Entscheidung 0005), ohne Rückfall auf ein Web-Gespräch.
+ * (Entscheidung 0005), ohne Rückfall auf ein Web-Gespräch. Seit Issue #227
+ * (Nachtrag zu 0005): ohne Forum-Gruppe ein reines Web-Gespräch.
  */
 
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
@@ -62,15 +63,17 @@ describe("POST /api/conversations legt ein Topic an", () => {
     await noTopicCreated(env);
   });
 
-  test("ohne Forum-Gruppe: 409 no_group", async () => {
+  test("ohne Forum-Gruppe: 201 mit reinem Web-Gespräch, kein Topic (Issue #227)", async () => {
     const env = await topicEnv(root);
     env.group.id = null;
     const ctx = await topicServer(root, servers, env);
     const res = await ctx.api("/api/conversations", "POST", { agent: "research" });
-    expect(res.status).toBe(409);
-    expect(await res.json()).toEqual({ error: "Keine Forum-Gruppe eingerichtet (TELEGRAM_GROUP_ID)", reason: "no_group" });
+    expect(res.status).toBe(201);
+    const { conversation } = await res.json();
+    expect(conversation).toMatchObject({ title: "Neues Gespräch", agent: "research" });
+    expect(conversation.id).toMatch(/^[0-9a-f-]{36}$/);
     await noTopicCreated(env);
-    await noWebConversation(ctx);
+    expect((await ctx.store.listConversations()).map(c => c.id)).toEqual([conversation.id]);
   });
 
   test("ohne Recht Topics verwalten: 403 no_manage_topics", async () => {
@@ -95,8 +98,17 @@ describe("POST /api/conversations legt ein Topic an", () => {
     await noWebConversation(ctx);
   });
 
-  test("ohne Topic-Verwaltung: 503, kein Web-Gespräch", async () => {
+  test("ohne Telegram (keine Quelle, keine Topic-Verwaltung): Web-Gespräch (Issue #227)", async () => {
     const ctx = await topicServer(root, servers, null);
+    const res = await ctx.api("/api/conversations", "POST", { agent: "research" });
+    expect(res.status).toBe(201);
+    expect((await res.json()).conversation.agent).toBe("research");
+    expect(await ctx.store.listConversations()).toHaveLength(1);
+  });
+
+  test("mit Gruppe, aber ohne Topic-Verwaltung: 503, kein Web-Gespräch", async () => {
+    const env = await topicEnv(root);
+    const ctx = await topicServer(root, servers, env, { topics: undefined });
     const res = await ctx.api("/api/conversations", "POST", { agent: "research" });
     expect(res.status).toBe(503);
     expect((await res.json()).error).toBe("Topics verwalten ist nicht eingerichtet");

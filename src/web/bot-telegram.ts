@@ -25,6 +25,7 @@ import {
   type SavedMessageEvent,
   type TopicActivity,
 } from "../lib/convex";
+import { dmChatId, telegramConfigured } from "../lib/channels";
 import { getTopicNames } from "../lib/topic-names";
 import { TopicStateStore, type TopicStateEntry } from "../lib/topic-state";
 import { pickApiAttachments } from "./attachments";
@@ -61,11 +62,15 @@ const WEB_CHANNEL = "web";
 
 const AGENT_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 const GROUP_ID_PATTERN = /^-\d{1,20}$/;
-const USER_ID_PATTERN = /^\d{1,20}$/;
+/** Chat des Direktchats: Telegram-Nutzer-ID oder, ohne Telegram, "web" (WEB_DM_CHAT_ID, Issue #227) */
+const USER_ID_PATTERN = /^(\d{1,20}|web)$/;
 const TOPIC_KEY_PATTERN = /^[1-9]\d{0,9}$/;
 
 export interface BotTelegramDeps {
-  /** TELEGRAM_USER_ID; ohne gültige ID gibt es keinen Direktchat */
+  /**
+   * Chat des Direktchats: TELEGRAM_USER_ID, ohne Telegram "web" (Issue #227,
+   * dmChatId aus src/lib/channels.ts); ohne gültige ID gibt es keinen Direktchat
+   */
   userId?: string;
   /** Chat-ID der Forum-Gruppe, bei jedem Aufruf neu (topics.json wird live gelesen); null: nur Direktchat */
   groupId(): string | null;
@@ -95,8 +100,13 @@ export function resolveGroupId(env: Env, configuredChatIds: string[]): string | 
   return configuredChatIds.find(id => GROUP_ID_PATTERN.test(id)) ?? null;
 }
 
-/** Forum-Gruppe des laufenden Bots: .env und config/topics.json (live gelesen) */
+/**
+ * Forum-Gruppe des laufenden Bots: .env und config/topics.json (live gelesen).
+ * Ohne Telegram (Issue #227) keine: eine übrig gebliebene Konfiguration
+ * aktiviert keine Topics.
+ */
 export function botGroupId(env: Env): string | null {
+  if (!telegramConfigured(env)) return null;
   return resolveGroupId(env, getTopicConfigChatIds());
 }
 
@@ -357,7 +367,7 @@ export interface DisplayOnlyPollDeps {
 }
 
 export interface TelegramLiveDeps {
-  /** TELEGRAM_USER_ID */
+  /** Chat des Direktchats wie in BotTelegramDeps (TELEGRAM_USER_ID oder "web") */
   userId?: string;
   /** Wie in BotTelegramDeps, bei jedem Ereignis neu gelesen */
   groupId(): string | null;
@@ -727,7 +737,7 @@ export const botTopicState = new TopicStateStore();
 /** Echte Live-Quelle für src/bot.ts: Nachrichten aus saveMessage und Meldungen anderer Prozesse */
 export function createBotTelegramLive(env: Env, log?: (message: string) => void): TelegramLiveFeed {
   return createTelegramLiveFeed({
-    userId: env.TELEGRAM_USER_ID,
+    userId: dmChatId(env),
     groupId: () => botGroupId(env),
     onMessageSaved,
     topicState: chatId => botTopicState.forChat(chatId),
@@ -741,7 +751,7 @@ export function createBotTelegramLive(env: Env, log?: (message: string) => void)
 /** Echte Quelle für src/bot.ts: Supabase über src/lib/convex.ts, Namen und Zuordnung aus data/ und config/. */
 export function createBotTelegram(env: Env, log?: (message: string) => void): TelegramSource {
   return createTelegramSource({
-    userId: env.TELEGRAM_USER_ID,
+    userId: dmChatId(env),
     groupId: () => botGroupId(env),
     topicNames: getTopicNames,
     topicMapping: getTopicMappingForChat,

@@ -36,10 +36,12 @@ describe("startWebUi", () => {
 });
 
 describe("src/bot.ts (nur als Text)", () => {
-  test("Adapter um bot.api und Übergabe an startWebUi", async () => {
-    const bot = await Bun.file(join(repo, "src", "bot.ts")).text();
-    expect(bot).toContain('import { createBotTopics } from "./web/bot-topics";');
-    expect(bot).toContain("const telegramTopicApi: TelegramTopicApi = {");
+  test("Adapter um bot.api (Telegram-Laufzeit) und Übergabe an startWebUi", async () => {
+    const source = await Bun.file(join(repo, "src", "bot.ts")).text();
+    expect(source).toContain('import { createBotTopics } from "./web/bot-topics";');
+    // Issue #228: der Adapter lebt in der Telegram-Laufzeit, ohne Telegram gibt es keinen
+    const bot = await Bun.file(join(repo, "src", "lib", "telegram-runtime.ts")).text();
+    expect(bot).toContain("const topicApi: TelegramTopicApi = {");
     expect(bot).toContain("(await bot.api.createForumTopic(chatId, name)).message_thread_id");
     // grammY erwartet den Namen als Objekt
     expect(bot).toContain("await bot.api.editForumTopic(chatId, topicId, { name });");
@@ -49,8 +51,8 @@ describe("src/bot.ts (nur als Text)", () => {
     // Rechte des Haupt-Bots über getChatMember mit der eigenen ID
     expect(bot).toContain("mainBotId ??= (await bot.api.getMe()).id;");
     expect(bot).toContain("return rightsFromChatMember(await bot.api.getChatMember(chatId, mainBotId));");
-    const call = bot.slice(bot.indexOf("webServer = await startWebUi({"));
-    expect(call.slice(0, call.indexOf("});"))).toContain("topics: createBotTopics(process.env, telegramTopicApi)");
+    const call = source.slice(source.indexOf("webServer = await startWebUi({"));
+    expect(call.slice(0, call.indexOf("});"))).toContain("topics: telegramRuntime.topicApi ? createBotTopics(process.env, telegramRuntime.topicApi) : undefined,");
   });
 
   test("Quelle und Live-Feed nutzen denselben Topic-Zustand wie die Verwaltung", async () => {
