@@ -1,0 +1,706 @@
+/**
+ * Issue #64, Checkbox 4: Schritte voraussetzungen, autostart und pruefung.
+ * Befehle sind Attrappen: kein launchctl, kein PM2, kein Claude-Aufruf.
+ * Dienstdateien landen nur in temporären Ordnern.
+ */
+
+import { afterAll, describe, expect, test } from "bun:test";
+import { chmod, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { PROJECT_ROOT } from "../src/setup/context";
+import { createProviders } from "../src/setup/providers";
+import { checkStep } from "../src/setup/steps";
+import { autostartStep, PM2_INSTALL } from "../src/setup/steps/autostart";
+import {
+  CLAUDE_INSTALL,
+  CLAUDE_INSTALL_WINDOWS,
+  CLAUDE_NOT_IN_PATH,
+  LOCAL_BIN_PATH_FIX,
+  MIN_BUN_VERSION,
+  prerequisitesStep,
+  versionAtLeast,
+} from "../src/setup/steps/prerequisites";
+import { backupsOf, cleanup, FAKE, FULL_ENV, fakeRun, leakedSecrets, makeCtx, root } from "./setup-fixture";
+
+afterAll(cleanup);
+
+// ---------------------------------------------------------------------------
+// Importsicherheit der alten Skripte
+// ---------------------------------------------------------------------------
+
+describe("Einrichtungsmodule sind importsicher", () => {
+  test("Import startet nichts und beendet den Prozess nicht", async () => {
+    const launchd = await import("../src/setup/services/launchd");
+    const command = await import("../src/setup/services/command");
+    const pm2 = await import("../src/setup/services/pm2");
+    const linux = await import("../src/setup/services/linux");
+    expect(typeof launchd.setUpService).toBe("function");
+    expect(typeof command.runServicesCommand).toBe("function");
+    expect(typeof pm2.configurePM2Service).toBe("function");
+    expect(typeof linux.setUpTimer).toBe("function");
+    expect(await launchd.selectServices("cloudflare-tunnel", "/gibt/es/nicht/.env")).toEqual(["cloudflare-tunnel"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Voraussetzungen
+// ---------------------------------------------------------------------------
+
+describe("Schritt voraussetzungen", () => {
+  test("Mindestversion wie package.json", async () => {
+    const pkg = JSON.parse(await readFile(join(PROJECT_ROOT, "package.json"), "utf8"));
+    expect(pkg.engines.bun).toBe(`>=${MIN_BUN_VERSION}`);
+    expect(versionAtLeast("1.3.10", "1.3.10")).toBe(true);
+    expect(versionAtLeast("1.4.0", "1.3.10")).toBe(true);
+    expect(versionAtLeast("1.3.9", "1.3.10")).toBe(false);
+    expect(versionAtLeast("1.2.99", "1.3.10")).toBe(false);
+  });
+
+  test("alles da: erledigt", async () => {
+    const s = await prerequisitesStep.status(await makeCtx());
+    expect(s.state).toBe("erledigt");
+    expect(s.items?.map(i => i.label)).toEqual(["Bun", "Claude CLI", "Git"]);
+  });
+
+  test("leere Maschine: Anleitung statt Installation", async () => {
+    const ctx = await makeCtx({ overrides: { bunVersion: "1.2.0", platform: "linux", run: fakeRun() } });
+    ctx.providers.results.claudeVersion = { ok: false, message: "Claude CLI nicht gefunden." };
+    const s = await prerequisitesStep.status(ctx);
+    expect(s.state).toBe("fehlt");
+    expect(s.detail).toBe("Fehlt oder zu alt: Bun, Claude CLI, Git.");
+    expect(s.items?.map(i => i.fix)).toEqual(["bun upgrade", CLAUDE_INSTALL, "sudo apt install git"]);
+    // Nur Prüfbefehle, keine Installation
+    expect(ctx.run.calls).toEqual([["git", "--version"]]);
+  });
+
+  test("Git-Anleitung je Plattform", async () => {
+    for (const [platform, fix] of [
+      ["darwin", "xcode-select --install"],
+      ["win32", "winget install Git.Git"],
+    ] as const) {
+      const ctx = await makeCtx({ overrides: { platform, run: fakeRun() } });
+      const s = await prerequisitesStep.status(ctx);
+      expect(s.state).toBe("teilweise");
+      expect(s.items?.find(i => i.label === "Git")?.fix).toBe(fix);
+    }
+  });
+
+  test("CLAUDE_PATH aus .env wird genutzt", async () => {
+    const ctx = await makeCtx({ env: "CLAUDE_PATH=/opt/claude/bin/claude\n" });
+    await prerequisitesStep.test!({}, ctx);
+    expect(ctx.providers.calls.map(c => [c.method, c.args[0]])).toEqual([
+      ["claudeVersion", "/opt/claude/bin/claude"],
+      ["claudeProbe", "/opt/claude/bin/claude"],
+    ]);
+  });
+
+  test("Test Erfolg: angemeldet", async () => {
+    const r = await prerequisitesStep.test!({}, await makeCtx());
+    expect(r.ok).toBe(true);
+    expect(r.message).toBe("Alles da, Claude CLI ist angemeldet.");
+  });
+
+  test("Test Fehler: nicht angemeldet, mit Anleitung", async () => {
+    const ctx = await makeCtx();
+    ctx.providers.results.claudeProbe = { ok: false, message: "Claude CLI ist nicht angemeldet. Im Terminal „claude“ starten und /login ausführen." };
+    const r = await prerequisitesStep.test!({}, ctx);
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain("/login");
+  });
+
+  test("ohne Claude CLI kein Probeaufruf", async () => {
+    const ctx = await makeCtx();
+    ctx.providers.results.claudeVersion = { ok: false, message: "Claude CLI nicht gefunden." };
+    const r = await prerequisitesStep.test!({}, ctx);
+    expect(r.ok).toBe(false);
+    expect(ctx.providers.calls.map(c => c.method)).toEqual(["claudeVersion"]);
+  });
+
+  test("Versionsausgaben mit Geheimnissen: nur die Versionsnummer kommt durch", async () => {
+    const ctx = await makeCtx({
+      overrides: { run: fakeRun({ "git --version": { stdout: `git version 2.50.0 token=${FAKE.token} ${FAKE.openrouterKey}` } }) },
+    });
+    const s = await prerequisitesStep.status(ctx);
+    // Danach folgt der Hinweis zur Verbindung mit dem Repo (Issue #305)
+    expect(s.items?.find(i => i.label === "Git")?.detail).toStartWith("Git 2.50.0. ");
+    expect(leakedSecrets(s)).toEqual([]);
+    const noVersion = await makeCtx({ overrides: { run: fakeRun({ "git --version": { stdout: `wrapper ${FAKE.webPassword}` } }) } });
+    const s2 = await prerequisitesStep.status(noVersion);
+    expect(s2.items?.find(i => i.label === "Git")?.detail).toStartWith("Git gefunden. ");
+    expect(leakedSecrets(s2)).toEqual([]);
+  });
+
+  test("empfohlener Installationsweg: nativer Installer, unter Windows npm", async () => {
+    expect(CLAUDE_INSTALL).toBe("curl -fsSL https://claude.ai/install.sh | bash");
+    for (const [platform, fix] of [
+      ["linux", CLAUDE_INSTALL],
+      ["darwin", CLAUDE_INSTALL],
+      ["win32", CLAUDE_INSTALL_WINDOWS],
+    ] as const) {
+      const ctx = await makeCtx({ overrides: { platform } });
+      ctx.providers.results.claudeVersion = { ok: false, message: "Claude CLI nicht gefunden.", notFound: true };
+      const s = await prerequisitesStep.status(ctx);
+      expect(s.items?.find(i => i.label === "Claude CLI")?.fix).toBe(fix);
+    }
+    expect(CLAUDE_INSTALL_WINDOWS).toBe("npm install -g @anthropic-ai/claude-code");
+  });
+
+  test("schreibt nichts", async () => {
+    const ctx = await makeCtx();
+    await prerequisitesStep.status(ctx);
+    await prerequisitesStep.test!({}, ctx);
+    expect(prerequisitesStep.apply).toBeUndefined();
+    expect(await Bun.file(ctx.envPath).exists()).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #212: claude in ~/.local/bin, aber nicht im PATH
+// ---------------------------------------------------------------------------
+
+describe("Schritt voraussetzungen: Claude CLI in ~/.local/bin", () => {
+  type Answer = { ok: boolean; message: string; notFound?: true };
+  const NOT_FOUND: Answer = { ok: false, message: "Claude CLI nicht gefunden.", notFound: true };
+  const BROKEN: Answer = { ok: false, message: "Die Claude CLI ist da, startet aber nicht richtig („claude --version“ scheitert). Neu installieren." };
+  const WORKS: Answer = { ok: true, message: "Claude CLI 2.1.300" };
+
+  /**
+   * Kontext mit Antworten je Pfad: "claude" (Suche im PATH) und die Datei in
+   * ~/.local/bin. localFile: Datei anlegen (sonst fehlt sie).
+   */
+  async function ctxWith(options: { inPath: Answer; local?: Answer; localFile?: boolean; env?: string; platform?: NodeJS.Platform }) {
+    const ctx = await makeCtx({ env: options.env, overrides: { platform: options.platform ?? "linux" } });
+    const local = join(ctx.home, ".local", "bin", "claude");
+    if (options.localFile !== false) {
+      await mkdir(dirname(local), { recursive: true });
+      await writeFile(local, "#!/bin/sh\n");
+      await chmod(local, 0o755);
+    }
+    const asked: string[] = [];
+    ctx.providers.claudeVersion = async path => {
+      asked.push(path);
+      return path === local ? (options.local ?? WORKS) : options.inPath;
+    };
+    return { ctx, local, asked };
+  }
+
+  const claudeOf = (items?: { label: string; ok: boolean; detail: string; fix?: string }[]) => items?.find(i => i.label === "Claude CLI");
+
+  test("vorhanden, nicht im PATH: PATH-Hinweis statt Installationsbefehl (status und test)", async () => {
+    const { ctx, local, asked } = await ctxWith({ inPath: NOT_FOUND });
+    const s = await prerequisitesStep.status(ctx);
+    const item = claudeOf(s.items);
+    expect(item?.ok).toBe(false);
+    expect(item?.detail).toStartWith("Claude CLI liegt in ~/.local/bin, das ist noch nicht im PATH: neue Sitzung öffnen.");
+    expect(item?.detail).toBe(CLAUDE_NOT_IN_PATH);
+    expect(item?.fix).toBe(LOCAL_BIN_PATH_FIX);
+    expect(item?.fix).toBe('export PATH="$HOME/.local/bin:$PATH"');
+    expect(asked).toEqual(["claude", local]);
+
+    const r = await prerequisitesStep.test!({}, ctx);
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain(CLAUDE_NOT_IN_PATH);
+    expect(claudeOf(r.items)?.fix).toBe(LOCAL_BIN_PATH_FIX);
+    // Kein Probeaufruf, keine Installation
+    expect(ctx.providers.calls.map(c => c.method)).not.toContain("claudeProbe");
+    expect(ctx.run.calls).toEqual([["git", "--version"], ["git", "--version"]]);
+  });
+
+  test("auch im Einrichtungsmodus des Browsers", async () => {
+    const { ctx } = await ctxWith({ inPath: NOT_FOUND });
+    ctx.noModelCalls = true;
+    const r = await prerequisitesStep.test!({}, ctx);
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain(CLAUDE_NOT_IN_PATH);
+  });
+
+  test("fehlt ganz: Installationsbefehl", async () => {
+    const { ctx, asked } = await ctxWith({ inPath: NOT_FOUND, localFile: false });
+    const item = claudeOf((await prerequisitesStep.status(ctx)).items);
+    expect(item?.detail).toBe("Claude CLI nicht gefunden.");
+    expect(item?.fix).toBe("curl -fsSL https://claude.ai/install.sh | bash");
+    expect(asked).toEqual(["claude"]);
+  });
+
+  test("schon im PATH erreichbar: ok, ~/.local/bin wird nicht extra gefragt", async () => {
+    const { ctx, asked } = await ctxWith({ inPath: WORKS });
+    const s = await prerequisitesStep.status(ctx);
+    expect(claudeOf(s.items)?.ok).toBe(true);
+    expect(claudeOf(s.items)?.fix).toBeUndefined();
+    expect(asked).toEqual(["claude"]);
+    const r = await prerequisitesStep.test!({}, ctx);
+    expect(r.ok).toBe(true);
+  });
+
+  test("im PATH, aber defekt: kein PATH-Hinweis, Neuinstallation", async () => {
+    const { ctx, asked } = await ctxWith({ inPath: BROKEN });
+    const item = claudeOf((await prerequisitesStep.status(ctx)).items);
+    expect(item?.detail).toBe(BROKEN.message);
+    expect(item?.fix).toBe(CLAUDE_INSTALL);
+    expect(asked).toEqual(["claude"]);
+  });
+
+  test("in ~/.local/bin, startet dort aber nicht: kein PATH-Hinweis", async () => {
+    const { ctx } = await ctxWith({ inPath: NOT_FOUND, local: BROKEN });
+    const item = claudeOf((await prerequisitesStep.status(ctx)).items);
+    expect(item?.detail).toBe("Claude CLI liegt in ~/.local/bin, startet dort aber nicht. Neu installieren.");
+    expect(item?.fix).toBe(CLAUDE_INSTALL);
+  });
+
+  test("CLAUDE_PATH gesetzt: gilt, ~/.local/bin wird nicht als Ersatz genommen", async () => {
+    const { ctx, asked } = await ctxWith({ inPath: NOT_FOUND, env: "CLAUDE_PATH=/opt/claude/bin/claude\n" });
+    const item = claudeOf((await prerequisitesStep.status(ctx)).items);
+    expect(item?.detail).toBe("Claude CLI nicht gefunden.");
+    expect(item?.fix).toBe(CLAUDE_INSTALL);
+    expect(asked).toEqual(["/opt/claude/bin/claude"]);
+  });
+
+  test("Ordner ~/.local/bin/claude statt Datei: Installationsbefehl", async () => {
+    const { ctx, local } = await ctxWith({ inPath: NOT_FOUND, localFile: false });
+    await mkdir(local, { recursive: true });
+    expect(claudeOf((await prerequisitesStep.status(ctx)).items)?.fix).toBe(CLAUDE_INSTALL);
+  });
+
+  test("nutzt ctx.home, nicht das echte HOME", async () => {
+    const { ctx, asked } = await ctxWith({ inPath: NOT_FOUND });
+    await prerequisitesStep.status(ctx);
+    expect(asked[1]).toStartWith(ctx.home);
+    expect(ctx.home).not.toBe(process.env.HOME);
+  });
+
+  test("Windows: kein Sonderfall, npm-Weg", async () => {
+    const { ctx, asked } = await ctxWith({ inPath: NOT_FOUND, platform: "win32" });
+    const item = claudeOf((await prerequisitesStep.status(ctx)).items);
+    expect(item?.fix).toBe(CLAUDE_INSTALL_WINDOWS);
+    expect(asked).toEqual(["claude"]);
+  });
+});
+
+describe("Claude-Port", () => {
+  const probe = (answer: Record<string, unknown>) => {
+    const run = fakeRun({ "claude -p": answer });
+    const envs: unknown[] = [];
+    const wrapped = (async (cmd: string[], options?: { env?: Record<string, string> }) => {
+      envs.push(options?.env);
+      return run(cmd);
+    }) as typeof run;
+    const providers = createProviders({
+      fetch: async () => new Response(""),
+      run: wrapped,
+      subprocessEnv: () => ({ PATH: "/usr/bin", TYBO_SUBPROCESS: "1" }),
+    });
+    return { providers, run, envs };
+  };
+
+  test("Erfolg mit Zeitlimit und gefilterter Umgebung", async () => {
+    const { providers, run, envs } = probe({ stdout: JSON.stringify({ is_error: false, result: "OK" }) });
+    expect(await providers.claudeProbe("claude")).toEqual({ ok: true, message: "Claude CLI ist angemeldet und antwortet." });
+    expect(run.calls[0].slice(0, 3)).toEqual(["claude", "-p", "Antworte nur mit OK"]);
+    expect(envs[0]).toEqual({ PATH: "/usr/bin", TYBO_SUBPROCESS: "1" });
+  });
+
+  test("nicht angemeldet, Zeitlimit, Limit erreicht", async () => {
+    const notLoggedIn = probe({ code: 1, stdout: JSON.stringify({ is_error: true, result: "Invalid API key · Please run /login" }) });
+    expect((await notLoggedIn.providers.claudeProbe("claude")).message).toContain("nicht angemeldet");
+    const slow = probe({ code: -1, timedOut: true });
+    expect((await slow.providers.claudeProbe("claude")).message).toContain("Zeitlimit");
+    const limit = probe({ code: 1, stdout: JSON.stringify({ is_error: true, result: "Usage limit reached" }) });
+    expect((await limit.providers.claudeProbe("claude")).message).toContain("Nutzungslimit");
+  });
+
+  test("rohe Ausgaben landen nicht in der Meldung", async () => {
+    const leaky = probe({ code: 1, stderr: `boom ${FAKE.openrouterKey}` });
+    const r = await leaky.providers.claudeProbe("claude");
+    expect(r.ok).toBe(false);
+    expect(leakedSecrets(r)).toEqual([]);
+  });
+
+  test("Version", async () => {
+    const found = createProviders({ fetch: async () => new Response(""), run: fakeRun({ "claude --version": { stdout: "2.1.300 (Claude Code)" } }) });
+    expect(await found.claudeVersion("claude")).toEqual({ ok: true, message: "Claude CLI 2.1.300" });
+    const missing = createProviders({ fetch: async () => new Response(""), run: fakeRun() });
+    expect(await missing.claudeVersion("claude")).toEqual({ ok: false, message: "Claude CLI nicht gefunden.", notFound: true });
+  });
+
+  test("Version: vorhanden, aber defekt oder nicht ausführbar gilt nicht als „nicht gefunden“ (Issue #212)", async () => {
+    for (const answer of [
+      { code: -1, stdout: "", stderr: "Befehl ließ sich nicht starten", spawnError: "EACCES" },
+      { code: 1, stdout: "", stderr: "Fehler" },
+      { code: -1, stdout: "", stderr: "", timedOut: true },
+    ]) {
+      const broken = createProviders({ fetch: async () => new Response(""), run: (async () => answer) as any });
+      const r = await broken.claudeVersion("claude");
+      expect(r.ok).toBe(false);
+      expect(r.notFound).toBeUndefined();
+      expect(r.message).toContain("startet aber nicht richtig");
+    }
+  });
+
+  test("Version: Geheimnisse in der Ausgabe werden vollständig unterdrückt", async () => {
+    const leaky = createProviders({
+      fetch: async () => new Response(""),
+      run: fakeRun({ "claude --version": { stdout: `2.1.300 (Claude Code) ANTHROPIC_API_KEY=${FAKE.openrouterKey} ${FAKE.token}` } }),
+    });
+    const r = await leaky.claudeVersion("claude");
+    expect(r).toEqual({ ok: true, message: "Claude CLI 2.1.300" });
+    expect(leakedSecrets(r)).toEqual([]);
+    const noVersion = createProviders({ fetch: async () => new Response(""), run: fakeRun({ "claude --version": { stdout: `Fehler ${FAKE.legacyDbToken}` } }) });
+    const r2 = await noVersion.claudeVersion("claude");
+    expect(r2).toEqual({ ok: true, message: "Claude CLI gefunden." });
+    expect(leakedSecrets(r2)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Autostart
+// ---------------------------------------------------------------------------
+
+const LOADED = { stdout: "123\t0\tai.tybo.telegram-relay" };
+
+const MAC_COMMANDS = {
+  "which bun": { stdout: "/opt/bun/bin/bun" },
+  "which claude": { stdout: "/Users/test/.local/bin/claude" },
+  "launchctl load": {},
+  "launchctl list": LOADED,
+};
+
+async function writePlist(ctx: { launchAgentsDir: string }, content = "<plist/>") {
+  await mkdir(ctx.launchAgentsDir, { recursive: true });
+  const plist = join(ctx.launchAgentsDir, "ai.tybo.telegram-relay.plist");
+  await writeFile(plist, content);
+  return plist;
+}
+
+describe("Schritt autostart (macOS)", () => {
+  test("Status: leer, geladen, nur Datei, Zustand unbekannt", async () => {
+    const ctx = await makeCtx({ overrides: { run: fakeRun({ "launchctl list": LOADED }) } });
+    expect((await autostartStep.status(ctx)).state).toBe("fehlt");
+    expect(ctx.run.calls).toEqual([]);
+    await writePlist(ctx);
+    expect((await autostartStep.status(ctx)).state).toBe("erledigt");
+    expect(ctx.run.calls).toEqual([["launchctl", "list"]]);
+
+    const fileOnly = await makeCtx({ overrides: { run: fakeRun({ "launchctl list": { stdout: "1\t0\tai.tybo.telegram-relay-alt\n2\t0\tcom.apple.x" } }) } });
+    await writePlist(fileOnly);
+    const s = await autostartStep.status(fileOnly);
+    expect(s.state).toBe("teilweise");
+    expect(s.detail).toContain("nicht geladen");
+
+    const unknown = await makeCtx({ overrides: { run: fakeRun({ "launchctl list": { code: 1 } }) } });
+    await writePlist(unknown);
+    expect((await autostartStep.status(unknown)).state).toBe("teilweise");
+  });
+
+  test("Einrichten: nur der Bot, Plist im temporären LaunchAgents-Ordner", async () => {
+    const ctx = await makeCtx({ overrides: { run: fakeRun(MAC_COMMANDS) } });
+    const r = await autostartStep.apply!({}, ctx);
+    const plist = join(ctx.launchAgentsDir, "ai.tybo.telegram-relay.plist");
+    expect(r).toEqual({ ok: true, message: "Autostart eingerichtet: tybo läuft jetzt und startet mit dem Rechner.", changed: [plist] });
+    expect(await readdir(ctx.launchAgentsDir)).toEqual(["ai.tybo.telegram-relay.plist"]);
+    const content = await readFile(plist, "utf8");
+    expect(content).toContain(`<string>${ctx.root}</string>`);
+    expect(content).toContain("/opt/bun/bin/bun");
+    expect(content).toContain("/Users/test/.local/bin");
+    expect(content).not.toContain("{{");
+    const launchctl = ctx.run.calls.filter(c => c[0] === "launchctl");
+    expect(launchctl).toEqual([["launchctl", "load", plist], ["launchctl", "list"]]);
+    expect(ctx.run.calls.flat().join(" ")).not.toMatch(/cloudflare|smart-checkin|morning-briefing|watchdog|whatsapp/);
+  });
+
+  test("schon geladen: nichts entladen, nichts überschreiben", async () => {
+    const ctx = await makeCtx({ overrides: { run: fakeRun(MAC_COMMANDS) } });
+    const plist = await writePlist(ctx, "<plist>eigene Fassung</plist>");
+    const r = await autostartStep.apply!({}, ctx);
+    expect(r).toEqual({ ok: true, message: "Autostart ist schon eingerichtet, nichts geändert.", changed: [] });
+    expect(await readFile(plist, "utf8")).toBe("<plist>eigene Fassung</plist>");
+    expect(ctx.run.calls).toEqual([["launchctl", "list"]]);
+  });
+
+  test("Laden scheitert: feste Meldung ohne stderr, danach erneuter Ladeversuch", async () => {
+    const answers: Parameters<typeof fakeRun>[0] = {
+      ...MAC_COMMANDS,
+      "launchctl list": { stdout: "" },
+      "launchctl load": { code: 1, stderr: `Load failed: 5: Input/output error TELEGRAM_BOT_TOKEN=${FAKE.token} ${FAKE.webPassword}` },
+    };
+    const ctx = await makeCtx({ overrides: { run: fakeRun(answers) } });
+    const plist = join(ctx.launchAgentsDir, "ai.tybo.telegram-relay.plist");
+
+    const r = await autostartStep.apply!({}, ctx);
+    expect(r.ok).toBe(false);
+    expect(r.message).toBe(
+      "Autostart ließ sich nicht einrichten: launchctl konnte den Dienst nicht laden. Die Dienstdatei liegt da; ein erneuter Versuch lädt sie noch einmal.",
+    );
+    expect(leakedSecrets(r)).toEqual([]);
+    expect(r.message).not.toContain("Input/output");
+    const written = await readFile(plist, "utf8");
+
+    // Liegengebliebene Plist gilt nicht als eingerichtet
+    expect((await autostartStep.status(ctx)).state).toBe("teilweise");
+    expect((await autostartStep.test!({}, ctx)).message).not.toBe("Autostart ist eingerichtet.");
+
+    // Wiederholung mit weiter scheiterndem Laden: ehrlich, ohne Geheimnisse
+    const again = await autostartStep.apply!({}, ctx);
+    expect(again.ok).toBe(false);
+    expect(leakedSecrets(again)).toEqual([]);
+
+    // Wiederholung, jetzt klappt das Laden: nur laden, Datei bleibt
+    answers["launchctl load"] = {};
+    ctx.run.calls.length = 0;
+    const ok = await autostartStep.apply!({}, ctx);
+    expect(ok).toEqual({ ok: true, message: "Autostart eingerichtet: tybo läuft jetzt und startet mit dem Rechner.", changed: [plist] });
+    expect(ctx.run.calls).toEqual([["launchctl", "list"], ["launchctl", "load", plist]]);
+    expect(await readFile(plist, "utf8")).toBe(written);
+    answers["launchctl list"] = LOADED;
+    expect((await autostartStep.status(ctx)).state).toBe("erledigt");
+  });
+
+  test("Zustand unbekannt: nichts laden, nichts schreiben", async () => {
+    const ctx = await makeCtx({ overrides: { run: fakeRun({ ...MAC_COMMANDS, "launchctl list": { code: 1, stderr: FAKE.token } }) } });
+    const plist = await writePlist(ctx, "<plist>eigene Fassung</plist>");
+    const r = await autostartStep.apply!({}, ctx);
+    expect(r.ok).toBe(false);
+    expect(r.changed).toEqual([]);
+    expect(leakedSecrets(r)).toEqual([]);
+    expect(ctx.run.calls).toEqual([["launchctl", "list"]]);
+    expect(await readFile(plist, "utf8")).toBe("<plist>eigene Fassung</plist>");
+    expect((await autostartStep.test!({}, ctx)).ok).toBe(false);
+  });
+
+  test("Schreibfehler: verständliche Meldung, Wiederholung klappt danach", async () => {
+    const ctx = await makeCtx({ overrides: { run: fakeRun({ ...MAC_COMMANDS, "launchctl list": { stdout: "" } }) } });
+    await mkdir(ctx.launchAgentsDir, { recursive: true });
+    await chmod(ctx.launchAgentsDir, 0o500);
+    try {
+      const r = await autostartStep.apply!({}, ctx);
+      expect(r).toEqual({ ok: false, message: "Autostart ließ sich nicht einrichten: die Dienstdatei konnte nicht geschrieben werden (EACCES).", changed: [] });
+      expect(ctx.run.calls.some(c => c[0] === "launchctl")).toBe(false);
+      expect((await autostartStep.status(ctx)).state).toBe("fehlt");
+    } finally {
+      await chmod(ctx.launchAgentsDir, 0o700);
+    }
+    const ok = await autostartStep.apply!({}, ctx);
+    expect(ok.ok).toBe(true);
+    expect(await readdir(ctx.launchAgentsDir)).toEqual(["ai.tybo.telegram-relay.plist"]);
+  });
+
+  test("Fehler: Bun fehlt (Plist kommt seit Issue #368 aus dem Katalog, keine Vorlage nötig)", async () => {
+    const ctx = await makeCtx({ overrides: { run: fakeRun({ ...MAC_COMMANDS, "which bun": { code: 1 } }) } });
+    const t = await autostartStep.test!({}, ctx);
+    expect(t.ok).toBe(false);
+    expect(t.message).toContain("Bun nicht im PATH gefunden");
+    expect(t.message).not.toContain("Vorlage");
+    const r = await autostartStep.apply!({}, ctx);
+    expect(r).toEqual({ ok: false, message: "Autostart ließ sich nicht einrichten: Bun wurde nicht im PATH gefunden.", changed: [] });
+    expect(ctx.run.calls.some(c => c[0] === "launchctl")).toBe(false);
+  });
+
+  test("Test Erfolg mit Bun", async () => {
+    const ctx = await makeCtx({ overrides: { run: fakeRun(MAC_COMMANDS) } });
+    expect((await autostartStep.test!({}, ctx)).ok).toBe(true);
+  });
+});
+
+describe("Schritt autostart (Linux, PM2)", () => {
+  const linux = (answers: Parameters<typeof fakeRun>[0]) => makeCtx({ overrides: { platform: "linux", run: fakeRun(answers) } });
+  const pm2Ok = { "pm2 --version": { stdout: "6.0.0" }, "pm2 jlist": { stdout: "[]" }, "pm2 delete": { code: 1 }, "pm2 start": {}, "pm2 save": {} };
+  const RUNNING = { stdout: JSON.stringify([{ name: "tybo-telegram-relay" }]) };
+  /** Was ein erfolgreiches „pm2 save“ hinterlässt: der Bot in dump.pm2 */
+  async function writeDump(ctx: { pm2DumpPath: string }) {
+    await mkdir(dirname(ctx.pm2DumpPath), { recursive: true });
+    await writeFile(ctx.pm2DumpPath, JSON.stringify([{ name: "tybo-telegram-relay", env: { SECRET: FAKE.token } }]));
+  }
+
+  test("PM2 fehlt: Anleitung, keine Installation, kein npx", async () => {
+    const ctx = await linux({});
+    const s = await autostartStep.status(ctx);
+    expect(s.state).toBe("fehlt");
+    expect(s.items?.[0].fix).toBe(PM2_INSTALL);
+    const r = await autostartStep.apply!({}, ctx);
+    expect(r).toEqual({ ok: false, message: `PM2 fehlt. Erst installieren mit: ${PM2_INSTALL}`, changed: [] });
+    expect(ctx.run.calls.flat()).not.toContain("npx");
+    expect(ctx.run.calls.flat()).not.toContain("npm");
+  });
+
+  test("Einrichten: nur tybo-telegram-relay, pm2 direkt, danach pm2 save", async () => {
+    const ctx = await linux(pm2Ok);
+    const r = await autostartStep.apply!({}, ctx);
+    expect(r.ok).toBe(true);
+    expect(r.message).toContain("pm2 startup");
+    expect(r.changed).toEqual(["pm2:tybo-telegram-relay"]);
+    const pm2 = ctx.run.calls.filter(c => c[0] === "pm2").map(c => c.slice(0, 4).join(" "));
+    expect(pm2).toEqual(["pm2 --version", "pm2 jlist", "pm2 jlist", "pm2 start bun --name", "pm2 save"]);
+    const start = ctx.run.calls.find(c => c[1] === "start")!;
+    expect(start).toContain(join(ctx.root, "src/bot.ts"));
+    expect(ctx.run.calls.flat()).not.toContain("npx");
+  });
+
+  test("Status erledigt und kein zweites Einrichten", async () => {
+    const ctx = await linux({ "pm2 --version": { stdout: "6.0.0" }, "pm2 jlist": RUNNING });
+    await writeDump(ctx);
+    const s = await autostartStep.status(ctx);
+    expect(s.state).toBe("erledigt");
+    expect(leakedSecrets(s)).toEqual([]);
+    const r = await autostartStep.apply!({}, ctx);
+    expect(r.message).toBe("Autostart ist schon eingerichtet, nichts geändert.");
+    expect(ctx.run.calls.some(c => c[1] === "start" || c[1] === "delete")).toBe(false);
+  });
+
+  for (const [name, jlist] of [
+    ["jlist scheitert", { code: 1, stderr: `connect EACCES ${FAKE.token}` }],
+    ["jlist unlesbar", { stdout: `[PM2] Spawning daemon ${FAKE.openrouterKey}\n[{"name":"tybo-telegram-relay"` }],
+    ["jlist kein Array", { stdout: "{}" }],
+  ] as const) {
+    test(`Zustand unbekannt (${name}): nichts löschen, nichts starten`, async () => {
+      const ctx = await linux({ ...pm2Ok, "pm2 jlist": jlist });
+      const s = await autostartStep.status(ctx);
+      expect(s.state).toBe("teilweise");
+      const r = await autostartStep.apply!({}, ctx);
+      expect(r.ok).toBe(false);
+      expect(r.message).toContain("pm2 jlist");
+      expect(r.changed).toEqual([]);
+      expect(ctx.run.calls.some(c => c[1] === "delete" || c[1] === "start" || c[1] === "save")).toBe(false);
+      expect((await autostartStep.test!({}, ctx)).ok).toBe(false);
+      expect(leakedSecrets([s, r])).toEqual([]);
+    });
+  }
+
+  test("pm2 save scheitert: ehrliche Meldung, kein Erfolg", async () => {
+    const ctx = await linux({ ...pm2Ok, "pm2 save": { code: 1, stderr: `EACCES ${FAKE.token}` } });
+    const r = await autostartStep.apply!({}, ctx);
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain("„pm2 save“ ist gescheitert");
+    expect(r.changed).toEqual(["pm2:tybo-telegram-relay"]);
+    expect(leakedSecrets(r)).toEqual([]);
+  });
+
+  test("pm2 save scheitert: Status und Test ehrlich, Wiederholung speichert nur, ohne Neustart", async () => {
+    const answers: Parameters<typeof fakeRun>[0] = { ...pm2Ok, "pm2 save": { code: 1 } };
+    const ctx = await linux(answers);
+    const first = await autostartStep.apply!({}, ctx);
+    expect(first.ok).toBe(false);
+    expect(first.message).toContain("„pm2 save“ ist gescheitert");
+
+    // Der Bot läuft jetzt unter PM2, steht aber nicht in dump.pm2
+    answers["pm2 jlist"] = RUNNING;
+    const s = await autostartStep.status(ctx);
+    expect(s.state).toBe("teilweise");
+    expect(s.detail).toContain("pm2 save");
+    const t = await autostartStep.test!({}, ctx);
+    expect(t.message).not.toBe("Autostart ist eingerichtet.");
+    expect(t.items?.some(i => i.label === "PM2-Speicherung")).toBe(true);
+
+    const calls = () => ctx.run.calls.splice(0).filter(c => c[0] === "pm2").map(c => c[1]);
+    ctx.run.calls.splice(0);
+    const second = await autostartStep.apply!({}, ctx);
+    expect(second.ok).toBe(false);
+    expect(second.message).toContain("„pm2 save“ ist gescheitert");
+    expect(second.message).not.toBe("Autostart ist schon eingerichtet, nichts geändert.");
+    expect(calls()).toEqual(["--version", "jlist", "save"]);
+
+    answers["pm2 save"] = {};
+    const third = await autostartStep.apply!({}, ctx);
+    expect(third.ok).toBe(true);
+    expect(third.changed).toEqual(["pm2:tybo-telegram-relay"]);
+    expect(calls()).toEqual(["--version", "jlist", "save"]);
+
+    await writeDump(ctx);
+    expect((await autostartStep.status(ctx)).state).toBe("erledigt");
+    expect((await autostartStep.apply!({}, ctx)).message).toBe("Autostart ist schon eingerichtet, nichts geändert.");
+    expect(calls()).toEqual(["--version", "jlist", "--version", "jlist"]);
+  });
+
+  test("Abweichendes PM2_HOME: nur das Testziel zählt, externe Sicherung nie", async () => {
+    const before = process.env.PM2_HOME;
+    const external = join(root, "externes-pm2-home");
+    await mkdir(external, { recursive: true });
+    process.env.PM2_HOME = external;
+    try {
+      // Externe Sicherung enthält den Bot, das Testziel noch nicht: nicht gespeichert
+      await writeFile(join(external, "dump.pm2"), JSON.stringify([{ name: "tybo-telegram-relay" }]));
+      const ctx = await linux({ "pm2 --version": { stdout: "6.0.0" }, "pm2 jlist": RUNNING, "pm2 save": {} });
+      expect(ctx.pm2DumpPath.startsWith(ctx.root)).toBe(true);
+      expect((await autostartStep.status(ctx)).state).toBe("teilweise");
+      expect((await autostartStep.apply!({}, ctx)).message).not.toBe("Autostart ist schon eingerichtet, nichts geändert.");
+
+      // Externe Sicherung ohne Bot, Testziel mit Bot: gespeichert
+      await writeFile(join(external, "dump.pm2"), "[]");
+      await writeDump(ctx);
+      expect((await autostartStep.status(ctx)).state).toBe("erledigt");
+      expect((await autostartStep.apply!({}, ctx)).message).toBe("Autostart ist schon eingerichtet, nichts geändert.");
+    } finally {
+      if (before === undefined) delete process.env.PM2_HOME;
+      else process.env.PM2_HOME = before;
+    }
+  });
+
+  test("Start scheitert: feste Meldung ohne stderr, Wiederholung klappt danach", async () => {
+    const answers: Parameters<typeof fakeRun>[0] = { ...pm2Ok, "pm2 start": { code: 1, stderr: `bun not found OPENROUTER_API_KEY=${FAKE.openrouterKey}` } };
+    const ctx = await linux(answers);
+    const r = await autostartStep.apply!({}, ctx);
+    expect(r).toEqual({ ok: false, message: "Autostart ließ sich nicht einrichten: PM2 konnte den Bot nicht starten. Details mit: pm2 logs tybo-telegram-relay", changed: [] });
+    expect(leakedSecrets(r)).toEqual([]);
+    answers["pm2 start"] = {};
+    const ok = await autostartStep.apply!({}, ctx);
+    expect(ok.ok).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Gesamtprüfung
+// ---------------------------------------------------------------------------
+
+describe("Schritt pruefung", () => {
+  async function fullCtx() {
+    const run = fakeRun({ "git --version": { stdout: "git version 2.50.0" }, "launchctl list": LOADED });
+    const ctx = await makeCtx({ env: FULL_ENV, profile: "# Testperson\n", overrides: { run } });
+    await writePlist(ctx);
+    return ctx;
+  }
+
+  test("leer: Test meldet fehlende Schritte, ohne Anbieter zu fragen", async () => {
+    const ctx = await makeCtx();
+    const r = await checkStep.test!({}, ctx);
+    expect(r.ok).toBe(false);
+    expect(r.message).toBe("Es fehlt noch: Datenbank, Profil, Autostart. Richte Telegram oder die WebUI ein, sonst erreicht dich tybo nirgends.");
+    expect(ctx.providers.calls.map(c => c.method)).toEqual(["claudeVersion", "claudeVersion", "claudeProbe"]);
+  });
+
+  test("Issue #228: übrig gebliebene TELEGRAM_GROUP_ID ohne Telegram: Gruppe übersprungen, kein Fehler, kein Telegram-Aufruf", async () => {
+    const run = fakeRun({ "git --version": { stdout: "git version 2.50.0" }, "launchctl list": LOADED });
+    const env = FULL_ENV.split("\n").filter(l => !l.startsWith("TELEGRAM_BOT_TOKEN=") && !l.startsWith("TELEGRAM_USER_ID=")).join("\n");
+    expect(env).toContain(`TELEGRAM_GROUP_ID=${FAKE.groupId}`);
+    const ctx = await makeCtx({ env, profile: "# Testperson\n", overrides: { run } });
+    await writePlist(ctx);
+    const r = await checkStep.test!({}, ctx);
+    expect(r.ok).toBe(true);
+    expect(r.items?.find(i => i.label === "Forum-Gruppe")).toEqual({ label: "Forum-Gruppe", ok: true, detail: "Übersprungen: ohne Telegram gibt es keine Forum-Gruppe." });
+    const methods = ctx.providers.calls.map(c => c.method);
+    expect(methods.filter(m => m.startsWith("telegram"))).toEqual([]);
+  });
+
+  test("fertig: testet eingerichtete Schritte mit gespeicherten Werten, schreibt nichts", async () => {
+    const ctx = await fullCtx();
+    const r = await checkStep.test!({}, ctx);
+    expect(r.ok).toBe(true);
+    expect(r.message).toBe("Alles eingerichtet und erreichbar.");
+    const methods = ctx.providers.calls.map(c => c.method);
+    expect(methods).toContain("telegramGetMe");
+    expect(methods).toContain("telegramCheckGroup");
+    expect(methods).toContain("supabaseQuery");
+    expect(methods).toContain("openrouterKey");
+    expect(ctx.providers.calls.find(c => c.method === "supabaseQuery")?.args).toEqual([FAKE.supabaseUrl, FAKE.serviceKey]);
+    expect(await readFile(ctx.envPath, "utf8")).toBe(FULL_ENV);
+    expect(await backupsOf(ctx)).toEqual([]);
+    expect(leakedSecrets(r)).toEqual([]);
+    expect(checkStep.apply).toBeUndefined();
+  });
+
+  test("Fehler eines Anbieters wird benannt", async () => {
+    const ctx = await fullCtx();
+    ctx.providers.results.telegramGetMe = { ok: false, message: "Telegram lehnt das Token ab." };
+    const r = await checkStep.test!({}, ctx);
+    expect(r.ok).toBe(false);
+    expect(r.message).toBe("Fehlgeschlagen: Telegram.");
+    expect(r.items?.find(i => i.label === "Telegram")?.detail).toBe("Telegram lehnt das Token ab.");
+  });
+});

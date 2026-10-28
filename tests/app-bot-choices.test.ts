@@ -1,0 +1,257 @@
+// Issue #344: Rückfragen des laufenden Bots als Verhalten von wireBotChoices
+// (ersetzt die Quelltext-Prüfungen der Handler und Zustellwege in bot.ts).
+// Prozessweite Anmeldungen sind Attrappen, damit im Testprozess nichts hängen bleibt.
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createChoicePostWeb, wireBotChoices, type BotChoicesDeps, type ChoiceInstallers } from "../src/app/bot-choices";
+import { createBotCommandServices } from "../src/app/command-services";
+import { createBotNotices } from "../src/lib/bot-notices";
+import { getChoice, setChoicesFileForTests, type Choice, type ChoiceConversation, type ChoiceHandler, type ChoiceKind } from "../src/lib/choices";
+import type { ReviewDecision } from "../src/lib/intent-gate";
+import { REVIEW_MEMORY_OPTIONS, REVIEW_ROUTINE_OPTIONS, REVIEW_SOURCE, WEB_COPY_PREFIX } from "../src/lib/review-choices";
+import type { BotSession } from "../src/lib/session-manager";
+import type { PendingReview, ReviewNotifier } from "../src/lib/session-distill";
+import { createTelegramRuntime } from "../src/lib/telegram-runtime";
+import { THREAD_CHOICE_TEXT, THREAD_SOURCE } from "../src/lib/thread-choices";
+
+function setup(env: Record<string, string> = {}, parts: BotChoicesDeps["parts"] = {}) {
+  const kinds: ChoiceKind[] = [];
+  const handlers = new Map<ChoiceKind, ChoiceHandler>();
+  const installed: string[] = [];
+  const note = (name: string) => () => void installed.push(name);
+  let reviewNotifier: ReviewNotifier | null = null;
+  const installers: ChoiceInstallers = {
+    onChoiceDecided: ((kind, handler) => (kinds.push(kind), handlers.set(kind, handler), () => {})) as ChoiceInstallers["onChoiceDecided"],
+    onGoalChange: (() => (installed.push("goalChange"), () => {})) as never,
+    onTopicMappingSet: (() => (installed.push("topicMapping"), () => {})) as never,
+    installThreadChoiceExpiry: (() => (installed.push("threadExpiry"), () => {})) as never,
+    setPhoneCallService: note("phoneService") as never,
+    setToolApprovalHandler: note("toolApproval") as never,
+    expireOrphanedToolChoices: async () => (installed.push("expireTools"), 0),
+    setReviewNotifier: (fn => (installed.push("reviewNotifier"), (reviewNotifier = fn))) as ChoiceInstallers["setReviewNotifier"],
+    setMemoryAsker: note("memoryAsker") as never,
+    installAskOffer: note("askOffer") as never,
+    resumeCalls: note("resumeCalls"),
+  };
+  const telegramSends: unknown[][] = [];
+  const sentChoices: Choice[] = [];
+  const base = createTelegramRuntime({ env: {}, log: () => {} });
+  const runtime = {
+    ...base,
+    sendMessage: async (...args: unknown[]) => void telegramSends.push(args),
+    choices: { ...base.choices, sendChoice: async (choice: Choice) => (sentChoices.push(choice), { sent: true, recorded: true, messages: [] }) },
+  };
+  const services = createBotCommandServices({ routineMenu: async () => false });
+  const posted: string[] = [];
+  const webPosts: { id: string; post: Record<string, unknown> }[] = [];
+  const web = {
+    postToConversation: async (id: string, post: { text: string }) => (posted.push(`stored ${id} ${post.text}`), webPosts.push({ id, post }), true),
+    postLive: async (id: string, post: { text: string }) => (posted.push(`live ${id} ${post.text}`), true),
+  };
+  const choices = wireBotChoices({
+    root: "/srv/tybo",
+    env,
+    runtime,
+    web: () => web as never,
+    notices: createBotNotices({ telegram: () => false, send: async () => ({ ok: true }) as never, sendStatusMessage: async () => {}, dmChatId: () => "" }),
+    phoneTask: {} as never,
+    services,
+    installers,
+    parts,
+  });
+  return { choices, kinds, handlers, installed, services, posted, webPosts, telegramSends, sentChoices, reviewNotifier: () => reviewNotifier };
+}
+
+describe("wireBotChoices", () => {
+  test("jede Art des Registers außer tool bekommt genau einen Handler", () => {
+    const { kinds } = setup();
+    expect([...kinds].sort()).toEqual(["ask", "call", "goal", "memory", "proactive", "reminder", "review", "routine", "thread", "topicmap"]);
+  });
+
+  test("Ablauf der Faden-Rückfragen, Ziel- und Topic-Änderungen, Freigaben und Anrufe angemeldet", () => {
+    const { installed, services } = setup();
+    expect(installed).toEqual(["goalChange", "topicMapping", "threadExpiry", "resumeCalls", "phoneService", "toolApproval", "expireTools"]);
+    // /anruf und phone_call: derselbe Zugang
+    expect(services.phone).toBeDefined();
+  });
+
+  test("Zustellwege der Vorschläge erst mit installNotifiers", () => {
+    const s = setup();
+    expect(s.installed).not.toContain("reviewNotifier");
+    s.choices.installNotifiers();
+    expect(s.installed.slice(-3)).toEqual(["reviewNotifier", "memoryAsker", "askOffer"]);
+  });
+
+  test("postWeb: Web-Gespräch abgelegt über die WebUI", async () => {
+    const s = setup();
+    const id = "11111111-2222-4333-8444-555555555555";
+    expect(await s.choices.postWeb(id, { text: "Vorschlag", kind: "notice" } as never)).toBe(true);
+    expect(s.posted).toEqual([`stored ${id} Vorschlag`]);
+  });
+});
+
+describe("createChoicePostWeb", () => {
+  const telegramConversation = "topic-7";
+
+  test("Telegram-Gespräch: dauerhaft als Meldung mit Quelle und choiceId, live nur ohne Ablage", async () => {
+    const recorded: unknown[] = [];
+    const live: string[] = [];
+    const web = { postToConversation: async () => false, postLive: async (id: string) => (live.push(id), true) };
+    const kept = createChoicePostWeb({ web: () => web, recordNotice: async (_id, post) => (recorded.push(post), true) });
+    expect(await kept(telegramConversation, { text: "Merken?", source: "review", choiceId: "abc" } as never)).toBe(true);
+    expect(recorded).toEqual([{ text: "Merken?", source: "review", choiceId: "abc" }]);
+    expect(live).toEqual([]);
+
+    const notKept = createChoicePostWeb({ web: () => web, recordNotice: async () => false });
+    expect(await notKept(telegramConversation, { text: "Merken?" } as never)).toBe(true);
+    expect(live).toEqual([telegramConversation]);
+  });
+
+  test("ohne WebUI: Web-Gespräch nicht zustellbar", async () => {
+    const post = createChoicePostWeb({ web: () => null, recordNotice: async () => false });
+    expect(await post("11111111-2222-4333-8444-555555555555", { text: "x" } as never)).toBe(false);
+    expect(await post(telegramConversation, { text: "x" } as never)).toBe(false);
+  });
+});
+
+describe("wireBotChoices: Handler der Art review ausgelöst", () => {
+  const WEB_CONVERSATION = "11111111-2222-4333-8444-555555555555";
+  const review = (chatId: string, topicId?: number) => ({ id: "r1", type: "routine", chatId, ...(topicId ? { topicId } : {}), routineDescription: "Wetter am Morgen" }) as PendingReview;
+  const session = { key: "dm:general", agentName: "general" } as BotSession;
+  const decided = (conversation: ChoiceConversation, key: string): Choice =>
+    ({ id: "c1", kind: "review", conversation, text: "Routine anlegen?", options: [], state: "done", result: { key, label: key, via: "web", at: 0 }, createdAt: 0, ref: "r1" }) as Choice;
+
+  async function waitFor(check: () => boolean): Promise<void> {
+    const end = Date.now() + 2000;
+    while (!check()) {
+      if (Date.now() > end) throw new Error("Zeitüberschreitung beim Warten");
+      await Bun.sleep(5);
+    }
+  }
+
+  function withReview(decision: ReviewDecision, env: Record<string, string> = {}) {
+    const calls: string[] = [];
+    const outbox: { chatId: string; text: string }[] = [];
+    const saved: { chat_id: string; content: string; metadata?: Record<string, unknown> }[] = [];
+    const s = setup(env, {
+      decideReview: async (action, reviewId) => (calls.push(`${action}:${reviewId}`), decision),
+      createRoutine: async () => ({ text: "Routine angelegt", isError: false }) as never,
+      sendAndRecord: async input => (outbox.push({ chatId: input.chatId, text: input.text }), { sent: true }) as never,
+      saveMessage: async message => (saved.push(message as never), true),
+    });
+    return { ...s, calls, outbox, saved, handler: s.handlers.get("review")! };
+  }
+
+  test("Routine im Web-Direktchat ohne Telegram: Bericht in den Verlauf, nichts an Telegram", async () => {
+    const r = withReview({ kind: "routine", review: review("web"), session });
+    await r.handler(decided({ type: "telegram", chatId: "web" }, "routine"));
+    await waitFor(() => r.saved.length > 0);
+    expect(r.calls).toEqual(["routine:r1"]);
+    expect(r.telegramSends).toEqual([]);
+    expect(r.saved).toEqual([{ chat_id: "web", role: "assistant", content: "Routine angelegt", metadata: { type: "routine_report" } } as never]);
+  });
+
+  test("Routine in einem Telegram-Topic: Bericht über die Laufzeit an Chat und Topic", async () => {
+    const r = withReview({ kind: "routine", review: review("-100", 9), session });
+    await r.handler(decided({ type: "telegram", chatId: "-100", topicId: 9 }, "routine"));
+    await waitFor(() => r.saved.length > 0);
+    expect(r.telegramSends).toEqual([["-100", "Routine angelegt", 9]]);
+    expect(r.saved[0].chat_id).toBe("-100");
+  });
+
+  test("Web-Gespräch: Ergebnis über die WebUI, Kopie im Direktchat nur mit Telegram", async () => {
+    const discarded = { kind: "discarded", review: review(`web:${WEB_CONVERSATION}`) } as ReviewDecision;
+    const webOnly = withReview(discarded);
+    await webOnly.handler(decided({ type: "web", conversationId: WEB_CONVERSATION }, "discard"));
+    expect(webOnly.posted).toHaveLength(1);
+    expect(webOnly.posted[0]).toStartWith(`stored ${WEB_CONVERSATION} `);
+    expect(webOnly.outbox).toEqual([]);
+
+    const withTelegram = withReview(discarded, { TELEGRAM_BOT_TOKEN: "123:test", TELEGRAM_USER_ID: "4242" });
+    await withTelegram.handler(decided({ type: "web", conversationId: WEB_CONVERSATION }, "discard"));
+    expect(withTelegram.outbox).toHaveLength(1);
+    expect(withTelegram.outbox[0].chatId).toBe("4242");
+    expect(withTelegram.outbox[0].text).toStartWith(WEB_COPY_PREFIX);
+    expect(withTelegram.telegramSends).toEqual([]);
+  });
+});
+
+describe("wireBotChoices: Handler der Art thread ausgelöst", () => {
+  const WEB_CONVERSATION = "11111111-2222-4333-8444-555555555555";
+  const TELEGRAM_ENV = { TELEGRAM_BOT_TOKEN: "123:test", TELEGRAM_USER_ID: "4242" };
+  const decided = (conversation: ChoiceConversation, key: string): Choice =>
+    ({ id: "c7", kind: "thread", conversation, text: "Offen seit gestern", options: [], state: "done", result: { key, label: key, via: "telegram", at: 0 }, createdAt: 0, ref: "T1" }) as Choice;
+
+  function withThread(env: Record<string, string> = TELEGRAM_ENV) {
+    const applied: string[] = [];
+    const outbox: Record<string, unknown>[] = [];
+    const s = setup(env, {
+      applyThreadButton: async (id, button) => (applied.push(`${id}:${button}`), { status: "closed", thread: {} as never }),
+      sendAndRecord: async input => (outbox.push({ ...input }), { sent: true }) as never,
+    });
+    return { ...s, applied, outbox, handler: s.handlers.get("thread")! };
+  }
+
+  test("Telegram-Topic: Antwort an Chat und Topic der Rückfrage, keine Kopie im Direktchat", async () => {
+    const t = withThread();
+    await t.handler(decided({ type: "telegram", chatId: "-100", topicId: 9 }, "done"));
+    expect(t.applied).toEqual(["T1:done"]);
+    expect(t.outbox).toEqual([{ chatId: "-100", topicId: 9, text: THREAD_CHOICE_TEXT.done, source: THREAD_SOURCE, format: "plain" }]);
+    expect(t.telegramSends).toEqual([]);
+    expect(t.posted).toEqual([]);
+  });
+
+  test("Web-Gespräch: Antwort nur im Gespräch selbst, auch mit Telegram keine Kopie im Direktchat", async () => {
+    const t = withThread();
+    await t.handler(decided({ type: "web", conversationId: WEB_CONVERSATION }, "drop"));
+    expect(t.applied).toEqual(["T1:drop"]);
+    expect(t.outbox).toEqual([{ chatId: `web:${WEB_CONVERSATION}`, text: THREAD_CHOICE_TEXT.dropped, source: THREAD_SOURCE, format: "plain" }]);
+    expect(t.telegramSends).toEqual([]);
+  });
+});
+
+describe("wireBotChoices: Zustellweg der Vorschläge aus installNotifiers ausgelöst", () => {
+  const GROUP = "-1001234567890";
+  const WEB_CONVERSATION = "11111111-2222-4333-8444-555555555555";
+  // createChoice legt die Rückfrage im Register ab: Register in einer Temp-Datei
+  const dir = mkdtempSync(join(tmpdir(), "app-bot-choices-"));
+  beforeAll(() => setChoicesFileForTests(join(dir, "choices.json")));
+  afterAll(() => {
+    setChoicesFileForTests(null);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function installed() {
+    const s = setup();
+    s.choices.installNotifiers();
+    const notifier = s.reviewNotifier();
+    if (!notifier) throw new Error("kein Zustellweg angemeldet");
+    return { ...s, notifier };
+  }
+
+  test("Merk-Vorschlag im Telegram-Topic: Rückfrage über sendChoice, nichts in die WebUI", async () => {
+    const s = installed();
+    await s.notifier({ reviewId: "r-tg", type: "memory", chatId: GROUP, topicId: 42, text: "🧠 Merk-Vorschlag", createdAt: Date.now() });
+    expect(s.sentChoices).toHaveLength(1);
+    expect(s.sentChoices[0]).toMatchObject({
+      kind: "review",
+      ref: "r-tg",
+      conversation: { type: "telegram", chatId: GROUP, topicId: 42 },
+      text: "🧠 Merk-Vorschlag",
+      options: REVIEW_MEMORY_OPTIONS,
+    });
+    expect((await getChoice(s.sentChoices[0].id))?.state).toBe("open");
+    expect(s.webPosts).toEqual([]);
+  });
+
+  test("Routine-Angebot aus einem Web-Gespräch: abgelegt im Gespräch mit choiceId, dazu sendChoice", async () => {
+    const s = installed();
+    await s.notifier({ reviewId: "r-web", type: "routine", chatId: `web:${WEB_CONVERSATION}`, text: "Als Routine speichern?", createdAt: Date.now() });
+    expect(s.sentChoices).toHaveLength(1);
+    const choice = s.sentChoices[0];
+    expect(choice).toMatchObject({ kind: "review", ref: "r-web", conversation: { type: "web", conversationId: WEB_CONVERSATION }, options: REVIEW_ROUTINE_OPTIONS });
+    expect(s.webPosts).toEqual([{ id: WEB_CONVERSATION, post: { text: "Als Routine speichern?", kind: "notice", source: REVIEW_SOURCE, choiceId: choice.id } }]);
+  });
+});

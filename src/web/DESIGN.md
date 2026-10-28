@@ -1,0 +1,514 @@
+---
+name: tybo WebUI
+description: Browser-Zugang zu tybo, vertraut wie ChatGPT und Telegram Desktop, ruhig, hell und dunkel nach Geräteeinstellung oder eigener Wahl.
+colors:
+  accent: "#1f6fd6"
+  accent-ink: "#ffffff"
+  bg: "#ffffff"
+  sidebar: "#f5f6f8"
+  raised: "#ffffff"
+  ink: "#1a1c20"
+  muted: "#5c626c"
+  placeholder: "#6b717b"
+  line: "#e4e6ea"
+  hover: "#eceef1"
+  active: "#e2e9f5"
+  bubble: "#e8effb"
+  bubble-ink: "#14233a"
+  code: "#f4f5f7"
+  error: "#b42318"
+  error-bg: "#fdf1f0"
+  error-line: "#f3c9c4"
+  agent-general: "#cf6a2e"
+  agent-research: "#0f8b7f"
+  agent-cto: "#7357c6"
+  agent-coo: "#9a7a14"
+  agent-finance: "#3b8540"
+  agent-strategy: "#b0409f"
+  agent-content: "#0e7490"
+  agent-critic: "#c0392b"
+  accent-dark: "#5b9bf0"
+  accent-ink-dark: "#0d1726"
+  bg-dark: "#1f2023"
+  sidebar-dark: "#18191b"
+  raised-dark: "#27292d"
+  ink-dark: "#e7e8eb"
+  muted-dark: "#a2a7b0"
+  placeholder-dark: "#8c929c"
+  line-dark: "#303237"
+  hover-dark: "#2a2c30"
+  active-dark: "#25324a"
+  bubble-dark: "#283548"
+  bubble-ink-dark: "#e6eefb"
+  code-dark: "#17181a"
+  error-dark: "#f2877d"
+  error-bg-dark: "#3a2220"
+  error-line-dark: "#5a302c"
+  agent-general-dark: "#f0a070"
+  agent-research-dark: "#3cc2b3"
+  agent-cto-dark: "#a28cf0"
+  agent-coo-dark: "#d8b64a"
+  agent-finance-dark: "#74c07a"
+  agent-strategy-dark: "#e08ad4"
+  agent-content-dark: "#4cc3dc"
+  agent-critic-dark: "#ef7b6f"
+typography:
+  headline:
+    fontFamily: "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", system-ui, sans-serif"
+    fontSize: "1.5rem"
+    fontWeight: 600
+    lineHeight: 1.5
+    letterSpacing: "-0.01em"
+  title:
+    fontFamily: "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", system-ui, sans-serif"
+    fontSize: "1rem"
+    fontWeight: 600
+    lineHeight: 1.5
+  content-h1:
+    fontFamily: "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", system-ui, sans-serif"
+    fontSize: "1.375rem"
+    lineHeight: 1.3
+    letterSpacing: "-0.01em"
+  content-h2:
+    fontFamily: "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", system-ui, sans-serif"
+    fontSize: "1.1875rem"
+    lineHeight: 1.3
+    letterSpacing: "-0.01em"
+  content-h3:
+    fontFamily: "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", system-ui, sans-serif"
+    fontSize: "1.0625rem"
+    lineHeight: 1.3
+    letterSpacing: "-0.01em"
+  body:
+    fontFamily: "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", system-ui, sans-serif"
+    fontSize: "1rem"
+    fontWeight: 400
+    lineHeight: 1.5
+  body-reading:
+    fontFamily: "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", system-ui, sans-serif"
+    fontSize: "1rem"
+    fontWeight: 400
+    lineHeight: 1.65
+  body-small:
+    fontFamily: "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", system-ui, sans-serif"
+    fontSize: "0.9375rem"
+    fontWeight: 400
+    lineHeight: 1.5
+  label:
+    fontFamily: "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", system-ui, sans-serif"
+    fontSize: "0.8125rem"
+    fontWeight: 600
+    lineHeight: 1.5
+  meta:
+    fontFamily: "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", system-ui, sans-serif"
+    fontSize: "0.75rem"
+    fontWeight: 400
+    lineHeight: 1.5
+  wordmark:
+    fontFamily: "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", system-ui, sans-serif"
+    fontSize: "1.0625rem"
+    fontWeight: 700
+    letterSpacing: "-0.01em"
+  mono:
+    fontFamily: "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, Consolas, monospace"
+    fontSize: "0.875em"
+    lineHeight: 1.5
+rounded:
+  code: "0.3rem"
+  sm: "0.6rem"
+  md: "0.75rem"
+  bubble: "1.15rem"
+  composer: "1.5rem"
+  pill: "999px"
+  round: "50%"
+spacing:
+  xs: "0.25rem"
+  sm: "0.5rem"
+  md: "0.75rem"
+  lg: "1rem"
+  xl: "1.5rem"
+  message-gap: "1.75rem"
+  column: "47.5rem"
+  sidebar-width: "17.5rem"
+components:
+  button-primary:
+    backgroundColor: "{colors.accent}"
+    textColor: "{colors.accent-ink}"
+    typography: "{typography.title}"
+    rounded: "{rounded.md}"
+    padding: "0.75rem 1rem"
+  button-send:
+    backgroundColor: "{colors.accent}"
+    textColor: "{colors.accent-ink}"
+    rounded: "{rounded.round}"
+    size: "2.25rem"
+  button-send-disabled:
+    backgroundColor: "{colors.hover}"
+    textColor: "{colors.placeholder}"
+    rounded: "{rounded.round}"
+    size: "2.25rem"
+  button-stop:
+    backgroundColor: "{colors.ink}"
+    textColor: "{colors.bg}"
+    rounded: "{rounded.round}"
+    size: "2.25rem"
+  button-new-chat:
+    backgroundColor: "{colors.raised}"
+    textColor: "{colors.ink}"
+    typography: "{typography.body-small}"
+    rounded: "{rounded.sm}"
+    padding: "0.6rem 0.65rem"
+  button-quiet:
+    backgroundColor: "transparent"
+    textColor: "{colors.muted}"
+    typography: "{typography.body-small}"
+    rounded: "{rounded.sm}"
+    padding: "0.55rem 0.6rem"
+  button-quiet-hover:
+    backgroundColor: "{colors.hover}"
+    textColor: "{colors.ink}"
+  button-choice-primary:
+    backgroundColor: "{colors.accent}"
+    textColor: "{colors.accent-ink}"
+    typography: "{typography.body-small}"
+    rounded: "{rounded.sm}"
+    padding: "0.55rem 0.6rem"
+  button-icon:
+    backgroundColor: "transparent"
+    textColor: "{colors.muted}"
+    rounded: "{rounded.sm}"
+    size: "2.5rem"
+  input-text:
+    backgroundColor: "{colors.raised}"
+    textColor: "{colors.ink}"
+    typography: "{typography.body}"
+    rounded: "{rounded.md}"
+    padding: "0.75rem 0.9rem"
+  composer-box:
+    backgroundColor: "{colors.raised}"
+    textColor: "{colors.ink}"
+    typography: "{typography.body}"
+    rounded: "{rounded.composer}"
+    padding: "0.35rem 0.35rem 0.35rem 1rem"
+  conversation-item:
+    backgroundColor: "transparent"
+    textColor: "{colors.ink}"
+    typography: "{typography.body-small}"
+    rounded: "{rounded.sm}"
+    padding: "0.5rem 0.6rem"
+  conversation-item-hover:
+    backgroundColor: "{colors.hover}"
+  conversation-item-active:
+    backgroundColor: "{colors.active}"
+  agent-chip:
+    backgroundColor: "{colors.hover}"
+    textColor: "{colors.muted}"
+    typography: "{typography.label}"
+    rounded: "{rounded.pill}"
+    padding: "0.15rem 0.6rem 0.15rem 0.5rem"
+  bubble-user:
+    backgroundColor: "{colors.bubble}"
+    textColor: "{colors.bubble-ink}"
+    typography: "{typography.body}"
+    rounded: "{rounded.bubble}"
+    padding: "0.6rem 0.95rem"
+  message-error:
+    backgroundColor: "{colors.error-bg}"
+    textColor: "{colors.error}"
+    rounded: "{rounded.md}"
+    padding: "0.6rem 0.9rem"
+  message-note:
+    backgroundColor: "transparent"
+    textColor: "{colors.muted}"
+    rounded: "{rounded.pill}"
+    padding: "0.3rem 0.75rem"
+  activity-line:
+    backgroundColor: "transparent"
+    textColor: "{colors.muted}"
+    rounded: "{rounded.pill}"
+    padding: "0.35rem 0.7rem 0.35rem 0.6rem"
+  code-block:
+    backgroundColor: "{colors.code}"
+    textColor: "{colors.ink}"
+    typography: "{typography.mono}"
+    rounded: "{rounded.md}"
+    padding: "0.8rem 1rem"
+---
+
+# Design System: tybo WebUI
+
+## Overview
+
+**Creative North Star: "Der vertraute Schreibtisch"**
+
+Die WebUI sieht absichtlich aus wie ein Werkzeug, das man schon kennt: links die Gesprächsliste wie in Telegram Desktop, rechts der Chat wie in ChatGPT. Das System verweigert eine eigene Effekt-Welt. Es besteht aus neutralem Grau, einer einzigen ruhigen blauen Akzentfarbe, der Systemschrift des Geräts, feinen 1-px-Linien und einer runden Eingabebox. Der Dunkelmodus ist ein gleichwertiges Anthrazit, kein invertiertes Hell; standardmäßig folgen beide Modi `prefers-color-scheme`, der Schalter System / Hell / Dunkel in der Seitenleiste legt einen Modus pro Browser fest.
+
+Charakter trägt nur, was Information trägt: die Agentenfarben (ein Punkt pro Agent), die einklappbare Statuszeile eines laufenden Turns und kleine Details wie der Senden-Knopf, der zum Stopp wird. Die Dichte ist die eines Chat-Werkzeugs, nicht die einer Landingpage: 16 px Grundschrift, eine Lesespalte von 760 px, großzügige 1.75rem Abstand zwischen Nachrichten, sonst kompakt.
+
+Bewegung gibt es genau zweimal: Nachrichten blenden ein, die Schublade gleitet. Alles andere (Chevron, Hover, Senden/Stopp) wechselt sofort ohne Übergang. Unter `prefers-reduced-motion: reduce` entfallen auch die beiden Bewegungen.
+
+**Key Characteristics:**
+- Eine Akzentfarbe (ruhiges Blau), alles andere neutral grau bzw. anthrazit
+- Agentenfarben als einziger Farbcharakter, immer als 0.5rem-Punkt neben dem Namen
+- Systemschrift, keine Webfonts, kein Display-Schnitt
+- Flach: Tiefe über Tonflächen und 1-px-Linien, nur zwei Schatten im ganzen System
+- Hell und dunkel vollwertig, Standard nach Geräteeinstellung, im Seitenleisten-Fuß umschaltbar
+- Zustand sichtbar: Statuszeile, Verbindungsbalken, Senden/Stopp am selben Ort
+
+## Colors
+
+Neutrales Grau mit einem einzigen ruhigen Blau als Handlungsfarbe; die acht Agentenfarben sind Kennzeichen, keine Dekoration. Jeder Farbtoken existiert zweimal (hell und `-dark`); im Code heißen sie gleich. Die dunklen Werte stehen in `style.css` zweimal: auf `:root[data-theme="dark"]` (Wahl „Dunkel") und im `@media (prefers-color-scheme: dark)`-Block auf `:root:not([data-theme="light"])` (System dunkel, solange nicht „Hell" gewählt ist). `tests/web-theme-css.test.ts` prüft, dass beide Blöcke gleich sind; neue dunkle Werte gehören in beide. `data-theme` setzt `public/theme.js` im `<head>` vor dem ersten Zeichnen, samt `color-scheme` und `theme-color`.
+
+### Primary
+- **Ruhiges Arbeitsblau** (accent / accent-dark): Primärknopf beim Login, Senden-Knopf, Fokusring (2 px, Abstand 2 px), Links, Textcursor, Punkt der Statuszeile, Textauswahl (24 % gemischt) und der Rahmen der Eingabebox bei Fokus (55 % in die Linienfarbe gemischt). Text darauf ist `accent-ink`: weiß im Hellen, fast schwarzes Blau im Dunkeln.
+
+### Secondary
+- **Agentenpalette** (agent-general Orange, agent-research Petrol, agent-cto Violett, agent-coo Ocker, agent-finance Grün, agent-strategy Magenta, agent-content Cyan, agent-critic Rot; jeweils mit aufgehellter `-dark`-Variante): kennzeichnet, welcher Agent spricht bzw. ein Gespräch besitzt. Zugeordnet über das Attribut `data-agent`, das die Variable `--agent` setzt; unbekannte Agenten fallen auf General zurück, fehlt `--agent` ganz, auf `muted`.
+
+### Neutral
+- **Papierweiß / Anthrazit** (bg / bg-dark): Hauptfläche mit Verlauf und Kopfzeile. Auch `theme-color` der Browserleiste (bei System je nach Media-Abfrage, bei fester Wahl beide Tags auf denselben Wert).
+- **Leisegrau der Seitenleiste** (sidebar / sidebar-dark): eine Stufe vom Hauptbereich abgesetzt; im Dunkeln dunkler als der Hauptbereich.
+- **Erhabene Fläche** (raised / raised-dark): Eingabebox, Passwortfeld, Knopf "Neues Gespräch".
+- **Tinte** (ink / ink-dark): Fließtext, Titel; zugleich Fläche des Stopp-Knopfs.
+- **Gedämpft** (muted / muted-dark): Agentennamen, Metazeilen, Gruppenlabels, Icons in Ruhe, Statuszeile, Fortschrittsliste, Tabellenkopf-Linie.
+- **Platzhalter** (placeholder / placeholder-dark): nur Platzhaltertext und das Pfeil-Icon des deaktivierten Senden-Knopfs.
+- **Haarlinie** (line / line-dark): alle Trennlinien und Rahmen, 1 px.
+- **Schwebeton** (hover / hover-dark): Hover-Fläche, außerdem Hintergrund von Agent-Chip, Verbindungsbalken, Hinweis-Schritt und deaktiviertem Senden.
+- **Auswahlblau** (active / active-dark): nur das aktuell geöffnete Gespräch in der Liste.
+- **Blasenblau** (bubble, bubble-ink und ihre `-dark`-Varianten): ausschließlich die Nutzerblase.
+- **Codegrau** (code / code-dark): Inline-Code, Codeblöcke, Zitate.
+- **Fehlerrot** (error, error-bg, error-line und `-dark`): Fehlernachricht im Verlauf und Login-Fehlertext, Meldungen im Menü. Einzige Fläche in Rot: der Knopf „Endgültig löschen" für Topics (Issue #30). Einziger roter Punkt: das offene Mikrofon, also die laufende Sprachaufnahme (Issue #109) „Hört zu" im Sprechmodus (Issue #250) und das offene Mikrofon am Telefonhörer (Issue #258). Nie für den Stopp auf eigenen Wunsch.
+
+### Named Rules
+**Die Eine-Stimme-Regel.** Blau heißt "hier handelst du" oder "hier ist Fokus". Keine blauen Flächen, Überschriften oder Dekorationen; die einzige blaue Fläche in Ruhe ist der Senden-Knopf.
+
+**Die Punkt-Regel.** Agentenfarben erscheinen nur als 0.5rem-Kreis neben einem Agentennamen (Antwortkopf, Gesprächsliste, Kopfzeilen-Chip). Der Name selbst bleibt `muted`; Agentenfarbe wird nie Textfarbe, Fläche oder Rahmen. So trägt die Farbe keine Lesbarkeitslast.
+
+**Die Kein-Rot-für-Absicht-Regel.** Rot ist Fehlern vorbehalten. Ein vom Nutzer ausgelöster Stopp ("Abgebrochen.") wird als ruhige graue Pillen-Notiz gezeigt. Ausnahmen: das endgültige Löschen eines Telegram-Topics (Issue #30), weil es nicht umkehrbar ist, und der stehende 0.625rem-Punkt für ein offenes Mikrofon: während einer laufenden Sprachaufnahme (Issue #109) und im Sprechmodus, solange er zuhört (Issue #250; mit der Kopfhörer-Einstellung auch während der Antwort, weil das Mikrofon dann offen bleibt) und am Telefonhörer, solange das Mikrofon offen und nicht stumm ist, auch während tybo spricht (Issue #258). Rot zeigt dort ein offenes Mikrofon an, wie überall auf Geräten üblich; der Punkt steht still, er blinkt nicht und hat keine Bewegung, damit `prefers-reduced-motion` nichts abschalten muss. In allen anderen Zuständen des Sprechmodus ist der Punkt grau (`placeholder`).
+
+## Typography
+
+**Body Font:** Systemschrift (`-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif`)
+**Mono Font:** `ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace`
+
+**Character:** Die Schrift des Geräts, damit die Oberfläche sich wie eine native App anfühlt. Hierarchie entsteht über Gewicht (400, 500, 600, 650, 700) und wenige Größenstufen, nicht über eine zweite Familie.
+
+### Hierarchy
+- **Wortmarke** (700, 1.0625rem, -0.01em; auf dem Login 1.75rem): der Produktname (tybo, aus `src/brand.ts`) oben in der Seitenleiste und als Login-Überschrift. Reiner Text, kein Logo in der Oberfläche; das Zeichen von tybo.ai (dunkles Quadrat, heller Ring, oranger Punkt, im Dunkelmodus invertiert) erscheint nur als Tab-Symbol `/favicon.svg`, als Home-Bildschirm-Symbol `/apple-touch-icon.png` (180 px, randlos, exakt aus der Geometrie des Seitenkopfs von tybo.ai gerechnet) und als App-Symbol der installierbaren Web-App (Issue #224): `/icon-192.png` und `/icon-512.png` genau wie `favicon.svg` (helle Fassung, abgerundetes Quadrat, Ecken durchsichtig), `/icon-maskable-512.png` randlos mit dem dunklen Quadrat als Fläche, Ring und Punkt so verkleinert, dass sie in der sicheren Zone (Kreis mit 80 % Durchmesser) liegen. Alle drei rechnet `scripts/web-icons.ts`; nie von Hand bearbeiten.
+- **Headline** (600, 1.5rem, -0.01em): nur der Leerzustand "Womit kann ich helfen?".
+- **Title** (600, 1rem): Gesprächstitel in der Kopfzeile, einzeilig mit Auslassung.
+- **Antwort-Überschriften** (h1 1.375rem, h2 1.1875rem, h3 1.0625rem, h4 1rem; Zeilenhöhe 1.3, -0.01em, `text-wrap: balance`): nur innerhalb gerenderter Antworten.
+- **Body** (400, 1rem, 1.5): Grundschrift, Nutzerblase, Eingabe.
+- **Lesetext** (400, 1rem, 1.65): Antwortinhalt; Absätze und Listen mit 0.9rem Abstand, `strong` in 650.
+- **Body small** (0.9375rem): Gesprächstitel in der Liste, Seitenleisten-Knöpfe, Tabellen, Leerzustandstext.
+- **Label** (600, 0.8125rem): Agentenname im Antwortkopf; der Agent-Chip nutzt dieselbe Größe in 500.
+- **Meta** (0.75rem): Agentenzeile unter Gesprächstiteln; in 600 als Gruppenlabel ("Web-Gespräche").
+- **Mono** (0.875em relativ): Inline-Code und Codeblöcke.
+
+### Named Rules
+**Die Lesespalten-Regel.** Lange Antworten stehen in 1.65 Zeilenhöhe in einer Spalte von höchstens 47.5rem. Tabellen nutzen `tabular-nums`; Codeblöcke und breite Tabellen scrollen in sich, nie die Seite.
+
+## Layout
+
+Zwei Spalten ab 56rem: feste Seitenleiste (17.5rem) links, Hauptbereich rechts mit Kopfzeile, Verlauf und Eingabe. Verlauf und Eingabebox sind auf dieselbe zentrierte Spalte (`--column`, 47.5rem) begrenzt, damit Text und Eingabe fluchten.
+
+Unter 56rem wird die Seitenleiste zur Schublade (höchstens 86vw breit), die mit 220 ms von links gleitet und einen Scrim darüber legt. Geschlossen ist sie `visibility: hidden`, also für Tastatur und Screenreader unerreichbar. Das Menü-Icon in der Kopfzeile und das Schließen-Icon in der Schublade tragen `mobile-only` und verschwinden am Desktop.
+
+Die Seite scrollt nie als Ganzes (`body.app` ist fest positioniert, `100dvh` hoch, `overflow: hidden`); nur der Verlauf und die Gesprächsliste scrollen. Safe-Area-Insets werden oben (Kopfzeile, Seitenleiste), unten (Eingabe, Seitenleiste, Einstellungen) und seit Issue #229 auch links und rechts (Querformat mit Kamera-Aussparung: Kopfzeile, Seitenleiste, Verlauf, Eingabe, Einstellungen, Menü der Kopfzeile, Login und Offline-Seite) respektiert.
+
+**Handy als App (Issue #229).** Bildschirmtastatur: `interactive-widget=resizes-content` im Viewport lässt Chrome auf Android das Layout verkleinern; auf iOS setzt `app.js` aus `visualViewport` die Variablen `--app-height` und `--app-top`, solange die Tastatur offen ist, und begrenzt damit `body.app` auf den sichtbaren Bereich. Stand der Verlauf unten, bleibt er unten, sonst bleibt die Leseposition; keine eigene Bewegung. Unter 56rem hat die Schublade Verlaufseinträge: Zurück schließt die offene Schublade, aus einem Gespräch führt Zurück in die Gesprächsliste (offene Schublade), erst danach verlässt Zurück die App. Wischen vom linken Rand (erste 20 px, mindestens 60 px weit, vor allem waagrecht) öffnet die Schublade, Wischen nach links schließt sie; es gibt kein Mitziehen, die Schublade gleitet wie beim Tipp auf das Menü (mit `prefers-reduced-motion` ohne Gleiten). Auf Code-Blöcken, Tabellen und Eingaben beginnt kein Wisch, der Verlauf selbst reagiert nicht auf Wischen.
+
+Abstände laufen in rem auf einer lockeren Leiter: 0.25, 0.5, 0.75, 1, 1.5rem, dazu 1.75rem zwischen Nachrichten und 1.5rem vor der Statuszeile. Spaltenpolster: 1.25rem/1rem am Handy, 1.75rem/1.5rem am Desktop.
+
+**Die Daumen-Regel.** Unter 56rem wachsen Senden, Stopp und Statuszeile auf 2.75rem Zielgröße; Icon-Knöpfe sind überall 2.5rem.
+
+## Elevation & Depth
+
+Das System ist flach. Tiefe entsteht über Tonflächen (Seitenleiste eine Stufe abgesetzt, `raised` für Bedienflächen) und 1-px-Haarlinien. Es gibt genau zwei Schatten: einen weichen unter der Eingabebox und einen breiten unter der geöffneten Schublade, der am Desktop entfällt.
+
+### Shadow Vocabulary
+- **Eingabe-Schwebe** (`box-shadow: 0 2px 10px rgba(20, 24, 31, 0.07)`; dunkel `0 2px 12px rgba(0, 0, 0, 0.35)`): nur die Eingabebox, als Token `--shadow`.
+- **Schubladen-Schatten** (`box-shadow: 0 0 40px rgba(0, 0, 0, 0.2)`): nur die geöffnete Seitenleiste am Handy, zusammen mit dem Scrim (`--scrim`).
+
+### Named Rules
+**Die Linie-statt-Schatten-Regel.** Karten, Listen, Blasen und Knöpfe haben keinen Schatten. Wer eine Fläche absetzen will, nimmt `line`, `hover` oder `raised`.
+
+## Shapes
+
+Weich, aber nicht verspielt. Die Radien wachsen mit der Größe der Form: 0.3rem für Inline-Code, 0.6rem für Listeneinträge, Icon-Knöpfe, Zitate und Hinweise, 0.75rem für Felder, Primärknopf, Codeblöcke und Fehlerkästen, 1.15rem für die Nutzerblase, 1.5rem für die Eingabebox. Der Build streut diese Mittelstufe leicht (0.55rem Gesprächseintrag und leiser Knopf, 0.6rem Icon-Knopf, 0.65rem "Neues Gespräch"); normativ ist 0.6rem, neue Komponenten nehmen diesen Wert. Pillen (999px) für alles, was ein Zustand ist: Agent-Chip, Statuszeile, Stopp-Notiz. Kreise (50 %) für Senden, Stopp und alle Punkte.
+
+Die Nutzerblase hat eine kleinere Ecke unten rechts (`1.15rem 1.15rem 0.35rem 1.15rem`), der Ansatz zeigt zum Absender. Antworten haben keine Blase und keinen Rahmen.
+
+Icons sind inline SVG im 24er-Raster, Kontur 1.8 (in runden Knöpfen 2.2), runde Enden, 1.25rem Standardgröße, Farbe per `currentColor`. Das Stopp-Icon ist das einzige gefüllte.
+
+## Components
+
+### Buttons
+Zurückhaltend und vertraut; nur der Handlungsknopf bekommt Farbe.
+- **Primär** (Login "Anmelden"): Akzentfläche, Radius 0.75rem, 600. Hover hellt per `filter: brightness(1.08)` auf, sofort ohne Übergang; deaktiviert 60 % Deckkraft.
+- **Senden / Stopp:** ein runder Knopf von 2.25rem (Handy 2.75rem) rechts in der Eingabebox. Während ein Turn läuft, wird Senden ausgeblendet und Stopp an derselben Stelle gezeigt: Tintenfläche mit gefülltem Quadrat. Wartet der Turn auf die Antwort zu einer Freigabe-Frage, stehen beide nebeneinander: Senden für die Antwort, Stopp zum Abbrechen. Senden ohne Text ist `hover`-grau mit Platzhalter-Icon.
+- **Neues Gespräch:** Rahmen `line`, Fläche `raised`, Stift-Icon in `muted`, 500.
+- **Leise Knöpfe** (Abmelden) und **Icon-Knöpfe** (Menü, Schließen): ohne Fläche, `muted`; Hover füllt `hover` und färbt auf `ink`.
+- **Fokus:** überall derselbe 2-px-Akzentring mit 2 px Abstand (`:focus-visible`), im Passwortfeld 1 px Abstand.
+
+### Chips
+- **Agent-Chip** (Kopfzeile, neben dem Gesprächstitel): Pille in `hover`, Text `muted` 0.8125rem/500, davor der Agentenpunkt. Leer wird er ausgeblendet.
+- **Motor-Pille** (Issue #126, Kopfzeile rechts neben dem Agent-Chip): Pille mit Haarlinie `line`, ohne Fläche und ohne Punkt, Text `muted` 0.8125rem/500, kein Umbruch; so unterscheidet sie sich vom Agent-Chip. Sie steht nur, wenn der eingestellte Motor des Gesprächs vom Standard abweicht oder der Standard nicht Claude Code ist, und nennt dann den Motor („Codex", „OpenCode", „Claude Code"). Sie zeigt die Einstellung, nicht den Motor der letzten Antwort (der steht in der Metazeile). `/motor` aus jedem Kanal, ein neuer Standard und „Auf Standard" ändern sie ohne Neuladen. `title` erklärt „Wechseln mit /motor". Keine Bewegung, keine neue Farbe.
+
+### Inputs / Fields
+- **Passwortfeld:** Rahmen `line`, Fläche `raised`, Radius 0.75rem, 1rem Schrift; Fokus über den Akzentring.
+- **Eingabebox:** Pillenform mit Radius 1.5rem, Rahmen `line`, Fläche `raised`, Eingabe-Schwebe. Die Textarea selbst ist randlos und wächst bis 8 Zeilen. Fokus färbt den Rahmen der Box leicht blau, kein Ring.
+- **Büroklammer am Handy** (Issue #229): Auf Touch-Geräten (`pointer: coarse`) öffnet die Büroklammer ein kleines Menü über sich, gebaut wie das Menü der Kopfzeile (Fläche `raised`, Haarlinie `line`, Radius 0.75rem, 0.25rem Innenabstand, kein Schatten), links an der Eingabebox ausgerichtet. Zwei leise Knöpfe in `ink` mit Symbol (Kamera, Büroklammer), je 2.75rem hoch: „Foto aufnehmen" (Feld mit `capture="environment"`, öffnet die Kamera) und „Datei wählen" (wie bisher). Escape, Tipp daneben oder eine Wahl schließt es. Am Rechner öffnet die Büroklammer direkt die Dateiwahl. Keine Bewegung.
+- **Geteilt** (Issue #229): Kommen Inhalte aus dem Teilen-Menü (Android), steht über den Anhängen eine leise Zeile in 0.8125rem `muted` („Geteilt: 1 Bild, Text"), rechts der leise Knopf „Anderes Gespräch" (am Handy 2.75rem hoch). Nach dem Tipp ergänzt die Zeile „Gespräch in der Liste wählen." und die Liste öffnet sich. Liegt der Inhalt noch in keinem Gespräch, heißt es „Noch in keinem Gespräch." und der Knopf „Gespräch wählen". Abgewiesene Dateien nennt der Hinweis über den Anhängen im Fehlerstil. Nach dem Senden ist die Zeile weg. Keine neue Farbe, keine Bewegung.
+- **Sprachaufnahme** (Issue #109): Mikrofon als runder Knopf wie die Büroklammer (`muted`, Hover `hover`/`ink`), rechts vor Senden. Nur im sicheren Kontext (HTTPS, localhost) mit Mikrofon und MediaRecorder und nur, wo Anhänge gehen; sonst gibt es ihn nicht. Während der Aufnahme ersetzt eine Zeile Feld, Büroklammer, Mikrofon und Senden: stehender roter Punkt (0.625rem, `error`, siehe Kein-Rot-für-Absicht-Regel), „Aufnahme" in 0.875rem `muted`, die Zeit mm:ss in `ink` mit `tabular-nums`, rechts „Verwerfen" als leise Pille und „Stopp" als Pille in `ink` mit Text `bg` (wie der Stopp-Knopf). Am Handy alles 2.75rem hoch. Nach dem Stopp wird die Aufnahme ein Anhang-Chip mit Noten-Symbol, Dauer und Größe, dazu ein Icon-Knopf „Aufnahme abspielen"/„Pause" in der Größe von Entfernen. Keine Bewegung.
+
+### Sprechmodus (Issue #250)
+Nur vorhandene Farben und Bausteine, keine Bewegung. Der Zustand steht immer als Text da, nie nur als Farbe.
+- **Knopf „Sprechen":** runder Knopf wie das Mikrofon der Aufnahme (`muted`, Hover `hover`/`ink`), rechts daneben und vor Senden. Inline SVG aus fünf senkrechten Strichen (Tonspur), Kontur 1.9; Name für Screenreader „Mit <Name> sprechen". Am Handy 2.75rem. Es gibt ihn nur, wenn ein Sprechmodus bereit ist (`GET /api/voice`) und der Browser ihn kann (sicherer Kontext, Mikrofon, AudioContext mit AudioWorklet, zum Vorlesen speechSynthesis bzw. ein Audio-Element); sonst fehlt er ganz. Gesperrt (halbe Deckkraft) ohne Gespräch, im geschlossenen Topic, beim Senden und während einer Aufnahme; während der Aufnahmezeile steht er nicht da. Läuft der Sprechmodus, ist umgekehrt die Aufnahme gesperrt.
+- **Bereich:** Solange der Modus läuft, ersetzt ein Bereich die Eingabebox (gleiche Spaltenbreite, Haarlinie, Fläche `raised`, Radius 1.4rem, der Schatten der Eingabebox; er steht an ihrer Stelle, kein weiterer Schatten). Der Verlauf darüber bleibt sichtbar und bedienbar; erkannter Text und Antwort erscheinen dort als normale Nachrichten. Aufbau von oben: eine Zeile mit Punkt (0.625rem), Zustand in 0.9375rem/600 `ink`, beim Denken daneben der jüngste Schritt der Statuszeile in 0.875rem `muted` (eine Zeile, abgeschnitten), rechts der Pegel. Darunter der Hinweis in 0.875rem `ink` (`role="status"`), dann höchstens zwei Zeilen „Du: …" (zuletzt Erkanntes) und „<Name>: …" (Anfang der Antwort) in 0.875rem `muted`, je auf zwei Zeilen begrenzt. Unten rechts die Knöpfe als Pillen wie in der Aufnahmezeile: „Pause" bzw. „Weiter" leise, „Auflegen" in `ink` mit Text `bg`. Der Bereich ist fokussierbar (`role="group"`, Name „Sprechmodus") und bekommt beim Start den Fokus.
+- **Zustände als Text:** „Mikrofon wird freigegeben …", „Hört zu", „Verstehe …", „Denkt …", „Spricht", „Nichts verstanden", „Wartet", „Pausiert", „Fehler". Hinweise darunter in ganzen Sätzen, etwa „In diesem Gespräch läuft schon eine Antwort. Nichts gesendet.", „Wieder frei. Sprich noch einmal.", „Längste Äußerung erreicht, gesendet.", „Keine Antwort zum Vorlesen. Siehe Verlauf.", „Das kann je nach Motor dauern.", „Vorlesen fehlgeschlagen. Die Antwort steht im Verlauf.", „Tippe, um die Antwort zu hören.".
+- **Punkt:** rot (`error`) nur, solange das Mikrofon offen ist (siehe Kein-Rot-für-Absicht-Regel), sonst `placeholder`. Er steht still.
+- **Pegel:** stehender Balken (4.5rem breit, 0.3rem hoch, Fläche `hover`, Füllung `muted`, bei erkannter Sprache `ink`), nur solange das Mikrofon offen ist. Die Breite springt etwa zehnmal je Sekunde auf den neuen Wert, ohne Übergang. Unter `prefers-reduced-motion: reduce` gibt es ihn nicht, dann steht nur der Text.
+- **Antippen:** Während „Spricht" unterbricht ein Tipp auf den Bereich (nicht auf einen Knopf) oder die Leertaste die Antwort; der Zeiger zeigt es (`cursor: pointer`). Während „Denkt …" fragt derselbe Tipp im Hinweis „Antwort abbrechen?", dazu links die Pillen „Ja, abbrechen" und „Nein"; „Pause" tritt solange zurück. Kein Rot: Abbrechen ist eine Absicht.
+- **Fehler:** Zustand „Fehler", der Satz darunter in `error`, einziger Knopf „Schließen" (wie „Auflegen"). Mikrofon, Ausgabe und Bildschirmsperre sind dann schon frei; Schließen bringt die Eingabebox zurück.
+- **Abschnitt „Sprechmodus auf diesem Gerät"** im Reiter „Sprechen", unter „Hören und Sprechen", gebaut wie „Benachrichtigungen auf diesem Gerät": oben „Gilt nur für diesen Browser auf diesem Gerät und wird nur hier gespeichert." in `.actions-hint`. Darunter „Pause bis zum Senden" als Segment-Steuerung Kurz / Normal / Lang, „Stimme" als Auswahlfeld (Vorauswahl, dann die deutschen Stimmen des Browsers, auf dem Gerät gespeicherte zuerst, Online-Stimmen mit „online" gekennzeichnet), „Tempo" als Auswahlfeld 0,8- bis 1,4-fach mit dem leisen Knopf „Probe" darunter, und „Mit Kopfhörer: per Stimme unterbrechen" als Segment-Steuerung An / Aus mit einem Satz, dass das nur mit Kopfhörer taugt. Kein Speichern-Knopf: jede Änderung gilt sofort. Ohne deutsche Stimme, ohne eingebaute Stimme, ohne Speicher im Browser und bei einer Server-Stimme steht je ein Satz in `.actions-hint`; ohne Speicher sind die Felder gesperrt.
+- **Neuladen:** Läuft der Sprechmodus, nennt die Rückfrage vor dem Neuladen „Der Sprechmodus läuft und wird beendet."
+- **Abschnitt „Eigene Stimme"** (Issue #253) im Reiter „Sprechen", unter „Sprechmodus auf diesem Gerät", gebaut wie „Benachrichtigungen": oben zwei Sätze in `.actions-hint`, was eine eigene Stimme ist und dass die Aufnahme nur auf diesem Rechner bleibt; darunter die Klon-Engine in einem Satz (eingerichtet mit Name und Lizenzhinweis, sonst der Weg über `tybo setup sprache`). Gespeicherte Stimmen als Liste wie „Andere Geräte" (`.settings-devices`): links „<Name> (KI-Stimme)", darunter Datum und Dauer in 0.75rem `muted`, bei der gewählten „Liest im Sprechmodus vor"; rechts leise Knöpfe „Probe anhören", „Als Stimme verwenden", „Löschen" (fragt in derselben Zeile neutral nach, kein Rot). Ohne Engine sind Probe und Verwenden gesperrt. Eine Probe hängt einen Abspieler (`audio controls`, volle Zeile, höchstens 24rem) an die Zeile.
+- **Neue Stimme aufnehmen:** Zuerst nur das Pflicht-Häkchen wie in der Einrichtung (`.setup-check`, Akzentfarbe des Systems) mit dem Wortlaut der Einwilligung und darunter „Ohne dieses Häkchen öffnet tybo das Mikrofon nicht und speichert nichts." Erst mit Häkchen erscheinen Name (Feld wie überall), der Text zum Vorlesen als Zitat mit Haarlinie links (0.9375rem `ink`, Zeilenhöhe 1.55) und „Aufnahme starten" als Primärknopf. Während der Aufnahme dieselbe Zeile wie bei der Sprachaufnahme (M4b): stehender roter Punkt, „Aufnahme", Zeit mm:ss, Pillen „Verwerfen" und „Stopp". Danach „Anhören:" mit Abspieler, „Speichern" als Primärknopf und „Wiederholen" leise; unter 5 Sekunden ist Speichern gesperrt mit Satz. Kein Datei-Feld, kein Ziehen. Keine neue Farbe, keine Bewegung.
+
+### Telefonhörer (Issue #258)
+Ein flüssiges Gespräch über den WebSocket `/api/call`. Baut auf den Teilen des Sprechmodus auf: nur vorhandene Farben und Bausteine, keine Bewegung, der Zustand steht immer als Text da.
+- **Knopf „Telefonhörer":** runder Knopf wie „Sprechen" (`muted`, Hover `hover`/`ink`), rechts neben „Sprechen" und vor Senden. Inline SVG eines Telefonhörers, Kontur 1.8; Name für Screenreader „Mit <Name> telefonieren". Am Handy 2.75rem. Es gibt ihn nur, wenn `modes.call.ready` aus `GET /api/voice` stimmt und der Browser ihn kann (sicherer Kontext, Mikrofon, AudioContext mit AudioWorklet, WebSocket, mit der Browser-Stimme speechSynthesis); sonst fehlt er ganz, der Grund steht im Reiter „Sprechen" (#260). Aufnahme, Sprechmodus und Telefonhörer schließen sich aus: läuft einer, sind die anderen beiden gesperrt (halbe Deckkraft).
+- **Ansicht:** an der Stelle des Sprechmodus, also statt der Eingabebox unter dem Verlauf, gleicher Bereich (`.talk-panel`: Spaltenbreite, Haarlinie, `raised`, Radius 1.4rem, Schatten der Eingabebox), kein Modal. Von oben: Kopfzeile in 0.8125rem mit „Telefonhörer" (`ink`, 600), dem Agenten (`muted`, abgeschnitten) und rechts der Dauer mm:ss in `tabular-nums` (nach dem Ende „nach mm:ss"); die Zustandszeile des Sprechmodus mit Punkt, Zustand, beim Denken dem Schritt („schaut nach …") und dem Pegel; die Erwartung aus `modes.call.expectation` in 0.8125rem `muted` („Erster Satz nach rund 1,5 Sekunden"), vom Verbinden bis zur ersten erkannten Äußerung; der Hinweis in 0.875rem `ink` (`role="status"`); höchstens vier Zeilen des Gesprächs, „Du: …" in `ink`, „<Name>: …" in `muted`, je auf zwei Zeilen begrenzt; unten rechts die Pillen „Stumm" (leise, gedrückt mit Fläche `hover` und `aria-pressed`), „Auflegen" in `ink` mit Text `bg`, nach dem Ende „Noch einmal" (leise) und „Schließen" (`ink`). Die Ansicht ist fokussierbar (`role="group"`, Name „Telefonhörer") und bekommt beim Start den Fokus.
+- **Zustände als Text:** „Verbindet …", „Hört zu", „Versteht …", „Denkt …", „Spricht", „Stumm" (statt „Hört zu", tybo spricht weiter), „Verbindung weg" (ein neuer Versuch läuft), „Aufgelegt" (mit Dauer und Grund, etwa „Zwei Minuten nichts gehört."), „Fehler" (Satz in `error` und „Noch einmal"). Tybos Sätze erscheinen erst, wenn sie gespielt werden, nicht beim Empfang.
+- **Punkt und Pegel:** rot (`error`) und stehend, solange das Mikrofon offen und nicht stumm ist, auch während tybo spricht (der Strom bleibt bis zum Auflegen offen). Pegel wie im Sprechmodus, beim Zuhören und Sprechen; unter `prefers-reduced-motion` nur der Text.
+- **Antippen:** Während „Versteht …", „Denkt …" und „Spricht" unterbricht ein Tipp auf die Ansicht (nicht auf einen Knopf) oder die Leertaste sofort; der Zeiger zeigt es. Per Stimme nur während „Spricht", mit Ton aus dem Server und der Geräte-Einstellung „Per Stimme und Antippen". Unterbricht tybo sich zweimal hintereinander selbst (zweimal „nichts verstanden" nach Unterbrechen per Stimme), steht „Ins Wort fallen per Stimme ist für dieses Gespräch aus, <Name> hat sich wohl selbst gehört. Tippe zum Unterbrechen." als Hinweis da.
+- **Hinweis einmal pro Gerät:** „Mit Kopfhörern kannst du <Name> ins Wort fallen. Über Lautsprecher tippe zum Unterbrechen." in einem Kasten mit Haarlinie (Radius 0.8rem) und der leisen Pille „Verstanden". Auf dem iPhone (installierte App) einmal unter „Verbindet …": „Auf dem iPhone fragt die installierte App bei jedem Gespräch nach dem Mikrofon. Einfach erlauben."
+- **Abschnitt „Telefonhörer auf diesem Gerät"** im Reiter „Sprechen", nach „Sprechmodus auf diesem Gerät", nur wenn der Server den Telefonhörer kennt: „Ins Wort fallen" als Segment-Steuerung „Per Stimme und Antippen" / „Nur Antippen" mit einem Satz zu Kopfhörer und Echo-Unterdrückung. Kein Speichern-Knopf, eigene Ablage in localStorage.
+- **Neuladen:** Läuft ein Gespräch, nennt die Rückfrage vor dem Neuladen „Ein Gespräch am Telefonhörer läuft und wird aufgelegt."
+
+### Navigation
+- **Seitenleiste:** Wortmarke, "Neues Gespräch", Gruppenlabel (0.75rem/600, `muted`), Gesprächsliste, unten durch eine Haarlinie abgetrennt der Darstellungs-Schalter und darunter "Abmelden".
+- **Darstellungs-Schalter** (System / Hell / Dunkel): Segment-Steuerung aus drei gleich breiten Knöpfen mit Symbol (Monitor, Sonne, Mond, 1rem) und Text in 0.8125rem/500. Rahmen `line`, Radius 0.6rem, 0.125rem Innenabstand; Knöpfe Radius 0.45rem (innerer Radius passend zum Rahmen), in Ruhe `muted`, Hover `hover`/`ink`, gewählt Fläche `raised` mit Rahmen `line` und Text `ink`. Keine Akzentfarbe, keine Bewegung. `role="radiogroup"` mit Namen „Darstellung", Knöpfe `role="radio"` mit `aria-checked`; genau ein Tab-Stopp (der gewählte), Pfeiltasten wechseln Fokus und Wahl reihum, Pos1/Ende an den Rand, Leertaste wählt. Unter 56rem mindestens 2.75rem hoch. Die Wahl liegt in `localStorage["tybo-theme"]` und gilt auch auf der Login-Seite, die selbst keinen Schalter hat.
+- **Gesprächseintrag:** zweizeilig, Titel 0.9375rem einzeilig mit Auslassung, darunter Agentenpunkt plus Name in 0.75rem `muted`. Hover `hover`, aktuelles Gespräch `active` mit `aria-current="true"`. 1 px Abstand zwischen Einträgen. Telegram-Einträge mit neuer Nachricht seit dem letzten Öffnen tragen `data-unread="true"` und am Ende der Meta-Zeile einen 0.5rem-Punkt in `ink` (Name „neu" für Screenreader); er verschwindet beim Öffnen. Keine Akzentfarbe, keine Zahl, keine Bewegung.
+- **Kopfzeile:** min. 3.25rem, Haarlinie unten, Titel plus Agent-Chip; am Handy links das Menü-Icon.
+- **Offline-Seite „tybo nicht erreichbar" (Issue #224):** Aufbau wie das Login (Spalte 21rem, mittig, Safe-Area unten): Überschrift in Wortmarken-Größe 1.75rem, ein Satz in `muted`, darunter die drei Gründe (Rechner aus oder schläft, Tunnel unterbrochen, kein Netz) als leise Liste in 0.9375rem `muted`, dann „Erneut versuchen" als `primary-button` über die ganze Breite (lädt `/`). Hell/Dunkel über `theme.js` wie überall, auch die gespeicherte Wahl. Keine neue Farbe, keine Bewegung, kein Symbol.
+- **Verbindungsbalken:** zentrierte 0.8125rem-Zeile in `hover` unter der Kopfzeile, nur sichtbar, wenn die Verbindung weg ist (`role="status"`).
+- **Neue Version (Issue #111):** Zeile wie der Verbindungsbalken, direkt darunter bzw. unter der Kopfzeile der Einstellungen, Text in `ink`, daneben ein kleiner Knopf „Neu laden“ (0.8125rem/500, Radius 0.6rem, Fläche `accent`, Text `accent-ink`). Die Rückfrage vor dem Neuladen (Aufnahme, Sprechmodus, Upload, Anhänge, Einstellungen, nicht sicherbare Entwürfe) steht in derselben Zeile, dazu „Abbrechen“ als Knopf mit Haarlinie auf `raised`, Fokus dort. Leer unsichtbar, die `status`-Region bleibt im Dokument. Kein automatisches Neuladen, keine Animation.
+
+### Web-Gespräche verwalten (Issue #21)
+Nur aus vorhandenen Bausteinen, keine neuen Farben, keine Bewegung.
+- **Agentenauswahl:** Klick auf "Neues Gespräch" klappt darunter eine Liste auf (Gruppenlabel "Mit welchem Agenten?", Einträge wie Gesprächseinträge mit Agentenpunkt und Name). Kein Dialog, am Handy in der Schublade. `role="listbox"`, Einträge `role="option"`; markiert ist General, markierter Eintrag in `hover` (nicht `active`, das bleibt dem offenen Gespräch). Pfeiltasten wandern reihum, Pos1/Ende, Enter legt an, Escape schließt.
+- **Titel umbenennen:** Der Titel der Kopfzeile ist ein Knopf (Hover `hover`, Radius 0.6rem), bei Telegram-Gesprächen gesperrt und wie Text. Antippen ersetzt ihn durch ein Feld wie das Passwortfeld in Titelgröße (Rahmen `line`, `raised`); Enter speichert, Escape und Verlassen brechen ab. Ungültig: Rahmen `error-line`, Hinweis im Verbindungsbalken.
+- **Menü:** Drei-Punkte-Icon-Knopf rechts in der Kopfzeile und rechts an jedem Web-Gesprächseintrag (am Desktop erst bei Hover/Fokus bzw. beim offenen Gespräch sichtbar, am Handy immer, dort 2.75rem). Das Menü der Kopfzeile ist eine flache Fläche `raised` mit Haarlinie und Radius 0.75rem rechts unter dem Knopf (kein Schatten); am Eintrag hängt es an einer Haarlinie links wie die Fortschrittsliste. Inhalt: leise Knöpfe "Umbenennen" und "Löschen".
+- **Rückfrage:** "Löschen" ersetzt den Inhalt durch "Gespräch löschen?" (600, `ink`), "Löschen" (leiser Knopf in `ink`, 600) und "Abbrechen" mit Fokus. Kein Rot: Löschen ist eine Absicht, kein Fehler.
+
+### Topics verwalten (Issue #30)
+Neue Gespräche sind Telegram-Topics (Entscheidung 0005). Dafür gelten drei bewusste Ausnahmen von den übrigen Regeln, sonst nur vorhandene Bausteine, keine Bewegung.
+- **Titel umbenennen** gilt auch für Topics; gesperrt und wie Text bleiben nur „General" und der Direktchat. Topic-Namen folgen Telegram (bis 128 Zeichen, Leerraum innen bleibt).
+- **Menü** an Topics (Kopfzeile und Eintrag, gleiche Form wie bei Web-Gesprächen): „Umbenennen", „Schließen" bzw. „Wieder öffnen", „Löschen …". General und Direktchat haben kein Menü. Fehlt dem Bot das Recht „Nachrichten löschen" (oder ist es unbekannt), ist „Löschen …" gesperrt; darunter steht die Erklärung in 0.8125rem `muted` (`.actions-hint`, mit `aria-describedby`) und ein leiser Knopf „Rechte erneut prüfen". Meldungen des Servers stehen im Menü in 0.8125rem `error` (`.actions-error`, `role="alert"`). Die Kopfzeilen-Fläche ist höchstens 22rem breit, lange Texte brechen um.
+- **Ausnahme Schloss:** Geschlossene Topics stehen unabhängig von ihrer Aktivität unter „Ältere Topics", Titel in `muted`, in der Meta-Zeile ein Schloss (0.75rem, Kontur 2.2, `role="img"`, Name „geschlossen"). Das ist das einzige Zustandssymbol an Einträgen; weitere Topic-Icons gibt es nicht. Im offenen geschlossenen Topic ist die Eingabe gesperrt, darüber ein Hinweis in 0.8125rem `muted` (`.composer-note`).
+- **Ausnahme Rot:** Die Rückfrage vor dem endgültigen Löschen eines Topics nennt den Namen („Topic ‚…' in Telegram endgültig löschen?", 600), erklärt die Folgen in `muted`, hat ein Feld wie das Passwortfeld (Label „Zum Bestätigen Namen eintippen") und den Knopf „Endgültig löschen" in `error` mit Text in `bg`, Radius 0.75rem. Gesperrt (bis der Name exakt stimmt) sieht er aus wie Senden ohne Text (`hover`, `placeholder`). Das ist der einzige rote Knopf: Löschen in Telegram ist nicht umkehrbar. Die Rückfrage für ältere Web-Gespräche bleibt neutral wie oben.
+- **Neue Topics** stehen, bis sie Aktivität haben, ganz oben unter „Topics" (auch nach einem Abgleich der Liste). Die Gruppe „Web-Gespräche" erscheint nur, wenn es welche gibt.
+- **Leerzustand ohne Gespräch:** „Noch kein Gespräch", eine Zeile `muted`, darunter der Knopf „Neues Gespräch" (gleicher Baustein wie in der Seitenleiste, nur so breit wie sein Inhalt). Es wird nie von selbst ein Gespräch angelegt.
+
+### Einstellungen (Issue #38)
+Nur vorhandene Bausteine, keine neuen Farben, keine Bewegung.
+- **Einstieg:** leiser Knopf „Einstellungen" mit Zahnrad im Seitenleisten-Fuß über dem Darstellungs-Schalter; offen mit `aria-current="page"` in `active`. Adresse `#/einstellungen/agenten`, Neuladen und Direktaufruf landen dort.
+- **Ansicht:** ersetzt im Hauptbereich Kopfzeile, Verlauf und Eingabe (`.main[data-view="settings"]`), am Handy damit Vollbild. Eigene Kopfzeile mit Zurück-Pfeil (Icon-Knopf) und Titel, Inhalt in der Lesespalte.
+- **Reiter:** dieselbe Segment-Steuerung wie System / Hell / Dunkel (`role="tablist"`, gewählt `raised` mit `line`). Noch nicht gebaute Reiter sind gesperrt (60 % Deckkraft).
+- **Agentenzeile:** wie ein Gesprächseintrag, Punkt und Name, darunter Modell und Effort in Meta `muted`, rechts ein Chevron. Aufgeklappt hängt der Inhalt an einer Haarlinie links wie das Menü eines Eintrags.
+- **Felder und Auswahl:** wie das Passwortfeld (Rahmen `line`, `raised`, Radius 0.75rem, 16 px); Auswahlfelder ohne Systempfeil, dafür ein Chevron in `muted`. Speichern ist der Primärknopf, danach „Gespeichert." in 0.8125rem `ink`. Anweisungen: nummerierte Liste, Feld, leise Knöpfe; „Alle entfernen" mit neutraler Rückfrage wie bei Web-Gesprächen.
+- **Datei ungültig:** Hinweis oben im Stil der Fehlernachricht. Meldungen je Agent in `.actions-error`.
+- **„Agent ändern …"** im Topic-Menü: Liste wie die Agentenauswahl beim Anlegen, der aktuelle Agent in `hover` mit „(aktuell)".
+
+### Offene Fäden (Issue #293)
+Nur vorhandene Farben und Bausteine, keine Bewegung.
+- **Eintrag:** leiser Knopf „Offene Fäden" mit Sprechblasen-Fragezeichen im Seitenleisten-Fuß über „Einstellungen", nur wenn die Fäden an sind. Rechts die Anzahl offener Fäden als Pille (`hover`, Text `ink`, 0.75rem/600, `tabular-nums`), ohne offene Fäden keine Pille. Offen mit `aria-current="page"` in `active`. Die Anzahl wird beim Laden, beim Öffnen der Schublade, beim Zurückkehren in den Tab und nach jeder Antwort mehrmals nachgeholt (die Erkennung läuft nach der Antwort).
+- **Ansicht `#/faeden`:** wie die Einstellungen (`.main[data-view="threads"]`, eigene Kopfzeile mit Zurück-Pfeil, Lesespalte). Oben ein Satz in `.settings-intro`, darunter der leise Knopf „Auch geschlossene zeigen" mit `aria-pressed` (gedrückt in `active`). Je Faden: Nummer in `muted` und Thema (600), Kontext in `muted`, „Frage: …", Meta-Zeile in 0.75rem `muted` (Ort · Alter · Frist · nächste Erinnerung), darunter die leisen Knöpfe „Zum Gespräch", „Erledigt", „Nicht mehr wichtig" (am Handy 2.75rem). Haarlinie zwischen den Fäden, lange Wörter brechen um. Kein Rot: Schließen ist eine Absicht. Geschlossene stehen unter dem Gruppenlabel „Geschlossen in den letzten 7 Tagen", Thema und Frage in `muted`, nur „Zum Gespräch". Leer: „Keine offenen Fäden." in `.settings-empty`.
+- **Einstellungen:** im Reiter „Modelle" das vierte Nebenmodell „Offene Fäden" und als letzter Abschnitt „Offene Fäden": Segment-Steuerung Standard / An / Aus wie „Nur offline", „Erinnerung nach" als Auswahlfeld (Standard, 1 bis 14 Tage), „Ruhezeit" als Auswahlfeld (Standard oder Eigene Zeiten, dann „Von" und „Bis" als zwei Auswahlfelder nebeneinander, volle Stunden).
+
+### Einstellungen: Modelle und Status (Issue #39)
+Nur vorhandene Bausteine, keine neuen Farben, keine Bewegung.
+- **Reiter** Modelle und Status sind frei; Pfeiltasten wechseln reihum, die Adresse folgt ohne neuen Verlaufseintrag.
+- **Abschnitte** (Standard für alle Agenten, Nebenmodelle, Fallback) mit Haarlinie oben, Titel als Label, Erklärung in `.actions-hint`, eigener Primärknopf „Speichern" je Abschnitt.
+- **Lange Modell-Listen** (ab 12 Einträgen): darüber ein Filterfeld im Stil des Passwortfelds, darunter die Trefferzahl in `.actions-hint`. Gefiltert wird im Browser.
+- **„Nur offline (Ollama)"**: dieselbe Segment-Steuerung wie System / Hell / Dunkel mit Standard / An / Aus (`role="radiogroup"`), nur so breit wie nötig.
+- **Status**: Begriff in `muted` links, Wert rechts (am Handy untereinander), Zahlen mit `tabular-nums`. Schlüssel als Liste mit Haarlinien, Name in Mono, rechts „gesetzt" in `ink` bzw. „fehlt" in `muted`; nie ein Wert.
+- **„Jetzt neu starten"**: leiser Knopf, danach neutrale Rückfrage wie „Alle entfernen" (Fokus auf „Abbrechen"), kein Rot.
+
+### Einstellungen: Motor (Issue #126)
+Nur vorhandene Bausteine, keine neuen Farben, keine Bewegung.
+- **Abschnitt „Motor"** ganz oben im Reiter Agenten, vor der Agentenliste, wie die Abschnitte im Reiter Modelle (Haarlinie oben, Titel als Label, Erklärung in `.actions-hint`, eigener Primärknopf „Speichern").
+- **Verfügbarkeit** je Motor als Liste wie die Schlüssel im Status, Name in normaler Schrift, rechts der Zustand: „angemeldet, Version …" in `ink`, sonst in `muted` („nicht angemeldet: codex login im Terminal", „nicht installiert", „installiert, …; Anmeldung nicht feststellbar"). Ungeprüft heißt nie angemeldet.
+- **Standard-Motor** als Auswahl mit „Standard (…)" wie die übrigen Felder, darunter die Gruppe „Codex" wie ein Nebenmodell (Titel als Label, Hinweis): Modell als freies Feld mit Platzhalter „Standard aus der Codex-Konfiguration", Effort und Rechte als Auswahl. Rechte in der Reihenfolge Voller Zugriff (Standard), Projekt schreiben, Nur lesen, darunter die Erklärung der Stufen in `.actions-hint`.
+- **Gruppe „OpenCode"** (Issue #129) unter „Codex", gleich gebaut: Hinweis, eine Zeile Verfügbarkeit in `.actions-hint` („OpenCode: angemeldet, Version …" oder die Meldung der Prüfung), Modell wie die Modell-Felder im Reiter Modelle (Auswahl aus `opencode models` mit Filter bei langen Listen, „Standard aus der OpenCode-Konfiguration", „Eigenes Modell …"; OpenRouter-Modelle zuerst; Fehler der Liste darunter mit „Eigenes Modell bleibt möglich."), Variante als freies Feld mit Platzhalter „Standard von OpenCode", Rechte als Auswahl in der Reihenfolge Automatisch freigeben (Standard), Fragen ablehnen. Fehlt OpenCode unter den Motoren des Servers, fehlt die Gruppe.
+- **Abweichende Gespräche** unter dem Speichern: Liste mit Haarlinien, links Name und Motor als Motor-Pille, rechts der leise Knopf „Auf Standard" (ohne Rückfrage, wie `/motor standard`). Nicht zuzuordnende Einträge heißen „Nicht mehr zuzuordnen" mit Erklärung darunter. Fehler je Zeile in `.actions-error`, Erfolg als „Auf Standard gestellt." in der Statuszeile. Am Handy bricht der Knopf unter den Namen.
+- **Agenten-Modelle** tragen unter der Auswahl den Hinweis „gilt für Claude Code" in `.actions-hint`, ebenso der Standard im Reiter Modelle.
+- **Status:** Abschnitt „Motoren" zwischen den Angaben und den Schlüsseln, gleiche Liste wie die Verfügbarkeit.
+
+### Einstellungen: Agenten verwalten (Issue #51)
+Nur vorhandene Farben, keine Bewegung.
+- **System-Prompt** oben im aufgeklappten Agenten (über Modell und Anweisungen): Label „System-Prompt“ mit Kennzeichnung als Pille (0.75rem/500, Fläche `hover`; „Standard“ in `muted`, „Angepasst“ und „Eigener Agent“ in `ink`), darunter der Hinweis auf die frische Session. Der Text steht in einer Fläche `code` mit Haarlinie und Radius 0.6rem, höchstens 16rem hoch, scrollt in sich, Zeilenumbrüche bleiben. „Bearbeiten“ ersetzt sie durch ein Feld wie das Passwortfeld (mindestens 12rem hoch) mit Zeichenzahl, Primärknopf „Speichern“ und leisem „Abbrechen“. „Auf Standard zurücksetzen“ nur bei angepassten mitgelieferten Agenten, mit neutraler Rückfrage (Fokus auf „Abbrechen“).
+- **„Bei /board dabei“**: Segment-Steuerung An/Aus wie „Nur offline“, speichert sofort; General zeigt nur einen Hinweis.
+- **„Neuer Agent“**: leiser Knopf oben im Reiter, klappt ein Formular mit Kennung, Beschreibung, System-Prompt, Modell und Effort auf. Fehler stehen direkt unter dem Feld (`.actions-error`, `aria-invalid`).
+- **„Agent löschen …“** unten im aufgeklappten Agenten (nicht bei General): Rückfrage nennt die Topics, die zu General wechseln, als Liste und verlangt die Kennung in einem Feld; der Knopf ist bis dahin gesperrt. Neutral wie „Alle entfernen“, kein Rot: Mitgelieferte lassen sich wiederherstellen.
+- **„Gelöschte Agenten“** unter der Liste: Zeilen mit Punkt, Name und Beschreibung, rechts leiser Knopf „Wiederherstellen“.
+- **Meldung nach Anlegen, Löschen, Wiederherstellen** oben im Reiter: Erfolg in 0.8125rem `ink`, Teilerfolg im Stil des Hinweises „Datei ungültig“.
+
+### Einstellungen: Benachrichtigungen (Issue #225)
+Nur vorhandene Bausteine und Farben, keine Bewegung.
+- **Reiter „Benachrichtigungen"** als fünfter Reiter (`#/einstellungen/benachrichtigungen`). Die Reiterleiste hat fünf Spalten, jede mindestens so breit wie ihr Name (breit also ohne Trennung); am Handy (unter 56rem) drei je Zeile, der letzte Reiter nimmt dort die freie Spalte neben „Status“ mit. Wird es doch zu eng, trennen lange Namen (`hyphens: auto`) statt über den Rand zu laufen.
+- **Abschnitt „Benachrichtigungen auf diesem Gerät"** wie die Abschnitte im Reiter Modelle. Oben der Satz „Meldet sich, wenn die App geschlossen ist. Gilt nur für dieses Gerät." in `.settings-intro`. Der Schalter An / Aus ist dieselbe Segment-Steuerung wie „Bei /board dabei" (`role="radiogroup"`, Label „Benachrichtigungen"); darunter der Zustand in Klartext in `.actions-hint` („An: Dieses Gerät bekommt Benachrichtigungen." bzw. „Aus: …"). Während Einschalten oder Ausschalten laufen, steht „Einen Moment …" daneben, der Schalter ist gesperrt. Die Berechtigung des Browsers fragt erst der Tipp auf „An", nie das Öffnen.
+- **Eingeschaltet** folgt eine Zeile wie in der Liste unten: Name dieses Geräts, darunter „zuletzt erreicht …" in 0.75rem `muted` (`tabular-nums`), rechts leiser Knopf „Umbenennen" (klappt ein Feld wie das Passwortfeld mit Primärknopf „Speichern" und leisem „Abbrechen" auf). Darunter leiser Knopf „Test senden"; Erfolg als „Test gesendet. …" in `.settings-status`, Fehler in `.actions-error`.
+- **Erklärung statt toter Schalter:** Geht Push hier nicht, gibt es keinen Schalter, sondern einen Satz in `.actions-hint`: ohne sicheren Kontext (http im Heimnetz), auf iPhone/iPad im Browser („erst zum Home-Bildschirm hinzufügen … Ab iOS 16.4."), Browser ohne Push, Server ohne Schlüssel. Ist die Berechtigung blockiert, folgen die Wege zum Wiedererlauben als leise Liste (0.8125rem `muted`, je eine Zeile für iPhone/iPad, Android, Rechner) und „Danach diese Seite neu laden."
+- **„Andere Geräte"** als eigener Abschnitt darunter: Liste mit Haarlinien wie die abweichenden Gespräche (`.settings-devices`), links Name und „zuletzt erreicht …" bzw. „noch nie erreicht", rechts leiser Knopf „Entfernen". Er fragt in derselben Zeile neutral nach („Entfernen?" in 600, „Entfernen" als leiser Knopf in `ink` 600, „Abbrechen" mit Fokus), kein Rot. Ohne weitere Geräte: „Keine anderen Geräte." in `.actions-hint`. Am Handy alle Knöpfe 2.75rem hoch.
+- **Benachrichtigung selbst** (Service Worker): Symbol `icon-192.png`, Titel und Text aus dem Server, ohne Titel der Name aus `src/brand.ts` und „Neue Nachricht". Ein Tipp holt ein offenes Fenster nach vorn und führt es zum Ziel, sonst öffnet er die App dort.
+
+### Einstellungen: Was sich meldet, Direktlink (Issue #226)
+Nur vorhandene Bausteine und Farben, keine Bewegung.
+- **„Was sich meldet"** unter „Test senden", nur wenn dieses Gerät an ist: Label mit Haarlinie oben (`.settings-push-categories`), darunter „Nie für das Gespräch, das gerade offen auf dem Bildschirm ist." in `.actions-hint`. Vier Zeilen Antworten, Rückfragen, Meldungen, „Inhalt in der Benachrichtigung zeigen", je Label, Segment-Steuerung An / Aus wie „Bei /board dabei" und ein Satz in `.actions-hint`. Speichert sofort, während des Speicherns „Einen Moment …" daneben und alle Schalter gesperrt; ein Fehler steht in `.actions-error` unter genau dieser Zeile.
+- **Benachrichtigungen:** Antwort mit Gesprächstitel als Titel und „Antwort von <Agent>"; Rückfrage mit „<Name> fragt nach" und „<Art> · <Gesprächstitel>"; Meldung mit dem Absender („Pipeline", „Job" …) und „Neue Meldung" bzw. „Neue Datei". Mit „Inhalt zeigen" statt dessen die ersten 120 Zeichen als Klartext bzw. „Datei: <Name>". Je Gespräch ersetzt eine neue Benachrichtigung die alte.
+- **Direktlink** `#/gespraech/<id>` öffnet genau dieses Gespräch (auch nach der Anmeldung), danach ist die Adresse wieder leer. Ein Tipp auf eine Benachrichtigung wechselt in einem offenen Fenster das Gespräch ohne Neuladen. Unbekanntes oder gelöschtes Gespräch: Direktchat offen, im Verbindungsbalken „Dieses Gespräch gibt es nicht mehr. Hier ist der Direktchat."
+
+### Nachrichten (Signaturkomponente)
+- **Nutzer:** rechtsbündige Blase in `bubble`, höchstens 85 % bzw. 36rem breit, Text mit erhaltenen Zeilenumbrüchen.
+- **Antwort:** volle Spaltenbreite, keine Blase. Darüber ein Kopf mit Agentenpunkt und Agentenname (0.8125rem/600, `muted`); im DOM steht der Kopf hinter dem Inhalt und wird per `order: -1` davor gezeigt. Inhalt ist das vom Server gerenderte Markdown im Lesetext-Stil: Codeblöcke mit Rahmen und `code`-Fläche, Zitate als `code`-Fläche in `muted`, Tabellen mit Haarlinien und dunklerer Kopflinie.
+- **Fußzeile der Antwort** (Issue #22): unter dem Inhalt, im DOM hinter dem Kopf. Links ein Icon-Knopf „Antwort kopieren" (zwei Blätter, 2.5rem, am Handy 2.75rem; ein negativer Rand lässt das Symbol mit der Textkante fluchten), daneben die Metazeile „Uhrzeit · Agent · Motor · Modell · Dauer" in Meta-Größe 0.75rem und `muted`, mit `tabular-nums`. Nur was die Nachricht mitbringt; ältere Antworten ohne Angaben zeigen nur den Knopf. Den Motor („Claude Code", „Codex", „OpenCode", Issues #126/#129) nennt nur eine Antwort, die ihn mitbringt, Fallback-Antworten nicht. Nach dem Kopieren steht 2 s „Kopiert" in `ink` daneben (`role="status"`), bei Misserfolg „Kopieren nicht möglich" in `error`. Keine Bewegung, keine neue Farbe.
+- **Fehler:** volle Breite, `error-bg`, Rahmen `error-line`, Text `error`, Radius 0.75rem.
+- **Stopp-Notiz:** Pille mit Haarlinie, `muted`, 0.875rem.
+- **Zeitstempel** (Issue #186): bei Antworten vorn in der Metazeile, bei eigenen Nachrichten rechtsbündig 0.25rem unter der Blase bzw. den Anhängen, beides 0.75rem `muted` mit `tabular-nums`, ohne Umbruch in der Zeit. Heute „21:08", gestern „gestern 21:08", dieses Jahr „26.09. 21:08", sonst „26.09.2025 21:08", Zeitzone des Browsers. In der Fußzeile bricht nur die Metazeile um (die Fußzeile selbst bleibt eine Reihe, oben ausgerichtet, erste Textzeile mittig zum Knopf), Uhrzeit und „Kopiert" bleiben daneben. Als `<time datetime>`, das volle Datum („Samstag, 26. September 2026, 21:08 Uhr") steht im `title` und als unsichtbarer Text für Screenreader (`visually-hidden`), die Kurzform ist für sie verborgen. Ohne gültigen Zeitpunkt keine Zeit. Bleibt die Seite über Mitternacht offen, wird der Verlauf kurz danach bzw. beim Zurückkehren in den Tab neu gezeichnet. Keine Bewegung, keine neue Farbe.
+- **Meldung** (Issue #47): Nachricht eines Dienstes (Pipeline, Briefing, Check-in, Watchdog, Watcher, Datei), keine Blase und kein Agentenkopf. Oben eine Zeile „Absender · Uhrzeit" in 0.75rem `muted`, Absender 600; unbekannte Absender erscheinen mit ihrer Kennung, ohne Angabe „Meldung". Darunter das Markdown des Servers in 0.9375rem `muted` an einer Haarlinie links (wie die Fortschrittsliste).
+- **Rückfrage-Knöpfe** (Issue #115, Entscheidung 0017): unter einer Nachricht mit Rückfrage aus dem Register (Werkzeug-Freigabe, Merk-Vorschlag, „Weiter?", Topic-Zuordnung) eine umbrechende Reihe leiser Knöpfe (`button-quiet`, Abstand 0.35rem), Beschriftung aus dem Register nur als Text. Der erste Knopf trägt die Handlungsfarbe (`button-choice-primary`: Fläche `accent`, Text `accent-ink`, 500), die übrigen bleiben leise; kein Rot, auch nicht für „Ablehnen". Mindestens 2.25rem hoch, am Handy 2.75rem. Während ein Klick beim Server liegt, sind alle Knöpfe der Frage gesperrt (`aria-busy`), auch über Neuzeichnen und Gesprächswechsel hinweg. Nach der Entscheidung ersetzt eine Zeile in 0.8125rem `muted` mit `tabular-nums` die Knöpfe: „Erledigt: <Knopf> · im Browser/in Telegram/im Terminal · <Uhrzeit>" bzw. „Abgelaufen"; kommt 409, zeigt sie den gemeldeten Endzustand statt eines Fehlers. Andere Fehler stehen darunter in 0.8125rem `error` (`role="alert"`), die Knöpfe sind wieder frei. Steht die Frage in einem anderen Gespräch als ihrem eigenen (Kopie einer Web-Frage im Direktchat), gibt es keine Knöpfe, sondern die Zeile „Antwort im Gespräch, aus dem die Frage kommt." und einen leisen Knopf „Zum Gespräch". Keine Fläche um die Reihe, kein Schatten, keine Bewegung.
+- **Dateikarte** (Issue #47): höchstens 28rem breit, Rahmen `line`, Fläche `raised`, Radius 0.6rem, kein Schatten. Blatt-Icon in `muted`, Name in `ink` 0.9375rem, Größe in 0.75rem `muted`, rechts ein leiser Knopf „Herunterladen" (am Handy 2.75rem hoch). PNG, JPEG, WebP und GIF zusätzlich als Vorschau darüber (höchstens 20rem hoch, Rahmen `line`, Radius 0.6rem). Steht in der Meldung nur der Dateiname, entfällt der Text über der Karte.
+- **Einblenden:** neue Nachrichten (`data-fresh`) in 180 ms von 20 % Deckkraft und 4 px tiefer.
+
+### Statuszeile (Signaturkomponente)
+Solange ein Turn läuft, steht unter dem Verlauf eine Pille mit blauem Punkt, dem jüngsten Schritt ("Datei lesen …", "Formuliert die Antwort …") und einem Chevron. Klick klappt die Fortschrittsliste auf; der Chevron steht dann sofort um 180° gedreht, ohne Übergang. Die Liste hängt an einer Haarlinie links und zeigt drei Schrittarten: Werkzeug (normal), Snippet (kursiv), Hinweis (Fläche `hover`, Text `ink`, Radius 0.6rem).
+
+### Login
+Eine zentrierte Spalte von 21rem: Wortmarke 1.75rem, eine Zeile Einleitung in `muted`, Label 0.875rem/600, Passwortfeld, Primärknopf, Fehlertext in `error`.
+
+### Künftige Meilensteine
+- **M2 Telegram-Topics in der Seitenleiste:** Topics sind weitere Gruppen in derselben Liste. Gruppenlabel wie "Web-Gespräche" (Meta 600, `muted`), Einträge als Gesprächseintrag mit Agentenpunkt über `data-agent`, aktuelles Topic in `active` mit `aria-current`. Keine neuen Icons pro Topic, keine farbigen Flächen; ungelesene oder synchrone Zustände als leiser `muted`-Text oder mit dem bestehenden Punktformat. Die Schublade am Handy bleibt dieselbe.
+- **M3 Einstellungen:** im Hauptbereich mit Kopfzeile und derselben Lesespalte (`--column`). Felder wie das Passwortfeld (Rahmen `line`, `raised`, Radius 0.75rem), Speichern als Primärknopf, Nebenaktionen als leise Knöpfe, Abschnittstrenner als Haarlinie, Fehler im Fehlerstil. Einstieg aus dem Seitenleisten-Fuß als leiser Knopf neben "Abmelden"; der Darstellungs-Schalter bleibt dort und wandert nicht in die Einstellungen. Agentenfarben nur als Punkt neben Agentennamen, keine neuen Akzentfarben.
+
+## Do's and Don'ts
+
+### Do:
+- **Do** jede Farbe über die Custom Properties auf `:root` beziehen und für jeden neuen Token sofort einen Wert im Dunkel-Block setzen.
+- **Do** Agentenzugehörigkeit über `data-agent` plus 0.5rem-Punkt zeigen und den Namen in `muted` daneben setzen.
+- **Do** laufende Arbeit über die Statuszeile und Senden/Stopp am selben Ort sichtbar machen.
+- **Do** neue Bedienziele am Handy auf mindestens 2.75rem bringen und Safe-Area-Insets respektieren, auch links und rechts für das Querformat.
+- **Do** Zustandswechsel (Hover, Aufklappen, Senden/Stopp) sofort umschalten; die beiden Bewegungen liegen auf der Kurve `--ease` (`cubic-bezier(0.2, 0.7, 0.2, 1)`) und stehen im `prefers-reduced-motion`-Block.
+- **Do** Icons als inline SVG mit `currentColor`, Kontur 1.8 und runden Enden zeichnen.
+- **Do** Tabellen und Code in sich scrollen lassen, nie die Seite.
+
+### Don't:
+- **Don't** eine zweite Akzentfarbe oder farbige Flächen einführen; Blau bleibt Handlung und Fokus.
+- **Don't** Agentenfarben als Textfarbe, Hintergrund oder Rahmen einsetzen.
+- **Don't** Webfonts, eine Display-Schrift oder Icon-Fonts laden; die Oberfläche lädt nichts von außen.
+- **Don't** Karten, Blasen oder Listeneinträge mit Schatten absetzen; nur Eingabebox und offene Schublade haben einen.
+- **Don't** Antworten in Blasen oder Rahmen setzen; nur die Nutzerblase ist eine Blase.
+- **Don't** einen vom Nutzer gewollten Stopp rot darstellen.
+- **Don't** weitere Bewegung als Einblenden und Schublade hinzufügen, auch keine Übergänge an Knöpfen oder am Chevron.

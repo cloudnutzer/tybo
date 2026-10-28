@@ -1,0 +1,275 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`Snapshot je Dienst telegram-relay 1`] = `
+"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Erzeugt von tybo aus src/lib/services/catalog.ts; die nächste Einrichtung überschreibt Änderungen -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.tybo.telegram-relay</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/bun/bin/bun</string>
+		<string>run</string>
+		<string>src/bot.ts</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/home/test/tybo</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/bun/bin:/home/test/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>HOME</key>
+		<string>/home/test</string>
+		<key>GO_PROJECT_ROOT</key>
+		<string>/home/test/tybo</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>StandardOutPath</key>
+	<string>/home/test/tybo/logs/telegram-relay.log</string>
+	<key>StandardErrorPath</key>
+	<string>/home/test/tybo/logs/telegram-relay.error.log</string>
+</dict>
+</plist>
+"
+`;
+
+exports[`Snapshot je Dienst smart-checkin 1`] = `
+"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Erzeugt von tybo aus src/lib/services/catalog.ts; die nächste Einrichtung überschreibt Änderungen -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.tybo.smart-checkin</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/bun/bin/bun</string>
+		<string>--no-env-file</string>
+		<string>src/routine-run.ts</string>
+		<string>--id</string>
+		<string>ai.tybo.smart-checkin</string>
+		<string>--</string>
+		<string>/opt/bun/bin/bun</string>
+		<string>run</string>
+		<string>src/routines/checkin.ts</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/home/test/tybo</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/bun/bin:/home/test/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>HOME</key>
+		<string>/home/test</string>
+		<key>GO_PROJECT_ROOT</key>
+		<string>/home/test/tybo</string>
+	</dict>
+	<key>StartCalendarInterval</key>
+	<array>
+		<dict>
+			<key>Hour</key>
+			<integer>10</integer>
+			<key>Minute</key>
+			<integer>30</integer>
+		</dict>
+		<dict>
+			<key>Hour</key>
+			<integer>14</integer>
+			<key>Minute</key>
+			<integer>30</integer>
+		</dict>
+	</array>
+	<key>StandardOutPath</key>
+	<string>/home/test/tybo/logs/smart-checkin.log</string>
+	<key>StandardErrorPath</key>
+	<string>/home/test/tybo/logs/smart-checkin.error.log</string>
+</dict>
+</plist>
+"
+`;
+
+exports[`Snapshot je Dienst morning-briefing 1`] = `
+"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Erzeugt von tybo aus src/lib/services/catalog.ts; die nächste Einrichtung überschreibt Änderungen -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.tybo.morning-briefing</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/bun/bin/bun</string>
+		<string>--no-env-file</string>
+		<string>src/routine-run.ts</string>
+		<string>--id</string>
+		<string>ai.tybo.morning-briefing</string>
+		<string>--</string>
+		<string>/opt/bun/bin/bun</string>
+		<string>run</string>
+		<string>src/routines/briefing.ts</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/home/test/tybo</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/bun/bin:/home/test/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>HOME</key>
+		<string>/home/test</string>
+		<key>GO_PROJECT_ROOT</key>
+		<string>/home/test/tybo</string>
+	</dict>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>9</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/home/test/tybo/logs/morning-briefing.log</string>
+	<key>StandardErrorPath</key>
+	<string>/home/test/tybo/logs/morning-briefing.error.log</string>
+</dict>
+</plist>
+"
+`;
+
+exports[`Snapshot je Dienst health-check 1`] = `
+"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Erzeugt von tybo aus src/lib/services/catalog.ts; die nächste Einrichtung überschreibt Änderungen -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.tybo.health-check</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/bun/bin/bun</string>
+		<string>--no-env-file</string>
+		<string>src/routine-run.ts</string>
+		<string>--id</string>
+		<string>ai.tybo.health-check</string>
+		<string>--</string>
+		<string>/opt/bun/bin/bun</string>
+		<string>run</string>
+		<string>src/health-check.ts</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/home/test/tybo</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/bun/bin:/home/test/.local/bin:/home/test/.local/bin:/home/test/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin</string>
+		<key>HOME</key>
+		<string>/home/test</string>
+		<key>GO_PROJECT_ROOT</key>
+		<string>/home/test/tybo</string>
+	</dict>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>3</integer>
+		<key>Minute</key>
+		<integer>30</integer>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/home/test/tybo/logs/health-check.log</string>
+	<key>StandardErrorPath</key>
+	<string>/home/test/tybo/logs/health-check.error.log</string>
+</dict>
+</plist>
+"
+`;
+
+exports[`Snapshot je Dienst software-update 1`] = `
+"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Erzeugt von tybo aus src/lib/services/catalog.ts; die nächste Einrichtung überschreibt Änderungen -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.tybo.software-update</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/bun/bin/bun</string>
+		<string>--no-env-file</string>
+		<string>src/routine-run.ts</string>
+		<string>--id</string>
+		<string>ai.tybo.software-update</string>
+		<string>--</string>
+		<string>/opt/bun/bin/bun</string>
+		<string>run</string>
+		<string>src/software-update.ts</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/home/test/tybo</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/bun/bin:/home/test/.local/bin:/home/test/.local/bin:/home/test/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin</string>
+		<key>HOME</key>
+		<string>/home/test</string>
+		<key>GO_PROJECT_ROOT</key>
+		<string>/home/test/tybo</string>
+	</dict>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>3</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/home/test/tybo/logs/software-update.log</string>
+	<key>StandardErrorPath</key>
+	<string>/home/test/tybo/logs/software-update.error.log</string>
+</dict>
+</plist>
+"
+`;
+
+exports[`Snapshot je Dienst supabase 1`] = `
+"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Erzeugt von tybo aus src/lib/services/catalog.ts; die nächste Einrichtung überschreibt Änderungen -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.tybo.supabase</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/bun/bin/bun</string>
+		<string>--no-env-file</string>
+		<string>/home/test/tybo/scripts/tybo.ts</string>
+		<string>datenbank</string>
+		<string>start</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/home/test/tybo</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/home/test/.local/bin:/home/test/.bun/bin:/opt/bun/bin:/opt/homebrew/bin:/usr/local/bin:/home/test/.orbstack/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>HOME</key>
+		<string>/home/test</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ExitTimeOut</key>
+	<integer>330</integer>
+	<key>StandardOutPath</key>
+	<string>/home/test/tybo/logs/supabase.log</string>
+	<key>StandardErrorPath</key>
+	<string>/home/test/tybo/logs/supabase.log</string>
+</dict>
+</plist>
+"
+`;

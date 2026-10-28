@@ -1,0 +1,30 @@
+// Typprüfung für `bun run typecheck` (tsc --noEmit). Bun führt die Dateien
+// selbst aus, gebaut wird nichts.
+{
+  "compilerOptions": {
+    // Sprachstand und Module wie in Bun
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "esModuleInterop": true,
+    "types": ["bun-types"],
+
+    // Strenge Prüfung des eigenen Codes, nicht der .d.ts-Dateien der Pakete
+    "strict": true,
+    "skipLibCheck": true,
+
+    // Nur Dateien aus diesem Ordner; dist/ nur, falls tsc ohne --noEmit läuft
+    "rootDir": ".",
+    "outDir": "dist"
+  },
+  // Bot, Skripte und setup/; tests/ läuft nur unter bun test
+  "include": [
+    "src/**/*.ts",
+    "scripts/**/*.ts",
+    "setup/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
+}

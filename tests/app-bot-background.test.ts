@@ -1,0 +1,173 @@
+// Issue #344: Hintergrunddienste beim Start als Verhalten von startBackground
+// (ersetzt die Quelltext-Prüfungen zu Embedding, Jobs, Routinen-Wache,
+// Fäden-Erinnerungen und Ablauf der Rückfragen in bot.ts). Alle Zeitgeber
+// und Dienste sind Attrappen.
+import { describe, expect, test } from "bun:test";
+import { startBackground, type BackgroundServices } from "../src/app/bot-start";
+import { createBotNotices } from "../src/lib/bot-notices";
+import { DRAIN_INTERVAL_MS } from "../src/lib/embedding";
+import type { AlertMeta } from "../src/lib/routines/alerts";
+
+interface RoutineMenu {
+  offerStatus?: "sent" | "none" | "unknown";
+}
+
+function setup(overrides: Partial<BackgroundServices> = {}, env: Record<string, string | undefined> = {}, menu: RoutineMenu = {}) {
+  const events: string[] = [];
+  const plainAlerts: { text: string; meta: unknown }[] = [];
+  const offers: { conversation: unknown; id: string; text: string }[] = [];
+  let watchArgs: Parameters<BackgroundServices["startRoutineWatch"]>[0] | undefined;
+  const timers: { ms: number; run: () => void }[] = [];
+  const lines: string[] = [];
+  let threadDeps: Parameters<BackgroundServices["startThreadReminders"]>[0] | undefined;
+  const services: Partial<BackgroundServices> = {
+    checkEmbedding: async () => (events.push("checkEmbedding"), { ok: false, message: "Anbieter weicht ab" }) as never,
+    drainEmbeddings: async () => (events.push("drain"), { state: "fertig", written: 2, rejected: 0 }) as never,
+    syncChunks: async () => null,
+    rotateLogs: async () => void events.push("rotate"),
+    recoverJobs: async (root, e) => (events.push(`jobs ${root} ${e === env}`), { aborted: [], resent: [] }) as never,
+    watchDeps: (root => (events.push(`watchDeps ${root}`), { marker: "watch-deps", send: async (text: string, meta: unknown) => (plainAlerts.push({ text, meta }), { sent: true, recorded: true }) })) as never,
+    startRoutineWatch: (deps => ((watchArgs = deps), events.push("routineWatch"), { id: "watch" })) as never,
+    startThreadReminders: (deps => ((threadDeps = deps), events.push("threadReminders"), { id: "threads" })) as never,
+    startReminderPlanner: (() => (events.push("planner"), { id: "planner" })) as never,
+    webConversationExists: async id => (events.push(`exists ${id}`), false),
+    topicDeleted: async () => false,
+    every: (ms, run) => void timers.push({ ms, run }),
+    log: line => void lines.push(line),
+    warn: line => void lines.push(`WARN ${line}`),
+    error: line => void lines.push(`ERROR ${line}`),
+    ...overrides,
+  };
+  let sweeps = 0;
+  const background = startBackground({
+    root: "/srv/tybo",
+    env,
+    notices: createBotNotices({ telegram: () => false, send: async () => ({ ok: true }) as never, sendStatusMessage: async () => {}, dmChatId: () => "" }),
+    choices: { sweep: async () => (sweeps++, events.push("sweep"), [{ id: "x" }]) } as never,
+    routineChoices: { offerMenu: async (conversation: unknown, id: string, text: string) => (offers.push({ conversation, id, text }), { status: menu.offerStatus ?? "none" }) } as never,
+    postWeb: async () => false,
+    refresh: async () => [],
+    services,
+  });
+  return { background, events, timers, lines, thread: () => threadDeps!, sweeps: () => sweeps, watch: () => watchArgs!, plainAlerts, offers };
+}
+
+const tick = () => new Promise(r => setTimeout(r, 5));
+
+describe("startBackground", () => {
+  test("Reihenfolge: Embedding, Logs, Jobs, Routinen-Wache, Fäden, Erinnerungen, dann die erste Ablauf-Prüfung", async () => {
+    const s = setup();
+    await s.background.firstSweep;
+    expect(s.events.slice(0, 9)).toEqual(["checkEmbedding", "drain", "rotate", "jobs /srv/tybo true", "watchDeps /srv/tybo", "routineWatch", "threadReminders", "planner", "sweep"]);
+    expect(s.background.routineWatch).toEqual({ id: "watch" } as never);
+    expect(s.background.threadReminders).toEqual({ id: "threads" } as never);
+    expect(s.background.reminderPlanner).toEqual({ id: "planner" } as never);
+  });
+
+  test("Abweichung des Embedding-Anbieters als Warnung, nachgezogene Einträge im Log", async () => {
+    const s = setup();
+    await tick();
+    expect(s.lines).toContain("WARN [embedding] ACHTUNG: Anbieter weicht ab");
+    expect(s.lines).toContain("[embedding] 2 vorgemerkte Einträge nachgezogen, 0 abgelehnt");
+    expect(s.lines).toContain("[choices] 1 Rückfragen abgelaufen");
+  });
+
+  test("Abschnitte langer Nachrichten (Issue #479): nach dem Nachziehen, beim Start und mit jedem Embedding-Nachzug", async () => {
+    const order: string[] = [];
+    const s = setup({
+      drainEmbeddings: async () => (order.push("drain"), { state: "fertig", written: 0, rejected: 0 }) as never,
+      syncChunks: async () => (order.push("chunks"), { state: "fertig", messages: 2, chunks: 7, failed: 1 }),
+    });
+    await tick();
+    expect(order).toEqual(["drain", "chunks"]);
+    expect(s.lines).toContain("[embedding] Abschnitte für 2 lange Nachrichten nachgezogen (7 Abschnitte), 1 gescheitert");
+    s.timers.find(t => t.ms === DRAIN_INTERVAL_MS)!.run();
+    await tick();
+    expect(order).toEqual(["drain", "chunks", "drain", "chunks"]);
+  });
+
+  test("Abschnitte: auch nach gescheitertem Nachziehen; still ohne Arbeit, ohne Migration und bei Fehler", async () => {
+    let calls = 0;
+    const s = setup({
+      drainEmbeddings: async () => {
+        throw new Error("weg");
+      },
+      syncChunks: async () => (calls++, { state: "fertig", messages: 0, chunks: 0, failed: 0 }),
+    });
+    await tick();
+    expect(calls).toBe(1);
+    for (const result of [{ state: "fehlt" as const }, null]) {
+      const quiet = setup({ syncChunks: async () => result });
+      await tick();
+      expect(quiet.lines.some(l => l.includes("Abschnitte"))).toBe(false);
+    }
+    const failing = setup({
+      syncChunks: async () => {
+        throw new Error("kaputt");
+      },
+    });
+    await tick();
+    expect(failing.lines.some(l => l.includes("Abschnitte"))).toBe(false);
+    expect(s.lines.some(l => l.includes("Abschnitte"))).toBe(false);
+  });
+
+  test("regelmäßig: Embedding-Nachzug, Log-Rotation stündlich, Rückfragen jede Minute", async () => {
+    const s = setup();
+    expect(s.timers.map(t => t.ms)).toEqual([DRAIN_INTERVAL_MS, 3_600_000, 60_000]);
+    s.timers[2].run();
+    await tick();
+    expect(s.sweeps()).toBe(2);
+  });
+
+  test("Fäden: Telegram aus der Umgebung, gelöschte Web-Gespräche über die Gesprächsliste", async () => {
+    const s = setup({}, { TELEGRAM_BOT_TOKEN: "1:a", TELEGRAM_USER_ID: "1" });
+    const deps = s.thread();
+    expect(deps.telegram()).toBe(true);
+    expect(setup().thread().telegram()).toBe(false);
+    const gone = await deps.conversationGone({ type: "web", conversationId: "11111111-2222-4333-8444-555555555555" } as never);
+    expect(s.events).toContain("exists 11111111-2222-4333-8444-555555555555");
+    expect(gone).toBe(true);
+  });
+
+  test("Fehler beim Aufräumen der Jobs landen nur im Log", async () => {
+    const s = setup({ recoverJobs: async () => { throw new TypeError("weg"); } });
+    await tick();
+    expect(s.lines).toContain("ERROR [job] Aufräumen beim Start gescheitert (TypeError)");
+  });
+});
+
+describe("startBackground: Versandweg der Routinen-Wache ausgelöst", () => {
+  const TELEGRAM_ENV = { TELEGRAM_BOT_TOKEN: "1:a", TELEGRAM_USER_ID: "4242" };
+  const missed: AlertMeta = { kind: "missed", id: "ai.tybo.wetter" };
+
+  test("übrige Angaben der Wache unverändert weitergereicht", () => {
+    const s = setup();
+    expect((s.watch() as unknown as { marker: string }).marker).toBe("watch-deps");
+  });
+
+  test("ausgebliebener Lauf mit Telegram: Menü im Direktchat, keine Meldung ohne Knöpfe", async () => {
+    const s = setup({}, TELEGRAM_ENV, { offerStatus: "sent" });
+    const result = await s.watch().send("Wetter ist ausgeblieben", missed);
+    expect(result).toEqual({ sent: true, recorded: true });
+    expect(s.offers).toEqual([{ conversation: { type: "telegram", chatId: "4242" }, id: "ai.tybo.wetter", text: "Wetter ist ausgeblieben" }]);
+    expect(s.plainAlerts).toEqual([]);
+  });
+
+  test("ohne Telegram: Menü für den Web-Direktchat", async () => {
+    const s = setup({}, {}, { offerStatus: "sent" });
+    await s.watch().send("Wetter ist fehlgeschlagen", { kind: "failed", id: "ai.tybo.wetter" });
+    expect(s.offers).toEqual([{ conversation: { type: "telegram", chatId: "web" }, id: "ai.tybo.wetter", text: "Wetter ist fehlgeschlagen" }]);
+    expect(s.plainAlerts).toEqual([]);
+  });
+
+  test("Menü nicht gezeigt: Meldung über den einfachen Versand der Wache; andere Meldungen gleich dorthin", async () => {
+    const s = setup({}, TELEGRAM_ENV, { offerStatus: "none" });
+    await s.watch().send("Wetter ist ausgeblieben", missed);
+    expect(s.offers).toHaveLength(1);
+    expect(s.plainAlerts).toEqual([{ text: "Wetter ist ausgeblieben", meta: missed }]);
+
+    await s.watch().send("Wetter läuft wieder", { kind: "recovered", id: "ai.tybo.wetter" });
+    expect(s.offers).toHaveLength(1);
+    expect(s.plainAlerts).toHaveLength(2);
+  });
+});

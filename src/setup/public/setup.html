@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1f2023" media="(prefers-color-scheme: dark)">
+  <script src="/theme.js"></script>
+  <title>{{brand.name}} Einrichtung</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <script src="/brand.js"></script>
+  <script src="/setup.js" defer></script>
+</head>
+<body class="setup">
+  <nav class="setup-nav" aria-label="Schritte der Einrichtung">
+    <div class="setup-brand">
+      <span class="wordmark">{{brand.name}}</span>
+      <span class="setup-brand-label">Einrichtung</span>
+    </div>
+    <ol id="setup-steps" class="setup-steps"></ol>
+  </nav>
+  <main class="setup-main">
+    <div id="setup-panel" class="setup-column"></div>
+  </main>
+</body>
+</html>

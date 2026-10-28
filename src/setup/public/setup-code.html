@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1f2023" media="(prefers-color-scheme: dark)">
+  <script src="/theme.js"></script>
+  <title>{{brand.name}} Einrichtung</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <script src="/brand.js"></script>
+  <script src="/setup-code.js" defer></script>
+</head>
+<body class="login">
+  <main class="login-panel">
+    <h1 class="wordmark wordmark-large">{{brand.name}}</h1>
+    <p class="login-lead">Einrichtung im Browser. Den Code findest du im Terminal oder im Log, in dem {{brand.name}} gestartet wurde.</p>
+    <form id="code-form" class="login-form" method="post" action="/api/setup/code" novalidate>
+      <label for="code">Einmal-Code</label>
+      <input id="code" name="code" type="text" inputmode="text" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" maxlength="12" required autofocus>
+      <button type="submit" id="code-button" class="primary-button">Weiter</button>
+      <p id="code-error" class="error" role="alert" hidden></p>
+    </form>
+  </main>
+</body>
+</html>

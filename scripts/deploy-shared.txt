@@ -1,0 +1,33 @@
+# Pfade, die sich alle Releases von deploy.sh teilen (Issue #352).
+#
+# Je Zeile ein Pfad relativ zum Projektordner (DEPLOY_DIR), ohne führendes /
+# und ohne "..". Leere Zeilen und Zeilen mit # am Anfang zählen nicht.
+#
+# Pfad mit / am Ende: ein Ordner. Das Release bekommt einen Link auf den
+# ganzen Ordner im Projektordner; fehlt er dort, legt deploy.sh ihn an.
+# Dateien darin überstehen jeden Deploy, auch wenn tybo sie atomar ersetzt
+# (config/settings.json, config/agents.json, config/topics.json).
+# Mitgelieferte Dateien des Releases in diesem Ordner kommen nur dazu, wenn
+# es sie im Projektordner noch nicht gibt; vorhandene bleiben unverändert.
+# War der Ordner im vorigen Release ein echter Ordner (Layout vor #352),
+# übernimmt deploy.sh dessen eigene Dateien nach dem Anhalten in den
+# Projektordner; unverändert mitgelieferte Dateien bleiben dabei liegen.
+#
+# Pfad ohne / am Ende: eine einzelne Datei, verlinkt, wenn es sie im
+# Projektordner gibt. Ersetzt tybo den Link durch eine echte Datei,
+# übernimmt der nächste Deploy diese nach dem Anhalten des alten Release in
+# den Projektordner. Die .env bleibt ein Link; Schlüssel-Seite und
+# Push-Schlüssel schreiben dann die echte .env im Projektordner, nie über
+# den Link (defaultEnvPath in src/web/bot-keys.ts).
+
+.env
+config/
+data/
+uploads/
+logs/
+models/
+knowledge-base/
+memory.json
+memory.json.sqlite
+session-state.json
+credit-tally.json

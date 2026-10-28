@@ -1,0 +1,62 @@
+# Was nie ins Repo gehört. Prüfung: tests/gitignore.test.ts
+
+# --- Geheimnisse ---
+# Jede .env-Variante in jedem Ordner, nur die Vorlage bleibt sichtbar
+**/.env
+**/.env.*
+!**/.env.example
+config/.google-tokens.json
+.elevenlabs-*
+
+# --- Eigene Einstellungen (Vorlagen liegen daneben als *.example.*) ---
+config/profile.md
+config/schedule.json
+config/agent-overrides.json
+config/settings.json
+config/settings.json.lock
+config/topics.json
+config/agents.json
+config/routines.json
+config/whatsapp-groups.json
+config/reminders.json
+config/*-state.json
+
+# --- Zustand des Bots, in welchem Ordner er auch liegt ---
+**/bot.lock
+**/session-state.json
+**/memory.json
+**/credit-tally.json
+**/checkin-state.json
+**/CLAUDE.local.md
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# --- Laufzeitdaten und Arbeitskopien, in jedem Ordner ---
+data/
+tmp/
+models/
+knowledge-base/
+.releases/
+.wrangler/
+**/logs/
+**/temp/
+**/uploads/
+
+# --- Abhängigkeiten und Build ---
+**/node_modules/
+**/dist/
+
+# --- Dateien älterer Versionen ---
+# tybo schreibt sie nicht mehr, eine bestehende Installation kann sie aber
+# noch haben; sie sollen auch dort nie ins Repo
+config/patterns.md
+**/news-history.json
+**/last-processed-call.json
+**/meeting-actions-state.json
+
+# --- Private Webprojekte des Maintainers, bleiben nur lokal ---
+scripts/why-workshop-worker/
+docs/foto-fit-worker.js
+docs/foto-x100vi-anleitung.html
+docs/voice-bridge-reference/pages-password-worker.js

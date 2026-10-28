@@ -1,0 +1,76 @@
+{
+  "name": "tybo",
+  "version": "2.16.0",
+  "description": "Always-on AI assistant on Telegram and in the browser, powered by Claude Code, with agents, persistent memory and background jobs",
+  "homepage": "https://tybo.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cloudnutzer/tybo.git"
+  },
+  "bugs": "https://github.com/cloudnutzer/tybo/issues",
+  "type": "module",
+  "bin": {
+    "tybo": "scripts/tybo.ts"
+  },
+  "scripts": {
+    "tybo": "bun --no-env-file scripts/tybo.ts",
+    "start": "bun run src/bot.ts",
+    "vps": "bun run src/bot.ts --profile server",
+    "whatsapp": "bun run src/whatsapp-gateway.ts",
+    "voice": "bun run src/voice-bridge.ts",
+    "restart:request": "bun run scripts/request-restart.ts",
+    "notify": "bun run scripts/notify.ts",
+    "job": "bun --no-env-file scripts/job.ts",
+    "checkin": "bun run src/routines/checkin.ts",
+    "briefing": "bun run src/routines/briefing.ts",
+    "health": "bun run src/health-check.ts",
+    "updates": "bun run src/software-update.ts",
+    "setup": "bun --no-env-file scripts/tybo.ts setup",
+    "setup:launchd": "bun --no-env-file scripts/tybo.ts dienste",
+    "setup:services": "bun --no-env-file scripts/tybo.ts dienste",
+    "setup:verify": "bun --no-env-file scripts/tybo.ts pruefen",
+    "setup:google": "bun --no-env-file scripts/tybo.ts setup google",
+    "uninstall": "bun --no-env-file scripts/tybo.ts deinstallieren",
+    "test:tools": "bun run setup/probe-tools.ts",
+    "web:dev": "bun run scripts/web-dev.ts",
+    "typecheck": "tsc --noEmit --pretty false",
+    "test": "bun test --timeout 30000 --preload ./tests/preload-env.ts tests src/lib/voice-bridge",
+    "check": "bun run typecheck && bun run test"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@supabase/supabase-js": "^2.116.0",
+    "grammy": "^1.46.0",
+    "htmlparser2": "^12.0.0",
+    "marked": "^18.0.14",
+    "pdfkit": "^0.17.2",
+    "pptxgenjs": "^4.0.1",
+    "telegram": "^2.26.22",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "css-select": "^7.0.0",
+    "css-tree": "^3.2.1",
+    "domutils": "^4.0.2",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "bun": ">=1.3.10"
+  },
+  "license": "MIT",
+  "overrides": {
+    "@hono/node-server": "1.19.17",
+    "body-parser": "2.3.0",
+    "fast-uri": "3.1.7",
+    "form-data": "4.0.6",
+    "hono": "4.13.7",
+    "image-size": "1.2.1",
+    "ip-address": "10.7.0",
+    "qs": "6.16.0"
+  },
+  "patchedDependencies": {
+    "image-size@1.2.1": "patches/image-size@1.2.1.patch"
+  }
+}

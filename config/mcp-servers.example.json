@@ -1,0 +1,14 @@
+{
+  "description": "Vorlage für config/mcp-servers.json: MCP-Server, deren Werkzeuge tybo den Ersatzmodellen (OpenRouter, Ollama) gibt. Einträge hier gehen vor MCP_CONFIG_PATH und ~/.claude.json. Lokale Server: command, args, env; tybo startet sie selbst und beendet sie beim Herunterfahren. Entfernte Server: type http, url, headers. ${NAME} wird aus der .env ersetzt. Schreibende Werkzeuge fragen vor dem Aufruf nach; was nur liest, darf in MCP_READ_ONLY_TOOLS als server/werkzeug stehen. Prüfen: bun run test:tools",
+  "servers": { "notizen": {
+      "command": "/pfad/zu/.bun/bin/bun",
+      "args": ["run", "/pfad/zu/mcp-servern/notizen/server.ts"],
+      "env": { "NOTIZEN_API_KEY": "${NOTIZEN_API_KEY}" }
+    },
+    "websuche": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${WEBSUCHE_API_KEY}" }
+    }
+  }
+}

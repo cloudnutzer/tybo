@@ -1,0 +1,48 @@
+diff --git a/dist/types/heif.js b/dist/types/heif.js
+index 7997d3f159d60da91f73b498e59714298e0effd1..7e14872f1315c5fc5e4459b5f6ed43d030674396 100644
+--- a/dist/types/heif.js
++++ b/dist/types/heif.js
+@@ -23,6 +23,7 @@ exports.HEIF = {
+         return brand in brandMap;
+     },
+     calculate(input) {
++        throw new TypeError("tybo security policy: heif image parsing disabled (upstream DoS advisory)");
+         // Based on https://nokiatech.github.io/heif/technical.html
+         const metaBox = (0, utils_1.findBox)(input, 'meta', 0);
+         const iprpBox = metaBox && (0, utils_1.findBox)(input, 'iprp', metaBox.offset + 12);
+diff --git a/dist/types/icns.js b/dist/types/icns.js
+index f2bfafef3723cb423b110304815e56e3f97f81e0..da8038112b679cd52f91d0e76cf230e5d8992eee 100644
+--- a/dist/types/icns.js
++++ b/dist/types/icns.js
+@@ -77,6 +77,7 @@ function getImageSize(type) {
+ exports.ICNS = {
+     validate: (input) => (0, utils_1.toUTF8String)(input, 0, 4) === 'icns',
+     calculate(input) {
++        throw new TypeError("tybo security policy: icns image parsing disabled (upstream DoS advisory)");
+         const inputLength = input.length;
+         const fileLength = (0, utils_1.readUInt32BE)(input, FILE_LENGTH_OFFSET);
+         let imageOffset = SIZE_HEADER;
+diff --git a/dist/types/jxl-stream.js b/dist/types/jxl-stream.js
+index e73316b41f05c3fadc7c0b5f931bfa59b9171331..1d7a5cfcdbca41cdd5764dfe7174e5039fdd1dfc 100644
+--- a/dist/types/jxl-stream.js
++++ b/dist/types/jxl-stream.js
+@@ -35,6 +35,7 @@ exports.JXLStream = {
+         return (0, utils_1.toHexString)(input, 0, 2) === 'ff0a';
+     },
+     calculate(input) {
++        throw new TypeError("tybo security policy: jxl-stream image parsing disabled (upstream DoS advisory)");
+         const reader = new bit_reader_1.BitReader(input, 'little-endian');
+         const isSmallImage = reader.getBits(1) === 1;
+         const height = calculateImageDimension(reader, isSmallImage);
+diff --git a/dist/types/jxl.js b/dist/types/jxl.js
+index f557b0aea7e679d2cb84d9915e957dd2254eba97..2d0367b718088723a3d5a93ad2e3bf717b35f643 100644
+--- a/dist/types/jxl.js
++++ b/dist/types/jxl.js
+@@ -51,6 +51,7 @@ exports.JXL = {
+         return brand === 'jxl ';
+     },
+     calculate(input) {
++        throw new TypeError("tybo security policy: jxl image parsing disabled (upstream DoS advisory)");
+         const codestream = extractCodestream(input);
+         if (codestream)
+             return jxl_stream_1.JXLStream.calculate(codestream);

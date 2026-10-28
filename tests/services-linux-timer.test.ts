@@ -1,0 +1,438 @@
+/**
+ * Issue #370: Routinen unter Linux als systemd-Timer, ohne systemd als
+ * cron-Zeilen (src/lib/services/systemd.ts, src/setup/services/linux.ts).
+ * systemctl, loginctl, crontab, which und das Dateisystem sind Attrappen;
+ * kein Test richtet einen echten Dienst ein.
+ */
+
+import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
+import { serviceDefinition } from "../src/lib/services/catalog";
+import { cronLines, cronMarker, cronTimes, isOwnCronLine, legacyCronMarker, onCalendar, serviceUnit, timerUnit, UnitError, type LinuxMachine } from "../src/lib/services/systemd";
+import { readCrontab, setUpTimer, timerFailureMessage, userUnitDir, type LinuxDeps } from "../src/setup/services/linux";
+import { EMPTY_ROUTINES_CONFIG } from "../src/lib/routines/config";
+import { routineIdAllowed } from "../src/lib/routines/runs";
+import type { SetupSchedule } from "../src/lib/proactive/setup-schedule";
+
+const ROOT = "/home/alex/tybo";
+const HOME = "/home/alex";
+const UNITS = "/home/alex/.config/systemd/user";
+const RUN_DIR = "/run/systemd/system";
+const MACHINE: LinuxMachine = { bun: "/home/alex/.bun/bin/bun", claudeDir: "/home/alex/.local/bin", home: HOME, projectRoot: ROOT };
+const CHECKIN = serviceDefinition("smart-checkin");
+const BRIEFING = serviceDefinition("morning-briefing");
+const SCHEDULE: SetupSchedule = { morning_briefing: { hour: 7, minute: 15, enabled: true }, check_in_intervals: [{ hour: 10, minute: 30 }, { hour: 14, minute: 0 }] };
+
+const FOREIGN_CRON = "5 4 * * * /usr/bin/backup.sh";
+const OLD_CHECKIN_CRON = `30 10 * * * cd ${ROOT} && bun run ${ROOT}/src/routines/checkin.ts >> ${ROOT}/logs/smart-checkin.log 2>&1 ${legacyCronMarker("smart-checkin")}`;
+const OLD_BRIEFING_CRON = `0 9 * * * cd ${ROOT} && bun run ${ROOT}/src/routines/briefing.ts >> ${ROOT}/logs/morning-briefing.log 2>&1 ${legacyCronMarker("morning-briefing")}`;
+
+describe("Einheiten aus dem Katalog", () => {
+  test("Dienst-Einheit: oneshot, Wrapper mit zugelassener Kennung, PATH, Protokoll", () => {
+    const unit = serviceUnit(CHECKIN, MACHINE);
+    expect(unit).toContain("Type=oneshot");
+    expect(unit).toContain(`WorkingDirectory=${ROOT}`);
+    expect(unit).toContain(
+      `ExecStart=${MACHINE.bun} --no-env-file src/routine-run.ts --id ai.tybo.smart-checkin -- ${MACHINE.bun} run src/routines/checkin.ts`,
+    );
+    expect(unit).toContain(`Environment=PATH=/home/alex/.bun/bin:/home/alex/.local/bin:/usr/local/bin:/usr/bin:/bin`);
+    expect(unit).toContain(`Environment=GO_PROJECT_ROOT=${ROOT}`);
+    expect(unit).toContain(`StandardOutput=append:${ROOT}/logs/smart-checkin.log`);
+    expect(unit).toContain(`StandardError=append:${ROOT}/logs/smart-checkin.error.log`);
+    expect(routineIdAllowed("ai.tybo.smart-checkin", EMPTY_ROUTINES_CONFIG)).toBe(true);
+    expect(routineIdAllowed("ai.tybo.morning-briefing", EMPTY_ROUTINES_CONFIG)).toBe(true);
+  });
+
+  test("Timer: ein OnCalendar je Termin, Persistent, Verweis auf den Dienst", () => {
+    const timer = timerUnit(CHECKIN, SCHEDULE);
+    expect(timer.split("\n").filter(l => l.startsWith("OnCalendar="))).toEqual(["OnCalendar=*-*-* 10:30:00", "OnCalendar=*-*-* 14:00:00"]);
+    expect(timer).toContain("Persistent=true");
+    expect(timer).toContain("Unit=tybo-smart-checkin.service");
+    expect(timer).toContain("WantedBy=timers.target");
+    expect(timerUnit(BRIEFING, SCHEDULE)).toContain("OnCalendar=*-*-* 07:15:00");
+  });
+
+  test("Platzhalter aus dem Katalog (volle Reihen) werden *", () => {
+    const everyHour = Array.from({ length: 24 }, (_, hour) => ({ hour, minute: 30 }));
+    const timer = timerUnit(CHECKIN, { ...SCHEDULE, check_in_intervals: everyHour });
+    expect(timer.split("\n").filter(l => l.startsWith("OnCalendar="))).toEqual(["OnCalendar=*-*-* *:30:00"]);
+    expect(onCalendar({ hour: 9 })).toBe("*-*-* 09:*:00");
+    expect(onCalendar({})).toBe("*-*-* *:*:00");
+    expect(cronLines(CHECKIN, MACHINE, { ...SCHEDULE, check_in_intervals: everyHour })[0].startsWith("30 * * * * ")).toBe(true);
+  });
+
+  test("cron: überlappende Termine starten je Zeitpunkt genau einmal", () => {
+    const everyHourAt30 = Array.from({ length: 24 }, (_, hour) => ({ hour, minute: 30 }));
+    const everyMinuteOf10 = Array.from({ length: 60 }, (_, minute) => ({ hour: 10, minute }));
+    const schedule = { ...SCHEDULE, check_in_intervals: [...everyHourAt30, ...everyMinuteOf10, { hour: 15, minute: 5 }] };
+    const lines = cronLines(CHECKIN, MACHINE, schedule).map(l => l.split(" ").slice(0, 2).join(" "));
+    // Auslösungen je Minute des Tages, ohne Duplikate zu verschlucken
+    const fires = new Map<number, number>();
+    const values = (field: string, size: number) =>
+      field === "*"
+        ? Array.from({ length: size }, (_, i) => i)
+        : field.split(",").flatMap(part => {
+            const [a, b = a] = part.split("-").map(Number);
+            return Array.from({ length: b - a + 1 }, (_, i) => a + i);
+          });
+    for (const line of lines) {
+      const [m, h] = line.split(" ");
+      for (const hour of values(h, 24)) for (const minute of values(m, 60)) fires.set(hour * 60 + minute, (fires.get(hour * 60 + minute) ?? 0) + 1);
+    }
+    expect(fires.get(10 * 60 + 30)).toBe(1);
+    expect([...fires.values()].every(n => n === 1)).toBe(true);
+    expect(fires.size).toBe(24 + 60 - 1 + 1);
+    expect(cronTimes([{ minute: 30 }, { hour: 10 }])).toEqual(["30 *", "0-29,31-59 10"]);
+    expect(cronTimes([{ hour: 10 }, { minute: 30 }, { hour: 10, minute: 30 }])).toEqual(["* 10", "30 0-9,11-23"]);
+    expect(cronTimes([{ minute: 30 }, {}])).toEqual(["30 *", "0-29,31-59 *"]);
+  });
+
+  test("ohne Termine kein Timer (systemd lehnt ihn ab)", () => {
+    expect(() => timerUnit(CHECKIN, { ...SCHEDULE, check_in_intervals: [] })).toThrow(UnitError);
+    expect(cronLines(CHECKIN, MACHINE, { ...SCHEDULE, check_in_intervals: [] })).toEqual([]);
+  });
+
+  test("Pfade mit Leerzeichen, %, $ oder Anführungszeichen werden abgelehnt", () => {
+    for (const projectRoot of ["/home/a b/tybo", "/home/a%b", "/home/$x", `/home/"x"`]) {
+      expect(() => serviceUnit(CHECKIN, { ...MACHINE, projectRoot })).toThrow(UnitError);
+      expect(() => cronLines(CHECKIN, { ...MACHINE, projectRoot }, SCHEDULE)).toThrow(UnitError);
+    }
+    expect(() => serviceUnit(CHECKIN, { ...MACHINE, claudeDir: "/opt/a:b" })).toThrow(UnitError);
+  });
+
+  test("nur Routinen: Bot und Supabase bekommen keinen Timer", () => {
+    expect(() => serviceUnit(serviceDefinition("telegram-relay"), MACHINE)).toThrow(UnitError);
+    expect(() => timerUnit(serviceDefinition("supabase"), SCHEDULE)).toThrow(UnitError);
+  });
+
+  test("cron-Zeile: Wrapper, Umgebung, Protokoll, Markierung am Ende", () => {
+    const [line] = cronLines(BRIEFING, MACHINE, SCHEDULE);
+    expect(line).toBe(
+      `15 7 * * * cd ${ROOT} && PATH=/home/alex/.bun/bin:/home/alex/.local/bin:/usr/local/bin:/usr/bin:/bin GO_PROJECT_ROOT=${ROOT} ` +
+        `${MACHINE.bun} --no-env-file src/routine-run.ts --id ai.tybo.morning-briefing -- ${MACHINE.bun} run src/routines/briefing.ts ` +
+        `>> ${ROOT}/logs/morning-briefing.log 2>> ${ROOT}/logs/morning-briefing.error.log # tybo-morning-briefing`,
+    );
+  });
+
+  test("Markierungen: eigene und frühere, nie ein ähnlicher Name", () => {
+    expect(cronMarker("smart-checkin")).toBe("# tybo-smart-checkin");
+    expect(isOwnCronLine(OLD_CHECKIN_CRON, "smart-checkin")).toBe(true);
+    expect(isOwnCronLine(`x ${cronMarker("smart-checkin")}  `, "smart-checkin")).toBe(true);
+    expect(isOwnCronLine(OLD_CHECKIN_CRON, "morning-briefing")).toBe(false);
+    expect(isOwnCronLine("x # go-smart-checkin-alt", "smart-checkin")).toBe(false);
+    expect(isOwnCronLine(FOREIGN_CRON, "smart-checkin")).toBe(false);
+  });
+
+  test("XDG-Ordner der Benutzereinheiten", () => {
+    expect(userUnitDir({}, HOME)).toBe(UNITS);
+    expect(userUnitDir({ XDG_CONFIG_HOME: "/cfg" }, HOME)).toBe("/cfg/systemd/user");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Einrichtung gegen Attrappen
+// ---------------------------------------------------------------------------
+
+interface FakeOptions {
+  systemd?: boolean;
+  unreachable?: boolean;
+  crontab?: string[] | "missing" | "broken";
+  failCrontabWrite?: boolean;
+  failEnable?: boolean;
+  failDisable?: boolean;
+  failWrite?: boolean;
+  linger?: "yes" | "no";
+  scheduleJson?: unknown;
+  settingsJson?: unknown;
+}
+
+function fakeLinux(options: FakeOptions = {}) {
+  const files = new Map<string, string>();
+  if (options.scheduleJson !== undefined) files.set(join(ROOT, "config", "schedule.json"), JSON.stringify(options.scheduleJson));
+  if (options.settingsJson !== undefined) files.set(join(ROOT, "config", "settings.json"), JSON.stringify(options.settingsJson));
+  let crontab: string[] | null = Array.isArray(options.crontab) ? [...options.crontab] : null;
+  const timers = new Map<string, { active: boolean; enabled: boolean }>();
+  const calls: string[] = [];
+  const lines: string[] = [];
+  const ok = (stdout = "") => ({ ok: true, stdout, stderr: "" });
+  const fail = (stderr = "Fehler") => ({ ok: false, stdout: "", stderr });
+  const deps: LinuxDeps = {
+    projectRoot: ROOT,
+    home: HOME,
+    unitDir: UNITS,
+    runDir: RUN_DIR,
+    user: "alex",
+    async run(cmd, opts) {
+      const text = cmd.join(" ");
+      if (cmd[0] === "which") return ok(cmd[1] === "bun" ? MACHINE.bun : `${MACHINE.claudeDir}/claude`);
+      if (cmd[0] === "loginctl") return ok(options.linger ?? "yes");
+      if (cmd[0] === "crontab") {
+        if (options.crontab === "missing") return { ok: false, stdout: "", stderr: "Befehl nicht gefunden", missing: true };
+        if (cmd[1] === "-l") {
+          if (options.crontab === "broken") return fail("crontab: Zugriff verweigert");
+          return crontab === null ? fail("no crontab for alex") : ok(crontab.join("\n"));
+        }
+        calls.push("crontab -");
+        if (options.failCrontabWrite) return fail();
+        const input = opts?.stdin ?? "";
+        crontab = input === "" ? [] : input.replace(/\n$/, "").split("\n");
+        return ok();
+      }
+      if (cmd[0] !== "systemctl" || cmd[1] !== "--user") throw new Error(`unerwarteter Befehl: ${text}`);
+      if (options.unreachable) return fail("Failed to connect to bus");
+      const unit = cmd[cmd.length - 1];
+      if (cmd[2] === "show") {
+        const name = cmd[3];
+        const loaded = files.has(join(UNITS, name));
+        const t = timers.get(name) ?? { active: false, enabled: false };
+        return ok(`LoadState=${loaded ? "loaded" : "not-found"}\nActiveState=${t.active ? "active" : "inactive"}\nUnitFileState=${t.enabled ? "enabled" : loaded ? "disabled" : ""}`);
+      }
+      calls.push(cmd.slice(2).join(" "));
+      if (cmd[2] === "daemon-reload") return ok();
+      if (cmd[2] === "enable") {
+        if (options.failEnable) return fail();
+        timers.set(unit, { ...(timers.get(unit) ?? { active: false }), enabled: true });
+        return ok();
+      }
+      if (cmd[2] === "restart") {
+        timers.set(unit, { ...(timers.get(unit) ?? { enabled: false }), active: true });
+        return ok();
+      }
+      if (cmd[2] === "disable") {
+        if (options.failDisable) return fail();
+        timers.set(unit, { active: false, enabled: false });
+        return ok();
+      }
+      throw new Error(`unerwarteter Befehl: ${text}`);
+    },
+    exists: p => (p === RUN_DIR ? options.systemd !== false : files.has(p)),
+    readFile: p => {
+      const c = files.get(p);
+      if (c === undefined) throw new Error(`ENOENT ${p}`);
+      return c;
+    },
+    writeFile: (p, c) => {
+      if (options.failWrite) throw new Error("EACCES");
+      files.set(p, c);
+    },
+    remove: p => void files.delete(p),
+    mkdir: () => {},
+    log: l => lines.push(l),
+  };
+  return { deps, files, timers, calls, lines, crontab: () => crontab, setOptions: (o: FakeOptions) => Object.assign(options, o) };
+}
+
+const TIMER_FILE = join(UNITS, "tybo-smart-checkin.timer");
+const SERVICE_FILE = join(UNITS, "tybo-smart-checkin.service");
+
+describe("setUpTimer mit systemd", () => {
+  test("erstmals: beide Einheiten, daemon-reload, enable, restart; Standardtermine aus den Einstellungen", async () => {
+    const fk = fakeLinux({ settingsJson: { proactive: { checkin: { times: ["11:00", "15:45"] } } } });
+    const r = await setUpTimer("smart-checkin", fk.deps);
+    expect(r).toEqual({ ok: true, service: "smart-checkin", via: "systemd", action: "written", cronLinesRemoved: 0 });
+    expect(fk.calls).toEqual(["daemon-reload", "enable tybo-smart-checkin.timer", "restart tybo-smart-checkin.timer"]);
+    expect(fk.files.get(TIMER_FILE)).toContain("OnCalendar=*-*-* 11:00:00\nOnCalendar=*-*-* 15:45:00\n");
+    expect(fk.files.get(SERVICE_FILE)).toContain("--id ai.tybo.smart-checkin");
+    // keine crontab vorhanden: nichts geschrieben
+    expect(fk.crontab()).toBeNull();
+  });
+
+  test("Wiederholung: nichts geschrieben, kein systemctl außer show", async () => {
+    const fk = fakeLinux();
+    await setUpTimer("smart-checkin", fk.deps);
+    fk.calls.length = 0;
+    const r = await setUpTimer("smart-checkin", fk.deps);
+    expect(r.ok && r.action).toBe("unchanged");
+    expect(fk.calls).toEqual([]);
+  });
+
+  test("geänderter Zeitplan: neu geschrieben und Timer neu gestartet", async () => {
+    const fk = fakeLinux({ scheduleJson: { check_in_intervals: [{ hour: 9, minute: 0 }] } });
+    await setUpTimer("smart-checkin", fk.deps);
+    fk.files.set(join(ROOT, "config", "schedule.json"), JSON.stringify({ check_in_intervals: [{ hour: 12, minute: 5 }] }));
+    fk.calls.length = 0;
+    const r = await setUpTimer("smart-checkin", fk.deps);
+    expect(r.ok && r.action).toBe("written");
+    expect(fk.calls).toEqual(["daemon-reload", "enable tybo-smart-checkin.timer", "restart tybo-smart-checkin.timer"]);
+    expect(fk.files.get(TIMER_FILE)).toContain("OnCalendar=*-*-* 12:05:00");
+    expect(fk.files.get(TIMER_FILE)).not.toContain("09:00");
+  });
+
+  test("Lesart „zero“: fehlende Minute in schedule.json ist 0, wie bisher unter cron", async () => {
+    const fk = fakeLinux({ scheduleJson: { check_in_intervals: [{ hour: 10 }], morning_briefing: { hour: 8 } } });
+    await setUpTimer("smart-checkin", fk.deps);
+    await setUpTimer("morning-briefing", fk.deps);
+    expect(fk.files.get(TIMER_FILE)!.split("\n").filter(l => l.startsWith("OnCalendar="))).toEqual(["OnCalendar=*-*-* 10:00:00"]);
+    expect(fk.files.get(join(UNITS, "tybo-morning-briefing.timer"))).toContain("OnCalendar=*-*-* 08:00:00");
+  });
+
+  test("leerer Zeitplan: vorhandener Timer abgeschaltet und gelöscht; ohne Timer nichts", async () => {
+    const fk = fakeLinux({ scheduleJson: { check_in_intervals: [{ hour: 9, minute: 0 }] } });
+    await setUpTimer("smart-checkin", fk.deps);
+    fk.files.set(join(ROOT, "config", "schedule.json"), JSON.stringify({ check_in_intervals: [] }));
+    fk.calls.length = 0;
+    const r = await setUpTimer("smart-checkin", fk.deps);
+    expect(r.ok && r.action).toBe("removed");
+    expect(fk.calls).toEqual(["disable --now tybo-smart-checkin.timer", "daemon-reload"]);
+    expect(fk.files.has(TIMER_FILE) || fk.files.has(SERVICE_FILE)).toBe(false);
+    fk.calls.length = 0;
+    const again = await setUpTimer("smart-checkin", fk.deps);
+    expect(again.ok && again.action).toBe("none");
+    expect(fk.calls).toEqual([]);
+  });
+
+  test("leerer Zeitplan: aktiver Timer ohne Dateien wird trotzdem abgeschaltet", async () => {
+    const fk = fakeLinux({ scheduleJson: { check_in_intervals: [] } });
+    fk.timers.set("tybo-smart-checkin.timer", { active: true, enabled: true });
+    const r = await setUpTimer("smart-checkin", fk.deps);
+    expect(r).toEqual({ ok: true, service: "smart-checkin", via: "systemd", action: "removed", cronLinesRemoved: 0 });
+    expect(fk.calls).toEqual(["disable --now tybo-smart-checkin.timer", "daemon-reload"]);
+    expect(fk.timers.get("tybo-smart-checkin.timer")).toEqual({ active: false, enabled: false });
+    expect(fk.lines.join("\n")).not.toContain("kein Timer eingerichtet");
+    // nur aktiviert, nicht aktiv: ebenso
+    const enabledOnly = fakeLinux({ scheduleJson: { check_in_intervals: [] } });
+    enabledOnly.timers.set("tybo-smart-checkin.timer", { active: false, enabled: true });
+    expect((await setUpTimer("smart-checkin", enabledOnly.deps)).ok && enabledOnly.calls[0]).toBe("disable --now tybo-smart-checkin.timer");
+  });
+
+  test("leerer Zeitplan: Stopp scheitert, kein Erfolg gemeldet", async () => {
+    const fk = fakeLinux({ scheduleJson: { check_in_intervals: [] }, failDisable: true, crontab: [OLD_CHECKIN_CRON] });
+    fk.timers.set("tybo-smart-checkin.timer", { active: true, enabled: true });
+    const r = await setUpTimer("smart-checkin", fk.deps);
+    expect(r).toEqual({ ok: false, service: "smart-checkin", failure: "disable" });
+    expect(fk.crontab()).toEqual([OLD_CHECKIN_CRON]);
+    expect(fk.lines.join("\n")).not.toContain("✓");
+  });
+
+  test("Benutzer-Manager nicht erreichbar: Abbruch, keine Datei, crontab unberührt", async () => {
+    const fk = fakeLinux({ unreachable: true, crontab: [OLD_CHECKIN_CRON, FOREIGN_CRON] });
+    const r = await setUpTimer("smart-checkin", fk.deps);
+    expect(r).toEqual({ ok: false, service: "smart-checkin", failure: "user-manager" });
+    expect(fk.files.size).toBe(0);
+    expect(fk.crontab()).toEqual([OLD_CHECKIN_CRON, FOREIGN_CRON]);
+    expect(fk.lines.join("\n")).toContain(timerFailureMessage("user-manager", "smart-checkin"));
+  });
+
+  test("Umstieg: eigene # go-Zeilen des Diensts verschwinden erst nach dem Timer, fremde und andere Dienste bleiben", async () => {
+    const fk = fakeLinux({ crontab: [FOREIGN_CRON, OLD_CHECKIN_CRON, OLD_BRIEFING_CRON, OLD_CHECKIN_CRON.replace("30 10", "30 14")] });
+    const r = await setUpTimer("smart-checkin", fk.deps);
+    expect(r).toEqual({ ok: true, service: "smart-checkin", via: "systemd", action: "written", cronLinesRemoved: 2 });
+    expect(fk.crontab()).toEqual([FOREIGN_CRON, OLD_BRIEFING_CRON]);
+    expect(fk.calls.indexOf("crontab -")).toBeGreaterThan(fk.calls.indexOf("restart tybo-smart-checkin.timer"));
+    // Wiederholung: nichts mehr zu entfernen, keine Doppelplanung
+    fk.calls.length = 0;
+    const again = await setUpTimer("smart-checkin", fk.deps);
+    expect(again.ok && again.cronLinesRemoved).toBe(0);
+    expect(fk.calls).toEqual([]);
+  });
+
+  test("Timer scheitert: alte cron-Zeilen bleiben (kein Verlust des Zeitplans)", async () => {
+    const fk = fakeLinux({ failEnable: true, crontab: [OLD_CHECKIN_CRON] });
+    const r = await setUpTimer("smart-checkin", fk.deps);
+    expect(r.ok ? null : r.failure).toBe("enable");
+    expect(fk.crontab()).toEqual([OLD_CHECKIN_CRON]);
+    expect(fk.calls).not.toContain("crontab -");
+  });
+
+  test("Schreiben der Einheiten scheitert: Fehler write, crontab unberührt", async () => {
+    const fk = fakeLinux({ failWrite: true, crontab: [OLD_CHECKIN_CRON] });
+    const r = await setUpTimer("smart-checkin", fk.deps);
+    expect(r.ok ? null : r.failure).toBe("write");
+    expect(fk.crontab()).toEqual([OLD_CHECKIN_CRON]);
+  });
+
+  test("Aufräumen der crontab scheitert: gemeldet als Doppellauf, nicht still", async () => {
+    const fk = fakeLinux({ failCrontabWrite: true, crontab: [OLD_CHECKIN_CRON] });
+    const r = await setUpTimer("smart-checkin", fk.deps);
+    expect(r.ok ? null : r.failure).toBe("cron-cleanup");
+    expect(fk.lines.join("\n")).toContain("startet doppelt");
+  });
+
+  test("crontab nicht lesbar: nichts geändert; nicht installiert zählt als leer", async () => {
+    const broken = fakeLinux({ crontab: "broken" });
+    const r = await setUpTimer("smart-checkin", broken.deps);
+    expect(r.ok ? null : r.failure).toBe("crontab-unreadable");
+    expect(broken.files.size).toBe(0);
+    expect(broken.calls).toEqual([]);
+    const missing = fakeLinux({ crontab: "missing" });
+    expect(await readCrontab(missing.deps)).toEqual([]);
+    expect((await setUpTimer("smart-checkin", missing.deps)).ok).toBe(true);
+  });
+
+  test("Linger fehlt: Hinweis mit Befehl, keine Änderung daran", async () => {
+    const fk = fakeLinux({ linger: "no" });
+    await setUpTimer("smart-checkin", fk.deps);
+    expect(fk.lines.join("\n")).toContain("sudo loginctl enable-linger alex");
+    expect(fk.calls.some(c => c.includes("linger"))).toBe(false);
+  });
+
+  test("kein Zeitplan-Dienst: abgelehnt, nichts geändert", async () => {
+    const fk = fakeLinux();
+    for (const s of ["telegram-relay", "health-check", "cloudflare-tunnel"] as const) {
+      const r = await setUpTimer(s, fk.deps);
+      expect(r.ok ? null : r.failure).toBe("not-a-timer");
+    }
+    expect(fk.files.size).toBe(0);
+  });
+
+  test("unsicherer Projektordner: abgelehnt, nichts geändert", async () => {
+    const fk = fakeLinux();
+    const r = await setUpTimer("smart-checkin", { ...fk.deps, projectRoot: "/home/alex/mein tybo" });
+    expect(r.ok ? null : r.failure).toBe("unsafe-path");
+    expect(fk.calls).toEqual([]);
+  });
+});
+
+describe("setUpTimer ohne systemd (cron)", () => {
+  test("eigene Zeilen ersetzt, alte # go-Zeilen weg, fremde bleiben; Wiederholung schreibt nichts", async () => {
+    const fk = fakeLinux({ systemd: false, scheduleJson: { check_in_intervals: [{ hour: 10, minute: 30 }, { hour: 18, minute: 30 }] }, crontab: [FOREIGN_CRON, OLD_CHECKIN_CRON, OLD_BRIEFING_CRON] });
+    const r = await setUpTimer("smart-checkin", fk.deps);
+    expect(r).toEqual({ ok: true, service: "smart-checkin", via: "cron", action: "written", cronLinesRemoved: 1 });
+    const tab = fk.crontab()!;
+    expect(tab.slice(0, 2)).toEqual([FOREIGN_CRON, OLD_BRIEFING_CRON]);
+    expect(tab.slice(2).map(l => l.split(" ").slice(0, 2).join(" "))).toEqual(["30 10", "30 18"]);
+    expect(tab.slice(2).every(l => l.endsWith("# tybo-smart-checkin"))).toBe(true);
+    expect(fk.files.size).toBe(1); // nur schedule.json, keine Einheit
+    fk.calls.length = 0;
+    const again = await setUpTimer("smart-checkin", fk.deps);
+    expect(again.ok && again.action).toBe("unchanged");
+    expect(fk.calls).toEqual([]);
+  });
+
+  test("leerer Zeitplan entfernt nur die eigenen Zeilen", async () => {
+    const fk = fakeLinux({ systemd: false, scheduleJson: { check_in_intervals: [] }, crontab: [FOREIGN_CRON, OLD_CHECKIN_CRON] });
+    const r = await setUpTimer("smart-checkin", fk.deps);
+    expect(r.ok && r.action).toBe("removed");
+    expect(fk.crontab()).toEqual([FOREIGN_CRON]);
+  });
+
+  test("crontab nicht schreibbar: Fehler, bisherige Zeilen bleiben", async () => {
+    const fk = fakeLinux({ systemd: false, failCrontabWrite: true, crontab: [FOREIGN_CRON, OLD_CHECKIN_CRON] });
+    const r = await setUpTimer("smart-checkin", fk.deps);
+    expect(r.ok ? null : r.failure).toBe("crontab-write");
+    expect(fk.crontab()).toEqual([FOREIGN_CRON, OLD_CHECKIN_CRON]);
+  });
+
+  test("logs/ nicht anlegbar: Fehler, keine neue crontab, kein Erfolg gemeldet", async () => {
+    const fk = fakeLinux({ systemd: false, crontab: [FOREIGN_CRON, OLD_CHECKIN_CRON] });
+    const r = await setUpTimer("smart-checkin", {
+      ...fk.deps,
+      mkdir: () => {
+        throw new Error("EACCES");
+      },
+    });
+    expect(r.ok ? null : r.failure).toBe("logs-dir");
+    expect(fk.calls).not.toContain("crontab -");
+    expect(fk.crontab()).toEqual([FOREIGN_CRON, OLD_CHECKIN_CRON]);
+    const log = fk.lines.join("\n");
+    expect(log).toContain(timerFailureMessage("logs-dir", "smart-checkin"));
+    expect(log).not.toContain("✓");
+  });
+
+  test("leere crontab („no crontab“): neue Zeilen eingetragen", async () => {
+    const fk = fakeLinux({ systemd: false });
+    const r = await setUpTimer("morning-briefing", fk.deps);
+    expect(r.ok && r.action).toBe("written");
+    expect(fk.crontab()!.length).toBe(1);
+  });
+});
