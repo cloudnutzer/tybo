@@ -63,6 +63,16 @@ import { createRoutinesApi, ROUTINES_API_TEXT, type RoutinesPort } from "./routi
 import { createThreadsApi, THREADS_API_TEXT, type ThreadsPort } from "./threads";
 import { createRemindersApi, REMINDERS_API_TEXT, type RemindersPort } from "./reminders";
 import { voiceStatusBody, VOICE_TEXT, type VoicePort } from "./voice";
+import {
+  VOICE_AGENT_API_PATH,
+  VOICE_AGENT_CONNECT_HOSTS,
+  VOICE_AGENT_PAGE_PATH,
+  VOICE_AGENT_SDK_PATH,
+  VOICE_AGENT_SESSION_TEXT,
+  type VoiceAgentSessionPort,
+} from "./voice-agent-page";
+import { parseVersionParam, VOICE_AGENT_ADMIN_PATH, VOICE_AGENT_ADMIN_TEXT, VOICE_AGENTS_PAGE, type VoiceAgentAdminPort } from "./voice-agent-admin";
+import { matchWizardPath, VOICE_WIZARD_TEXT, WIZARD_ATTACHMENT_MAX_BYTES, type VoiceWizardPort, type VoiceWizardResult } from "./voice-agent-wizard";
 import { createCallHistory, type CallMemoryPort } from "./call-history";
 import {
   CALL_PROBE_PATH,
@@ -182,6 +192,34 @@ export const SECURITY_HEADERS: Record<string, string> = {
   // Telefonhörer (Issue #257): Mikrofon und Kamera nur für die eigene Seite, nichts anderes
   "Permissions-Policy": "microphone=(self), camera=(self), geolocation=(), payment=()",
 };
+
+/**
+ * Gesprächsseite eines Sprachagenten (/sa/<kennung>, Issue #494): connect-src
+ * zusätzlich mit den Hosts des Anbieters, Mikrofon erlaubt, Kamera nicht. Alle
+ * anderen Seiten behalten SECURITY_HEADERS unverändert, auch Sprechmodus und
+ * Telefonhörer.
+ */
+export const VOICE_AGENT_PAGE_HEADERS: Record<string, string> = {
+  ...SECURITY_HEADERS,
+  "Content-Security-Policy": SECURITY_HEADERS["Content-Security-Policy"].replace(
+    "connect-src 'self';",
+    `connect-src 'self' ${VOICE_AGENT_CONNECT_HOSTS.join(" ")};`
+  ),
+  "Permissions-Policy": "microphone=(self), camera=(), geolocation=(), payment=(), autoplay=(self)",
+};
+
+/** Köpfe je Antwort: erweitert nur für eine ausgelieferte Gesprächsseite */
+export function securityHeadersFor(path: string, status: number): Record<string, string> {
+  return status === 200 && VOICE_AGENT_PAGE_PATH.test(path) ? VOICE_AGENT_PAGE_HEADERS : SECURITY_HEADERS;
+}
+
+/** Gesprächsseite ohne Login (Issue #494): 401 statt Umleitung, mit Weg zur Anmeldung */
+const LOGIN_REQUIRED_HTML =
+  '<!doctype html><html lang="de"><head><meta charset="utf-8">' +
+  '<meta name="viewport" content="width=device-width, initial-scale=1"><title>Anmeldung nötig</title>' +
+  '<link rel="stylesheet" href="/style.css"></head><body class="login"><main class="login-panel">' +
+  '<p>Dieses Gespräch gibt es nur nach der Anmeldung.</p><p><a href="/login">Zur Anmeldung</a></p>' +
+  "</main></body></html>";
 
 /** Höchstens so lange auf Buns server.stop() warten (siehe stop()) */
 const SERVER_STOP_WAIT_MS = 2_000;
@@ -363,6 +401,35 @@ export interface WebServerDeps {
    * Routen mit 503.
    */
   voiceClone?: VoiceClonePort;
+  /**
+   * Web-Gespräch je Rezept (Issue #494): Token beim Anbieter, Web-Freigabe der
+   * Brücke, Rate-Limit und Minutenbudget unter /api/voice-agents/<kennung> und
+   * die Gesprächsseite /sa/<kennung>. In bot.ts createVoiceAgentSessions aus
+   * ./bot-voice-agent-session, in Tests mit Fetch-Attrappe. Ohne ihn antworten
+   * Routen und Seite mit 503.
+   */
+  voiceAgentSessions?: VoiceAgentSessionPort;
+  /**
+   * Nur web:dev (Issue #495): Quelltext einer SDK-Attrappe, ausgeliefert statt
+   * des eingecheckten SDK unter VOICE_AGENT_SDK_PATH, wie dieses nur nach dem
+   * Login. Der Bot setzt ihn nie.
+   */
+  voiceAgentSdkScript?: string;
+  /**
+   * Bereich „Sprachagenten“ (Issue #495): Liste, Rezept in Klartext,
+   * Versionen, Testen, Link und Löschen unter /api/voice-agents und die Seite
+   * /sprachagenten. In bot.ts createVoiceAgentAdmin aus
+   * ./bot-voice-agent-admin, in web:dev eine Attrappe. Ohne ihn antworten die
+   * Routen mit 503.
+   */
+  voiceAgentAdmin?: VoiceAgentAdminPort;
+  /**
+   * Wizard für Sprachagenten, Serverteil (Issue #514): Vorschlag, Entwurf,
+   * feste Regeln, Anhänge und Bauen unter /api/voice-agents/wizard. Im Bot
+   * createVoiceAgentWizard aus ./bot-voice-agent-wizard über denselben
+   * Entwurfsdienst wie /sprachagent neu. Ohne ihn antworten die Routen mit 503.
+   */
+  voiceAgentWizard?: VoiceWizardPort;
   /**
    * Agenten-Anweisungen wie /agent (Issue #36); in bot.ts botInstructions
    * aus ./bot-settings. Ohne sie antworten die Routen mit 503.
@@ -596,6 +663,15 @@ function tooLarge(): Response {
 
 function methodNotAllowed(allow: string): Response {
   return json({ error: "Methode nicht erlaubt" }, 405, { Allow: allow });
+}
+
+/** Ein Pfadabschnitt dekodiert; null, wenn er sich nicht dekodieren lässt */
+function decodeSegment(raw: string): string | null {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
 }
 
 function redirect(location: string): Response {
@@ -1257,7 +1333,10 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     let conversation: TelegramConversation | null = null;
     if (deps.telegram) {
       try {
-        conversation = await deps.telegram.getConversation(id);
+        // Die letzte Aktivität braucht nur, wer das Gespräch an den Browser zurückgibt (Issue #684):
+        // Abruf und Verwaltung ohne Aktion, Schließen und Öffnen. Alles andere prüft nur, ob es das Gespräch gibt
+        const activity = !action || action === "close" || action === "reopen";
+        conversation = await deps.telegram.getConversation(id, { activity });
       } catch (e) {
         log(`Telegram-Gespräch nicht lesbar (${errorName(e)})`);
       }
@@ -1362,7 +1441,7 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
   async function choiceConversationExists(conversationId: string): Promise<boolean> {
     if (parseTelegramConversationId(conversationId)) {
       try {
-        return !!(deps.telegram && (await deps.telegram.getConversation(conversationId)));
+        return !!(deps.telegram && (await deps.telegram.getConversation(conversationId, { activity: false })));
       } catch (e) {
         log(`Telegram-Gespräch nicht lesbar (${errorName(e)})`);
         return false;
@@ -1488,7 +1567,7 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     const denied = await deps.topics!.checkDeleteRights();
     if (denied) return json(denied.body, denied.status);
     const confirmed = async () => {
-      const current = await deps.telegram!.getConversation(id);
+      const current = await deps.telegram!.getConversation(id, { activity: false });
       return !!current && (await deps.topics!.exactName(topicId, current.title)) === confirm;
     };
     const result = await telegramHub.exclusive(id, () => deps.topics!.delete(topicId, confirmed));
@@ -1553,7 +1632,7 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
    * GET /api/files/<id> (Issue #47): nur ids aus festgehaltenen Einträgen,
    * sonst 404; Auslieferung und Inline-Regeln in ./files.
    */
-  async function downloadFile(id: string, inline: boolean): Promise<Response> {
+  async function downloadFile(id: string, inline: boolean, range: string | null): Promise<Response> {
     const notFound = () => json({ error: "Datei nicht gefunden" }, 404);
     if (!deps.files || !OUTBOX_FILE_ID_PATTERN.test(id)) return notFound();
     let file: NoticeFile | null;
@@ -1566,7 +1645,7 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
       return json({ error: "Datei gerade nicht abrufbar" }, 503);
     }
     if (!file || file.id !== id) return notFound();
-    const res = await serveOutboxFile(deps.files.dir, file, inline);
+    const res = await serveOutboxFile(deps.files.dir, file, inline, undefined, { range });
     if (!res) {
       log("Datei aus Meldung fehlt in der Ablage oder ist nicht auslieferbar");
       return notFound();
@@ -1587,7 +1666,7 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     let conversation: TelegramConversation | null = null;
     if (deps.telegram) {
       try {
-        conversation = await deps.telegram.getConversation(id);
+        conversation = await deps.telegram.getConversation(id, { activity: false });
       } catch (e) {
         log(`Telegram-Gespräch nicht lesbar (${errorName(e)})`);
       }
@@ -1675,7 +1754,7 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
       let found: TelegramConversation | null = null;
       if (deps.telegram) {
         try {
-          found = await deps.telegram.getConversation(id);
+          found = await deps.telegram.getConversation(id, { activity: false });
         } catch (e) {
           log(`Telegram-Gespräch nicht lesbar (${errorName(e)})`);
         }
@@ -2229,7 +2308,7 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     const fileMatch = FILES_PATH.exec(path);
     if (fileMatch) {
       if (method !== "GET") return methodNotAllowed("GET");
-      return downloadFile(fileMatch[1], new URL(req.url).searchParams.get("inline") === "1");
+      return downloadFile(fileMatch[1], new URL(req.url).searchParams.get("inline") === "1", req.headers.get("range"));
     }
     const instructionsMatch = INSTRUCTIONS_PATH.exec(path);
     if (instructionsMatch) {
@@ -2545,6 +2624,16 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
       return voiceCreateRoute(req, url.searchParams, auth);
     }
 
+    // Anhänge des Wizards (Issue #514): Rohdaten mit eigener Grenze, vor dem allgemeinen Text-Body-Leser
+    const wizardUpload = method === "POST" ? matchWizardPath(path) : null;
+    if (wizardUpload?.action === "anhaenge" && wizardUpload.datei === undefined) {
+      if (!loggedIn) {
+        await discardBody(req);
+        return json({ error: "Nicht angemeldet" }, 401);
+      }
+      return wizardUploadRoute(req, wizardUpload.segment, auth);
+    }
+
     // Jeden Body vor dem Routing lesen, damit das Limit überall gilt, mit und ohne Content-Length
     const isNewMessage = method === "POST" && /^\/api\/conversations\/[^/]+\/messages$/.test(path);
     let body: string;
@@ -2611,18 +2700,211 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
         }
         return json({ ok: true }, 200, { "Set-Cookie": sessionCookie("", 0, origin.tunneled) });
       }
+      const wizard = matchWizardPath(path);
+      if (wizard) return voiceWizardRoute(wizard, method, body, auth, keepOpen);
+      const voiceAgentAdmin = VOICE_AGENT_ADMIN_PATH.exec(path);
+      if (voiceAgentAdmin) return voiceAgentAdminRoute(voiceAgentAdmin[1], voiceAgentAdmin[2] ?? "", method, body, auth, url.searchParams, keepOpen);
+      const voiceAgentApi = VOICE_AGENT_API_PATH.exec(path);
+      if (voiceAgentApi) return voiceAgentRoute(voiceAgentApi[1], voiceAgentApi[2] ?? "", method, body, auth, keepOpen);
       const chatResponse = await conversationRoutes(req, path, method, body, auth, keepOpen);
       if (chatResponse) return chatResponse;
       return json({ error: "Nicht gefunden" }, 404);
     }
 
+    // Gesprächsseite (Issue #494): nur angemeldet, ohne Login 401 statt Umleitung
+    const voiceAgentPage = VOICE_AGENT_PAGE_PATH.exec(path);
+    if (voiceAgentPage) {
+      if (method !== "GET" && method !== "HEAD") return text("Methode nicht erlaubt", 405);
+      if (!loggedIn) return new Response(LOGIN_REQUIRED_HTML, { status: 401, headers: { "Content-Type": "text/html; charset=utf-8" } });
+      if (!deps.voiceAgentSessions) return text(VOICE_AGENT_SESSION_TEXT.notConfigured, 503);
+      const kennung = decodeSegment(voiceAgentPage[1]);
+      if (kennung === null || (await deps.voiceAgentSessions.page(kennung)) !== "ok") return text("Nicht gefunden", 404);
+      return (await serveFile(publicDir, "/sprachagent.html", uiVersion)) ?? text("Nicht gefunden", 404);
+    }
+
     if (method !== "GET" && method !== "HEAD") return text("Methode nicht erlaubt", 405);
     if (!loggedIn) return redirect("/login");
+    // Bereich „Sprachagenten“ (Issue #495): Liste und Detail, Gespräche weiter unter /sa/<kennung>
+    if (path === VOICE_AGENTS_PAGE) return (await serveFile(publicDir, "/sprachagenten.html", uiVersion)) ?? text("Nicht gefunden", 404);
+    // SDK-Attrappe nur in web:dev (Issue #495), wie das echte SDK erst nach dem Login
+    if (path === VOICE_AGENT_SDK_PATH && deps.voiceAgentSdkScript !== undefined) {
+      return new Response(deps.voiceAgentSdkScript, { headers: { "Content-Type": "text/javascript; charset=utf-8" } });
+    }
     return (await serveFile(publicDir, path === "/" ? "/index.html" : path, uiVersion)) ?? text("Nicht gefunden", 404);
   }
 
+  /**
+   * Web-Gespräch je Rezept (Issue #494), nach Login und Origin-Prüfung. Token
+   * nur für den Browser: Mit dem Terminal-Schlüssel gibt es keins.
+   */
+  async function voiceAgentRoute(rawKennung: string, sub: string, method: string, body: string, auth: RequestAuth, keepOpen: () => void): Promise<Response> {
+    const port = deps.voiceAgentSessions;
+    const allow = sub ? "POST" : "GET";
+    if (method !== allow) return methodNotAllowed(allow);
+    if (!port) return json({ error: VOICE_AGENT_SESSION_TEXT.notConfigured }, 503);
+    const kennung = decodeSegment(rawKennung);
+    if (kennung === null) return json({ error: VOICE_AGENT_SESSION_TEXT.unknown, reason: "unbekannt" }, 404);
+    if (sub && auth.source !== "web") return json({ error: VOICE_AGENT_SESSION_TEXT.browserOnly }, 403);
+    // Statusabrufe beim Anbieter (je höchstens VOICE_AGENT_PROVIDER_TIMEOUT_MS),
+    // beim Ende mehrere mit Wartezeiten, beim Start dazu der Tokenabruf: zusammen
+    // länger als Buns Ruhezeit von 10 Sekunden. Begrenzt ist jeder einzelne Abruf.
+    keepOpen();
+    const result =
+      sub === "/session"
+        ? await port.start(kennung)
+        : sub === "/session/end"
+          ? await port.end(kennung, body)
+          : await port.info(kennung);
+    return json(result.body, result.status, result.headers ?? {});
+  }
+
+  /**
+   * Verwaltung der Sprachagenten (Issue #495), nach Login und Origin-Prüfung.
+   * Lesen auch mit dem Terminal-Schlüssel, Ändern (Testen, Link, Löschen) nur
+   * im Browser; Löschen nur mit { bestaetigt: true } nach der Rückfrage der Seite.
+   */
+  async function voiceAgentAdminRoute(
+    rawKennung: string | undefined,
+    action: string,
+    method: string,
+    body: string,
+    auth: RequestAuth,
+    params: URLSearchParams,
+    keepOpen: () => void,
+  ): Promise<Response> {
+    const port = deps.voiceAgentAdmin;
+    const allow = action === "" || action === "rezept" ? "GET" : "POST";
+    if (method !== allow) return methodNotAllowed(allow);
+    if (!port) return json({ error: VOICE_AGENT_ADMIN_TEXT.notConfigured }, 503);
+    if (action === "") return result((await port.list()));
+    const kennung = decodeSegment(rawKennung ?? "");
+    if (kennung === null || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(kennung)) return json({ error: VOICE_AGENT_ADMIN_TEXT.unknown, reason: "unbekannt" }, 404);
+    if (action === "rezept") {
+      const version = parseVersionParam(params.get("version"));
+      if (version !== null && Number.isNaN(version)) return json({ error: VOICE_AGENT_ADMIN_TEXT.noVersion, reason: "keine_version" }, 404);
+      // Die Minuten im Browser fragen beim Anbieter nach (je Abruf bis zu
+      // zehn Sekunden), zusammen länger als Buns Ruhezeit
+      keepOpen();
+      return result(await port.detail(kennung, version));
+    }
+    if (auth.source !== "web") return json({ error: VOICE_AGENT_ADMIN_TEXT.browserOnly }, 403);
+    // Testen und Löschen fragen beim Anbieter nach, das dauert länger als Buns Ruhezeit
+    keepOpen();
+    if (action === "test") return result(await port.test(kennung));
+    if (action === "link") return result(await port.link(kennung));
+    let confirmed = false;
+    try {
+      confirmed = JSON.parse(body || "{}")?.bestaetigt === true;
+    } catch {
+      return json({ error: VOICE_AGENT_SESSION_TEXT.invalid }, 400);
+    }
+    if (!confirmed) return json({ error: VOICE_AGENT_ADMIN_TEXT.confirm, reason: "bestaetigung" }, 400);
+    return result(await port.remove(kennung));
+
+    function result(r: { status: number; body: Record<string, unknown> }): Response {
+      return json(r.body, r.status);
+    }
+  }
+
+  /**
+   * Wizard für Sprachagenten (Issue #514), nach Login und Origin-Prüfung.
+   * Lesen (Liste, Entwurf, Fortschritt) auch mit dem Terminal-Schlüssel,
+   * alles andere nur im Browser.
+   */
+  async function voiceWizardRoute(
+    match: NonNullable<ReturnType<typeof matchWizardPath>>,
+    method: string,
+    body: string,
+    auth: RequestAuth,
+    keepOpen: () => void,
+  ): Promise<Response> {
+    const port = deps.voiceAgentWizard;
+    const { segment, action, datei } = match;
+    const reply = (r: VoiceWizardResult) =>
+      r.audio
+        ? new Response(new Uint8Array(r.audio.bytes), { status: r.status, headers: { ...(r.headers ?? {}), "Content-Type": r.audio.type, "Cache-Control": "no-store" } })
+        : json(r.body, r.status, r.headers ?? {});
+    const fixedSegments = ["vorschlag", "entwuerfe", "stimmen", "hoerprobe"];
+    if (fixedSegments.includes(segment) && action !== "") return json({ error: "Nicht gefunden" }, 404);
+    let allow: string;
+    if (segment === "vorschlag" || segment === "hoerprobe") allow = "POST";
+    else if (segment === "entwuerfe" || segment === "stimmen") allow = "GET";
+    else if (action === "") allow = "GET, PUT, DELETE";
+    else if (action === "bauen" || action === "umbenennen") allow = "POST";
+    else if (action === "fortschritt") allow = "GET";
+    else allow = datei === undefined ? "POST" : "DELETE";
+    if ((action === "bauen" || action === "umbenennen" || action === "fortschritt") && datei !== undefined) return json({ error: "Nicht gefunden" }, 404);
+    if (!allow.split(", ").includes(method)) return methodNotAllowed(allow);
+    if (!port) return json({ error: VOICE_WIZARD_TEXT.notConfigured }, 503);
+    if (method !== "GET" && auth.source !== "web") return json({ error: VOICE_WIZARD_TEXT.browserOnly }, 403);
+    const parse = (): { ok: true; value: unknown } | { ok: false } => {
+      try {
+        return { ok: true, value: body.trim() ? JSON.parse(body) : {} };
+      } catch {
+        return { ok: false };
+      }
+    };
+    if (fixedSegments.includes(segment)) {
+      if (segment === "entwuerfe") return reply(await port.list());
+      if (segment === "stimmen") return reply(await port.voices());
+      if (segment === "hoerprobe") {
+        const parsed = parse();
+        if (!parsed.ok) return json({ error: VOICE_WIZARD_TEXT.invalid }, 400);
+        // Der Anbieter braucht einige Sekunden
+        keepOpen();
+        return reply(await port.probe(parsed.value));
+      }
+      const parsed = parse();
+      if (!parsed.ok) return json({ error: VOICE_WIZARD_TEXT.invalid }, 400);
+      // Das Nebenmodell braucht einige Sekunden, länger als Buns Ruhezeit
+      keepOpen();
+      return reply(await port.propose(parsed.value));
+    }
+    const kennung = decodeSegment(segment);
+    if (kennung === null) return json({ error: VOICE_WIZARD_TEXT.unknown, reason: "unbekannt" }, 404);
+    if (action === "fortschritt") return reply(await port.progress(kennung));
+    if (action === "anhaenge") return reply(await port.removeAttachment(kennung, decodeSegment(datei ?? "") ?? ""));
+    if (method === "GET") return reply(await port.get(kennung));
+    if (method === "DELETE") return reply(await port.remove(kennung));
+    const parsed = parse();
+    if (!parsed.ok) return json({ error: VOICE_WIZARD_TEXT.invalid }, 400);
+    if (action === "bauen") return reply(await port.build(kennung, parsed.value));
+    if (action === "umbenennen") return reply(await port.rename(kennung, parsed.value));
+    return reply(await port.put(kennung, parsed.value));
+  }
+
+  /** Anhang des Wizards (Issue #514): nur im Browser, Grenze vor dem Lesen */
+  async function wizardUploadRoute(req: Request, segment: string, auth: RequestAuth): Promise<Response> {
+    const reject = async (res: Response) => {
+      await discardBody(req);
+      return res;
+    };
+    const port = deps.voiceAgentWizard;
+    if (!port) return reject(json({ error: VOICE_WIZARD_TEXT.notConfigured }, 503));
+    if (auth.source !== "web") return reject(json({ error: VOICE_WIZARD_TEXT.browserOnly }, 403));
+    const kennung = decodeSegment(segment);
+    if (kennung === null) return reject(json({ error: VOICE_WIZARD_TEXT.unknown, reason: "unbekannt" }, 404));
+    const name = parseAttachmentName(req.headers.get(FILE_NAME_HEADER));
+    if (name === null) return reject(json({ error: VOICE_WIZARD_TEXT.badName }, 400));
+    const declared = Number(req.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > WIZARD_ATTACHMENT_MAX_BYTES) return reject(json({ error: VOICE_WIZARD_TEXT.attachmentLarge, reason: "zu_gross" }, 413));
+    let bytes: Buffer;
+    try {
+      bytes = await readLimitedBytes(req, WIZARD_ATTACHMENT_MAX_BYTES);
+    } catch (e) {
+      if (e instanceof BodyTooLarge) return json({ error: VOICE_WIZARD_TEXT.attachmentLarge, reason: "zu_gross" }, 413);
+      throw e;
+    }
+    const r = await port.addAttachment(kennung, name, new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+    return json(r.body, r.status, r.headers ?? {});
+  }
+
   function finalize(res: Response, path: string): Response {
-    for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.headers.set(k, v);
+    for (const [k, v] of Object.entries(securityHeadersFor(path, res.status))) {
+      // HTML aus Meldungen bringt seine eigene, strengere Regel mit (./files)
+      if (k === "Content-Security-Policy" && res.headers.has(k)) continue;
+      res.headers.set(k, v);
+    }
     const api = path === "/api" || path.startsWith("/api/");
     res.headers.set("Cache-Control", api || res.status >= 300 ? "no-store" : "no-cache");
     return res;

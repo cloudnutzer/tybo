@@ -84,13 +84,19 @@ const e = process.env;
 const list = JSON.parse(fs.readFileSync(e.DEPLOY_RELEASES + "/previous.json", "utf8"));
 const running = list.find(p => p.name === e.DEPLOY_OLD_APP)?.pm2_env;
 if (!running?.pm_exec_path || !running?.pm_cwd) throw new Error("Einstellung des laufenden PM2-Prozesses nicht lesbar");
+// Frist zum Beenden (Issue #564, BOT_PM2_KILL_TIMEOUT_MS in src/setup/services/pm2.ts):
+// sonst SIGKILL nach 1,6 Sekunden und bot.lock bleibt liegen. Eine längere
+// Frist des laufenden Prozesses bleibt erhalten, auch auf dem Rückweg.
+const kept = Number(running.kill_timeout);
+const killTimeout = Math.max(10000, Number.isFinite(kept) ? kept : 0);
 const back = { name: e.DEPLOY_OLD_APP, script: running.pm_exec_path, cwd: running.pm_cwd,
-  interpreter: running.exec_interpreter, args: running.args, env: running.env || {}, exec_mode: "fork", instances: 1 };
+  interpreter: running.exec_interpreter, args: running.args, env: running.env || {}, exec_mode: "fork", instances: 1,
+  kill_timeout: killTimeout };
 // PM2 legt env über die Umgebung dieses Aufrufs; ein DEPLOY_PREVIOUS_APP mit
 // dem alten Namen bliebe sonst im Bot und ginge an den nächsten Deploy über /deploy
 const next = { name: e.DEPLOY_NEW_APP, script: e.DEPLOY_RELEASE + "/src/bot.ts", cwd: e.DEPLOY_RELEASE,
   interpreter: process.execPath, args: ["--profile", "server"], exec_mode: "fork", instances: 1,
-  env: { ...back.env, DEPLOY_DIR: e.DEPLOY_PROJECT, RELEASE_REVISION: e.DEPLOY_REVISION, DEPLOY_PREVIOUS_APP: e.DEPLOY_NEW_APP } };
+  kill_timeout: killTimeout, env: { ...back.env, DEPLOY_DIR: e.DEPLOY_PROJECT, RELEASE_REVISION: e.DEPLOY_REVISION, DEPLOY_PREVIOUS_APP: e.DEPLOY_NEW_APP } };
 fs.writeFileSync(e.DEPLOY_RELEASES + "/rollback.json", JSON.stringify({ apps: [back] }), { mode: 0o600 });
 fs.writeFileSync(e.DEPLOY_RELEASE + "/release.json", JSON.stringify({ apps: [next] }), { mode: 0o600 });
 fs.writeFileSync(e.DEPLOY_RELEASES + "/previous-cwd", running.pm_cwd, { mode: 0o600 });

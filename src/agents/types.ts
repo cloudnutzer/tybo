@@ -14,7 +14,7 @@ export interface AgentConfig {
   systemPrompt: string;
   /** Modell im Code; config/settings.json geht an den Aufrufstellen vor */
   model: string;
-  /** Denkstufe (low, medium, high, xhigh); fehlt sie, entscheidet der Motor */
+  /** Denkstufe (low, medium, high, xhigh, max); fehlt sie, entscheidet der Motor */
   effort?: string;
   /** Erlaubte Werkzeuge; fehlt die Liste, darf der Agent alle Werkzeuge, MCP-Server und Skills nutzen */
   allowedTools?: string[];

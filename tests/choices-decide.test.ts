@@ -3,7 +3,7 @@
  * gleichzeitig im Prozess und aus einem echten Kindprozess auf derselben Datei.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
@@ -206,25 +206,43 @@ describe("zwei Prozesse auf derselben Datei", () => {
     const modulePath = JSON.stringify(join(import.meta.dir, "..", "src", "lib", "choices.ts"));
     writeFileSync(
       script,
-      `import { CHOICE_KINDS, decideChoice, onChoiceDecided, setChoicesFileForTests } from ${modulePath};
+      `import { existsSync, readFileSync, writeFileSync } from "fs";
+import { CHOICE_KINDS, decideChoice, onChoiceDecided, setChoicesFileForTests } from ${modulePath};
 console.log = () => {};
-const [file, startAt, idList, shared] = process.argv.slice(2);
+const [file, readyFile, goFile, idList, shared] = process.argv.slice(2);
 setChoicesFileForTests(file);
 const handledIds: string[] = [];
 for (const kind of CHOICE_KINDS) onChoiceDecided(kind, c => { handledIds.push(c.id); });
 // Umgekehrte Reihenfolge mit kleinen Pausen: Eltern und Kind treffen sich in
 // der Mitte und greifen dort um dieselben Fragen, beide gewinnen einige
 const ids = idList.split(",").reverse();
-while (Date.now() < Number(startAt)) await Bun.sleep(1);
+// Bereit melden, dann auf den gemeinsamen Startzeitpunkt der Eltern warten
+writeFileSync(readyFile, "");
+while (!existsSync(goFile)) await Bun.sleep(1);
+const startAt = Number(readFileSync(goFile, "utf8"));
+while (Date.now() < startAt) await Bun.sleep(1);
 const sharedResult = await decideChoice(shared, "no", "terminal");
 const results = [];
 for (const id of ids) { results.push(await decideChoice(id, "no", "terminal")); await Bun.sleep(15); }
 process.stdout.write(JSON.stringify({ shared: sharedResult.status, statuses: results.map(r => r.status).reverse(), handledIds }));
 `
     );
-    // Beide Seiten starten zum selben Zeitpunkt, damit sie wirklich konkurrieren
-    const startAt = Date.now() + 700;
-    const child = Bun.spawn(["bun", script, file, String(startAt), ids.join(","), shared], { stdout: "pipe", stderr: "pipe" });
+    // Beide Seiten starten zum selben Zeitpunkt, damit sie wirklich konkurrieren.
+    // Der Zeitpunkt steht erst fest, wenn das Kind geladen ist: unter Last
+    // dauert der Start eines Bun-Prozesses länger als jede feste Vorgabe, und
+    // ein zu spät gestartetes Kind fände alle Fragen schon entschieden
+    const readyFile = join(base, "child.ready");
+    const goFile = join(base, "child.go");
+    const child = Bun.spawn(["bun", script, file, readyFile, goFile, ids.join(","), shared], { stdout: "pipe", stderr: "pipe" });
+    const readyBy = Date.now() + 15_000;
+    while (!existsSync(readyFile)) {
+      if (child.exitCode !== null) throw new Error(`Kindprozess endete vor dem Start: ${await new Response(child.stderr).text()}`);
+      if (Date.now() > readyBy) throw new Error("Kindprozess nach 15 s nicht bereit");
+      await Bun.sleep(5);
+    }
+    const startAt = Date.now() + 100;
+    writeFileSync(`${goFile}.tmp`, String(startAt));
+    renameSync(`${goFile}.tmp`, goFile);
     while (Date.now() < startAt) await Bun.sleep(1);
     const parentShared = await decideChoice(shared, "ok", "web");
     const parentResults = [];

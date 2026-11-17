@@ -175,9 +175,10 @@ export interface ResolvedEngine {
 }
 
 /**
- * Motor für den nächsten Turn eines Gesprächs. Claude wird nicht geprüft
- * (checkEngine meldet es als bereit), andere Motoren über checkEngine;
- * nicht installiert oder nicht angemeldet heißt Claude Code.
+ * Motor für den nächsten Turn eines Gesprächs. Claude wird hier nicht
+ * geprüft: es ist der Motor, auf den tybo zurückfällt (Issue #567: checkEngine
+ * prüft Claude zwar, die Motor-Wahl fragt es aber nicht). Andere Motoren über
+ * checkEngine; nicht installiert oder nicht angemeldet heißt Claude Code.
  */
 export async function resolveEngine(sessionKey: string, deps?: Partial<EngineChoiceDeps>): Promise<ResolvedEngine> {
   const d = resolveDeps(deps);
@@ -298,7 +299,11 @@ export async function setTopicEngine(sessionKey: string, engine: SelectableEngin
   resetEngineNotice(sessionKey);
 }
 
-/** /motor in allen Kanälen (CommandServices.engines, Issue #125); Tests reichen eine Prüf-Attrappe herein */
+/**
+ * /motor in allen Kanälen (CommandServices.engines, Issue #125); Tests reichen
+ * eine Prüf-Attrappe herein. available() zeigt seit Issue #567 auch für
+ * Claude Code den echten Stand (installiert, angemeldet).
+ */
 export function createEngineCommandServices(deps?: Partial<Pick<EngineChoiceDeps, "checkEngine" | "getSettings" | "env">>): EngineCommandServices {
   const d = resolveDeps(deps);
   return {

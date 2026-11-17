@@ -69,7 +69,7 @@ export const DECISION_PHRASES = [
   "which option",
 ] as const;
 
-const STEER_TAGS = /\[(?:REMEMBER|GOAL|DONE|CANCEL|FORGET|REMIND|INVOKE|ASSET_DESC)\s*:[^\]]*\]/gi;
+const STEER_TAGS = /\[(?:REMEMBER|GOAL|DONE|CANCEL|FORGET|KNOWLEDGE|REMIND|INVOKE|ASSET_DESC)\s*:[^\]]*\]/gi;
 const lexer = new Marked({ gfm: true });
 
 /** Text der Blöcke ohne Codeblöcke; Zitate und Listen werden durchlaufen. */
@@ -255,6 +255,8 @@ export interface NoteTurnInput {
 
 export type DetectOutcome =
   | { status: "off" }
+  /** Nebenaufgabe abgeschaltet (Issue #566): Claude fehlt, kein anderes Nebenmodell; kein Fehler, keine Logzeile */
+  | { status: "disabled" }
   | { status: "no-question" }
   | { status: "suppressed"; by: "choice" | "ask_user" }
   | { status: "none" }
@@ -306,6 +308,7 @@ export async function detectThread(input: NoteTurnInput, deps: Partial<ThreadDet
   } catch (e) {
     return fail(e instanceof Timeout ? "zeitüberschreitung" : "fehler");
   }
+  if (result.disabled) return { status: "disabled" };
   if (result.isError) return fail("fehler");
   const verdict = parseVerdict(result.text);
   if (!verdict) return fail("ungültige Antwort");

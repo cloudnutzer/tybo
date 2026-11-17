@@ -1,0 +1,5 @@
+; Standardwerte für den internen Nachrichtenbus (Issue #511)
+[threadpool]
+initial_size = 5
+idle_timeout_sec = 20
+max_size = 50

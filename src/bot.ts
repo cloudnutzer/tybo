@@ -10,6 +10,7 @@
  * - src/app/bot-web.ts: WebUI
  * - src/app/bot-start.ts: Startbanner und Hintergrunddienste
  * - src/app/hybrid.ts: Weiterleitung zwischen Server und eigenem Rechner
+ * - src/lib/telegram-token-mask.ts: kein Bot-Token in der Ausgabe
  *
  * Start: bun run start, auf einem Server bun run vps (--profile server,
  * Issue #352). Fehlt ein Kanal, startet nur der Einrichtungsmodus
@@ -23,7 +24,7 @@ import { logSubprocessEnvFilter } from "./lib/subprocess-env";
 import { activeExecutionCount, closeIntake, isAbortError, logAgentCapacity, runExecution } from "./lib/execution-context";
 import { createBotRestart } from "./app/bot-restart";
 import { clearRestartRequest, detectSupervisor, readRestartRequest } from "./lib/restart-request";
-import { createLifecycle, createProcessLock, installSignalHandlers } from "./app/lifecycle";
+import { acquireLockOrExit, createLifecycle, createProcessLock, installSignalHandlers } from "./app/lifecycle";
 import { registerBotShutdown } from "./app/bot-shutdown";
 import { createLastSessionStore } from "./app/last-session";
 import { describeAssetFromReply, healthAddress, loadTelegramPhoto, startHealthServer } from "./app/health-server";
@@ -33,7 +34,7 @@ import { createBotCommandServices } from "./app/command-services";
 import { wireBotChoices } from "./app/bot-choices";
 import { wireTelegramChannel } from "./app/bot-telegram-channel";
 import { startBotWeb } from "./app/bot-web";
-import { startBackground, startBanner, type Background } from "./app/bot-start";
+import { checkClaudeBeforeWork, startBackground, startBanner, type Background } from "./app/bot-start";
 import { allowedChat } from "./lib/http-security";
 import { processInBackground } from "./lib/process-background";
 import { createBotNotices } from "./lib/bot-notices";
@@ -42,6 +43,7 @@ import { setEdgeFallbackNotifier } from "./lib/store/supabase/edge-warning";
 import { dmChatId, isWebChatId, telegramConfigured } from "./lib/channels";
 import { chooseStartMode } from "./setup/start-mode";
 import { createTelegramRuntime, startAfterFirstSweep } from "./lib/telegram-runtime";
+import { createIntakeReporter, intakeStatePath } from "./lib/telegram-intake";
 import { createServerRoutes } from "./app/server-routes";
 import { startHybrid } from "./app/hybrid";
 import { chatProgressMessages, createTelegramProgressSink } from "./lib/telegram-progress";
@@ -67,6 +69,10 @@ import { activeCallTurnCount, createBotCall } from "./web/bot-call";
 import { botGroupId } from "./web/bot-telegram";
 import type { WebServer } from "./web/server";
 import type { LogLevel } from "./lib/store/types";
+import { installLogMask } from "./lib/telegram-token-mask";
+
+// Vor jeder Ausgabe (Issue #526): kein Bot-Token in console, stdout oder stderr
+installLogMask();
 
 const root = process.cwd();
 const env = process.env;
@@ -91,7 +97,7 @@ const log = (level: LogLevel, message: string, metadata?: Record<string, unknown
 // kein Bot, kein Polling, kein getMe
 // Im Server-Profil hängen /health, /deploy und /webhook/elevenlabs am
 // Webhook-Listener (Issue #351); den Anrufdienst gibt es erst weiter unten
-const runtime = createTelegramRuntime({ env, routes: createServerRoutes({ env, root, transcripts: () => choices.phone }) });
+const runtime = createTelegramRuntime({ env, routes: createServerRoutes({ env, root, transcripts: () => choices.aftercall }) });
 const owner = env.TELEGRAM_USER_ID ?? "";
 const timezone = env.USER_TIMEZONE || "UTC";
 // Höchstens so viele [INVOKE:]-Konsultationen je Antwort (Schutz vor Schleifen)
@@ -119,8 +125,10 @@ await lastSession.load();
 // Lebenszyklus: bot.lock gegen einen zweiten Bot, Herzschlag, Beenden, Signale.
 // Dieselbe Prozess-ID steht im Lock, im Startbanner und im Startlog
 const pid = process.pid;
-const lock = createProcessLock({ path: join(root, "bot.lock"), pid });
-if (!(await lock.acquire())) process.exit(1);
+// Sperre mit PID und Startzeit; ein abgelehnter Start sagt auf stderr, warum (Issue #564)
+const lockPath = join(root, "bot.lock");
+const lock = createProcessLock({ path: lockPath, pid, root });
+await acquireLockOrExit(lock, { path: lockPath, exit: code => process.exit(code) });
 const lifecycle = createLifecycle({
   lock,
   exit: code => process.exit(code),
@@ -150,6 +158,10 @@ installSignalHandlers(lifecycle, {
   on: (event, handler) => void process.on(event, handler),
   report: error => log("error", `Uncaught exception: ${error.message}`, { stack: error.stack }),
 });
+
+// Ist Claude Code da (Issue #566)? Abgewartet vor Anrufen, Übungsgesprächen, WebUI, Health-Port, Zielen
+// und Polling: Schon die erste Arbeit ohne Claude ruft keine Nebenaufgabe über Claude und bekommt keine Job-Regel
+await checkClaudeBeforeWork(env);
 
 // Telefonhörer (Issue #257): ein Port für WebUI und Neustart-Steuerung
 const call = createBotCall({ userId: dmChatId(env), groupId: () => botGroupId(env), agentForTopic: getAgentByTopicId });
@@ -312,4 +324,7 @@ background = startBackground({
 // Die Handler hängen nur mit Telegram am Bot
 const resumeGoals = goalResumeOnStart();
 runtime.bot?.use(telegram.channel.handlers);
-void startAfterFirstSweep(runtime, background.firstSweep, resumeGoals);
+// 401 und 409 legen nur den Eingang still (Issue #562), Meldung in den Direktchat der WebUI
+void startAfterFirstSweep(runtime, background.firstSweep, resumeGoals, {
+  report: createIntakeReporter({ statePath: intakeStatePath(root), postWeb: choices.postWeb }),
+});

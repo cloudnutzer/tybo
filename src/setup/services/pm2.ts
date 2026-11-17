@@ -13,7 +13,8 @@
  * - Prozesse anderer Namen (frühere Namen, fremde Programme) fasst das Modul
  *   nie an (Issue #142).
  * - Danach `pm2 start` mit allen PM2-Optionen vor dem Trenner „--“; dahinter
- *   stehen nur die Argumente für bun.
+ *   stehen nur die Argumente für bun. Der Bot bekommt BOT_PM2_OPTIONS
+ *   (Frist zum Beenden, Issue #564).
  * `pm2 save` ist ein eigener Schritt (savePm2), damit der Aufrufer erst alle
  * Dienste einrichtet und dann einmal speichert.
  *
@@ -27,7 +28,9 @@
  * der Umgebung enthalten). Alles Äußere steckt in Pm2Deps.
  */
 
+import { homedir } from "node:os";
 import { join } from "node:path";
+import { pm2RpcSocketPath, queryPm2Daemon, type Pm2Query } from "../../lib/routines/sources/pm2-rpc";
 import { pm2Name, SUPABASE_SERVICE, SUPABASE_START_STATE } from "../../lib/service-names";
 import { serviceDefinition } from "../../lib/services/catalog";
 import { PM2_KILL_TIMEOUT_MS } from "../local-supabase";
@@ -47,6 +50,17 @@ export const ONCE_WRAPPER = "scripts/run-once-and-stay.ts";
  */
 export const SUPABASE_PM2_OPTIONS = ["--no-autorestart", "--kill-timeout", String(PM2_KILL_TIMEOUT_MS)];
 
+/**
+ * Frist zum Beenden des Bots unter PM2 (Issue #564). PM2 schickt sonst nach
+ * 1,6 Sekunden SIGKILL; der Bot braucht für seine Closer und das Freigeben
+ * von bot.lock länger, und die Sperre bliebe bei jedem Neustart liegen.
+ * deploy.sh setzt denselben Wert als kill_timeout (Test in tests/deploy.test.ts).
+ */
+export const BOT_PM2_KILL_TIMEOUT_MS = 10_000;
+
+/** PM2-Optionen für den Bot (tybo-telegram-relay) */
+export const BOT_PM2_OPTIONS = ["--kill-timeout", String(BOT_PM2_KILL_TIMEOUT_MS)];
+
 /** Frist für `pm2 delete tybo-supabase`: PM2 wartet bis zu PM2_KILL_TIMEOUT_MS */
 export const SUPABASE_DELETE_TIMEOUT_MS = PM2_KILL_TIMEOUT_MS + 60_000;
 
@@ -60,6 +74,16 @@ export interface Pm2Deps {
   /** timeoutMs: eigene Frist für diesen Aufruf */
   run(cmd: string[], options?: { timeoutMs?: number }): Promise<ServiceRun>;
   log(line: string): void;
+  /**
+   * Prozessliste vom laufenden Daemon über seinen Socket (Issue #568,
+   * queryPm2Daemon); startet nie einen. Fehlt: nicht abfragbar.
+   */
+  query?(): Promise<Pm2Query>;
+  /**
+   * Gesicherte Liste (PM2_HOME/dump.pm2), die pm2 resurrect beim Hochfahren
+   * liest (Issue #568). Fehlt: nicht geprüft.
+   */
+  dumpPath?: string;
 }
 
 export type Pm2Failure = "list-unreadable" | "delete-failed" | "start-failed";
@@ -115,7 +139,7 @@ function bunArgs(service: Pm2Service, root: string): string[] {
  */
 export function pm2StartCommand(service: Pm2Service, root: string, pm2: string[]): string[] {
   const logFile = join(root, "logs", `${service}.log`);
-  const own = service === SUPABASE_SERVICE ? SUPABASE_PM2_OPTIONS : [];
+  const own = service === SUPABASE_SERVICE ? SUPABASE_PM2_OPTIONS : BOT_PM2_OPTIONS;
   return [...pm2, "start", "bun", "--name", pm2Name(service), ...own, "--output", logFile, "--error", logFile, "--merge-logs", "--", ...bunArgs(service, root)];
 }
 
@@ -143,9 +167,16 @@ export async function configurePM2Service(service: Pm2Service, deps: Pm2Deps): P
 /** Meldung, wenn `pm2 save` scheitert */
 export const PM2_SAVE_FAILED = "pm2 save ist gescheitert: nach einem Neustart des Rechners fehlen die Dienste. Einmal „pm2 save“ ausführen.";
 
-/** Hält die laufenden Prozesse fest (`pm2 save`), damit `pm2 resurrect` sie beim Hochfahren zurückholt */
-export async function savePm2(deps: Pm2Deps): Promise<boolean> {
-  const saved = (await deps.run([...deps.pm2, "save"])).ok;
+/**
+ * Hält die laufenden Prozesse fest (`pm2 save`), damit `pm2 resurrect` sie
+ * beim Hochfahren zurückholt. force (Issue #568): nach einem entfernten
+ * Prozess. Ohne --force überschreibt PM2 bei leerer Liste die alte
+ * Sicherung nicht, meldet aber Erfolg, und der Prozess käme beim
+ * Hochfahren zurück. Nur dann, denn sonst sicherte ein frisch gestarteter
+ * Daemon ohne resurrect die leere Liste über fremde Prozesse.
+ */
+export async function savePm2(deps: Pm2Deps, options: { force?: boolean } = {}): Promise<boolean> {
+  const saved = (await deps.run([...deps.pm2, "save", ...(options.force ? ["--force"] : [])])).ok;
   if (!saved) deps.log(`  ✗ ${PM2_SAVE_FAILED}`);
   return saved;
 }
@@ -157,10 +188,13 @@ export async function pm2Installed(deps: Pm2Deps): Promise<boolean> {
 
 /** Echte Zugriffe; Frist je Aufruf wie verlangt, sonst PM2_COMMAND_TIMEOUT_MS */
 export function realPm2Deps(root: string, log: (line: string) => void = line => console.log(line)): Pm2Deps {
+  const pm2Home = process.env.PM2_HOME || join(process.env.HOME || homedir(), ".pm2");
   return {
     projectRoot: root,
     pm2: ["pm2"],
     run: (cmd, options) => runWithTimeout(cmd, root, options?.timeoutMs ?? PM2_COMMAND_TIMEOUT_MS),
     log,
+    query: () => queryPm2Daemon(pm2RpcSocketPath(process.platform, pm2Home)),
+    dumpPath: join(pm2Home, "dump.pm2"),
   };
 }

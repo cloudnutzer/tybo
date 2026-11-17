@@ -109,7 +109,8 @@ describe("/gespraeche und /wechsel", () => {
     const lines = text.split("\n");
     expect(lines[0]).toBe("Gespräche");
     const recherche = lines.find(l => l.includes("Recherche"))!;
-    expect(recherche).toMatch(/^› +\d+ +Recherche +Research +heute \d\d:\d\d$/);
+    // Die Demo datiert das Topic fünf Minuten zurück: kurz nach Mitternacht ist das „gestern"
+    expect(recherche).toMatch(/^› +\d+ +Recherche +Research +(heute|gestern) \d\d:\d\d$/);
     expect(lines.find(l => l.includes("Direktchat"))).toMatch(/^ +1 +Direktchat +General/);
     expect(lines.find(l => l.includes("Archiv"))).toContain("geschlossen");
     expect(lines.find(l => /^ +\d+ +General +General/.test(l))).toContain("noch nichts");

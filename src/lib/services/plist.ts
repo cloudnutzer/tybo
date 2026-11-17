@@ -102,6 +102,7 @@ function slotDict(slot: SetupInterval): PlistDict {
   const dict: PlistDict = {};
   if (slot.hour !== undefined) dict.Hour = slot.hour;
   if (slot.minute !== undefined) dict.Minute = slot.minute;
+  if (slot.weekday !== undefined) dict.Weekday = slot.weekday;
   return dict;
 }
 

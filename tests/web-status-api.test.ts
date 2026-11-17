@@ -66,7 +66,7 @@ describe("GET /api/status", () => {
     for (const [, v] of res.headers) expect(v).not.toContain(SECRET);
     const body = JSON.parse(raw);
     expect(Object.keys(body).sort()).toEqual(
-      ["engines", "keys", "restartRequested", "running", "semanticSearch", "sessions", "startedAt", "storage", "supervisor", "uptimeSeconds", "version"].sort()
+      ["engines", "keys", "restartRequested", "running", "semanticSearch", "sessions", "startedAt", "storage", "supervisor", "telegramIntake", "uptimeSeconds", "version"].sort()
     );
     expect(body.version).toEqual({ app: "2.12.0", commit: "0fe4c19" });
     expect(body.supervisor).toBe("launchd");

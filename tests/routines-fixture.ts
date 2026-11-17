@@ -33,7 +33,17 @@ export interface FakeRoutinesOptions {
   /** Jetzt in ms; Standard: 15.10.2026 10:00 Berlin */
   now?: number;
   timeZone?: string;
+  /**
+   * Linux (Issue #568): läuft der Rechner mit systemd? Standard nein, nie
+   * der echte Rechner (sonst hinge das Ergebnis davon ab, wo der Test läuft)
+   */
+  systemd?: boolean;
+  /** Einheiten im Ordner SYSTEMD_UNITS: Dateiname → Inhalt; fehlt: Ordner fehlt */
+  units?: Record<string, string>;
 }
+
+/** Ordner der systemd-Benutzereinheiten in der Attrappe */
+export const SYSTEMD_UNITS = `${HOME}/.config/systemd/user`;
 
 /** Standard-Jetzt der Attrappe: Donnerstag, 15.10.2026, 10:00 in Berlin */
 export const FIXTURE_NOW = Date.parse("2026-10-15T08:00:00.000Z");
@@ -60,6 +70,10 @@ export function fakeRoutinesDeps(options: FakeRoutinesOptions = {}): RoutinesDep
     uid: 501,
     async run(cmd) {
       calls.push(cmd);
+      // systemctl --user show: jede Einheit aus units geladen und aktiv, nie gelaufen
+      if (cmd[0] === "systemctl" && cmd[1] === "--user" && cmd[2] === "show") {
+        return options.units?.[cmd[3]] !== undefined ? ok("LoadState=loaded\nActiveState=active\nUnitFileState=enabled") : ok("LoadState=not-found\nActiveState=inactive");
+      }
       if (cmd[0] === "plutil") {
         const file = cmd[cmd.length - 1].slice(AGENTS.length + 1);
         const plist = plists[file];
@@ -76,10 +90,15 @@ export function fakeRoutinesDeps(options: FakeRoutinesOptions = {}): RoutinesDep
       throw new Error(`unerwarteter Befehl: ${cmd.join(" ")}`);
     },
     listDir(path) {
+      if (path === SYSTEMD_UNITS) {
+        if (!options.units) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        return Object.keys(options.units);
+      }
       if (options.listDirThrows || path !== AGENTS) throw new Error("ENOENT");
       return Object.keys(plists);
     },
     readFile(path) {
+      if (path.startsWith(`${SYSTEMD_UNITS}/`)) return options.units?.[path.slice(SYSTEMD_UNITS.length + 1)] ?? null;
       if (path === `${ROOT}/config/routines.json`) return options.config !== undefined ? options.config : null;
       const run = /^.*\/data\/routines\/(.+)\.json$/.exec(path);
       if (run && path.startsWith(`${ROOT}/data/routines/`)) return options.runFiles?.[run[1]] ?? null;
@@ -92,6 +111,8 @@ export function fakeRoutinesDeps(options: FakeRoutinesOptions = {}): RoutinesDep
       calls.push(["<pm2-daemon>", "getMonitorData"]);
       return options.pm2 ?? { status: "ok", processes: [] };
     },
+    systemdBooted: () => options.systemd ?? false,
+    systemdUnitDir: SYSTEMD_UNITS,
     now: () => options.now ?? FIXTURE_NOW,
     timeZone: options.timeZone ?? "Europe/Berlin",
   };

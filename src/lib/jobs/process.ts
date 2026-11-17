@@ -14,6 +14,7 @@
  * der Baum wirklich weg ist.
  */
 
+import { readlinkSync } from "fs";
 import type { ProcRef } from "./store";
 
 export interface ProcessOps {
@@ -209,4 +210,113 @@ export async function terminateGroup(ref: ProcRef, ops: ProcessOps, options: Ter
   if (again !== "ok") return again;
   ops.signalGroup(ref.pid, "SIGKILL");
   return (await waitGroupGone(ref.pid, ops, killWaitMs, pollMs)) ? "gone" : "survived";
+}
+
+// ---------------------------------------------------------------------------
+// Startzeit und Befehl für Sperrdateien (Issue #564)
+// ---------------------------------------------------------------------------
+
+/**
+ * Umgebung für ps, wenn eine Startzeit gespeichert und später verglichen
+ * wird: lstart hängt von Sprache (LC_*) und Zeitzone (TZ) ab. Mit C und UTC
+ * sieht dieselbe Startzeit immer gleich aus, egal unter welcher Umgebung
+ * Schreiber und Leser laufen.
+ */
+export const STABLE_PS_ENV: Record<string, string> = { LC_ALL: "C", LANG: "C", TZ: "UTC" };
+
+/** lstart wie in PS_LINE */
+const LSTART = "[A-Z][a-z]{2} [A-Z][a-z]{2} [ \\d]\\d \\d\\d:\\d\\d:\\d\\d \\d{4}";
+
+/** Zeile von `ps -o lstart=,command=` */
+const LSTART_COMMAND_LINE = new RegExp(`^\\s*(${LSTART})\\s*(.*)$`);
+
+/** lstart in Teilen: Wochentag, Monat, Tag, Stunde, Minute, Sekunde, Jahr */
+const LSTART_PARTS = /^([A-Z][a-z]{2}) ([A-Z][a-z]{2}) ([ \d]\d) (\d\d):(\d\d):(\d\d) (\d{4})$/;
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/**
+ * Hat text genau die Form, die stableProcessInfo als Startzeit liefert, und
+ * ist es ein wirklicher Zeitpunkt? Monat und Wochentag englisch (LC_ALL=C),
+ * Tag im Monat vorhanden, Uhrzeit bis 23:59:59, Wochentag passt zum Datum
+ * (in UTC, wie STABLE_PS_ENV). „Thu Nov 12 99:17:33 2026“ ist keiner.
+ */
+export function isStableLstart(text: string): boolean {
+  const m = LSTART_PARTS.exec(text);
+  if (!m) return false;
+  const [, weekday, monthName, dayText, hh, mm, ss, yearText] = m;
+  const month = MONTHS.indexOf(monthName);
+  const [day, hour, minute, second, year] = [dayText, hh, mm, ss, yearText].map(t => Number(t.trim()));
+  if (month < 0 || hour > 23 || minute > 59 || second > 59 || day < 1) return false;
+  const date = new Date(Date.UTC(year, month, day, hour, minute, second));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month && date.getUTCDate() === day && WEEKDAYS[date.getUTCDay()] === weekday;
+}
+
+/**
+ * Eine Schreibweise je Zeitpunkt: der Tag im Monat mit Leerzeichen aufgefüllt
+ * wie bei ps lstart („Thu Oct  1 …“), auch wenn er als „01“ kam. null, wenn
+ * text kein wirklicher Zeitpunkt ist (isStableLstart). Nur so vergleichen
+ * sich zwei Startzeiten desselben Prozesses gleich.
+ */
+export function canonicalLstart(text: string): string | null {
+  const m = LSTART_PARTS.exec(text);
+  if (!m || !isStableLstart(text)) return null;
+  const [, weekday, monthName, dayText, hh, mm, ss, year] = m;
+  return `${weekday} ${monthName} ${String(Number(dayText.trim())).padStart(2, " ")} ${hh}:${mm}:${ss} ${year}`;
+}
+
+/** Startzeit (lstart, C und UTC) und Befehlszeile eines Prozesses */
+export interface StableProcessInfo {
+  started: string;
+  command: string;
+}
+
+export function parseLstartCommand(text: string): StableProcessInfo | null {
+  const m = LSTART_COMMAND_LINE.exec(text.split("\n")[0] ?? "");
+  return m ? { started: m[1], command: m[2].trim() } : null;
+}
+
+/**
+ * Startzeit und Befehl über ps mit STABLE_PS_ENV; null, wenn es die PID
+ * nicht gibt oder ps scheitert. Bewusst getrennt von realProcessOps.identity:
+ * die festgehaltenen Startzeiten laufender Jobs bleiben so vergleichbar.
+ */
+export function stableProcessInfo(pid: number): StableProcessInfo | null {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  try {
+    const result = Bun.spawnSync(["ps", "-ww", "-o", "lstart=,command=", "-p", String(pid)], {
+      stdout: "pipe",
+      stderr: "ignore",
+      env: { ...process.env, ...STABLE_PS_ENV },
+    });
+    if (result.exitCode !== 0) return null;
+    return parseLstartCommand(result.stdout.toString());
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Arbeitsordner eines Prozesses: unter Linux /proc/<pid>/cwd, sonst lsof.
+ * null, wenn er sich nicht feststellen lässt (fremder Nutzer, kein lsof).
+ */
+export function processCwd(pid: number): string | null {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  try {
+    if (process.platform === "linux") {
+      return readlinkSync(`/proc/${pid}/cwd`);
+    }
+    // launchd und PM2 führen /usr/sbin nicht immer im PATH
+    const lsof = Bun.which("lsof") ?? "/usr/sbin/lsof";
+    const result = Bun.spawnSync([lsof, "-a", "-p", String(pid), "-d", "cwd", "-Fn"], {
+      stdout: "pipe",
+      stderr: "ignore",
+      env: { ...process.env, ...STABLE_PS_ENV },
+    });
+    if (result.exitCode !== 0) return null;
+    const line = result.stdout.toString().split("\n").find(l => l.startsWith("n"));
+    return line ? line.slice(1) : null;
+  } catch {
+    return null;
+  }
 }

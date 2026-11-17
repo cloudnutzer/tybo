@@ -11,7 +11,7 @@ import { join, resolve } from "node:path";
 import { commandRegistry, HELP_TEXT } from "../src/lib/commands/builtin";
 import { runTelegramCommand } from "../src/lib/commands/telegram";
 import type { CommandServices } from "../src/lib/commands/types";
-import { formatJobList, jobLog, recoverJobs, recoverJobsUntilSettled, stopJob } from "../src/lib/jobs/control";
+import { formatJobList, jobLog, LOST_WATCHER_DETAIL, recoverJobs, recoverJobsUntilSettled, stopJob } from "../src/lib/jobs/control";
 import { createJobDeps } from "../src/lib/jobs/default-deps";
 import { realProcessOps } from "../src/lib/jobs/process";
 import { checkProcess, processGone, terminateGroup } from "../src/lib/jobs/process";
@@ -318,6 +318,9 @@ describe("Bot-Start: verwaiste Jobs", () => {
       expect(deps.sent).toHaveLength(3);
       const orphanText = deps.sent.find(s => s.text!.includes("Job 1"))?.text ?? deps.sent.map(s => s.text).join("\n");
       expect(orphanText).toContain("Job abgebrochen");
+      // Issue #561: der Neustart des Bots steht als möglicher Grund in der Meldung
+      expect(orphanText).toContain("Neustart des Bots");
+      expect((await readStatus(r, orphan))!.detail).toBe(LOST_WATCHER_DETAIL);
       expect(deps.sent.map(s => s.text).join("\n")).toContain("letzte Zeile vor dem Absturz");
       expect((await readStatus(r, alive))!.phase).toBe("running");
       expect((await readStatus(r, fresh))!.phase).toBe("starting");

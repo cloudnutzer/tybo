@@ -20,8 +20,8 @@ afterAll(cleanup);
 
 // Ohne watchdog seit Issue #365 (Prüfung „Routinen pünktlich“ im Nachtcheck)
 const LAUNCHD_BEFORE = ["telegram-relay", "smart-checkin", "morning-briefing", "whatsapp-gateway", "cloudflare-tunnel", "health-check"];
-// Unter Linux wie bisher mit setup:services: Bot, Check-in, Briefing
-const LINUX_BEFORE = ["telegram-relay", "smart-checkin", "morning-briefing"];
+// Unter Linux: Bot, Check-in, Briefing und seit Issue #568 der Nachtcheck
+const LINUX_BEFORE = ["telegram-relay", "smart-checkin", "morning-briefing", "health-check"];
 
 /** Auswahl unter Linux: wie `tybo dienste` nur Dienste mit Linux-Weg */
 const linux = {

@@ -4,13 +4,14 @@
  * der Weg über getStore().memory): Anlegen mit asynchronem Embedding
  * samt embedding_model (Rückfall ohne die Spalte), Lesen in fester
  * Reihenfolge, Löschen, Erledigen und Streichen per Teiltext (erster
- * Treffer), Ziele mit Frist, Delta nach created_at und still leere bzw.
- * falsche Antworten ohne Supabase oder bei Fehlern. Jeder Fall läuft gegen
+ * Treffer), Ziele mit Frist, Delta nach created_at und leere bzw. falsche
+ * Antworten ohne Supabase oder bei Fehlern (Fehler beim Ändern von Zielen werfen
+ * seit #518). Das echte Schema prüft memory-goals-pg.test.ts. Jeder Fall läuft gegen
  * jeden Weg in WAYS; kein Netz, supabase-js gegen die Attrappe aus
  * memory-fixture.ts.
  */
-import { afterEach, describe, expect, test } from "bun:test";
-import { memoryDelta } from "../src/lib/memory/context";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { FACT_DATE_NOTE, memoryDelta } from "../src/lib/memory/context";
 import { getStore, resetStore } from "../src/lib/store";
 import { supabaseMemory } from "../src/lib/store/supabase/memory";
 import type { MemoryItem } from "../src/lib/store/types";
@@ -66,10 +67,10 @@ function table(options: MemoryTableOptions = {}) {
 
 const SEED: Row[] = [
   { type: "fact", content: "Alex trinkt morgens Tee" },
-  { type: "goal", content: "Steuererklärung abgeben", completed: false, deadline: "2026-11-30T23:59:59.000Z" },
+  { type: "goal", content: "Steuererklärung abgeben", deadline: "2026-11-30T23:59:59.000Z" },
   { type: "fact", content: "Mia wohnt in Hamburg" },
-  { type: "goal", content: "Fahrrad reparieren", completed: false },
-  { type: "goal", content: "Keller aufräumen", completed: true },
+  { type: "goal", content: "Fahrrad reparieren" },
+  { type: "completed_goal", content: "Keller aufräumen" },
   { type: "fact", content: "Lieblingsfarbe ist Grün" },
 ];
 
@@ -131,13 +132,13 @@ for (const way of WAYS) {
       expect(await way.addGoal("Mehr lesen")).toBe(true);
       const bodies = fake.tableRequests().filter(r => r.method === "POST").map(r => JSON.parse(r.body));
       expect(bodies).toEqual([
-        { type: "goal", content: "Urlaub buchen", deadline: "2026-12-01T10:00:00.000Z", completed: false },
-        { type: "goal", content: "Mehr lesen", completed: false },
+        { type: "goal", content: "Urlaub buchen", deadline: "2026-12-01T10:00:00.000Z" },
+        { type: "goal", content: "Mehr lesen" },
       ]);
     });
 
     test("deleteFact löscht den ersten Treffer per Teiltext, ohne Groß- und Kleinschreibung", async () => {
-      const fake = table({ rows: [{ type: "fact", content: "Tee am Morgen" }, { type: "fact", content: "Tee am Abend" }, { type: "goal", content: "Tee kaufen", completed: false }] });
+      const fake = table({ rows: [{ type: "fact", content: "Tee am Morgen" }, { type: "fact", content: "Tee am Abend" }, { type: "goal", content: "Tee kaufen" }] });
       expect(await way.deleteFact("tee")).toBe(true);
       expect(fake.table.map(r => r.content)).toEqual(["Tee am Abend", "Tee kaufen"]);
       expect(await way.deleteFact("Kaffee")).toBe(false);
@@ -145,17 +146,17 @@ for (const way of WAYS) {
     });
 
     test("completeGoal markiert den ersten offenen Treffer mit Zeitpunkt", async () => {
-      const fake = table({ rows: [{ type: "goal", content: "Bericht schreiben", completed: true }, { type: "goal", content: "Bericht lesen", completed: false }, { type: "fact", content: "Bericht ist lang" }] });
+      const fake = table({ rows: [{ type: "completed_goal", content: "Bericht schreiben" }, { type: "goal", content: "Bericht lesen" }, { type: "fact", content: "Bericht ist lang" }] });
       expect(await way.completeGoal("bericht")).toBe(true);
       const done = fake.table.find(r => r.content === "Bericht lesen")!;
-      expect(done.completed).toBe(true);
+      expect(done.type).toBe("completed_goal");
       expect(Number.isNaN(Date.parse(String(done.completed_at)))).toBe(false);
-      expect(fake.table.find(r => r.content === "Bericht ist lang")!.completed).toBeUndefined();
+      expect(fake.table.find(r => r.content === "Bericht ist lang")!.type).toBe("fact");
       expect(await way.completeGoal("bericht")).toBe(false);
     });
 
     test("cancelGoal löscht den ersten offenen Treffer, Fakten und erledigte Ziele bleiben", async () => {
-      const fake = table({ rows: [{ type: "goal", content: "Garten gießen", completed: true }, { type: "fact", content: "Garten ist groß" }, { type: "goal", content: "Garten mähen", completed: false }] });
+      const fake = table({ rows: [{ type: "completed_goal", content: "Garten gießen" }, { type: "fact", content: "Garten ist groß" }, { type: "goal", content: "Garten mähen" }] });
       expect(await way.cancelGoal("Garten")).toBe(true);
       expect(fake.table.map(r => r.content)).toEqual(["Garten gießen", "Garten ist groß"]);
       expect(await way.cancelGoal("Garten")).toBe(false);
@@ -166,27 +167,29 @@ for (const way of WAYS) {
         rows: [
           { type: "fact", content: "alter Fakt", created_at: "2026-10-01T10:00:00.000Z" },
           { type: "fact", content: "neuer Fakt", created_at: "2026-10-02T10:00:00.000Z" },
-          { type: "goal", content: "altes Ziel", completed: false, created_at: "2026-10-01T09:00:00.000Z" },
-          { type: "goal", content: "neues Ziel", completed: false, deadline: "2026-12-24T18:00:00.000Z", created_at: "2026-10-03T10:00:00.000Z" },
-          { type: "goal", content: "neu und erledigt", completed: true, created_at: "2026-10-03T11:00:00.000Z" },
+          { type: "goal", content: "altes Ziel", created_at: "2026-10-01T09:00:00.000Z" },
+          { type: "goal", content: "neues Ziel", deadline: "2026-12-24T18:00:00.000Z", created_at: "2026-10-03T10:00:00.000Z" },
+          { type: "completed_goal", content: "neu und erledigt", created_at: "2026-10-03T11:00:00.000Z" },
           { type: "fact", content: "genau am Zeitpunkt", created_at: "2026-10-01T12:00:00.000Z" },
         ],
       });
       expect(await way.delta(new Date("2026-10-01T12:00:00.000Z"))).toBe(
-        ["- [fact] neuer Fakt", "- [goal] neues Ziel (due: 2026-12-24T18:00:00.000Z)"].join("\n"),
+        [FACT_DATE_NOTE, "- [fact] [2026-10-02] neuer Fakt", "- [goal] neues Ziel (due: 2026-12-24T18:00:00.000Z)"].join("\n"),
       );
       expect(await way.delta(new Date("2026-10-05T00:00:00.000Z"))).toBe("");
     });
 
-    test("bei Fehlern der Datenbank: false bzw. leer", async () => {
+    test("bei Fehlern der Datenbank: Lesen leer, Anlegen false, Ändern von Zielen wirft", async () => {
+      const error = spyOn(console, "error").mockImplementation(() => {});
+      cleanups.push(() => error.mockRestore());
       table({ failTable: true, rows: SEED });
       expect(await way.facts()).toEqual([]);
       expect(await way.activeGoals()).toEqual([]);
       expect(await way.addFact("x")).toBe(false);
       expect(await way.addGoal("x")).toBe(false);
       expect(await way.deleteFact("Tee")).toBe(false);
-      expect(await way.completeGoal("Fahrrad")).toBe(false);
-      expect(await way.cancelGoal("Fahrrad")).toBe(false);
+      await expect(way.completeGoal("Fahrrad")).rejects.toThrow("Supabase: Ziele suchen gescheitert");
+      await expect(way.cancelGoal("Fahrrad")).rejects.toThrow("Supabase: Ziele suchen gescheitert");
       expect(await way.delta(new Date(0))).toBe("");
     });
   });
@@ -230,10 +233,10 @@ describe("Teiltext wörtlich (Maskierung, #311)", () => {
   });
 
   test("gleiche Maskierung beim Erledigen und Streichen von Zielen", async () => {
-    const fake = table({ rows: [{ type: "goal", content: "Quote 100% erreichen", completed: false }, { type: "goal", content: "Quote 1000 erreichen", completed: false }] });
+    const fake = table({ rows: [{ type: "goal", content: "Quote 100% erreichen" }, { type: "goal", content: "Quote 1000 erreichen" }] });
     const memory = freshMemory();
     expect(await memory.completeGoal("0%")).toBe(true);
-    expect(fake.table.find(r => r.content === "Quote 100% erreichen")!.completed).toBe(true);
+    expect(fake.table.find(r => r.content === "Quote 100% erreichen")!.type).toBe("completed_goal");
     expect(await memory.cancelGoal("_")).toBe(false);
     const patterns = fake.tableRequests().filter(r => r.method === "GET").map(r => r.url.searchParams.get("content"));
     expect(patterns).toEqual(["ilike.%0\\%%", "ilike.%\\_%"]);
@@ -265,7 +268,7 @@ describe("factVectors (#311)", () => {
 
   test("fehlende Migration: rohe Vektoren der Fakten aus der Tabelle", async () => {
     const fake = table({
-      rows: [{ type: "fact", content: "a", embedding: "[1,2]" }, { type: "fact", content: "b" }, { type: "goal", content: "c", completed: false, embedding: "[3]" }],
+      rows: [{ type: "fact", content: "a", embedding: "[1,2]" }, { type: "fact", content: "b" }, { type: "goal", content: "c", embedding: "[3]" }],
       factVectors: () => new Response(JSON.stringify({ code: "PGRST202" }), { status: 404 }),
     });
     const vectors = await freshMemory().factVectors(query);

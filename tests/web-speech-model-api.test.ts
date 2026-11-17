@@ -78,7 +78,7 @@ describe("speech.model und speech.effort in /api/settings", () => {
     expect(JSON.stringify(body)).not.toContain("geheim");
     res = await ctx.api("/api/settings", "PATCH", { speech: { model: "-rf" } });
     expect(res.status).toBe(400);
-    res = await ctx.api("/api/settings", "PATCH", { speech: { effort: "max" } });
+    res = await ctx.api("/api/settings", "PATCH", { speech: { effort: "ultra" } });
     expect(res.status).toBe(400);
     body = await res.json();
     expect(body.issues[0].path).toBe("speech.effort");
@@ -96,6 +96,6 @@ describe("speech.model und speech.effort in /api/settings", () => {
     const demo = createDemoSettings({});
     expect(demo.validate({ speech: { model: "claude-sonnet-5", effort: "medium" } }).ok).toBe(true);
     expect(demo.validate({ speech: { model: "zwei worte" } }).ok).toBe(false);
-    expect(demo.validate({ speech: { effort: "max" } }).ok).toBe(false);
+    expect(demo.validate({ speech: { effort: "ultra" } }).ok).toBe(false);
   });
 });

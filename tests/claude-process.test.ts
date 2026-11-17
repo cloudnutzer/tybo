@@ -5,7 +5,7 @@
  * Prozessbeendigung ebenfalls (setRuntimeForTests): pid 0 bekommt nie ein
  * echtes Signal. Zeitlimits laufen mit echten, kurzen Timern.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
   abortClaudeCalls,
   activeClaudeCallCount,
@@ -15,11 +15,11 @@ import {
   setRuntimeForTests,
   setSpawnForTests,
 } from "../src/lib/claude";
-import { registeredEngineCallCount } from "../src/lib/engines/calls";
+import { registeredEngineCallCount, trackedEngineProcCount } from "../src/lib/engines/calls";
 import { abortExecutions, runExecution } from "../src/lib/execution-context";
 import { setMcpReaderForTests } from "../src/lib/subprocess-env";
 import { resolveStreamingLimits, runStreamingTurn, type ChatTurnDeps } from "../src/lib/chat-turn";
-import { stopTree, type ProcessPlatform } from "../src/lib/engines/platform";
+import { hostPlatform, stopTree, type ProcessPlatform } from "../src/lib/engines/platform";
 import { isolateShellEnv } from "./shell-env";
 
 // Effort steht in der Befehlszeile: ein CLAUDE_EFFORT aus der Shell darf sie nicht ändern
@@ -646,6 +646,14 @@ describe("Abschluss erst nach stdout, stderr und Prozessende (Issue #325)", () =
 });
 
 describe("Prozesskern mit Plattform-Attrappe: Kinder nach dem Prozessende (Entscheidung A, Issue #325)", () => {
+  const cleanups: (() => Promise<void>)[] = [];
+  afterEach(async () => {
+    for (const cleanup of cleanups.splice(0)) await cleanup();
+  });
+
+  /** Wartezeit nach dem Beenden; kein anderer Timer der Szene hat diese Länge */
+  const GRACE_MS = 300;
+
   /**
    * Prozess 4242 mit Kind in derselben Gruppe, nur als Attrappe: kein echtes
    * Signal geht raus. Das Kind ignoriert SIGTERM und hält stderr offen, bis
@@ -671,10 +679,13 @@ describe("Prozesskern mit Plattform-Attrappe: Kinder nach dem Prozessende (Entsc
       state.stderrOpen = false;
       err.close();
     };
+    // Welche Wartezeiten tatsächlich abgelaufen sind (in ms), statt Wanduhr
+    const fired: number[] = [];
     const timers = (set: Set<unknown>) => ({
       setTimeout: (fn: () => void, ms: number) => {
         const h = setTimeout(() => {
           set.delete(h);
+          fired.push(ms);
           fn();
         }, ms);
         set.add(h);
@@ -699,6 +710,21 @@ describe("Prozesskern mit Plattform-Attrappe: Kinder nach dem Prozessende (Entsc
       taskkill: (pid) => void log.push(`taskkill ${pid}`),
       ...timers(platformTimers),
     };
+    // Auch die gemeinsame Gruppenverwaltung sieht die Attrappe, niemals
+    // eine zufällig vorhandene echte Prozessgruppe mit der Test-PID.
+    const realAlive = hostPlatform.groupAlive;
+    const realSignal = hostPlatform.signalGroup;
+    const alive = spyOn(hostPlatform, "groupAlive").mockImplementation(pgid => pgid === proc.pid ? platform.groupAlive(pgid) : realAlive(pgid));
+    const signal = spyOn(hostPlatform, "signalGroup").mockImplementation((pgid, s) => pgid === proc.pid ? platform.signalGroup(pgid, s) : realSignal(pgid, s));
+    cleanups.push(async () => {
+      state.members = 0;
+      proc.exitCode = 0;
+      exit(0);
+      await proc.exited;
+      trackedEngineProcCount();
+      alive.mockRestore();
+      signal.mockRestore();
+    });
     const runtimeTimers = new Set<unknown>();
     setSpawnForTests((() => proc) as any);
     setRuntimeForTests({
@@ -707,11 +733,12 @@ describe("Prozesskern mit Plattform-Attrappe: Kinder nach dem Prozessende (Entsc
         terminated++;
         stopTree(p as any, { first: "SIGTERM", killAfterMs: 20 }, platform);
       },
-      stopGraceMs: 300,
+      stopGraceMs: GRACE_MS,
     });
     return {
       state,
       log,
+      fired,
       platformTimers,
       runtimeTimers,
       write: (text: string) => out.enqueue(new TextEncoder().encode(text)),
@@ -741,11 +768,15 @@ describe("Prozesskern mit Plattform-Attrappe: Kinder nach dem Prozessende (Entsc
 
   const fertig = (name: string) => (name === "callClaudeStreaming" ? line({ ...SUCCESS, result: "fertig" }) : "fertig");
 
-  /** Abschluss vor der Wartezeit von 300 ms: das SIGKILL an die Gruppe hat das Kind erreicht */
-  async function quickly(p: Promise<unknown>) {
-    const started = Date.now();
+  /**
+   * Abschluss vor der Wartezeit: das SIGKILL an die Gruppe hat das Kind
+   * erreicht. Geprüft wird, ob der Timer der Wartezeit abgelaufen ist, nicht
+   * die Wanduhr: unter hoher Rechnerlast kommen Timer verspätet, eine feste
+   * Zeitgrenze schlug dann im vollen Prüflauf fehl (PR #558).
+   */
+  async function quickly(p: Promise<unknown>, s: { fired: number[] }) {
     const r = await p;
-    expect(Date.now() - started).toBeLessThan(250);
+    expect(s.fired).not.toContain(GRACE_MS);
     return r;
   }
 
@@ -758,7 +789,7 @@ describe("Prozesskern mit Plattform-Attrappe: Kinder nach dem Prozessende (Entsc
       s.write(fertig(name));
       s.closeStdout();
       await s.exitLeader();
-      const r = await quickly(p);
+      const r = await quickly(p, s);
       if (name === "runClaudeWithTimeout") expect((r as Error).message).toBe("Timeout");
       else expect(r).toMatchObject({ isError: true, timedOut: true });
       expect(s.log).toEqual(["group -4242 SIGTERM", "group -4242 SIGKILL"]);
@@ -780,7 +811,7 @@ describe("Prozesskern mit Plattform-Attrappe: Kinder nach dem Prozessende (Entsc
       await s.exitLeader();
       await Bun.sleep(5);
       expect(abortClaudeCalls(key)).toBe(1);
-      const r = await quickly(p);
+      const r = await quickly(p, s);
       if (name === "runClaudeWithTimeout") expect(r).toMatchObject({ name: "AbortError" });
       else expect(r).toEqual({ text: "", isError: true, aborted: true });
       expect(s.log).toEqual(["group -4242 SIGTERM", "group -4242 SIGKILL"]);
@@ -796,7 +827,7 @@ describe("Prozesskern mit Plattform-Attrappe: Kinder nach dem Prozessende (Entsc
       await Bun.sleep(1);
       await s.exitLeader();
       s.failStdout();
-      await quickly(p);
+      await quickly(p, s);
       expect(s.log).toEqual(["group -4242 SIGTERM", "group -4242 SIGKILL"]);
       expect(registeredEngineCallCount()).toBe(0);
       expect(s.runtimeTimers.size).toBe(0);
@@ -819,6 +850,7 @@ describe("Prozesskern mit Plattform-Attrappe: Kinder nach dem Prozessende (Entsc
           abortClaudeCalls(key);
         }
         await p;
+        expect(s.fired).toContain(GRACE_MS);
         expect(s.log).toEqual([]);
         expect(s.state.stderrOpen).toBe(true);
         expect(registeredEngineCallCount()).toBe(0);

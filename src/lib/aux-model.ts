@@ -25,38 +25,12 @@ import { checkAborted, executionSignal } from "./execution-context";
  */
 
 import { callClaude } from "./claude";
+import { claudeMissing, whenClaudeChecked } from "./claude-availability";
 import { bookRunOutcome } from "./spend/credit";
-import { getSettings, parseAuxSpec, type Settings } from "./settings";
+import { getSettings, type Settings } from "./settings";
+import { auxTargetFor, describeAuxFrom, type AuxPurpose, type AuxSource, type AuxTarget } from "./aux-targets";
 
-export type AuxPurpose = "judge" | "distill" | "review" | "threads" | "call-summary" | "checkin";
-
-interface AuxTarget {
-  kind: "claude" | "openrouter" | "ollama";
-  model: string;
-}
-
-const DEFAULT_CLAUDE_AUX = "claude-haiku-5-5";
-
-// Per-Purpose-Defaults: Der Goal-Judge entscheidet, ob autonome Arbeit
-// weiterlaeuft oder stoppt — das ist Urteilsarbeit, per User-Vorgabe
-// mindestens Opus (21.08.2026: "nicht Haiku, nicht Sonnet"). Destillat und
-// Review sind Extraktionsaufgaben, da reicht Haiku.
-const PURPOSE_DEFAULTS: Record<AuxPurpose, AuxTarget> = {
-  judge: { kind: "claude", model: "claude-opus-5" },
-  distill: { kind: "claude", model: DEFAULT_CLAUDE_AUX },
-  review: { kind: "claude", model: DEFAULT_CLAUDE_AUX },
-  // Offene Fäden erkennen (Issue #290, Entscheidung 0025): Standard wie review
-  threads: { kind: "claude", model: DEFAULT_CLAUDE_AUX },
-  // Anruf-Zusammenfassung und Auftrag aus dem Anruf (Issue #306): Standard wie review
-  "call-summary": { kind: "claude", model: DEFAULT_CLAUDE_AUX },
-  // Check-in entscheiden und formulieren (Issue #364): Standard wie review
-  checkin: { kind: "claude", model: DEFAULT_CLAUDE_AUX },
-};
-
-/** Name der Env-Variable je Zweck: Bindestriche werden zu Unterstrichen (AUX_MODEL_CALL_SUMMARY) */
-export function auxEnvName(purpose: AuxPurpose): string {
-  return `AUX_MODEL_${purpose.toUpperCase().replaceAll("-", "_")}`;
-}
+export { auxEnvName, type AuxPurpose } from "./aux-targets";
 
 /** Vorrang: config/settings.json (aux.<purpose>) vor AUX_MODEL_<PURPOSE> vor Default. */
 export function resolveAux(purpose: AuxPurpose): AuxTarget {
@@ -73,18 +47,10 @@ export function describeAux(
   purpose: AuxPurpose,
   settings: Settings = getSettings(),
   quiet = false
-): { target: AuxTarget; source: "settings" | "env" | "code" } {
-  const fromSettings = settings.aux?.[purpose];
-  const parsedSettings = fromSettings ? parseAuxSpec(fromSettings) : null;
-  if (parsedSettings) return { target: parsedSettings, source: "settings" };
-  const envName = auxEnvName(purpose);
-  const raw = (process.env[envName] || "").trim();
-  if (raw) {
-    const parsed = parseAuxSpec(raw);
-    if (parsed) return { target: parsed, source: "env" };
-    if (!quiet) console.warn(`[AuxModel] Ungueltiges Format fuer ${envName}: "${raw}" — nutze Default`);
-  }
-  return { target: PURPOSE_DEFAULTS[purpose], source: "code" };
+): { target: AuxTarget; source: AuxSource } {
+  return describeAuxFrom(purpose, settings, process.env, quiet ? undefined : (envName, raw) => {
+    console.warn(`[AuxModel] Ungueltiges Format fuer ${envName}: "${raw}" — nutze Default`);
+  });
 }
 
 /**
@@ -92,16 +58,28 @@ export function describeAux(
  * resumen, dann gilt der Claude-Default des jeweiligen Purpose.
  */
 export function resolveAuxTarget(purpose: AuxPurpose, resume: boolean): AuxTarget {
-  const target = resolveAux(purpose);
-  if (!resume || target.kind === "claude") return target;
-  return PURPOSE_DEFAULTS[purpose].kind === "claude"
-    ? PURPOSE_DEFAULTS[purpose]
-    : { kind: "claude", model: DEFAULT_CLAUDE_AUX };
+  return auxTargetFor(resolveAux(purpose), purpose, resume);
+}
+
+/**
+ * Ist dieser Aufruf abgeschaltet (Issue #566)? Ja, wenn er über Claude
+ * liefe und Claude laut Startprüfung fehlt (src/lib/claude-availability.ts).
+ * Unbekannt (noch nicht geprüft) zählt nicht: dann läuft der Aufruf wie
+ * bisher.
+ */
+export function auxDisabled(purpose: AuxPurpose, resume = false): boolean {
+  return claudeMissing() && resolveAuxTarget(purpose, resume).kind === "claude";
 }
 
 export interface AuxResult {
   text: string;
   isError: boolean;
+  /**
+   * Abgeschaltet (Issue #566): Claude fehlt und kein anderes Nebenmodell ist
+   * eingestellt. Dann ist isError true, aufgerufen wurde nichts, und der
+   * Aufrufer schreibt keine Fehlerzeile und versucht es nicht erneut.
+   */
+  disabled?: true;
 }
 
 /**
@@ -124,6 +102,12 @@ export async function callAux(
 ): Promise<AuxResult> {
   checkAborted();
   const target = resolveAuxTarget(purpose, !!opts?.resumeSessionId);
+  if (target.kind === "claude") {
+    // Läuft die Startprüfung noch, erst ihr Ergebnis abwarten (Issue #566)
+    await whenClaudeChecked();
+    checkAborted();
+    if (claudeMissing()) return { text: "", isError: true, disabled: true };
+  }
   const timeoutMs = opts?.timeoutMs ?? 180_000;
 
   try {

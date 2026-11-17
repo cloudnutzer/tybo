@@ -64,7 +64,7 @@ describe("Modell-Listen", () => {
       ollama: { models: ["qwen3:8b", "llama9:latest"] },
       opencode: { models: [], error: OPENCODE_MODELS_TEXT.unavailable },
     });
-    expect(CLAUDE_MODELS).toEqual(["claude-opus-5-5", "claude-fable-5-1", "claude-opus-5", "claude-sonnet-5", "claude-haiku-5-5"]);
+    expect(CLAUDE_MODELS).toEqual(["claude-fable-5-2", "claude-opus-5-5", "claude-fable-5-1", "claude-opus-5", "claude-sonnet-5", "claude-haiku-5-5"]);
   });
 
   test("OpenRouter aus dem Zwischenspeicher bis 10 Minuten, danach neu; Ollama jedes Mal", async () => {

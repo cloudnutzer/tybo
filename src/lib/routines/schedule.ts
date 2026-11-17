@@ -2,7 +2,9 @@
  * Zeitplan einer Routine in Klartext (Issue #284, Entscheidung 0025).
  *
  * launchd: StartCalendarInterval (ein Eintrag oder eine Liste), StartInterval,
- * RunAtLoad, KeepAlive. PM2: einfache Cron-Ausdrücke aus cron_restart. Was
+ * RunAtLoad, KeepAlive. PM2: einfache Cron-Ausdrücke aus cron_restart.
+ * systemd (Issue #568): OnCalendar-Zeilen der Timer in der Form, die tybo
+ * selbst schreibt (src/lib/services/systemd.ts), mit Zeitzone. Was
  * sich nicht sicher in Worte fassen lässt, heißt ehrlich „eigener Zeitplan
  * (<Rohwert>)", nie eine geratene Beschreibung.
  */
@@ -24,7 +26,63 @@ export interface CronSchedule {
   cron: string | null;
 }
 
-export type RoutineSchedule = LaunchdSchedule | CronSchedule;
+/**
+ * Zeitplan eines systemd-Timers (Issue #568): die OnCalendar-Zeilen
+ * unverändert und, wenn sie sich lesen lassen, dieselben Einträge wie
+ * StartCalendarInterval (Minute, Hour, Weekday) samt Zeitzone. calendar
+ * null: mindestens eine Zeile ist nicht in der Form, die tybo schreibt.
+ */
+export interface SystemdSchedule {
+  type: "systemd";
+  onCalendar: string[];
+  calendar: Record<string, number>[] | null;
+  /** Zeitzone hinter den Terminen; null heißt die des Systems */
+  timeZone: string | null;
+}
+
+export type RoutineSchedule = LaunchdSchedule | CronSchedule | SystemdSchedule;
+
+const SYSTEMD_WEEKDAYS: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
+/**
+ * Eine OnCalendar-Zeile in der Form von onCalendar() aus
+ * src/lib/services/systemd.ts: „[Wochentag ]*-*-* HH:MM:00[ Zeitzone]“,
+ * Stunde und Minute als Zahl oder *. Alles andere null (eigener Zeitplan).
+ */
+export function parseOnCalendar(expression: string): { entry: Record<string, number>; timeZone: string | null } | null {
+  const m = /^(?:(Sun|Mon|Tue|Wed|Thu|Fri|Sat) )?\*-\*-\* (\*|\d{1,2}):(\*|\d{1,2}):00(?: ([A-Za-z][A-Za-z0-9_+\/-]*))?$/.exec(expression.trim());
+  if (!m) return null;
+  const entry: Record<string, number> = {};
+  if (m[1]) entry.Weekday = SYSTEMD_WEEKDAYS[m[1]];
+  if (m[2] !== "*") entry.Hour = Number(m[2]);
+  if (m[3] !== "*") entry.Minute = Number(m[3]);
+  if ((entry.Hour ?? 0) > 23 || (entry.Minute ?? 0) > 59) return null;
+  return { entry, timeZone: m[4] ?? null };
+}
+
+/** Kennt Intl die Zeitzone? Nur dann lassen sich Termine darin rechnen */
+function knownTimeZone(zone: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: zone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Zeitplan aus den OnCalendar-Zeilen eines Timers; verschiedene Zeitzonen machen ihn unlesbar */
+export function scheduleFromTimer(onCalendarLines: string[]): SystemdSchedule {
+  const parsed = onCalendarLines.map(parseOnCalendar);
+  const zones = new Set(parsed.map(p => p?.timeZone ?? null));
+  const zone = [...zones][0] ?? null;
+  const readable = parsed.length > 0 && parsed.every(p => p !== null) && zones.size === 1 && (zone === null || knownTimeZone(zone));
+  return {
+    type: "systemd",
+    onCalendar: onCalendarLines,
+    calendar: readable ? parsed.map(p => p!.entry) : null,
+    timeZone: readable ? parsed[0]!.timeZone : null,
+  };
+}
 export type RoutineKind = "scheduled" | "daemon";
 
 const OTHER_TRIGGERS = ["WatchPaths", "QueueDirectories", "StartOnMount"] as const;
@@ -59,6 +117,7 @@ function hasTimedTrigger(s: LaunchdSchedule): boolean {
  */
 export function classifySchedule(s: RoutineSchedule): RoutineKind {
   if (s.type === "cron") return s.cron ? "scheduled" : "daemon";
+  if (s.type === "systemd") return "scheduled";
   if (hasTimedTrigger(s)) return "scheduled";
   return keepsAlive(s.KeepAlive) ? "daemon" : "scheduled";
 }
@@ -236,6 +295,12 @@ export function describeCron(expression: string): string {
 /** Zeitplan einer Routine in Klartext */
 export function describeSchedule(s: RoutineSchedule): string {
   if (s.type === "cron") return s.cron ? describeCron(s.cron) : "Dauerdienst";
+  if (s.type === "systemd") {
+    if (s.onCalendar.length === 0) return "kein Zeitplan";
+    if (!s.calendar) return custom(s.onCalendar.join(", "));
+    const text = describeCalendar(s.calendar.length === 1 ? s.calendar[0] : s.calendar);
+    return s.timeZone ? `${text} (${s.timeZone})` : text;
+  }
   const parts: string[] = [];
   if (s.StartCalendarInterval !== undefined) parts.push(describeCalendar(s.StartCalendarInterval));
   if (s.StartInterval !== undefined) parts.push(describeInterval(s.StartInterval));
@@ -439,8 +504,17 @@ export interface NextRunOptions {
  *   Lauf null. Das Ergebnis kann in der Vergangenheit liegen (der Lauf ist
  *   fällig, etwa nach dem Ruhezustand); die Anzeige sagt dann „fällig".
  * - Beides: der frühere Zeitpunkt. PM2, RunAtLoad allein und Dauerdienste: null.
+ * - systemd-Timer (Issue #568): wie StartCalendarInterval, in der Zeitzone
+ *   des Timers, ohne eigene in der des Systems.
  */
 export function nextRun(s: RoutineSchedule | null, opts: NextRunOptions): number | null {
+  if (s?.type === "systemd") {
+    if (!s.calendar) return null;
+    const tz = s.timeZone ?? opts.timeZone ?? systemTimeZone();
+    const times = s.calendar.map(e => parseEntry(e)).map(e => (e ? nextForEntry(e, opts.now, tz) : null));
+    if (times.some(t => t === null)) return null;
+    return Math.min(...(times as number[]));
+  }
   if (!s || s.type !== "launchd") return null;
   const timeZone = opts.timeZone ?? systemTimeZone();
   const candidates: number[] = [];

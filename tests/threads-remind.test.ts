@@ -1,4 +1,4 @@
-import { test, expect, describe, beforeEach, afterEach, spyOn } from "bun:test";
+import { test, expect, describe, beforeEach, afterEach, setSystemTime, spyOn } from "bun:test";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -333,10 +333,18 @@ describe("Gespräch weg", () => {
   test("gelöschtes Topic und gelöschtes Web-Gespräch: still geschlossen, nichts gesendet", async () => {
     const a = await due("A?", TOPIC);
     const b = await due("B?", WEB);
-    const r = await reminders({ gone: async () => true }).tick();
-    expect(r.closed).toBe(2);
-    expect(sent.length).toBe(0);
-    for (const t of [a, b]) expect(await getThread(t.id)).toMatchObject({ state: "closed", closedReason: "Gespräch weg" });
+    // Die Ablage räumt geschlossene Fäden nach THREADS_CLOSED_KEEP_MS ab, gemessen
+    // an Date.now, geschlossen wird mit der Testuhr. Ohne gestellte Systemuhr
+    // verschwänden die Fäden, sobald T10 länger her ist.
+    setSystemTime(clock);
+    try {
+      const r = await reminders({ gone: async () => true }).tick();
+      expect(r.closed).toBe(2);
+      expect(sent.length).toBe(0);
+      for (const t of [a, b]) expect(await getThread(t.id)).toMatchObject({ state: "closed", closedReason: "Gespräch weg" });
+    } finally {
+      setSystemTime();
+    }
   });
 
   test("geschlossenes Topic (nicht gelöscht), Lesefehler und Sendefehler schließen nicht", async () => {

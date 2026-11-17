@@ -2,7 +2,12 @@
  * Routinen pünktlich (Issue #365, Entscheidung E10): Prüfung im Nachtcheck,
  * ob jede aktive zeitgesteuerte launchd-Routine ihren letzten fälligen
  * Termin wahrgenommen hat. Ersetzt den früheren Watchdog, der nur den
- * Check-in kannte.
+ * Check-in kannte. Seit Issue #568 ebenso jeder aktive systemd-Timer unter
+ * Linux (Check-in, Briefing, Wartung, Nachtcheck): Termine aus OnCalendar
+ * in der Zeitzone des Timers, Spur aus dem Verlauf unter ai.tybo.<dienst>.
+ * PM2-Zeitpläne prüft sie nicht. Der Wächter im Bot (watch.ts), der eine
+ * ausgebliebene Routine sofort meldet, bleibt bei launchd; unter Linux fällt
+ * sie spätestens im nächsten Nachtcheck auf.
  *
  * Nur lesend: keine Meldung, kein Schreiben in alerts.json, unabhängig vom
  * Wächter im Bot (watch.ts). Die Fälligkeit ergibt sich allein aus dem
@@ -89,10 +94,17 @@ function lastTrace(r: Routine, deps: PunctualDeps): { at: number; evidence: Evid
 }
 
 export function judgeRoutine(r: Routine, deps: PunctualDeps): Verdict {
-  if (r.source !== "launchd" || r.kind !== "scheduled") return { kind: "exempt", paused: false };
+  if ((r.source !== "launchd" && r.source !== "systemd") || r.kind !== "scheduled") return { kind: "exempt", paused: false };
   if (r.state === "paused" || r.state === "not-loaded") return { kind: "exempt", paused: true };
   if (r.state === "unknown") return { kind: "unchecked", reason: "Zustand unbekannt" };
   const s = r.schedule;
+  if (r.source === "systemd") {
+    if (!s || s.type !== "systemd") return { kind: "unchecked", reason: "Zeitplan nicht lesbar" };
+    if (s.onCalendar.length === 0) return { kind: "exempt", paused: false };
+    if (!s.calendar) return { kind: "unchecked", reason: "Zeitplan nicht auswertbar" };
+    if (typeof r.pid === "number") return { kind: "running" };
+    return judgeCalendar(s.calendar, lastTrace(r, deps), { ...deps, timeZone: s.timeZone ?? deps.timeZone });
+  }
   if (!s || s.type !== "launchd") return { kind: "unchecked", reason: "Zeitplan nicht lesbar" };
   if (s.StartCalendarInterval === undefined && s.StartInterval === undefined) return { kind: "exempt", paused: false };
   if (typeof r.pid === "number") return { kind: "running" };
@@ -123,7 +135,7 @@ function judgeInterval(interval: unknown, trace: { at: number; evidence: Evidenc
 }
 
 export interface PunctualSummary {
-  /** launchd-Übersicht lesbar (macOS) */
+  /** launchd-Übersicht (macOS) oder systemd-Timer (Linux) lesbar */
   available: boolean;
   /** Geprüfte Routinen: pünktlich, laufend, ausgeblieben oder nicht prüfbar */
   checked: number;
@@ -136,9 +148,10 @@ export interface PunctualSummary {
   notes: string[];
 }
 
-/** Alle Routinen der Übersicht beurteilen; PM2 und ohne Übersicht: available false */
+/** Alle Routinen der Übersicht beurteilen; nur PM2 und ohne Übersicht: available false */
 export function summarizePunctuality(list: RoutineList, deps: PunctualDeps): PunctualSummary {
-  const summary: PunctualSummary = { available: list.available && list.source === "launchd", checked: 0, running: [], missed: [], unchecked: [], paused: [], notes: [...list.notes] };
+  const readable = list.source === "launchd" || list.source === "systemd" || !!list.sources?.includes("systemd");
+  const summary: PunctualSummary = { available: list.available && readable, checked: 0, running: [], missed: [], unchecked: [], paused: [], notes: [...list.notes] };
   if (!summary.available) return summary;
   for (const r of list.routines) {
     const v = judgeRoutine(r, deps);

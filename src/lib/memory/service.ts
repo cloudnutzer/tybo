@@ -35,6 +35,16 @@
  * parseReminderTime (schedule/remind.ts) in USER_TIMEZONE; unlesbar: keine
  * Erinnerung, nur eine Log-Zeile. Zugestellt wird vom Planer im Bot.
  *
+ * Scheitert das Anlegen oder Ändern eines Ziels (Issue #518), bricht das den
+ * Turn nicht ab: Das Ergebnis nennt es (goalsFailed, goalChangesFailed), und
+ * reportMemoryFailures sagt es dem Nutzer im Gespräch des Turns (Zustellweg
+ * über setMemoryFailureNotice, aus memory/choices.ts). Übernahmen eines
+ * Vorschlags melden es stattdessen in ihrem Ergebnis (describeApplied).
+ *
+ * Ein REMEMBER mit Geheimnis (Issue #524, memory/secrets.ts) wird nicht gespeichert,
+ * auch nicht aus einem bestätigten Vorschlag; das Ergebnis zählt es (factsRefused),
+ * die Meldung verweist auf die .env und nennt den Wert nie.
+ *
  * Alle Schreibzugriffe eines Prozesses laufen nacheinander. Ins Log kommen
  * keine Merk-Inhalte.
  */
@@ -49,20 +59,27 @@ import type { MemoryItem } from "../store/types";
 import { parseReminderTime, reminderChat } from "../schedule/remind";
 import { getScheduleStore } from "../schedule/store";
 import { parseDeadline } from "../when";
-import { memoryContext } from "./context";
+import { memoryContext, memorySelection, type MemorySelection } from "./context";
 import { factsList, goalsList } from "./format";
 import { isVague, parseMemoryIntents, type MemoryIntent } from "./intents";
+import { containsSecret, secretRefusedText } from "./secrets";
 
 /** Was eine Antwort im Gedächtnis bewirkt hat; die Texte wie im Tag */
 export interface ProcessedIntents {
   /** Neue Ziele (GOAL) */
   goalsAdded: string[];
+  /** Ziele, die nicht gespeichert wurden (Issue #518); fehlt, wenn keines scheiterte */
+  goalsFailed?: string[];
+  /** DONE bzw. CANCEL, die die Datenbank nicht ausführen konnte, der Suchtext; fehlt, wenn keines scheiterte */
+  goalChangesFailed?: string[];
   /** Erledigte Ziele (DONE), der Suchtext */
   goalsCompleted: string[];
   /** Gestrichene Ziele (CANCEL), der Suchtext */
   goalsCancelled: string[];
   /** Neue Fakten (REMEMBER) */
   factsAdded: string[];
+  /** So viele REMEMBER enthielten ein Geheimnis und wurden nicht gespeichert (#524); fehlt, wenn keins */
+  factsRefused?: number;
   /** Vergessene Fakten (FORGET), der Suchtext */
   factsRemoved: string[];
   /** Titel der Wissenseinträge aus KNOWLEDGE (#317); fehlt, wenn keiner gespeichert wurde */
@@ -105,6 +122,16 @@ let asker: MemoryAsker | null = null;
 /** Zustellweg für Rückfragen; null nimmt ihn weg */
 export function setMemoryAsker(fn: MemoryAsker | null): void {
   asker = fn;
+}
+
+/** Sagt dem Nutzer, was nicht geklappt hat; darf werfen */
+export type MemoryFailureNotice = (where: IntentConversation, text: string) => Promise<void>;
+
+let failureNotice: MemoryFailureNotice | null = null;
+
+/** Zustellweg für Meldungen über gescheiterte Ziele; null nimmt ihn weg */
+export function setMemoryFailureNotice(fn: MemoryFailureNotice | null): void {
+  failureNotice = fn;
 }
 
 const memory = () => getStore().memory;
@@ -163,9 +190,6 @@ export function applyToEntry(action: SearchAction, id: string): Promise<boolean>
 // Lesen
 // ---------------------------------------------------------------------------
 
-/** Offene Ziele als nummerierte Liste (/goals) */
-export const listGoals = (): Promise<string> => memory().activeGoals().then(goalsList);
-
 /** Offene Ziele und der Speicher, aus dem sie kamen */
 export interface OpenGoals {
   goals: MemoryItem[];
@@ -200,6 +224,9 @@ export async function openGoals(options: { localFallback?: boolean } = {}): Prom
   }
 }
 
+/** Offene Ziele als nummerierte Liste (/goals); wirft, wenn sie nicht lesbar sind, damit das nie wie „keine Ziele“ aussieht */
+export const listGoals = (): Promise<string> => openGoals({ localFallback: false }).then(({ goals }) => goalsList(goals));
+
 /** Fakten als Spiegelstriche (/memory) */
 export const listFacts = (): Promise<string> => memory().facts().then(factsList);
 
@@ -211,6 +238,12 @@ export const listFacts = (): Promise<string> => memory().facts().then(factsList)
 export function getMemoryContext(userMessage?: string): Promise<string> {
   if (getStore().backend === "file") return memoryContext(memory(), undefined, { budget: Infinity });
   return memoryContext(memory(), userMessage);
+}
+
+/** Wie getMemoryContext, nennt dazu die gezeigten Fakten (Issue #523) */
+export function getMemorySelection(userMessage?: string): Promise<MemorySelection> {
+  if (getStore().backend === "file") return memorySelection(memory(), undefined, { budget: Infinity });
+  return memorySelection(memory(), userMessage);
 }
 
 // ---------------------------------------------------------------------------
@@ -242,7 +275,7 @@ async function addReminder(intent: Extract<MemoryIntent, { type: "remind" }>, wh
 }
 
 /** Ergebnis eines Suchtags: geändert, nichts gefunden bzw. getan, oder Rückfrage gestellt */
-type SearchOutcome = "changed" | "none" | "asked";
+type SearchOutcome = "changed" | "none" | "asked" | "failed";
 
 async function ask(question: AmbiguousMatch): Promise<boolean> {
   if (!asker) return false;
@@ -257,12 +290,25 @@ async function ask(question: AmbiguousMatch): Promise<boolean> {
 /** Sucht alle Treffer und ändert nur bei genau einem; bei mehreren Rückfrage */
 async function resolveSearch(intent: Search, where: IntentConversation | undefined): Promise<SearchOutcome> {
   const action = intent.type;
-  const found = await inTurn(() =>
-    action === "forget" ? memory().matchingFacts(intent.query, MAX_CHOICE_ENTRIES + 1) : memory().matchingGoals(intent.query, MAX_CHOICE_ENTRIES + 1),
-  );
+  let found: MemoryItem[];
+  try {
+    found = await inTurn(() =>
+      action === "forget" ? memory().matchingFacts(intent.query, MAX_CHOICE_ENTRIES + 1) : memory().matchingGoals(intent.query, MAX_CHOICE_ENTRIES + 1),
+    );
+  } catch (e) {
+    console.error(`[Gedächtnis] ${TAG_OF[action]} nicht ausgeführt (${e instanceof Error ? e.name : "Fehler"})`);
+    return "failed";
+  }
   const usable = found.filter(item => typeof item.id === "string" || typeof item.id === "number");
   if (usable.length === 0) return "none";
-  if (usable.length === 1) return (await applyToEntry(action, String(usable[0].id))) ? "changed" : "none";
+  if (usable.length === 1) {
+    try {
+      return (await applyToEntry(action, String(usable[0].id))) ? "changed" : "none";
+    } catch (e) {
+      console.error(`[Gedächtnis] ${TAG_OF[action]} nicht ausgeführt (${e instanceof Error ? e.name : "Fehler"})`);
+      return "failed";
+    }
+  }
 
   const tag = TAG_OF[action];
   if (!where) {
@@ -283,6 +329,47 @@ async function resolveSearch(intent: Search, where: IntentConversation | undefin
 
 const emptyResult = (): ProcessedIntents => ({ goalsAdded: [], goalsCompleted: [], goalsCancelled: [], factsAdded: [], factsRemoved: [] });
 
+/** Ziel aus einem Tag anlegen; wirft nie, damit ein Turn nicht vor der Antwort abbricht */
+async function tryAddGoal(text: string, deadline: string | undefined): Promise<boolean> {
+  try {
+    return await addGoal(text, deadline);
+  } catch (e) {
+    console.error(`[Gedächtnis] Ziel nicht gespeichert (${e instanceof Error ? e.name : "Fehler"})`);
+    return false;
+  }
+}
+
+type ReportedFailures = Pick<ProcessedIntents, "goalsFailed" | "goalChangesFailed" | "factsRefused">;
+
+/** Meldung über abgelehnte Fakten und gescheiterte Ziele; null, wenn nichts davon vorkam */
+export function memoryFailureText(processed: ReportedFailures): string | null {
+  const refused = processed.factsRefused ? [secretRefusedText(processed.factsRefused)] : [];
+  const lines = [
+    ...(processed.goalsFailed ?? []).map(goal => `⚠️ Das Ziel „${goal}" wurde nicht gespeichert. Nochmal anlegen: /track ${goal}`),
+    ...(processed.goalChangesFailed ?? []).map(query => `⚠️ Das Ziel zu „${query}" konnte ich nicht ändern, es ist unverändert.`),
+  ];
+  const failed = lines.length > 0 ? [...lines, "Das Speichern ist gescheitert, Details stehen im Log."] : [];
+  return refused.length + failed.length > 0 ? [...refused, ...failed].join("\n") : null;
+}
+
+/**
+ * Sagt dem Nutzer, welche Ziele und Fakten aus einer Antwort nicht gespeichert wurden.
+ * Wirft nie; kommt die Meldung nicht an, bleibt es beim Log.
+ */
+export async function reportMemoryFailures(processed: ReportedFailures, where: IntentConversation | undefined): Promise<void> {
+  const text = memoryFailureText(processed);
+  if (!text) return;
+  if (!failureNotice || !where) {
+    console.error("[Gedächtnis] Gescheiterte Ziele nicht gemeldet: kein Zustellweg oder Gespräch");
+    return;
+  }
+  try {
+    await failureNotice(where, text);
+  } catch (e) {
+    console.error(`[Gedächtnis] Meldung über gescheiterte Ziele nicht zugestellt (${e instanceof Error ? e.name : "Fehler"})`);
+  }
+}
+
 /**
  * Wendet die Merk-Tags einer Antwort an. where: Gespräch des Turns für
  * Rückfragen bei mehreren Treffern; ohne wird bei mehreren nichts geändert.
@@ -291,12 +378,18 @@ export async function processIntents(text: string, where?: IntentConversation): 
   const result = emptyResult();
   for (const intent of parseMemoryIntents(text)) {
     if (intent.type === "fact") {
+      if (containsSecret(intent.text)) {
+        console.log("[Gedächtnis] REMEMBER mit Geheimnis nicht gespeichert");
+        result.factsRefused = (result.factsRefused ?? 0) + 1;
+        continue;
+      }
       if (await addFact(intent.text)) result.factsAdded.push(intent.text);
       continue;
     }
     if (intent.type === "goal") {
       if (intent.deadline === undefined && result.goalsAdded.includes(intent.text)) continue;
-      if (await addGoal(intent.text, intent.deadline)) result.goalsAdded.push(intent.text);
+      if (await tryAddGoal(intent.text, intent.deadline)) result.goalsAdded.push(intent.text);
+      else (result.goalsFailed ??= []).push(intent.text);
       continue;
     }
     if (intent.type === "knowledge") {
@@ -318,6 +411,7 @@ export async function processIntents(text: string, where?: IntentConversation): 
     const outcome = await resolveSearch(intent, where);
     if (outcome === "changed") result[RESULT_OF[intent.type]].push(intent.query);
     if (outcome === "asked") (result.asked ??= []).push({ action: intent.type, query: intent.query });
+    if (outcome === "failed" && intent.type !== "forget") (result.goalChangesFailed ??= []).push(intent.query);
   }
   return result;
 }

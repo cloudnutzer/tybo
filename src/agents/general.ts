@@ -7,12 +7,12 @@
  * in ./prompt-parts), mit eigenen und ohne gelöschte Agenten. Der Prompt
  * verweist nur auf diesen Abschnitt.
  *
- * Die Merk-Tags für Ziele und Fakten stehen im Prompt selbst: Brücke und
+ * Die Merk-Tags für Ziele, Fakten und Wissen stehen im Prompt selbst: Brücke und
  * Telefonhörer lesen ihn ohne Builder, also ohne den Abschnitt MEMORY TAGS.
  */
 
 import type { AgentConfig } from "./types";
-import { BASE_CONTEXT, CONSULTATION_HEADING } from "./prompt-parts";
+import { BASE_CONTEXT, CONSULTATION_HEADING, FACT_AND_KNOWLEDGE_TAGS, MEMORY_RULES } from "./prompt-parts";
 
 /** Name des erzeugten Abschnitts, wie er im fertigen Prompt steht */
 const AGENT_LIST = CONSULTATION_HEADING.replace(/^#+\s*/, "");
@@ -58,13 +58,15 @@ For a request with several parts, say in one line what you will do and in
 which order.`;
 
 const memory = `## GOALS AND FACTS
-Keep track of the user's goals and of facts worth keeping. Write one of these
-tags into your reply; the system reads it, also in voice conversations where
-no other tag list is given:
+Keep track of the user's goals, of facts that change later sessions and of
+research results. Write one of these tags into your reply; the system reads
+it, also in voice conversations where no other tag list is given:
 - The user sets a goal: [GOAL: goal | DEADLINE: deadline]. Leave out
   "| DEADLINE: ..." when there is no deadline.
 - A goal is reached: [DONE: words from that goal]
-- A fact is worth keeping: [REMEMBER: fact]`;
+${FACT_AND_KNOWLEDGE_TAGS}
+
+${MEMORY_RULES}`;
 
 const limits = `## LIMITS
 - Only report something as done (sent, booked, saved, deleted) when a tool

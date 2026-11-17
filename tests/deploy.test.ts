@@ -20,6 +20,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { profileFromArgs } from "../src/app/bot-boot";
+import { BOT_PM2_KILL_TIMEOUT_MS } from "../src/setup/services/pm2";
 import { parseEnvContent } from "../src/lib/env-file";
 import { createBotKeys, defaultEnvPath } from "../src/web/bot-keys";
 import { prepareBotPush } from "../src/web/bot-push";
@@ -43,7 +44,7 @@ const STUBS: Record<string, string> = {
     '#!/bin/sh\necho "$*" >> "$PM2_LOG"\n' +
     'case "$1" in\n' +
     '  describe) [ "$2" = "$PM2_OLD_NAME" ];;\n' +
-    '  jlist) printf \'[{"name":"%s","pm2_env":{"pm_exec_path":"/vorher/app.ts","pm_cwd":"%s","exec_interpreter":"bun","args":[],"env":{"A":"1"}}}]\' "$PM2_OLD_NAME" "$PM2_OLD_CWD";;\n' +
+    '  jlist) printf \'[{"name":"%s","pm2_env":{"pm_exec_path":"/vorher/app.ts","pm_cwd":"%s","exec_interpreter":"bun","args":[],"kill_timeout":%s,"env":{"A":"1"}}}]\' "$PM2_OLD_NAME" "$PM2_OLD_CWD" "${PM2_OLD_KILL_TIMEOUT:-null}";;\n' +
     "esac\n",
   curl: '#!/bin/sh\nfor a; do url="$a"; done\necho "$url" >> "$CURL_LOG"\nprintf \'{"status":"ok","revision":"%s"}\' "$HEALTH_REVISION"\n',
   sleep: "#!/bin/sh\nexit 0\n",
@@ -160,7 +161,28 @@ describe("deploy.sh", () => {
     expect(app(join(run.releases, "rollback.json"))).toMatchObject({ name: "tybo", script: "/vorher/app.ts", cwd: root });
     expect(run.curl).toEqual(["http://127.0.0.1:3080/health"]);
     expect(existsSync(join(run.releases, "deploy.lock"))).toBe(false);
+    // Frist zum Beenden (Issue #564): neues Release und Rückweg
+    expect(next.kill_timeout).toBe(BOT_PM2_KILL_TIMEOUT_MS);
+    expect(app(join(run.releases, "rollback.json")).kill_timeout).toBe(BOT_PM2_KILL_TIMEOUT_MS);
   }, 60_000);
+
+  test("Frist zum Beenden: kill_timeout 10000, eine längere des laufenden Prozesses bleibt (Issue #564)", async () => {
+    const longer = await deploy({ project: project(), revision: "kt1", env: { PM2_OLD_KILL_TIMEOUT: "45000" } });
+    expect(longer.exit).toBe(0);
+    expect(app(join(longer.release!, "release.json")).kill_timeout).toBe(45000);
+    expect(app(join(longer.releases, "rollback.json")).kill_timeout).toBe(45000);
+
+    const shorter = await deploy({ project: project(), revision: "kt2", env: { PM2_OLD_KILL_TIMEOUT: "1600" } });
+    expect(app(join(shorter.release!, "release.json")).kill_timeout).toBe(10000);
+    expect(app(join(shorter.releases, "rollback.json")).kill_timeout).toBe(10000);
+
+    // Gescheitertes Release: der Rückweg startet mit derselben Frist
+    const bad = await deploy({ project: project(), revision: "kt3", health: "falsch", env: { PM2_OLD_KILL_TIMEOUT: "45000" } });
+    expect(bad.pm2.at(-1)).toBe(`start ${bad.releases}/rollback.json`);
+    expect(app(join(bad.releases, "rollback.json")).kill_timeout).toBe(45000);
+    // Wert in deploy.sh und in src/setup/services/pm2.ts gleich
+    expect(readFileSync(resolve("deploy.sh"), "utf8")).toContain(`Math.max(${BOT_PM2_KILL_TIMEOUT_MS},`);
+  }, 120_000);
 
   test("Health folgt TELEGRAM_WEBHOOK_PORT, DEPLOY_HEALTH_URL hat Vorrang", async () => {
     const a = await deploy({ project: project(), revision: "port1", env: { TELEGRAM_WEBHOOK_PORT: "3999" } });

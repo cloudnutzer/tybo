@@ -2800,7 +2800,7 @@ async function routinesChecks() {
             await js(`document.getElementById("settings-routines-daemons").scrollIntoView({ block: "center" })`);
             await shoot(`einstellungen-routinen-dauerdienste-${size.width}${suffix}`);
           } else {
-            const text = variant === "empty" ? "Keine Routinen gefunden." : "Routinen: auf diesem System nicht verfügbar (weder launchd noch PM2).";
+            const text = variant === "empty" ? "Keine Routinen gefunden." : "Routinen: auf diesem System nicht verfügbar (weder launchd noch systemd noch PM2).";
             await waitFor(`[...document.querySelectorAll("#settings-panel .settings-empty")].some(p => p.textContent === ${JSON.stringify(text)})`);
             check(`${label}: ${variant === "empty" ? "leer" : "nicht verfügbar"} als ruhiger Hinweis`,
               (await js<number>(`document.querySelectorAll("#settings-panel .actions-error").length`)) === 0 && (await noHorizontalScroll(size.width)));

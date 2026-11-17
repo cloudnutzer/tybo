@@ -288,7 +288,9 @@ describe("transcribe", () => {
     await withFiles(w);
     const controller = new AbortController();
     const p = w.provider.transcribe(Buffer.from("OggS"), "audio/ogg", { signal: controller.signal });
-    await Bun.sleep(10);
+    // Erst abbrechen, wenn ffmpeg läuft: davor liegen Verzeichnis und Temp-Datei
+    // auf der echten Platte, unter Last dauert das länger als eine feste Pause
+    for (const end = Date.now() + 3000; w.calls.length === 0 && Date.now() < end; ) await Bun.sleep(2);
     controller.abort();
     expect((await caught(p)).kind).toBe("timeout");
     expect(w.calls.map(c => c[0])).toEqual(["ffmpeg"]);

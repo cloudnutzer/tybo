@@ -1,4 +1,4 @@
-import { runExecution, checkAborted, currentExecution, isIntakeClosed } from "./execution-context";
+import { runExecution, abortError, checkAborted, currentExecution, isAbortError, isIntakeClosed, isRestartPendingError } from "./execution-context";
 import { terminateProcessTree } from "./process-tree";
 import { atomicWriteFile } from "./atomic-file";
 /**
@@ -22,6 +22,10 @@ import { atomicWriteFile } from "./atomic-file";
  *   - 2 Judge-Fehlschlaege in Folge → Pause (fail-open waere hier
  *     Budget-Verbrennung).
  *   - /stop bricht den laufenden Subprocess ab und pausiert das Ziel.
+ *     Ein Abbruch endet still (auch in der Warteschlange, in Gate oder
+ *     Judge): kein Befund, kein Judge-Fehlschlag, keine unbehandelte
+ *     Ablehnung (Issue #563). Jeder andere Fehler der Schleife pausiert
+ *     das Ziel mit Logzeile und Meldung im Gespraech.
  *
  * Zustand: data/goals.json (sessionKey → ActiveGoal), ueberlebt Neustarts.
  * Die Engine kennt Telegram/Claude nur ueber initGoalEngine()-Deps —
@@ -80,9 +84,10 @@ export interface GoalButton {
 /**
  * Art einer Statusmeldung: "turn" ist der Zwischenstand vor jedem Arbeits-Turn
  * (die Karte im Browser zeigt ihn selbst), "resumed" die Fortsetzung nach einem
- * Neustart (Issue #190), die anderen beenden oder pausieren.
+ * Neustart (Issue #190), die anderen beenden oder pausieren ("failed": ein
+ * Fehler in der Schleife, Issue #563).
  */
-export type GoalStatusKind = "turn" | "budget" | "waiting" | "judge-failed" | "no-reply" | "done" | "resumed";
+export type GoalStatusKind = "turn" | "budget" | "waiting" | "judge-failed" | "no-reply" | "failed" | "done" | "resumed";
 
 export interface GoalStatusMessage {
   kind: GoalStatusKind;
@@ -416,6 +421,9 @@ async function runGatesUnlocked(g: ActiveGoal): Promise<string | null> {
         return `Gate fehlgeschlagen (exit ${exitCode}): \`${cmd}\`\n${tail.substring(0, 1500)}`;
       }
     } catch (err) {
+      // Abbruch (/stop, Shutdown) ist kein Gate-Befund: weiterwerfen, damit
+      // lastNote unveraendert bleibt (Issue #563)
+      if (isAbortError(err) || currentExecution()?.controller.signal.aborted) throw abortError();
       return `Gate nicht ausfuehrbar: \`${cmd}\`: ${String(err).substring(0, 200)}`;
     }
   }
@@ -431,7 +439,7 @@ interface Verdict {
   reason: string;
 }
 
-async function judgeGoalUnlocked(g: ActiveGoal, lastResponse: string): Promise<Verdict | null> {
+async function judgeGoalUnlocked(g: ActiveGoal, lastResponse: string): Promise<Verdict | null | "disabled"> {
   const prompt = `Du bist der Ziel-Judge eines autonomen Assistenten. Bewerte streng, ob das Ziel des Users durch die bisherige Arbeit ERREICHT ist.
 
 ZIEL: ${g.goal}
@@ -449,6 +457,11 @@ Antworte AUSSCHLIESSLICH mit einem JSON-Objekt, ohne weiteren Text:
 {"verdict": "done" | "continue" | "wait", "reason": "kurze Begruendung bzw. naechster Schritt"}`;
 
   const result = await callAux("judge", prompt, { timeoutMs: 120_000 });
+  // callAux macht aus einem Abbruch isError; der zaehlte sonst als
+  // Judge-Fehlschlag (judgeFailures), obwohl /stop ihn ausgeloest hat (Issue #563)
+  checkAborted();
+  // Abgeschaltet (Issue #566): Claude fehlt und kein AUX_MODEL_JUDGE; kein Fehlschlag, der wiederholt wird
+  if (result.disabled) return "disabled";
   if (result.isError) return null;
   const parsed = parseAuxJSON(result.text);
   if (!parsed || !["done", "continue", "wait"].includes(parsed.verdict)) return null;
@@ -469,9 +482,55 @@ ${g.lastNote ? `\nBefund aus dem letzten Zyklus (Judge oder Quality Gate):\n${g.
 Arbeite jetzt den naechsten konkreten Schritt Richtung Ziel ab. Erledige echte Arbeit (Tools nutzen, Dateien schreiben, pruefen), keine Plaene ankuendigen. Wenn du das Ziel fuer vollstaendig erreicht haeltst, fasse das Ergebnis kompakt zusammen und benenne, woran man das Erreichen erkennt.`;
 }
 
+/** Ziel, an dem eine Schleife gerade arbeitet (fuer die Fehlermeldung, Issue #563) */
+interface LoopRun {
+  goalId?: number;
+}
+
+/**
+ * Ohne Claude und ohne eigenes Nebenmodell für den Richter (Issue #566):
+ * einmal sagen, warum, und das Ziel pausieren, statt den Richter zu
+ * wiederholen
+ */
+export const GOAL_JUDGE_DISABLED_TEXT =
+  "⚠️ Ziel pausiert: Der Richter von /goal läuft über Claude, und Claude ist hier nicht installiert oder nicht angemeldet. Abhilfe: Claude anmelden oder ein anderes Nebenmodell einstellen (AUX_MODEL_JUDGE oder WebUI, Modelle), dann /goal weiter.";
+
+/** Fehlertext im Gespraech, wenn die Ziel-Schleife an einem Fehler scheitert */
+export const GOAL_FAILED_TEXT =
+  "⚠️ Ziel pausiert: Bei der Arbeit am Ziel ist ein Fehler aufgetreten. Mit /goal weiter geht es weiter.";
+
+function errorLabel(err: unknown): string {
+  return err instanceof Error ? err.name : typeof err;
+}
+
+/**
+ * Ende einer Schleife durch einen Fehler (Issue #563). Ein Abbruch (/stop,
+ * /goal stop, Shutdown) und die Annahmesperre beim Neustart enden still: das
+ * Ziel bleibt, wie /stop oder der Shutdown es gesetzt hat. Jeder andere Fehler
+ * kommt ins Log (nur der Fehlername, kein Inhalt) und pausiert das Ziel, an dem
+ * die Schleife arbeitete, nie einen Nachfolger; dazu eine Meldung im Gespraech.
+ * Wirft selbst nie, auch wenn Speichern oder Meldung scheitern.
+ */
+async function loopFailed(sessionKey: string, run: LoopRun, err: unknown): Promise<void> {
+  if (isAbortError(err) || isRestartPendingError(err)) return;
+  if (deps?.isShuttingDown?.() || isIntakeClosed()) return;
+  console.error(`[GoalEngine] Ziel-Schleife gescheitert (${errorLabel(err)})`);
+  if (run.goalId === undefined) return;
+  try {
+    const g = await getGoal(sessionKey);
+    if (!g || g.createdAt !== run.goalId) return;
+    const target = g.status === "active" ? await pauseGoal(sessionKey, "Fehler in der Ziel-Schleife", run.goalId) : g;
+    if (!target) return;
+    await deps?.sendStatus(target, { kind: "failed", text: GOAL_FAILED_TEXT });
+  } catch (e) {
+    console.error(`[GoalEngine] Fehler der Ziel-Schleife nicht gemeldet (${errorLabel(e)})`);
+  }
+}
+
 /**
  * Evaluate the latest agent response for a goal and keep working if needed.
  * Called fire-and-forget after user-driven turns AND internally by the loop.
+ * Lehnt nie ab (Issue #563): Abbruch und Fehler enden in loopFailed.
  */
 export async function onAgentTurnForGoal(
   sessionKey: string,
@@ -479,7 +538,14 @@ export async function onAgentTurnForGoal(
   lastResponse: string
 ): Promise<void> {
   if (!deps) return;
-  const g = await getGoal(sessionKey);
+  const run: LoopRun = {};
+  let g: ActiveGoal | undefined;
+  try {
+    g = await getGoal(sessionKey);
+  } catch (err) {
+    await loopFailed(sessionKey, run, err);
+    return;
+  }
   if (!g || g.status !== "active") return;
   if (g.agentName !== agentName) return;
   // Neustart läuft (Issue #190): keine neue Schleife, das Ziel bleibt aktiv und geht danach weiter
@@ -487,25 +553,34 @@ export async function onAgentTurnForGoal(
 
   markLoop(sessionKey, true);
   let finished = false;
+  run.goalId = g.createdAt;
   try {
     await evaluateAndContinue(sessionKey, g.createdAt, lastResponse);
-    await continueWhileActive(sessionKey);
+    await continueWhileActive(sessionKey, run);
     finished = true;
+  } catch (err) {
+    await loopFailed(sessionKey, run, err);
   } finally {
     endLoop(sessionKey, finished);
   }
 }
 
-/** Kick off work on a freshly set goal (first turn) — used by /goal <text>. */
+/**
+ * Kick off work on a freshly set goal (first turn) — used by /goal <text>.
+ * Lehnt nie ab (Issue #563), wie onAgentTurnForGoal.
+ */
 export async function startGoalWork(sessionKey: string): Promise<void> {
   if (!deps) return;
   // Neustart läuft (Issue #190): nicht anfangen, resumeActiveGoalsAfterStart setzt fort
   if (runningLoops.has(sessionKey) || isIntakeClosed() || deps.isShuttingDown?.()) return;
   markLoop(sessionKey, true);
   let finished = false;
+  const run: LoopRun = {};
   try {
-    await continueWhileActive(sessionKey);
+    await continueWhileActive(sessionKey, run);
     finished = true;
+  } catch (err) {
+    await loopFailed(sessionKey, run, err);
   } finally {
     endLoop(sessionKey, finished);
   }
@@ -516,13 +591,15 @@ export async function startGoalWork(sessionKey: string): Promise<void> {
  * Nachfolger (/goal <text>) oder ein fortgesetztes Ziel (Weiter, /goal weiter,
  * waehrend die Budget- oder Warte-Meldung noch lief) wird hier weitergefuehrt.
  * workLoop kehrt bei einem aktiven Ziel nur zurueck, wenn es inzwischen
- * jemand fortgesetzt oder ersetzt hat.
+ * jemand fortgesetzt oder ersetzt hat. run haelt fest, an welchem Ziel gerade
+ * gearbeitet wird.
  */
-async function continueWhileActive(sessionKey: string): Promise<void> {
+async function continueWhileActive(sessionKey: string, run: LoopRun): Promise<void> {
   for (;;) {
     const next = await getGoal(sessionKey);
     // Beim Shutdown (Issue #190) keinen weiteren Turn anfangen, das Ziel bleibt aktiv
     if (!next || next.status !== "active" || deps?.isShuttingDown?.()) return;
+    run.goalId = next.createdAt;
     await workLoop(sessionKey, next.createdAt);
   }
 }
@@ -530,7 +607,8 @@ async function continueWhileActive(sessionKey: string): Promise<void> {
 /**
  * Markierung loesen und ohne await dazwischen nachsehen, ob das Ziel nach der
  * letzten Pruefung in continueWhileActive fortgesetzt wurde: dann neu starten.
- * Nach einem Fehler (finished false) nicht, sonst liefe er endlos wieder an.
+ * Nach einem Fehler oder Abbruch (finished false) nicht, sonst liefe er
+ * endlos wieder an.
  */
 function endLoop(sessionKey: string, finished: boolean): void {
   markLoop(sessionKey, false);
@@ -637,6 +715,12 @@ async function afterChecks(sessionKey: string, goalId: number, g: ActiveGoal, la
   // 2. Judge
   const verdict = await judgeGoal(g, lastResponse);
   if (deps.isShuttingDown?.()) return false;
+  if (verdict === "disabled") {
+    const paused = await pauseGoal(sessionKey, "Judge abgeschaltet (Claude fehlt)", goalId);
+    if (!paused) return false;
+    await deps.sendStatus(paused, { kind: "judge-failed", text: GOAL_JUDGE_DISABLED_TEXT });
+    return false;
+  }
   if (!verdict) {
     const failed = await updateGoal(sessionKey, { judgeFailures: g.judgeFailures + 1 }, goalId);
     if (!failed) return false;

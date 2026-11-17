@@ -1,0 +1,6 @@
+; Keine Funktionstasten (Weiterleiten, Parken, Aufnehmen) auf der Vermittlung (Issue #511)
+[general]
+
+[featuremap]
+
+[applicationmap]

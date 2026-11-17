@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AskOffer } from "../src/lib/ask-choices";
 import { ABORT_REPLY, resolveStreamingLimits, runJsonTurn, runStreamingTurn, type ChatTurnDeps, type TurnInfo, type TurnQuestion } from "../src/lib/chat-turn";
+import { DEFAULT_CLAUDE_MODEL } from "../src/lib/default-model";
 import { resetEngineChoiceForTests, resolveEngine, setTopicEngine } from "../src/lib/engine-choice";
 import { abortEngineCalls, activeEngineCallCount, createApiEngine, type Engine, type EngineId, type EngineRequest } from "../src/lib/engines";
 import { setSettingsPath } from "../src/lib/settings";
@@ -166,7 +167,7 @@ describe("gespeicherte Wahl erreicht den API-Motor ohne CLI", () => {
     await setTopicEngine(KEY, "api");
     fake.respond(textReply("ok"));
     await turn("streaming", deps({ getAgentConfig: () => ({ model: "opus" }) as ReturnType<ChatTurnDeps["getAgentConfig"]> }));
-    expect(fake.lastBody().model).toBe("claude-opus-5-5");
+    expect(fake.lastBody().model).toBe(DEFAULT_CLAUDE_MODEL);
     expect(fake.lastBody()).not.toHaveProperty("output_config");
   });
 

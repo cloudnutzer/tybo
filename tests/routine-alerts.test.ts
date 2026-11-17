@@ -553,6 +553,6 @@ describe("Nachtcheck", () => {
     const source = await readFile(join(import.meta.dir, "..", "src", "health-check.ts"), "utf-8");
     expect(source).not.toContain("alertAfterRun");
     expect(source).not.toContain("watchTick");
-    expect(source).toContain('runCheck("Routinen"');
+    expect(source).toContain('{ name: "Routinen", fn:');
   });
 });

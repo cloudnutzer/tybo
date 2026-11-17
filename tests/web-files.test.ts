@@ -1,6 +1,6 @@
 // Download von Dateien aus Meldungen (Issue #47, Schritt 2): GET /api/files/<id>
 // nur angemeldet, nur mit festgehaltenem Eintrag, nur aus der Ablage, immer als
-// Anhang; inline nur PNG, JPEG, WebP und GIF mit ?inline=1.
+// Anhang; inline mit ?inline=1 nur Bilder, Audio, Video und HTML in der Sandbox.
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -200,17 +200,103 @@ describe("GET /api/files/<id>", () => {
     );
   });
 
-  test("HTML und SVG mit ?inline=1 bleiben Anhang", async () => {
+  test("SVG mit ?inline=1 bleibt Anhang", async () => {
     const ctx = await start();
-    const html = await ctx.add("report.html", "<script>alert(1)</script>", "text/html");
-    const svg = await ctx.add("bild.svg", "<svg onload=alert(1)></svg>", "image/svg+xml");
-    for (const id of [html, svg]) {
+    const id = await ctx.add("bild.svg", "<svg onload=alert(1)></svg>", "image/svg+xml");
+    const res = await ctx.get(`/api/files/${id}?inline=1`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-disposition")).toStartWith("attachment;");
+    expect(res.headers.get("content-type")).toBe("application/octet-stream");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+  });
+
+  test("HTML mit ?inline=1 nur in der Sandbox, ohne inline als Anhang", async () => {
+    const ctx = await start();
+    const id = await ctx.add("report.html", "<script>alert(1)</script>", "text/html");
+    const res = await ctx.get(`/api/files/${id}?inline=1`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(res.headers.get("content-disposition")).toStartWith("inline;");
+    const csp = res.headers.get("content-security-policy")!;
+    expect(csp).toStartWith("sandbox ");
+    expect(csp).not.toContain("allow-same-origin");
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).not.toContain("connect-src");
+    const plain = await ctx.get(`/api/files/${id}`);
+    expect(plain.headers.get("content-disposition")).toStartWith("attachment;");
+    expect(plain.headers.get("content-type")).toBe("application/octet-stream");
+    expect(plain.headers.get("content-security-policy")).toStartWith("default-src 'self'");
+  });
+
+  test("HTML-Endung mit anderem Typ und Typ text/html mit anderer Endung: kein inline", async () => {
+    const ctx = await start();
+    const wrongMime = await ctx.add("report.html", "<script>alert(1)</script>", "text/plain");
+    const wrongName = await ctx.add("report.txt", "<script>alert(1)</script>", "text/html");
+    for (const id of [wrongMime, wrongName]) {
       const res = await ctx.get(`/api/files/${id}?inline=1`);
-      expect(res.status).toBe(200);
       expect(res.headers.get("content-disposition")).toStartWith("attachment;");
       expect(res.headers.get("content-type")).toBe("application/octet-stream");
-      expect(res.headers.get("x-content-type-options")).toBe("nosniff");
     }
+  });
+
+  test("Audio und Video mit ?inline=1 zum Abspielen, ohne inline als Anhang", async () => {
+    const ctx = await start();
+    const ascii = (text: string) => [...text].map(c => c.charCodeAt(0));
+    const pad = (bytes: number[]) => new Uint8Array([...bytes, ...new Array(20).fill(0)]);
+    const cases: [string, Uint8Array, string, string][] = [
+      ["a.mp3", pad(ascii("ID3")), "audio/mpeg", "audio/mpeg"],
+      ["b.mp3", pad([0xff, 0xfb]), "audio/mpeg", "audio/mpeg"],
+      ["c.m4a", pad([0, 0, 0, 32, ...ascii("ftyp")]), "audio/x-m4a", "audio/mp4"],
+      ["d.wav", pad([...ascii("RIFF"), 0, 0, 0, 0, ...ascii("WAVE")]), "audio/x-wav", "audio/wav"],
+      ["e.oga", pad(ascii("OggS")), "audio/ogg", "audio/ogg"],
+      ["f.flac", pad(ascii("fLaC")), "audio/x-flac", "audio/flac"],
+      ["g.mp4", pad([0, 0, 0, 32, ...ascii("ftyp")]), "video/mp4", "video/mp4"],
+      ["h.mov", pad([0, 0, 0, 32, ...ascii("moov")]), "video/quicktime", "video/quicktime"],
+      ["i.webm", pad([0x1a, 0x45, 0xdf, 0xa3]), "video/webm", "video/webm"],
+    ];
+    for (const [name, bytes, mime, served] of cases) {
+      const id = await ctx.add(name, bytes, mime);
+      const inline = await ctx.get(`/api/files/${id}?inline=1`);
+      expect(inline.status).toBe(200);
+      expect(inline.headers.get("content-type")).toBe(served);
+      expect(inline.headers.get("content-disposition")).toStartWith("inline;");
+      expect(inline.headers.get("accept-ranges")).toBe("bytes");
+      expect(inline.headers.get("x-content-type-options")).toBe("nosniff");
+      const plain = await ctx.get(`/api/files/${id}`);
+      expect(plain.headers.get("content-disposition")).toStartWith("attachment;");
+      expect(plain.headers.get("content-type")).toBe("application/octet-stream");
+    }
+  });
+
+  test("Audio-Endung mit fremdem Inhalt oder abweichendem Typ: kein inline", async () => {
+    const ctx = await start();
+    const fake = await ctx.add("tarn.mp3", "<html><script>alert(1)</script></html>", "audio/mpeg");
+    const wrongMime = await ctx.add("echt.mp3", new Uint8Array([0x49, 0x44, 0x33, 0, 0, 0]), "text/html");
+    for (const id of [fake, wrongMime]) {
+      const res = await ctx.get(`/api/files/${id}?inline=1`);
+      expect(res.headers.get("content-disposition")).toStartWith("attachment;");
+      expect(res.headers.get("content-type")).toBe("application/octet-stream");
+    }
+  });
+
+  test("Range liefert den Ausschnitt, ein Bereich außerhalb 416", async () => {
+    const ctx = await start();
+    const bytes = new Uint8Array(100).map((_, i) => i);
+    bytes.set([0x49, 0x44, 0x33]);
+    const id = await ctx.add("lied.mp3", bytes, "audio/mpeg");
+    const ranged = (range: string) => fetch(`${ctx.url}/api/files/${id}?inline=1`, { headers: { cookie: ctx.cookie, range } });
+    const part = await ranged("bytes=10-19");
+    expect(part.status).toBe(206);
+    expect(part.headers.get("content-range")).toBe("bytes 10-19/100");
+    expect([...new Uint8Array(await part.arrayBuffer())]).toEqual([10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+    const open = await ranged("bytes=95-");
+    expect(open.status).toBe(206);
+    expect(open.headers.get("content-range")).toBe("bytes 95-99/100");
+    const suffix = await ranged("bytes=-5");
+    expect(suffix.headers.get("content-range")).toBe("bytes 95-99/100");
+    const over = await ranged("bytes=500-600");
+    expect(over.status).toBe(416);
+    expect(over.headers.get("content-range")).toBe("bytes */100");
   });
 
   test("PNG, JPEG, WebP und GIF mit ?inline=1 als Vorschau, ohne inline als Anhang", async () => {

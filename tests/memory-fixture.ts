@@ -31,6 +31,9 @@ export interface MemoryTableOptions {
   missingModelColumn?: boolean;
 }
 
+/** Spalten von memory in db/schema.sql; wer andere schreibt oder filtert, scheitert wie am echten Schema (Issue #518) */
+const COLUMNS = new Set(["id", "created_at", "updated_at", "type", "content", "deadline", "completed_at", "priority", "metadata", "embedding", "embedding_model", "archived_at", "revised_at"]);
+
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 
@@ -61,6 +64,8 @@ function matches(row: Row, params: URLSearchParams): boolean {
     const cell = row[column];
     if (op === "eq" && String(cell) !== value) return false;
     if (op === "ilike" && !likeToRegExp(value).test(String(cell ?? ""))) return false;
+    if (op === "is" && value === "null" && cell !== null && cell !== undefined) return false;
+    if (filter === "not.is.null" && (cell === null || cell === undefined)) return false;
   }
   return true;
 }
@@ -94,6 +99,13 @@ export function useMemoryTable(options: MemoryTableOptions = {}) {
   function answerTable(request: FakeRequest): Response {
     if (options.failTable) return json({ message: "kaputt" }, 500);
     const params = request.url.searchParams;
+    for (const [column] of params) {
+      if (!["select", "order", "limit"].includes(column) && !COLUMNS.has(column)) return json({ code: "42703", message: `column memory.${column} does not exist` }, 400);
+    }
+    if (request.method === "POST" || request.method === "PATCH") {
+      const unknown = Object.keys(JSON.parse(request.body)).find(column => !COLUMNS.has(column));
+      if (unknown) return json({ code: "PGRST204", message: `Could not find the '${unknown}' column` }, 400);
+    }
     const single = (request.headers.get("accept") ?? "").includes("vnd.pgrst.object");
     if (request.method === "GET") {
       const limit = params.get("limit");

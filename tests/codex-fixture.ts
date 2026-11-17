@@ -17,6 +17,8 @@ export interface FakeRun {
   hang?: boolean;
   /** Prozessstart wirft (etwa: codex nicht installiert) */
   throws?: string;
+  /** Fehlercode der Startausnahme (wie Bun: error.code, etwa ENOENT oder EAGAIN) */
+  throwsCode?: string;
   /** stdin.write wirft mit dieser Meldung */
   stdinWriteThrows?: string;
   /** stdin.end liefert ein abgelehntes Promise mit dieser Meldung (etwa EPIPE) */
@@ -96,7 +98,7 @@ export function installCodexFake(opts: FakeOptions = {}): CodexFake {
   const fakeSpawn = (options: { cmd: string[]; cwd?: string; detached?: boolean; env?: Record<string, string> }) => {
     const run = opts.auto?.(options.cmd) ?? queue.shift();
     if (!run) throw new Error("unerwarteter Prozessstart");
-    if (run.throws) throw new Error(run.throws);
+    if (run.throws) throw Object.assign(new Error(run.throws), run.throwsCode ? { code: run.throwsCode } : {});
     const call: SpawnCall = { cmd: options.cmd, cwd: options.cwd, detached: options.detached, env: options.env, stdin: "" };
     spawns.push(call);
     let controller!: ReadableStreamDefaultController<Uint8Array>;

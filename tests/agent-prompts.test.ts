@@ -183,7 +183,12 @@ describe("neu formulierte Prompts (Issue #359)", () => {
       expect(parseMemoryIntents(goal!)).toEqual([{ type: "goal", text: "goal", deadline: "deadline" }]);
       expect(system).toMatch(/Leave out\s+"\| DEADLINE: \.\.\." when there is no deadline/);
       expect(system).toMatch(/A goal is reached: \[DONE: [^\]]+\]/);
-      expect(system).toMatch(/A fact is worth keeping: \[REMEMBER: [^\]]+\]/);
+      expect(system).toMatch(/A later session would act differently because of a fact: \[REMEMBER: [^\]]+\]/);
+      // Issue #521: auch im Gespräch ohne Builder stehen Regel, FORGET und KNOWLEDGE samt Kategorien
+      expect(system).toContain("[FORGET: partial match]");
+      expect(system).toContain("[KNOWLEDGE: category | title | content | project]");
+      expect(system).toContain("Valid categories: project, person,");
+      expect(system).toContain("Having nothing to remember is a good outcome");
     }
   });
 

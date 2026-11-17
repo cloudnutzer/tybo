@@ -33,7 +33,7 @@ const SCHEDULE: SetupSchedule = {
 };
 
 const MANAGED = SERVICE_CATALOG.filter(s => s.kind !== "external").map(s => s.name);
-const WRAPPED: ServiceName[] = ["smart-checkin", "morning-briefing", "health-check", "software-update"];
+const WRAPPED: ServiceName[] = ["smart-checkin", "morning-briefing", "health-check", "software-update", "wartung"];
 
 const plistOf = (name: ServiceName, machine = MACHINE, schedule = SCHEDULE) => servicePlist(serviceDefinition(name), machine, schedule);
 
@@ -43,7 +43,7 @@ describe("Katalog", () => {
     for (const name of SERVICE_NAMES) expect(await selectServices(name, "/gibt/es/nicht/.env")).toEqual([name]);
   });
 
-  test("Arten: Bot dauernd, vier Routinen über den Wrapper, Supabase einmal, zwei nur bekannt", () => {
+  test("Arten: Bot dauernd, fünf Routinen über den Wrapper, Supabase einmal, zwei nur bekannt", () => {
     const kinds = Object.fromEntries(SERVICE_CATALOG.map(s => [s.name, s.kind]));
     expect(kinds).toEqual({
       "telegram-relay": "daemon",
@@ -54,11 +54,12 @@ describe("Katalog", () => {
       "health-check": "routine",
       "software-update": "routine",
       supabase: "once",
+      wartung: "routine",
     });
     expect(SERVICE_CATALOG.filter(s => s.wrapped).map(s => s.name).sort()).toEqual([...WRAPPED].sort());
     // Routine heißt immer Wrapper
     for (const s of SERVICE_CATALOG) expect([s.name, s.kind === "routine"]).toEqual([s.name, s.wrapped]);
-    expect(SERVICE_CATALOG.filter(s => s.onlyExplicit).map(s => s.name)).toEqual(["software-update"]);
+    expect(SERVICE_CATALOG.filter(s => s.onlyExplicit).map(s => s.name)).toEqual(["software-update", "wartung"]);
   });
 
   test("Watchdog kommt nicht zurück", () => {
@@ -87,6 +88,7 @@ describe("Wrapper aus A1", () => {
       "morning-briefing": "src/routines/briefing.ts",
       "health-check": "src/health-check.ts",
       "software-update": "src/software-update.ts",
+      wartung: "src/maintenance.ts",
     };
     for (const name of WRAPPED) {
       const expected = [MACHINE.bun, "--no-env-file", "src/routine-run.ts", "--id", launchdLabel(name), "--", MACHINE.bun, "run", scripts[name]];
@@ -169,6 +171,18 @@ describe("Zeitplan", () => {
     const everyHour = Array.from({ length: 24 }, (_, hour) => ({ hour, minute: 15 }));
     const plist = plistOf("smart-checkin", MACHINE, { ...SCHEDULE, check_in_intervals: everyHour });
     expect(calendar(plist)).toBe("<array>\n\t\t<dict>\n\t\t\t<key>Minute</key>\n\t\t\t<integer>15</integer>\n\t\t</dict>\n\t</array>");
+  });
+
+  test("Wartung sonntags 03:15 (Weekday 0), kein Start beim Laden", () => {
+    const plist = plistOf("wartung");
+    expect(calendar(plist)).toBe("<dict>\n\t\t<key>Hour</key>\n\t\t<integer>3</integer>\n\t\t<key>Minute</key>\n\t\t<integer>15</integer>\n\t\t<key>Weekday</key>\n\t\t<integer>0</integer>\n\t</dict>");
+    expect(plist).not.toContain("RunAtLoad");
+    expect(plist).not.toContain("KeepAlive");
+  });
+
+  test("Wartung nur einzeln, nie in „all“", async () => {
+    expect(await selectServices("all", "/gibt/es/nicht/.env")).not.toContain("wartung");
+    expect(await selectServices("wartung", "/gibt/es/nicht/.env")).toEqual(["wartung"]);
   });
 
   test("Nachtcheck 03:30, Updates 03:00, unabhängig vom Zeitplan", () => {

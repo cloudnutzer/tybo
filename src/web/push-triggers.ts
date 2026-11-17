@@ -70,6 +70,10 @@ export const CHOICE_KIND_LABELS: Record<ChoiceKindName, string> = {
   proactive: "Meldung",
   ask: "Rückfrage",
   call: "Anruf",
+  cleanup: "Gedächtnis aufräumen",
+  core: "Kern",
+  secret: "Geheimnis im Gedächtnis",
+  sprachagent: "Sprachagent",
 };
 
 /** Anzeigenamen der Absender wie NOTICE_SOURCES in public/app.js; unbekannte groß geschrieben */
@@ -89,6 +93,7 @@ export const NOTICE_SOURCE_LABELS: Record<string, string> = {
   erinnerung: "Erinnerung",
   rueckfrage: "Rückfrage",
   anruf: "Anruf",
+  sprachagent: "Sprachagent",
 };
 
 /**

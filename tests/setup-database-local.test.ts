@@ -11,6 +11,7 @@ import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { cp, readdir, readFile, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { SetupContext } from "../src/setup/context";
+import { MIGRATION_LOCK_SQL } from "../src/setup/local-migrations";
 import { AUSGELASSEN, LOCAL_SUPABASE_URL, SUPABASE_CLI_VERSION } from "../src/setup/local-supabase";
 import { runsAsFlow } from "../src/setup/model";
 import { checkStep, existingFieldValues } from "../src/setup/steps";
@@ -216,7 +217,7 @@ describe("Terminal: tybo setup datenbank", () => {
     const env = await envText(ctx);
     const firstTrail = f.trail();
     f.run.calls.length = 0;
-    f.onQuery = text => (text.includes("storage.buckets") ? [{ public: false }] : []);
+    f.onQuery = text => (text.includes("storage.buckets") ? [{ public: false }] : text === MIGRATION_LOCK_SQL ? [{ locked: true }] : []);
     const r = await runWith(ARGS, ctx, scripted(["2", ""]));
     expect(r.code).toBe(0);
     expect(r.out).toContain("Stand: Supabase läuft lokal auf diesem Rechner.");

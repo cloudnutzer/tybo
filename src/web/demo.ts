@@ -1381,6 +1381,7 @@ export const DEMO_COMMANDS: readonly CommandListEntry[] = [
   { name: "done", aliases: [], description: "Gespeichertes Ziel als erledigt markieren", args: "optional", argsHint: "<text>" },
   { name: "cancel", aliases: [], description: "Gespeichertes Ziel streichen", args: "optional", argsHint: "<text>" },
   { name: "recall", aliases: ["search", "find"], description: "Frühere Gespräche durchsuchen", args: "optional", argsHint: "<frage>" },
+  { name: "kern", aliases: ["core"], description: "Fester Kern im Prompt: zeigen, Entwurf aus den Fakten, ändern, löschen", args: "optional", argsHint: "[entwurf | setzen <text> | loeschen]" },
   { name: "learn", aliases: [], description: "Quelle in die Knowledge Base destillieren", args: "optional", argsHint: "<URL oder Text>" },
   { name: "credit", aliases: [], description: "Verbrauch: Claude-Abo und Motoren im laufenden Zyklus", args: "none" },
   { name: "plan", aliases: [], description: "Plan-Obergrenze für das Guthaben anzeigen", args: "optional" },
@@ -1394,6 +1395,8 @@ export const DEMO_COMMANDS: readonly CommandListEntry[] = [
   { name: "erinnerungen", aliases: ["reminders"], description: "Offene Erinnerungen aller Gespräche, absagen mit der Kennung", args: "optional", argsHint: "[absagen <kennung>]" },
   { name: "voice", aliases: [], description: "Antwort als Sprachnachricht", args: "required", argsHint: "<text>" },
   { name: "anruf", aliases: [], description: "Ich rufe dich an, mit oder ohne Anlass", args: "optional", argsHint: "[anlass]" },
+  { name: "sprachagent", aliases: [], description: "Sprachagenten: liste, testen, loeschen, link, neu, aendern", args: "optional", argsHint: "[liste | testen <kennung> | loeschen <kennung> | link <kennung> | neu <beschreibung> | aendern <kennung> <wunsch>]" },
+  { name: "sprachagenten", aliases: [], description: "Alle Sprachagenten (wie /sprachagent liste)", args: "optional", argsHint: "[testen <kennung> | loeschen <kennung> | link <kennung> | neu <beschreibung> | aendern <kennung> <wunsch>]" },
 ];
 
 /** Befehlsname am Anfang der Nachricht („/New@bot x" → „new"), sonst null */
@@ -1449,7 +1452,7 @@ export const demoSessionReset: ConversationSessionReset = async (_id, whileBlock
 };
 
 /** Effort-Stufen wie EFFORT_LEVELS in src/lib/settings.ts (die Demo importiert src/lib nicht) */
-const DEMO_EFFORT_LEVELS = ["low", "medium", "high", "xhigh"] as const;
+const DEMO_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
 /**
  * Motoren der Demo (Issue #126), wie SELECTABLE_ENGINES, CODEX_EFFORT_LEVELS,
@@ -1462,7 +1465,7 @@ export const DEMO_ENGINE_OPTIONS = {
     { id: "opencode", label: "OpenCode" },
     { id: "api", label: "Anthropic API" },
   ],
-  codexEffortLevels: [...DEMO_EFFORT_LEVELS, "max"],
+  codexEffortLevels: [...DEMO_EFFORT_LEVELS],
   codexSandboxLevels: ["read-only", "workspace-write", "full"],
   codexDefaultSandbox: "full",
   opencodePermissionLevels: ["ask-deny", "auto"],

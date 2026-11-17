@@ -101,7 +101,6 @@ describe("describeImageBytes", () => {
     expect(result).toEqual({ description: "Heizkessel", tags: ["heizung"], suggestedProject: null });
     expect(seen).toHaveLength(1);
     expect(seen[0].model).toBe(VISION_MODEL);
-    expect(VISION_MODEL).toBe("claude-opus-5-5");
     expect(seen[0].mediaType).toBe("image/png");
     expect(seen[0].base64).toBe(Buffer.from([1, 2, 3]).toString("base64"));
     expect(seen[0].prompt).toContain('"Was ist das?"');

@@ -6,9 +6,12 @@
  *
  * Wer bei einem Fehler leer antwortet und wer wirft, ist Absicht:
  * - Suche: leer. Ohne Treffer arbeitet der Prompt einfach ohne Fundstellen.
+ *   Das Nachschlagen muss beides trennen, es nimmt searchChatChecked (wirft).
  * - Topic-Aktivität: leer plus Log-Zeile; fehlende Einträge gelten beim
  *   Aufrufer als „unbekannt“.
- * - Verlauf und die drei Meldungsleser: werfen. Ein leeres Ergebnis hieße
+ * - Topic-Aktivität ab einem Zeitpunkt (Issue #684): wirft. Der Aufrufer
+ *   schreibt damit einen Stand fort, leer hieße dort „nichts Neues“.
+ * - Verlauf und die Meldungsleser: werfen. Ein leeres Ergebnis hieße
  *   für den Abgleich der WebUI „nichts verpasst“ bzw. setzte den Cursor falsch.
  * Log-Zeilen nennen nur den Fehlercode, nie den Text des Datenbankfehlers.
  *
@@ -21,7 +24,20 @@ import { containsPattern } from "../../../../supabase/functions/_shared/like-pat
 import { supabaseHeaders } from "../../supabase-keys";
 import { isDisplayOnly, sessionKeyFor, withoutDisplayOnly } from "../message-rules";
 import type { MessageStore } from "../ports";
-import type { DisplayOnlyPageOptions, DisplayOnlyRow, HistoryOptions, HistoryRow, Message, TopicActivity } from "../types";
+import type {
+  DisplayOnlyHead,
+  DisplayOnlyPageOptions,
+  DisplayOnlyRow,
+  FactWish,
+  HistoryOptions,
+  HistoryRow,
+  HitsWithFacts,
+  MemoryItem,
+  Message,
+  TopicActivity,
+  TopicActivityChanges,
+} from "../types";
+import { factFromRow } from "./memory";
 import { edgeKey, NOT_DISPLAY_ONLY_FILTER, type ClientSource } from "./messages";
 
 const TABLE = "messages";
@@ -34,7 +50,10 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 export const HISTORY_COLUMNS = ["id", "created_at", "role", "content", "metadata"].join(", ");
 /** Höchstens so viele jüngste Zeilen wertet topicActivity aus; ältere Topics fehlen dann */
 export const TOPIC_ACTIVITY_ROW_LIMIT = 1_000;
+const ACTIVITY_COLUMNS = "session_key, created_at";
 const NOTICE_COLUMNS = ["id", "created_at", "chat_id", "role", "content", "metadata"].join(", ");
+/** Kopf einer Meldung, ohne Text und Metadaten (Issue #684) */
+export const NOTICE_HEAD_COLUMNS = "id, created_at";
 /** Nur Meldungen; PostgREST vergleicht den JSON-Wert als Text */
 const NOTICE_FLAG: [string, string] = ["metadata->>display_only", "true"];
 
@@ -84,41 +103,55 @@ async function rowsOrThrow<T>(task: string, run: () => PromiseLike<QueryResult>)
 // Suche
 // ---------------------------------------------------------------------------
 
+/** Antwort von search-memory; messages null, wenn die eigene Textsuche ran muss */
+interface EdgeAnswer {
+  messages: Message[] | null;
+  facts: MemoryItem[] | null;
+}
+
 /**
- * Antwort von search-memory, oder null, wenn die eigene Textsuche ran muss:
- * Function nicht erreichbar, kein 2xx, kein JSON-Array, oder eine Meldung
- * unter den Treffern. match_messages kennt nur Zeilen mit Embedding, und
- * Meldungen haben keins; stehen trotzdem welche drin, kam die Antwort aus
- * der Textsuche einer älteren Function, die erst nach dem Limit filtert,
- * und es fehlen womöglich echte Treffer. Der Suchtext geht roh hinaus.
+ * Fragt search-memory, mit facts auch nach Fakten aus demselben Vektor. Eine
+ * ältere Function kennt das Feld nicht und antwortet mit der Liste, dann bleibt
+ * facts null. messages ist null: Function nicht erreichbar, kein 2xx, keine
+ * Liste, oder eine Meldung unter den Treffern. match_messages kennt nur Zeilen
+ * mit Embedding, und Meldungen haben keins; stehen trotzdem welche drin, kam die
+ * Antwort aus der Textsuche einer älteren Function, die erst nach dem Limit
+ * filtert, und es fehlen womöglich echte Treffer. Der Suchtext geht roh hinaus.
  */
-async function edgeHits(chatId: string, query: string, limit: number): Promise<Message[] | null> {
+async function edgeAnswer(chatId: string, query: string, limit: number, facts?: FactWish): Promise<EdgeAnswer> {
+  const nothing: EdgeAnswer = { messages: null, facts: null };
   let body: unknown;
   try {
+    const wish = facts ? { facts: { limit: facts.limit, exclude_ids: facts.excludeIds } } : {};
     const response = await fetch(`${process.env.SUPABASE_URL}/functions/v1/${SEARCH_FUNCTION}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...supabaseHeaders(edgeKey()) },
-      body: JSON.stringify({ chat_id: chatId, query: query.slice(0, SEARCH_TEXT_LIMIT), limit }),
+      body: JSON.stringify({ chat_id: chatId, query: query.slice(0, SEARCH_TEXT_LIMIT), limit, ...wish }),
     });
-    if (!response.ok) return null;
+    if (!response.ok) return nothing;
     body = await response.json();
   } catch {
-    return null;
+    return nothing;
   }
-  if (!Array.isArray(body)) return null;
-  return body.some(row => isDisplayOnly(row?.metadata)) ? null : (body as Message[]);
+  const combined = !Array.isArray(body) && body !== null && typeof body === "object" ? (body as { messages?: unknown; facts?: unknown }) : null;
+  const rows = combined ? combined.messages : body;
+  const messages = Array.isArray(rows) && !rows.some(row => isDisplayOnly(row?.metadata)) ? (rows as Message[]) : null;
+  return { messages, facts: Array.isArray(combined?.facts) ? combined.facts.map(factFromRow) : null };
 }
 
 /**
  * Eigene Textsuche: Suchtext wörtlich (Platzhalterzeichen maskiert), ohne
  * Meldungen schon in der Abfrage, damit sie keine echten Treffer aus dem
- * Limit drängen. Neueste zuerst; Fehler ergeben eine leere Liste.
+ * Limit drängen. Neueste zuerst.
  */
+function textQuery(client: SupabaseClient, chatId: string, query: string, limit: number) {
+  const matching = client.from(TABLE).select("*").eq("chat_id", chatId).ilike("content", containsPattern(query));
+  return matching.or(NOT_DISPLAY_ONLY_FILTER).order("created_at", { ascending: false }).limit(limit);
+}
+
+/** Textsuche; Fehler ergeben eine leere Liste */
 async function textHits(client: SupabaseClient, chatId: string, query: string, limit: number): Promise<Message[]> {
-  const outcome = await readRows<Message>(() => {
-    const matching = client.from(TABLE).select("*").eq("chat_id", chatId).ilike("content", containsPattern(query));
-    return matching.or(NOT_DISPLAY_ONLY_FILTER).order("created_at", { ascending: false }).limit(limit);
-  });
+  const outcome = await readRows<Message>(() => textQuery(client, chatId, query, limit));
   return outcome.ok ? withoutDisplayOnly(outcome.rows) : [];
 }
 
@@ -130,7 +163,26 @@ async function textHits(client: SupabaseClient, chatId: string, query: string, l
  * kürzt auch Antworten einer älteren Edge Function ohne Ausschnitte.
  */
 export async function searchChat(client: SupabaseClient, chatId: string, query: string, limit: number): Promise<Message[]> {
-  return shapeHits((await edgeHits(chatId, query, limit)) ?? (await textHits(client, chatId, query, limit)), query);
+  return shapeHits((await edgeAnswer(chatId, query, limit)).messages ?? (await textHits(client, chatId, query, limit)), query);
+}
+
+/**
+ * Wie searchChat fürs Nachschlagen (Issue #523): wirft, wenn die Suche nicht lief,
+ * leer heißt dann wirklich „nichts gefunden“. Eine leere Antwort der Function reicht
+ * dafür nicht, sie antwortet auch bei einem Datenbankfehler mit einer leeren Liste.
+ * Deshalb entscheidet ohne Treffer die eigene Textsuche.
+ */
+export async function searchChatChecked(client: SupabaseClient, chatId: string, query: string, limit: number): Promise<Message[]> {
+  const { messages } = await edgeAnswer(chatId, query, limit);
+  if (messages?.length) return shapeHits(messages, query);
+  const rows = await rowsOrThrow<Message>("Nachrichten suchen", () => textQuery(client, chatId, query, limit));
+  return shapeHits(withoutDisplayOnly(rows), query);
+}
+
+/** Wie searchChat, dazu Fakten aus demselben Vektor; der Bot rechnet dafür keinen eigenen */
+export async function searchChatWithFacts(client: SupabaseClient, chatId: string, query: string, limit: number, facts: FactWish): Promise<HitsWithFacts> {
+  const answer = await edgeAnswer(chatId, query, limit, facts);
+  return { messages: shapeHits(answer.messages ?? (await textHits(client, chatId, query, limit)), query), facts: answer.facts };
 }
 
 // ---------------------------------------------------------------------------
@@ -167,21 +219,42 @@ export async function activityByTopic(
   sinceDays: number,
   now: number = Date.now()
 ): Promise<TopicActivity[]> {
-  const outcome = await readRows<{ session_key: unknown; created_at: unknown }>(() => {
-    const since = new Date(now - sinceDays * DAY_MS).toISOString();
-    const recentKeys = client.from(TABLE).select("session_key, created_at").eq("chat_id", chatId).gte("created_at", since);
-    return recentKeys.order("created_at", { ascending: false }).limit(TOPIC_ACTIVITY_ROW_LIMIT);
-  });
+  const outcome = await readRows<ActivityRow>(() => recentSessionKeys(client, chatId, new Date(now - sinceDays * DAY_MS).toISOString()));
   if (!outcome.ok) {
     logFailure("Aktivität lesen", outcome.cause);
     return [];
   }
+  return latestBySession(outcome.rows);
+}
+
+type ActivityRow = { session_key: unknown; created_at: unknown };
+
+/** Die jüngsten Zeilen eines Chats ab `since`, nur Sitzung und Zeitpunkt, neueste zuerst */
+function recentSessionKeys(client: SupabaseClient, chatId: string, since: string) {
+  const recentKeys = client.from(TABLE).select(ACTIVITY_COLUMNS).eq("chat_id", chatId).gte("created_at", since);
+  return recentKeys.order("created_at", { ascending: false }).limit(TOPIC_ACTIVITY_ROW_LIMIT);
+}
+
+function latestBySession(rows: ActivityRow[]): TopicActivity[] {
   const latest = new Map<string, string>();
-  for (const { session_key: key, created_at: at } of outcome.rows) {
+  for (const { session_key: key, created_at: at } of rows) {
     // Zeilen kommen neueste zuerst: der erste Zeitpunkt je Schlüssel ist der jüngste
     if (typeof key === "string" && typeof at === "string" && !latest.has(key)) latest.set(key, at);
   }
   return Array.from(latest, ([sessionKey, lastActivity]) => ({ sessionKey, lastActivity }));
+}
+
+/**
+ * Wie activityByTopic, aber ab einem festen Zeitpunkt (einschließlich) und
+ * mit Wurf bei jedem Fehler (Issue #684). Damit schreibt die WebUI ihren
+ * Stand fort: Liegt `since` kurz hinter der jüngsten bekannten Nachricht,
+ * kommen im Ruhezustand nur ein, zwei Zeilen zurück statt der jüngsten
+ * TOPIC_ACTIVITY_ROW_LIMIT. Ein ungültiger Zeitpunkt scheitert vor der Abfrage.
+ */
+export async function activitySince(client: SupabaseClient, chatId: string, since: string): Promise<TopicActivityChanges> {
+  if (!CURSOR_TIME.test(since)) throw new Error("ungültiger Zeitpunkt");
+  const rows = await rowsOrThrow<ActivityRow>("Aktivität lesen", () => recentSessionKeys(client, chatId, since));
+  return { activity: latestBySession(rows), truncated: rows.length >= TOPIC_ACTIVITY_ROW_LIMIT };
 }
 
 // ---------------------------------------------------------------------------
@@ -205,20 +278,43 @@ function afterCursor(createdAt: string, id: string): string {
  * Mikrosekunden aus der Datenbank erhalten. Ungültiges since oder after
  * scheitert vor der Abfrage; leere chatIds ergeben ohne Abfrage [].
  */
-export async function noticePage(
-  client: SupabaseClient,
-  chatIds: string[],
-  { since, after, limit }: DisplayOnlyPageOptions
-): Promise<DisplayOnlyRow[]> {
+export async function noticePage(client: SupabaseClient, chatIds: string[], options: DisplayOnlyPageOptions): Promise<DisplayOnlyRow[]> {
+  return noticePageOf<DisplayOnlyRow>(client, chatIds, NOTICE_COLUMNS, options);
+}
+
+/**
+ * Dieselbe Seite wie noticePage (Filter, Reihenfolge, Cursor, Limit), aber
+ * nur id und created_at (Issue #684): Der Abholer der WebUI sieht daran, was
+ * neu ist, und lädt Text und Metadaten nur dafür (noticeRows).
+ */
+export async function noticeHeads(client: SupabaseClient, chatIds: string[], options: DisplayOnlyPageOptions): Promise<DisplayOnlyHead[]> {
+  return noticePageOf<DisplayOnlyHead>(client, chatIds, NOTICE_HEAD_COLUMNS, options);
+}
+
+async function noticePageOf<T>(client: SupabaseClient, chatIds: string[], columns: string, { since, after, limit }: DisplayOnlyPageOptions): Promise<T[]> {
   if (chatIds.length === 0) return [];
   if (since && !CURSOR_TIME.test(since)) throw new Error("ungültiger Zeitpunkt");
   if (after && !(CURSOR_TIME.test(after.createdAt) && CURSOR_ID.test(after.id))) throw new Error("ungültiger Cursor");
-  return rowsOrThrow<DisplayOnlyRow>("Meldungen lesen", () => {
-    let query = noticesOf(client, chatIds, NOTICE_COLUMNS);
+  return rowsOrThrow<T>("Meldungen lesen", () => {
+    let query = noticesOf(client, chatIds, columns);
     if (since) query = query.gte("created_at", since);
     if (after) query = query.or(afterCursor(after.createdAt, after.id));
     return query.order("created_at", { ascending: true }).order("id", { ascending: true }).limit(limit);
   });
+}
+
+/**
+ * Volle Meldungen zu Zeilen-IDs aus noticeHeads, nur Meldungen der genannten
+ * Chats, sortiert wie die Seiten (Issue #684). Eine inzwischen gelöschte
+ * Zeile fehlt einfach. Leere chatIds oder ids ergeben ohne Abfrage [];
+ * eine ID, die keine Ziffernfolge ist, scheitert vor der Abfrage.
+ */
+export async function noticeRows(client: SupabaseClient, chatIds: string[], ids: string[]): Promise<DisplayOnlyRow[]> {
+  if (chatIds.length === 0 || ids.length === 0) return [];
+  if (!ids.every(id => CURSOR_ID.test(id))) throw new Error("ungültige Zeilen-ID");
+  return rowsOrThrow<DisplayOnlyRow>("Meldungen lesen", () =>
+    noticesOf(client, chatIds, NOTICE_COLUMNS).in("id", ids).order("created_at", { ascending: true }).order("id", { ascending: true })
+  );
 }
 
 /** created_at der jüngsten Meldung der Chats als Text der Datenbank, null ohne Meldung */
@@ -246,13 +342,22 @@ export async function noticeWithFile(client: SupabaseClient, fileId: string, cha
 /** Die Methoden von MessageStore, die dieses Modul trägt */
 export type SupabaseMessageReads = Pick<
   MessageStore,
-  "search" | "history" | "topicActivity" | "displayOnlyPage" | "latestDisplayOnlyAt" | "findDisplayOnlyFile"
+  | "search"
+  | "searchWithFacts"
+  | "history"
+  | "topicActivity"
+  | "topicActivitySince"
+  | "displayOnlyPage"
+  | "displayOnlyHeads"
+  | "displayOnlyRows"
+  | "latestDisplayOnlyAt"
+  | "findDisplayOnlyFile"
 >;
 
 /**
  * Lesende Nachrichten-Methoden über Supabase. Ohne Client (Supabase nicht
  * eingerichtet) liefern Suche, Verlauf und Aktivität leer, ohne Log; die
- * drei Meldungsleser werfen, auch bei leeren chatIds, damit der Aufrufer
+ * Meldungsleser werfen, auch bei leeren chatIds, damit der Aufrufer
  * „nicht eingerichtet“ nicht mit „keine Meldung“ verwechselt.
  */
 export function supabaseMessageReads(clientSource: ClientSource): SupabaseMessageReads {
@@ -266,6 +371,10 @@ export function supabaseMessageReads(clientSource: ClientSource): SupabaseMessag
       const client = clientSource();
       return client ? searchChat(client, chatId, query, limit) : [];
     },
+    async searchWithFacts(chatId, query, limit, facts) {
+      const client = clientSource();
+      return client ? searchChatWithFacts(client, chatId, query, limit, facts) : { messages: [], facts: null };
+    },
     async history(chatId, topicId, options) {
       const client = clientSource();
       return client ? historyPage(client, chatId, topicId, options) : [];
@@ -274,8 +383,18 @@ export function supabaseMessageReads(clientSource: ClientSource): SupabaseMessag
       const client = clientSource();
       return client ? activityByTopic(client, chatId, sinceDays) : [];
     },
+    async topicActivitySince(chatId, since) {
+      const client = clientSource();
+      return client ? activitySince(client, chatId, since) : { activity: [], truncated: false };
+    },
     async displayOnlyPage(chatIds, options) {
       return noticePage(required(), chatIds, options);
+    },
+    async displayOnlyHeads(chatIds, options) {
+      return noticeHeads(required(), chatIds, options);
+    },
+    async displayOnlyRows(chatIds, ids) {
+      return noticeRows(required(), chatIds, ids);
     },
     async latestDisplayOnlyAt(chatIds) {
       return newestNoticeAt(required(), chatIds);

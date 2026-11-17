@@ -26,8 +26,10 @@ import {
   type ReviewProposal,
 } from "../src/lib/session-distill";
 import type { TurnOptions } from "../src/lib/chat-turn";
+import { MAX_COMMAND_CHARS } from "../src/lib/turn-tools";
 import { abortAllExecutions } from "../src/lib/execution-context";
 import { createBotChat, createTelegramChat, type BotChatDeps, type IntentTurn } from "../src/web/bot-turn";
+import { NESTED_SUBSTITUTION_CASES, UNPROVEN_GH_COMMANDS } from "./fixtures/bash-network-cases";
 
 const base = mkdtempSync(join(tmpdir(), "intent-gate-"));
 afterAll(() => rmSync(base, { recursive: true, force: true }));
@@ -152,12 +154,121 @@ describe("Einstufung im Tor", () => {
     expect(logs).toEqual(["[Intents] Telegram (Anthropic API): Werkzeuge des Turns unbekannt, Merk-Tags wie bisher direkt angewendet"]);
   });
 
-  test("Read außerhalb des Projekts: abgelegt; innerhalb: direkt", async () => {
+  test("Issue #525: Dateien auf diesem Rechner sind nie fremd, auch außerhalb des Projekts", async () => {
     await processTurnIntents("[REMEMBER: a]", { uses: [{ name: "Read", path: "/etc/hosts" }], cwd: PROJECT }, { chatId: "1", origin: "T" }, gate);
     await processTurnIntents("[REMEMBER: b]", { uses: [{ name: "Read", path: "src/x.ts" }], cwd: PROJECT }, { chatId: "1", origin: "T" }, gate);
-    expect(applied).toEqual(["[REMEMBER: b]"]);
-    expect(Object.values(pendingOnDisk()).map(r => r.tags)).toEqual(["[REMEMBER: a]"]);
-    expect(sent[0].text).toContain("Read außerhalb des Projekts");
+    await processTurnIntents("[REMEMBER: c]", { uses: [{ name: "Grep" }], cwd: "/" }, { chatId: "1", origin: "T" }, gate);
+    expect(applied).toEqual(["[REMEMBER: a]", "[REMEMBER: b]", "[REMEMBER: c]"]);
+    expect(existsSync(file)).toBe(false);
+  });
+
+  describe("Issue #525: gh gegen eigene und fremde Repos", () => {
+    const saved = process.env.TYBO_TRUSTED_GITHUB_OWNERS;
+    beforeEach(() => {
+      process.env.TYBO_TRUSTED_GITHUB_OWNERS = "cloudnutzer";
+    });
+    afterEach(() => {
+      if (saved === undefined) delete process.env.TYBO_TRUSTED_GITHUB_OWNERS;
+      else process.env.TYBO_TRUSTED_GITHUB_OWNERS = saved;
+    });
+    const bash = (command: string) => ({ uses: [{ name: "Bash", command }], cwd: PROJECT });
+
+    test.each(UNPROVEN_GH_COMMANDS)("Eskalation: Vorschlag ohne Anwendung: %s", async command => {
+      expect(await processTurnIntents("[REMEMBER: x]", bash(command), { chatId: "1", origin: "T" }, gate)).toBe("staged");
+      expect(applied).toEqual([]);
+      expect(sent).toHaveLength(1);
+      expect(Object.values(pendingOnDisk())).toHaveLength(1);
+    });
+
+    for (const { command } of NESTED_SUBSTITUTION_CASES) {
+      test(`Eskalation 2: verschachtelter Abruf bleibt Vorschlag: ${command}`, async () => {
+        expect(await processTurnIntents("[REMEMBER: x]", bash(command), { chatId: "1", origin: "T" }, gate)).toBe("staged");
+        expect(applied).toEqual([]);
+        const pending = Object.values(pendingOnDisk());
+        expect(pending).toHaveLength(1);
+        expect(pending[0]).toMatchObject({ type: "memory", chatId: "1", tags: "[REMEMBER: x]" });
+        expect(sent).toHaveLength(1);
+        expect(sent[0]).toMatchObject({ reviewId: pending[0]!.id, chatId: "1", type: "memory" });
+      });
+    }
+
+    test("eigenes Repo: direkt angewendet", async () => {
+      expect(await processTurnIntents("[REMEMBER: a]", bash("gh issue list -R cloudnutzer/tybo"), { chatId: "1", origin: "T" }, gate)).toBe("applied");
+      expect(await processTurnIntents("[DONE: b]", bash("gh api repos/cloudnutzer/tybo/issues"), { chatId: "1", origin: "T" }, gate)).toBe("applied");
+      expect(applied).toEqual(["[REMEMBER: a]", "[DONE: b]"]);
+    });
+
+    test("fremdes Repo, kein Repo oder Umgehung über eine Befehlskette: Vorschlag", async () => {
+      for (const command of [
+        "gh api repos/fremd/x",
+        "gh issue list",
+        "gh api repos/fremd/x; gh issue list -R cloudnutzer/y",
+        "curl -s https://example.com",
+      ]) {
+        expect(await processTurnIntents("[REMEMBER: x]", bash(command), { chatId: "1", origin: "T" }, gate)).toBe("staged");
+      }
+      expect(applied).toEqual([]);
+      expect(sent[0]!.text).toContain("gh mit fremdem oder unklarem Repo");
+    });
+
+    test("Optionswerte, unklare Argumente und ausgeführte Zeichenketten: Vorschlag statt direkter Anwendung", async () => {
+      const commands = [
+        'gh issue list --template "-Rcloudnutzer/tybo"',
+        'gh issue list --search "-Rcloudnutzer/tybo"',
+        "gh issue list -- -R cloudnutzer/tybo",
+        'args="-R fremd/x"; gh issue list -R cloudnutzer/y $args',
+        'gh issue list -R cloudnutzer/y $(printf -- "-R fremd/x")',
+        "gh api repos/cloudnutzer/x -X $METHODE",
+        "bash -c 'gh \"api\" repos/fremd/x'; gh issue list -R cloudnutzer/y",
+        "bash -c 'g\\h api repos/fremd/x'; gh issue list -R cloudnutzer/y",
+        "bash -c \"g\\$'h' api repos/fremd/x\"; gh issue list -R cloudnutzer/y",
+        // Klammer-Erweiterung: issue, pr, release, api und eine Befehlskette
+        "gh issue list -R cloudnutzer/y {--repo=fremd/x,--state=open}",
+        "gh pr list -R cloudnutzer/y {--repo=fremd/x,--state=open}",
+        "gh release list -R cloudnutzer/y {-R,fremd/x}",
+        "gh api repos/cloudnutzer/x --{hostname=enterprise.example,paginate}",
+        "gh issue list -R cloudnutzer/a && gh pr list -R cloudnutzer/b {--repo=fremd/x,--state=open}",
+        // GH_HOST und Co. in maskierter Schreibweise
+        "env GH_HOS''T=enterprise.example gh issue list -R cloudnutzer/y",
+        "env GH_HO\\ST=enterprise.example gh issue list -R cloudnutzer/y",
+        "export GH_HOS''T=enterprise.example; gh issue list -R cloudnutzer/y",
+        "export GH_HO\\ST=enterprise.example && gh api repos/cloudnutzer/y",
+        // Kurzflag-Bündel mit angehängtem Repo-Wert: issue und pr
+        "gh issue view 1 -R cloudnutzer/y -cRfremd/x",
+        "gh pr view 1 -R cloudnutzer/y -cRfremd/x",
+        // Dateinamensmuster, das Bash zu gh macht, in einer Befehlskette
+        "gh issue list -R cloudnutzer/y; /opt/homebrew/bin/g[h] api repos/fremd/x",
+        'gh issue list -R cloudnutzer/y; "/opt/homebrew/bin/"g[h] api repos/fremd/x',
+        // eval verbindet die Argumente: Repo- und Hostwechsel
+        "eval 'gh issue list -R cloudnutzer/y' '-Rfremd/x'",
+        "eval 'gh api repos/cloudnutzer/y' '--hostname=enterprise.example'",
+        // erweiterte Muster in Bash und zsh
+        "gh issue list -R cloudnutzer/y; bash -O extglob -c '/opt/homebrew/bin/@(gh) api repos/fremd/x'",
+        "gh issue list -R cloudnutzer/y; zsh -c '/opt/homebrew/bin/(gh|zz-no-command) api repos/fremd/x'",
+      ];
+      for (const command of commands) {
+        expect(await processTurnIntents("[REMEMBER: x]", bash(command), { chatId: "1", origin: "T" }, gate)).toBe("staged");
+      }
+      expect(applied).toEqual([]);
+      expect(sent).toHaveLength(commands.length);
+      for (const message of sent) expect(message.text).toContain("gh mit fremdem oder unklarem Repo");
+    });
+
+    test("ältere gekürzte Einträge ohne Einstufung: Vorschlag", async () => {
+      const cut = `echo ${"x".repeat(MAX_COMMAND_CHARS + 100)}; gh api repos/fremd/x`.slice(0, MAX_COMMAND_CHARS);
+      expect(await processTurnIntents("[REMEMBER: x]", bash(cut), { chatId: "1", origin: "T" }, gate)).toBe("staged");
+      expect(applied).toEqual([]);
+      expect(sent[0]!.text).toContain("Bash mit gekürztem Befehl");
+    });
+
+    test("hochgeladene Datei bleibt fremd, auch zusammen mit erlaubten Werkzeugen", async () => {
+      const tools = { uses: [{ name: "Read", path: "/etc/hosts" }, { name: "Bash", command: "gh pr view 3 -R cloudnutzer/tybo" }], cwd: PROJECT };
+      expect(await processTurnIntents("[REMEMBER: aus PDF]", tools, { chatId: "1", origin: "Telegram", foreignInput: "hochgeladene Datei" }, gate)).toBe("staged");
+      expect(await processTurnIntents("[REMIND: morgen 9 Uhr | Foto ansehen]", tools, { chatId: "1", origin: "Telegram", foreignInput: "Foto" }, gate)).toBe("staged");
+      expect(applied).toEqual([]);
+      expect(sent[0]!.text).toContain("hochgeladene Datei");
+      expect(sent[1]!.text).toContain("Foto");
+    });
   });
 
   test("lesende MCP-Werkzeuge: Mail, Kalender, Firecrawl, Browser", async () => {

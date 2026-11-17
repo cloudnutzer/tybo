@@ -4,7 +4,7 @@
 // threads-reminder-wiring.test.ts.
 import { describe, expect, test } from "bun:test";
 import { createLifecycle } from "../src/app/lifecycle";
-import { registerBotShutdown, WEB_STOP_GRACE_MS, type BotShutdownParts } from "../src/app/bot-shutdown";
+import { registerBotShutdown, runsUnderSystemd, WEB_STOP_GRACE_MS, type BotShutdownParts } from "../src/app/bot-shutdown";
 import { SHUTDOWN_ABORT_REPLY } from "../src/lib/chat-turn";
 
 function rig(overrides: Partial<BotShutdownParts> = {}) {
@@ -35,6 +35,8 @@ function rig(overrides: Partial<BotShutdownParts> = {}) {
     mcp: { shutdown: async () => void events.push("mcp") },
     saveSession: async () => void events.push("session"),
     log: line => void events.push(`log ${line}`),
+    // fest, nie aus der Umgebung des Testlaufs (ein Runner kann selbst unter systemd laufen)
+    underSystemd: () => false,
     ...overrides,
   };
   registerBotShutdown(lifecycle, parts);
@@ -76,6 +78,74 @@ describe("Beenden des Bots", () => {
       "schonfrist",
       "sperre frei",
     ]);
+  });
+
+  test("Issue #561: unter systemd wartet es zuletzt auf die abgebrochenen Motor-Prozesse, Nachzügler im Log", async () => {
+    const procs = [{ pid: 4242, kill: () => {} }];
+    let waited: unknown;
+    const r = rig({
+      underSystemd: () => true,
+      abortRunning: () => {
+        r.events.push("abbrechen");
+        return procs;
+      },
+      waitForEngineExit: async list => {
+        waited = list;
+        r.events.push("motoren abwarten");
+        return 1;
+      },
+    });
+    await r.lifecycle.shutdown("SIGTERM");
+    expect(waited).toBe(procs);
+    expect(r.events.slice(-5)).toEqual(["session", "motoren abwarten", "log [shutdown] 1 Motor-Prozess(e) endeten nicht rechtzeitig und bekamen SIGKILL", "schonfrist", "sperre frei"]);
+  });
+
+  test("Issue #561: nichts abgebrochen, nichts abzuwarten", async () => {
+    let called = false;
+    const r = rig({ underSystemd: () => true, waitForEngineExit: async () => ((called = true), 0) });
+    await r.lifecycle.shutdown("SIGTERM");
+    expect(called).toBe(false);
+  });
+
+  test("Issue #561: unter PM2, launchd und ohne Dienst bleibt der bisherige Ablauf, kein Warten, kein SIGKILL", async () => {
+    let called = false;
+    const r = rig({
+      abortRunning: () => {
+        r.events.push("abbrechen");
+        return [{ pid: 4242, kill: () => {} }];
+      },
+      waitForEngineExit: async () => ((called = true), 1),
+    });
+    await r.lifecycle.shutdown("SIGTERM");
+    expect(called).toBe(false);
+    expect(r.events).toEqual([
+      "abbrechen",
+      "routinen",
+      "fäden",
+      "planer anhalten",
+      "telegram",
+      `web ${WEB_STOP_GRACE_MS} ${SHUTDOWN_ABORT_REPLY}`,
+      "mcp",
+      "session",
+      "schonfrist",
+      "sperre frei",
+    ]);
+    expect(r.exits).toEqual([0]);
+  });
+
+  test("Issue #561: runsUnderSystemd nur unter Linux mit INVOCATION_ID und TYBO_SYSTEMD_UNIT, nie unter PM2", () => {
+    const unit = { INVOCATION_ID: "0123abcd", TYBO_SYSTEMD_UNIT: "tybo-telegram-relay.service" };
+    expect(runsUnderSystemd(unit, "linux")).toBe(true);
+    // PM2 (auch wenn PM2 selbst unter systemd läuft und INVOCATION_ID vererbt)
+    expect(runsUnderSystemd({ ...unit, pm_id: "0" }, "linux")).toBe(false);
+    // launchd und andere Systeme
+    expect(runsUnderSystemd(unit, "darwin")).toBe(false);
+    expect(runsUnderSystemd(unit, "win32")).toBe(false);
+    // ohne Dienstdatei von tybo oder ohne systemd
+    expect(runsUnderSystemd({ INVOCATION_ID: "0123abcd" }, "linux")).toBe(false);
+    expect(runsUnderSystemd({ TYBO_SYSTEMD_UNIT: "tybo-telegram-relay.service" }, "linux")).toBe(false);
+    expect(runsUnderSystemd({ ...unit, INVOCATION_ID: " " }, "linux")).toBe(false);
+    expect(runsUnderSystemd({}, "linux")).toBe(false);
   });
 
   test("Teilinitialisierung (Absturz beim Start): nichts gestartet, trotzdem sauber beendet", async () => {

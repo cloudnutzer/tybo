@@ -12,6 +12,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getMemoryContext } from "../src/lib/memory";
+import { FACT_DATE_NOTE } from "../src/lib/memory/context";
 import { resetStore } from "../src/lib/store";
 import { pad, useMemoryTable, type Row } from "./memory-fixture";
 
@@ -28,7 +29,7 @@ const FACTS: Row[] = Array.from({ length: 12 }, (_, i) => ({
   type: "fact",
   content: `Fakt ${String(i).padStart(2, "0")}: ${i === 2 ? "Urlaub in Italien, " : ""}${FILLER}`,
 }));
-const firstFact = (context: string) => /^- (Fakt \d\d):/m.exec(context)?.[1];
+const firstFact = (context: string) => /^- \[[^\]]+\] (Fakt \d\d):/m.exec(context)?.[1];
 
 function supabaseTable() {
   resetStore();
@@ -65,7 +66,7 @@ describe("Gedächtnis-Dienst: getMemoryContext, Wahl des Weges", () => {
     cleanups.push(() => (saved === undefined ? delete process.env.MEMORY_CONTEXT_CHARS : (process.env.MEMORY_CONTEXT_CHARS = saved)));
     process.env.MEMORY_CONTEXT_CHARS = "abc";
     const context = await getMemoryContext(QUESTION);
-    expect(context.match(/^- Fakt \d\d:/gm)).toHaveLength(12);
+    expect(context.match(/^- \[[^\]]+\] Fakt \d\d:/gm)).toHaveLength(12);
     expect(firstFact(context)).toBe("Fakt 11");
     expect(context).not.toContain("facts shown");
     expect(fake.embeddingRequests()).toEqual([]);
@@ -96,7 +97,7 @@ process.stdout.write(JSON.stringify({ context: await getMemoryContext(${JSON.str
     });
     expect(proc.stderr.toString()).toBe("");
     expect(JSON.parse(proc.stdout.toString())).toEqual({
-      context: "**Known Facts:**\n- Alex mag Tee\n\n**Active Goals:**\n1. Mehr lesen",
+      context: `**Known Facts:**\n${FACT_DATE_NOTE}\n- [Anlagedatum unbekannt] Alex mag Tee\n\n**Active Goals:**\n1. Mehr lesen`,
       calls: 0,
     });
   });
@@ -118,7 +119,7 @@ process.stdout.write(JSON.stringify({ context: await getMemoryContext(${JSON.str
     });
     expect(proc.stderr.toString()).toBe("");
     const { context, calls } = JSON.parse(proc.stdout.toString());
-    expect(context).toBe(["**Known Facts:**", ...facts.map(fact => "- " + fact)].join("\n"));
+    expect(context).toBe(["**Known Facts:**", FACT_DATE_NOTE, ...facts.map(fact => "- [Anlagedatum unbekannt] " + fact)].join("\n"));
     expect(calls).toBe(0);
   });
 });

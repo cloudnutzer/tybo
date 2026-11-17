@@ -5,7 +5,7 @@
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createJobDeps } from "../src/lib/jobs/default-deps";
 import { descendantsOf, parseProcessList, realProcessOps, type ProcInfo } from "../src/lib/jobs/process";
@@ -79,6 +79,52 @@ describe("Wächter: Ausgänge", () => {
     expect(deps.spawned[0].prompt).toContain(`data/jobs/${id}/report.md`);
     expect(deps.spawned[0].cwd).toBe(root);
     expect(deps.spawned[0].cmd).toContain("acceptEdits");
+  });
+
+  test("Werkzeugregeln aus dem Status (Issue #493): erlaubte und gesperrte Werkzeuge gehen an Claude, acceptEdits bleibt", async () => {
+    const id = await prepareJob({ allowedTools: ["WebSearch", "WebFetch"], deniedTools: ["Edit(./config/**)"] });
+    const { deps } = await watch(id, { spawnClaude: fakeClaude({ code: 0, report: "ok" }) });
+    const cmd = deps.spawned[0].cmd;
+    expect(cmd).toContain("acceptEdits");
+    expect(cmd[cmd.indexOf("--allowedTools") + 1]).toBe("WebSearch,WebFetch");
+    expect(cmd[cmd.indexOf("--disallowedTools") + 1]).toBe("Monitor,ScheduleWakeup,CronCreate,Edit(./config/**)");
+  });
+
+  test("eigener Arbeitsordner (Issue #493): Claude startet dort eingeschränkt, ohne MCP und Befehle; der Bericht kommt aus dem Arbeitsordner", async () => {
+    const work = join(root, "arbeit-1");
+    mkdirSync(work);
+    const id = await prepareJob({ allowedTools: ["WebSearch", "WebFetch"], deniedTools: ["Bash"], workDir: work });
+    const spawnClaude: NonNullable<FakeOptions["spawnClaude"]> = spec => {
+      // Claude schreibt den Bericht in seinen Arbeitsordner, nicht in data/jobs
+      writeFileSync(join(spec.cwd, "bericht.md"), "Entwurf geschrieben.");
+      return fakeChild(55_556, Promise.resolve({ code: 0, signal: null }));
+    };
+    const { deps, status } = await watch(id, { spawnClaude });
+    const spec = deps.spawned[0];
+    expect(spec.cwd).toBe(work);
+    expect(spec.cmd).toContain("--restricted");
+    expect(spec.cmd).toContain("--strict-mcp-config");
+    expect(spec.cmd[spec.cmd.indexOf("--permission-mode") + 1]).toBe("acceptEdits");
+    expect(spec.cmd[spec.cmd.indexOf("--tools") + 1]).toBe("Read,Write,Edit,Glob,Grep,WebSearch,WebFetch");
+    expect(spec.cmd).not.toContain("bypassPermissions");
+    expect(spec.prompt).toContain(join(work, "bericht.md"));
+    expect(spec.prompt).not.toContain(`data/jobs/${id}/report.md`);
+    expect(status.outcome).toBe("success");
+    expect(readFileSync(jobFile(root, id, "report"), "utf8")).toBe("Entwurf geschrieben.");
+  });
+
+  test("eigener Arbeitsordner: ein Link statt Bericht wird nicht übernommen", async () => {
+    const work = join(root, "arbeit-2");
+    mkdirSync(work);
+    writeFileSync(join(root, "fremd.txt"), "fremder Inhalt");
+    const id = await prepareJob({ workDir: work });
+    const spawnClaude: NonNullable<FakeOptions["spawnClaude"]> = spec => {
+      symlinkSync(join(root, "fremd.txt"), join(spec.cwd, "bericht.md"));
+      return fakeChild(55_557, Promise.resolve({ code: 0, signal: null }));
+    };
+    const { status } = await watch(id, { spawnClaude });
+    expect(status.outcome).toBe("no_report");
+    expect(existsSync(jobFile(root, id, "report"))).toBe(false);
   });
 
   test("Absturz ohne Bericht: Exit-Code und genau die letzten 20 Log-Zeilen", async () => {
@@ -392,25 +438,45 @@ describe("Zustellung", () => {
 });
 
 describe("Wächter: Prozesse, die Claude überleben (1.10.2026)", () => {
+  /**
+   * Claude endet, nachdem der Wächter die Prozessliste einmal gelesen hat. Nach
+   * fester Wanduhr konnte Claude schon fertig sein, bevor der Wächter nach seinen
+   * Statusschreibvorgängen je nachsah; er kannte die Kinder dann nicht.
+   */
+  function claudeEndsAfterFirstLook() {
+    let done = false;
+    let looked = false;
+    let end: (exit: { code: number | null; signal: string | null }) => void = () => {};
+    const exited = new Promise<{ code: number | null; signal: string | null }>(r => (end = r));
+    return {
+      exited,
+      done: () => done,
+      look() {
+        if (looked) return;
+        looked = true;
+        setTimeout(() => {
+          done = true;
+          end({ code: 0, signal: null });
+        }, 0);
+      },
+    };
+  }
+
   /** Claude (55_555) startet einen Testlauf (60_001) und eine Shell (60_002), die vor Claude endet */
   function scenario(survives: boolean) {
-    let claudeDone = false;
+    const claude = claudeEndsAfterFirstLook();
     const table = (): ProcInfo[] => {
+      const claudeDone = claude.done();
       const list: ProcInfo[] = [{ pid: 55_555, ppid: 40_000, identity: "start-55555", command: "claude -p" }];
       if (!claudeDone) list.push({ pid: 60_002, ppid: 55_555, identity: "s2", command: "/bin/zsh -c sleep 1" });
       // Verwaist: nach Claudes Ende hängt der Testlauf an launchd (PID 1)
       if (survives || !claudeDone) list.push({ pid: 60_001, ppid: claudeDone ? 1 : 55_555, identity: "s1", command: "bun run test   --timeout 9" });
+      claude.look();
       return claudeDone ? list.slice(1) : list;
     };
     const spawnClaude: NonNullable<FakeOptions["spawnClaude"]> = spec => {
       appendFileSync(spec.logPath, "Der Testlauf läuft im Hintergrund, ich melde mich.\n");
-      const exited = new Promise<{ code: number | null; signal: string | null }>(r =>
-        setTimeout(() => {
-          claudeDone = true;
-          r({ code: 0, signal: null });
-        }, 60),
-      );
-      return fakeChild(55_555, exited);
+      return fakeChild(55_555, claude.exited);
     };
     return { table, spawnClaude };
   }
@@ -447,24 +513,20 @@ describe("Wächter: Prozesse, die Claude überleben (1.10.2026)", () => {
 
   test("Befehle mit Werten aus .env erscheinen maskiert", async () => {
     const id = await prepareJob();
-    // Die Prozessliste kippt erst mit Claudes Ende, nicht nach fester Wanduhr: auf einem
-    // langsamen Runner lief die Uhr sonst ab, bevor der Wächter den Kindprozess je sah
-    let done = false;
+    const claude = claudeEndsAfterFirstLook();
     const spawnClaude: NonNullable<FakeOptions["spawnClaude"]> = spec => {
       appendFileSync(spec.logPath, "Der Testlauf läuft im Hintergrund, ich melde mich.\n");
-      const exited = new Promise<{ code: number | null; signal: string | null }>(r =>
-        setTimeout(() => {
-          done = true;
-          r({ code: 0, signal: null });
-        }, 60),
-      );
-      return fakeChild(55_555, exited);
+      return fakeChild(55_555, claude.exited);
     };
     const deps = fakeDeps(root, { spawnClaude, secrets: ["geheim-123"] });
-    deps.procs.listProcesses = () => [
-      ...(done ? [] : [{ pid: 55_555, ppid: 1, identity: "start-55555", command: "claude" }]),
-      { pid: 61_000, ppid: done ? 1 : 55_555, identity: "x", command: "curl -H token=geheim-123 https://example.org" },
-    ];
+    deps.procs.listProcesses = () => {
+      const done = claude.done();
+      claude.look();
+      return [
+        ...(done ? [] : [{ pid: 55_555, ppid: 1, identity: "start-55555", command: "claude" }]),
+        { pid: 61_000, ppid: done ? 1 : 55_555, identity: "x", command: "curl -H token=geheim-123 https://example.org" },
+      ];
+    };
     deps.trackIntervalMs = 5;
     await runWatcher(id, deps);
     const status = (await readStatus(root, id))!;

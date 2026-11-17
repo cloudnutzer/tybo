@@ -1,0 +1,3 @@
+; Keine Manager-Schnittstelle (Issue #511)
+[general]
+enabled = no

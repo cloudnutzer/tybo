@@ -210,11 +210,13 @@ recall <frage> - alte Gespraeche durchsuchen
       // Gedächtnis-Befehle in allen Kanälen (Issue #333)
       .replace(
         "goals · memory · /tasks - gespeicherte Ziele, Fakten, offene Fragen\n",
-        "goals · memory · /tasks - gespeicherte Ziele, Fakten, offene Fragen\n/remember <fakt> · /forget <text> - Fakt merken bzw. vergessen\n/track <ziel> [| deadline: <frist>] · /done <text> · /cancel <text> - gespeichertes Ziel anlegen, erledigen, streichen\n"
+        "goals · memory · /tasks - gespeicherte Ziele, Fakten, offene Fragen\n/remember <fakt> · /forget <text> - Fakt merken bzw. vergessen\n/kern - fester Kern: steht bei jedem Start einer Session im Prompt · /kern entwurf · /kern setzen <text> · /kern loeschen\n/track <ziel> [| deadline: <frist>] · /done <text> · /cancel <text> - gespeichertes Ziel anlegen, erledigen, streichen\n"
       )
       .replace("recall <frage> - alte Gespraeche durchsuchen", "/recall <frage> - alte Gespraeche durchsuchen (auch /search, /find)")
       // /anruf statt "call me" (Issue #367)
       .replace('"call me ..." - Anruf', "/anruf [anlass] - ich rufe dich an")
+      // /sprachagent (Issue #492)
+      .replace("/anruf [anlass] - ich rufe dich an\n", "/anruf [anlass] - ich rufe dich an\n/sprachagent - Sprachagenten aus Rezepten: liste (auch /sprachagenten) · testen <kennung> · loeschen <kennung> · link <kennung>\n")
       // /credit in allen Kanälen, /plan mit eigenem Hinweis (Issue #346)
       .replace("/credit · /plan - Verbrauch", "/credit - Verbrauch (Claude-Abo, Motoren) · /plan - Limit und Reset-Tag");
     expect(await run("/help")).toEqual([html(expected)]);

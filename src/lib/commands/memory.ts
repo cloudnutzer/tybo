@@ -15,9 +15,13 @@
  * Antwort bleibt sichtbar.
  *
  * Die Ziele hier sind die gespeicherten Ziele (/goals), nicht /goal.
+ *
+ * Geheimnisse (Issue #524): /remember speichert keinen Wert, der nach Passwort
+ * oder Schlüssel aussieht, und sagt, wo er hingehört. /memory zeigt Fakten maskiert.
  */
 
 import { BRAND } from "../../brand";
+import { containsSecret, maskSecrets, secretRefusedText } from "../memory/secrets";
 import type { Message } from "../store/types";
 import { chunkForTelegram, sanitizeModelOutput } from "../telegram";
 import { ALL_CHANNELS, type CommandContext, type CommandDefinition, type MemoryCommandServices } from "./types";
@@ -32,6 +36,7 @@ export const MEMORY_COMMAND_TEXT = {
   completed: "Ziel erledigt. Gut gemacht!",
   cancelled: "Ziel gestrichen.",
   noGoal: (query: string) => `Kein offenes Ziel passt zu „${query}".`,
+  goalsUnreadable: "Die Ziele konnten gerade nicht gelesen werden. Bitte später nochmal versuchen.",
   factsTitle: "Gespeicherte Fakten:",
   noFacts: "Noch keine Fakten gespeichert. Merken: /remember <fakt>",
   noHits: (query: string) => `Nichts gefunden zu „${query}".`,
@@ -101,7 +106,10 @@ export function splitGoalDeadline(input: string): { goal: string; deadline?: str
 }
 
 async function runRemember(ctx: CommandContext): Promise<void> {
-  await write(ctx, TEXT.usage.remember, async (memory, fact) => ((await memory.addFact(fact)) ? TEXT.remembered : TEXT.failed));
+  await write(ctx, TEXT.usage.remember, async (memory, fact) => {
+    if (containsSecret(fact)) return secretRefusedText();
+    return (await memory.addFact(fact)) ? TEXT.remembered : TEXT.failed;
+  });
 }
 
 async function runForget(ctx: CommandContext): Promise<void> {
@@ -135,7 +143,7 @@ async function runMemory(ctx: CommandContext): Promise<void> {
   if (!memory) return;
   const facts = (await memory.facts()).filter(item => item.type === "fact");
   if (facts.length === 0) return ctx.reply(TEXT.noFacts);
-  await replyLong(ctx, `**${TEXT.factsTitle}**\n${facts.map(fact => `- ${fact.content}`).join("\n")}`);
+  await replyLong(ctx, `**${TEXT.factsTitle}**\n${facts.map(fact => `- ${maskSecrets(fact.content)}`).join("\n")}`);
 }
 
 function hitDate(iso: string | undefined): string {

@@ -30,10 +30,11 @@ import { parseAssetDescTag, stripAssetDescTag } from "../lib/assets/tags";
 import { uploadName } from "../lib/media-turn";
 import type { ProcessRequest } from "../lib/process-background";
 import { createProcessHandler } from "../lib/process-handler";
+import { HEALTH_SERVICE_ID } from "../lib/service-names";
 import type { LastSession } from "./last-session";
 
-/** Dienstname in der Health-Antwort; Prüfskripte erkennen den Bot daran */
-export const HEALTH_SERVICE = "tybo-telegram-bot";
+/** Dienstname in der Health-Antwort; Prüfskripte erkennen den Bot daran (Wert in service-names.ts) */
+export const HEALTH_SERVICE = HEALTH_SERVICE_ID;
 
 /** Größte Anfrage, die Bun überhaupt annimmt (der Process-Handler prüft selbst noch einmal) */
 const BODY_LIMIT = 64 * 1024;

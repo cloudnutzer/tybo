@@ -133,6 +133,7 @@ describe("createHistorySearchHandler", () => {
       searchMessages: async () => [],
       knowledgeContext: async () => "",
       searchImages: async () => [],
+      searchFacts: async () => [],
       ...overrides,
     };
   }

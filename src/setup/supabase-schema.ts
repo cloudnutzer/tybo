@@ -27,6 +27,8 @@ export const SCHEMA_FILES = [
   "db/migrations/20261017_scheduled_tasks.sql",
   "db/migrations/20261018_scheduled_tasks_lease.sql",
   "db/migrations/20261021_base_grants.sql",
+  "db/migrations/20261031_memory_archive.sql",
+  "db/migrations/20261031_memory_facts_search.sql",
 ] as const;
 
 /** Name der Migration beim Anbieter: tybo_<dateiname ohne .sql>, nur a-z, 0-9 und _ */
@@ -77,6 +79,12 @@ export function isValidBucketName(name: string): boolean {
   return BUCKET_NAME_PATTERN.test(name);
 }
 
+/** Zustand eines Bilder-Ordners, ohne ihn anzulegen (keine Zeile: gibt es nicht) */
+export function bucketStateSql(name: string): string {
+  if (!isValidBucketName(name)) throw new Error("Ungültiger Name für den Bilder-Ordner");
+  return `select public from storage.buckets where id = '${name}';`;
+}
+
 /**
  * Legt den Bilder-Ordner privat an, falls er fehlt, und liefert in einer
  * Zeile, ob er öffentlich ist (Spalte public). Ein vorhandener Ordner wird
@@ -113,7 +121,7 @@ export const LIST_MIGRATIONS_SQL = "select version, name from supabase_migration
  * Zeitmarke wie bei der Supabase CLI (nur Ziffern), name wie migrationName().
  */
 export function recordedMigrationSql(sql: string, version: string, name: string): string {
-  if (!/^\d{1,32}$/.test(version) || !/^[a-z0-9_]{1,80}$/.test(name)) throw new Error("Ungültige Migration");
+  checkMigration(version, name);
   return [
     "begin;",
     sql,
@@ -122,6 +130,22 @@ export function recordedMigrationSql(sql: string, version: string, name: string)
     `insert into supabase_migrations.schema_migrations (version, name) values ('${version}', '${name}') on conflict (version) do nothing;`,
     "commit;",
   ].join("\n");
+}
+
+function checkMigration(version: string, name: string): void {
+  if (!/^\d{1,32}$/.test(version) || !/^[a-z0-9_]{1,80}$/.test(name)) throw new Error("Ungültige Migration");
+}
+
+/**
+ * Nur das Verbuchen (Supabase auf diesem Rechner, Issue #560); wirft bei
+ * ungültiger Angabe. Ohne „on conflict“: Ist die Zeitmarke schon vergeben,
+ * scheitert die Anweisung, statt still nichts zu verbuchen. Sonst fehlte die
+ * Datei in der Historie, und ein späterer Start spielte sie allein noch einmal
+ * ein, nach Dateien, die ihre Funktionen inzwischen ersetzt haben.
+ */
+export function recordMigrationSql(version: string, name: string): string {
+  checkMigration(version, name);
+  return `insert into supabase_migrations.schema_migrations (version, name) values ('${version}', '${name}');`;
 }
 
 /** Zeitmarke JJJJMMTTHHMMSS (UTC), um offset Sekunden verschoben */

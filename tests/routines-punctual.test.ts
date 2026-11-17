@@ -348,7 +348,7 @@ describe("Log-Rückfall und fehlende Daten", () => {
   });
 
   test("ohne launchd (PM2, keine Übersicht): –", () => {
-    expect(evaluatePunctuality(summarizePunctuality(list([], "pm2"), deps(NIGHT)), NIGHT, TZ)).toEqual({ name: "Routinen pünktlich", status: "na", detail: "nur mit launchd (macOS)" });
+    expect(evaluatePunctuality(summarizePunctuality(list([], "pm2"), deps(NIGHT)), NIGHT, TZ)).toEqual({ name: "Routinen pünktlich", status: "na", detail: "nur mit launchd (macOS) oder systemd (Linux)" });
     expect(evaluatePunctuality(summarizePunctuality(list([], null), deps(NIGHT)), NIGHT, TZ).status).toBe("na");
   });
 });

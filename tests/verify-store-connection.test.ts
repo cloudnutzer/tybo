@@ -20,7 +20,10 @@ const ENV = `WEB_ENABLED=true\nWEB_PASSWORD=${FAKE.webPassword}\nSUPABASE_URL=${
 async function run(respond: () => Response, env = ENV) {
   const requests: string[] = [];
   const fetch: HttpFetch = async (url, init) => {
-    requests.push(`${init?.method ?? "GET"} ${new URL(url).pathname}`);
+    const u = new URL(url);
+    // Die Schemaprobe (Issue #560) fragt nur Strukturen (limit=0) und das Verzeichnis; sie liest keine Zeilen
+    const probe = u.searchParams.get("limit") === "0" || u.pathname === "/rest/v1/";
+    requests.push(`${init?.method ?? "GET"} ${probe ? "probe " : ""}${u.pathname}`);
     return respond();
   };
   const ctx = await makeCtx({ env, overrides: { fetch } });

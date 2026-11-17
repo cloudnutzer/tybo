@@ -143,6 +143,34 @@ describe("createVoiceContext", () => {
     expect(loads.profile).toBe(2);
   });
 
+  test("Memory kommt bei jeder Anfrage frisch, Profil und Verlauf aus dem Cache", async () => {
+    const { deps, calls, loads } = fakeDeps();
+    let memory = "- Alex wohnt in Hamburg";
+    const ctx = createVoiceContext({ agent, deps: { ...deps, getMemoryContext: async () => (loads.memory++, memory) } });
+    expect(await ctx.load("100")).toContain("Alex wohnt in Hamburg");
+    memory = "- Mia spielt Cello";
+    const next = await ctx.load("100");
+    expect(next).toContain("## MEMORY\n- Mia spielt Cello");
+    expect(next).not.toContain("Alex wohnt in Hamburg");
+    expect(loads).toEqual({ profile: 1, memory: 2 });
+    expect(calls.length).toBe(1);
+  });
+
+  test("Memory nicht ladbar: der Abschnitt fehlt, der alte Stand kommt nicht wieder", async () => {
+    const { deps } = fakeDeps();
+    let fails = false;
+    const ctx = createVoiceContext({
+      agent,
+      deps: { ...deps, getMemoryContext: async () => (fails ? Promise.reject(new Error("db weg")) : "- Alex wohnt in Hamburg") },
+    });
+    expect(await ctx.load("100")).toContain("Alex wohnt in Hamburg");
+    fails = true;
+    const text = await ctx.load("100");
+    expect(text).not.toContain("## MEMORY");
+    expect(text).not.toContain("Alex wohnt in Hamburg");
+    expect(text).toContain("## USER PROFILE");
+  });
+
   test("invalidate: ohne Topic alle Einträge der Chat-ID, mit Topic nur dieses", async () => {
     const { deps, calls } = fakeDeps();
     const ctx = createVoiceContext({ agent, deps });

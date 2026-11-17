@@ -22,6 +22,7 @@ import { mcpManager, type OpenAITool } from "../mcp/manager";
 import { getSettings, type Settings } from "../settings";
 import { bookRunOutcome } from "../spend/credit";
 import { TELEGRAM_FORMAT_RULES } from "../telegram";
+import { fallbackTryLogLine } from "../log-lines";
 import { realToolLoopDeps, runToolLoop, type ToolLoopDeps } from "./openai-tool-loop";
 
 // ---------------------------------------------------------------------------
@@ -272,7 +273,8 @@ export async function runFallbackChain(
     checkAborted();
     if (!stage.active()) continue;
     const model = stage.model();
-    console.log(`🔄 Fallback: versuche ${stage.name} (${model})`);
+    // Text aus log-lines.ts: der Nachtcheck zählt genau diese Zeile (Issue #568)
+    console.log(fallbackTryLogLine(stage.name, model));
     try {
       const text = await stage.ask({ model, request, tools, deps });
       // /stop während der Stufe: auch eine noch gelieferte Antwort verwerfen

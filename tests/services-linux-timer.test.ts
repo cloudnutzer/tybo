@@ -8,8 +8,10 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { serviceDefinition } from "../src/lib/services/catalog";
-import { cronLines, cronMarker, cronTimes, isOwnCronLine, legacyCronMarker, onCalendar, serviceUnit, timerUnit, UnitError, type LinuxMachine } from "../src/lib/services/systemd";
-import { readCrontab, setUpTimer, timerFailureMessage, userUnitDir, type LinuxDeps } from "../src/setup/services/linux";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { cronLines, cronMarker, cronTimes, isOwnCronLine, legacyCronMarker, onCalendar, pm2CronExpression, serviceUnit, timerTimeZone, timerUnit, UnitError, type LinuxMachine } from "../src/lib/services/systemd";
+import { readCrontab, readUserTimeZone, setUpTimer, timerFailureMessage, userUnitDir, type LinuxDeps } from "../src/setup/services/linux";
 import { EMPTY_ROUTINES_CONFIG } from "../src/lib/routines/config";
 import { routineIdAllowed } from "../src/lib/routines/runs";
 import type { SetupSchedule } from "../src/lib/proactive/setup-schedule";
@@ -105,6 +107,26 @@ describe("Einheiten aus dem Katalog", () => {
     expect(() => timerUnit(serviceDefinition("supabase"), SCHEDULE)).toThrow(UnitError);
   });
 
+  test("Wartung (Issue #485): sonntags 03:15 als Timer und cron-Zeile, nicht täglich", () => {
+    const wartung = serviceDefinition("wartung");
+    expect(onCalendar({ weekday: 0, hour: 3, minute: 15 })).toBe("Sun *-*-* 03:15:00");
+    const timer = timerUnit(wartung, SCHEDULE);
+    expect(timer).toContain("OnCalendar=Sun *-*-* 03:15:00\n");
+    expect(timer).not.toContain("OnCalendar=*-*-*");
+    const lines = cronLines(wartung, MACHINE, SCHEDULE);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].startsWith("15 3 * * 0 cd ")).toBe(true);
+    expect(lines[0]).toContain("--id ai.tybo.wartung -- /home/alex/.bun/bin/bun run src/maintenance.ts");
+    expect(lines[0].endsWith("# tybo-wartung")).toBe(true);
+    expect(serviceUnit(wartung, MACHINE)).toContain("src/routine-run.ts --id ai.tybo.wartung");
+    expect(routineIdAllowed("ai.tybo.wartung", EMPTY_ROUTINES_CONFIG)).toBe(true);
+  });
+
+  test("cron: Termine mit und ohne Wochentag in getrennten Zeilen", () => {
+    const def = { ...CHECKIN, calendar: () => ({ form: "list" as const, slots: [{ hour: 3, minute: 15, weekday: 0 }, { hour: 3, minute: 15 }, { hour: 4, minute: 0, weekday: 6 }] }) };
+    expect(cronLines(def, MACHINE, SCHEDULE).map(l => l.split(" ").slice(0, 5).join(" "))).toEqual(["15 3 * * 0", "15 3 * * *", "0 4 * * 6"]);
+  });
+
   test("cron-Zeile: Wrapper, Umgebung, Protokoll, Markierung am Ende", () => {
     const [line] = cronLines(BRIEFING, MACHINE, SCHEDULE);
     expect(line).toBe(
@@ -139,6 +161,8 @@ interface FakeOptions {
   crontab?: string[] | "missing" | "broken";
   failCrontabWrite?: boolean;
   failEnable?: boolean;
+  /** Prüfer-Hinweis zu #568: enable gelingt, restart scheitert */
+  failRestart?: boolean;
   failDisable?: boolean;
   failWrite?: boolean;
   linger?: "yes" | "no";
@@ -195,6 +219,7 @@ function fakeLinux(options: FakeOptions = {}) {
         return ok();
       }
       if (cmd[2] === "restart") {
+        if (options.failRestart) return fail();
         timers.set(unit, { ...(timers.get(unit) ?? { enabled: false }), active: true });
         return ok();
       }
@@ -334,6 +359,29 @@ describe("setUpTimer mit systemd", () => {
     expect(fk.calls).not.toContain("crontab -");
   });
 
+  test("Timer scheitert: auch nach gelungenem enable wieder abgeschaltet, weder aktiviert noch aktiv, cron bleibt", async () => {
+    for (const failure of [{ failEnable: true }, { failRestart: true }]) {
+      const fk = fakeLinux({ ...failure, crontab: [OLD_CHECKIN_CRON] });
+      const r = await setUpTimer("smart-checkin", fk.deps);
+      expect(r).toEqual({ ok: false, service: "smart-checkin", failure: "enable" });
+      expect(fk.calls.at(-1)).toBe("disable --now tybo-smart-checkin.timer");
+      const state = fk.timers.get("tybo-smart-checkin.timer") ?? { active: false, enabled: false };
+      expect(state.enabled).toBe(false);
+      expect(state.active).toBe(false);
+      expect(fk.crontab()).toEqual([OLD_CHECKIN_CRON]);
+      expect(fk.lines.join("\n")).toContain(timerFailureMessage("enable", "smart-checkin"));
+    }
+  });
+
+  test("restart scheitert und Abschalten auch: gemeldet als möglicher Doppellauf mit Befehl", async () => {
+    const fk = fakeLinux({ failRestart: true, failDisable: true, crontab: [OLD_CHECKIN_CRON] });
+    const r = await setUpTimer("smart-checkin", fk.deps);
+    expect(r.ok ? null : r.failure).toBe("enable-double");
+    expect(fk.lines.join("\n")).toContain("doppelt");
+    expect(fk.lines.join("\n")).toContain("systemctl --user disable --now tybo-smart-checkin.timer");
+    expect(fk.crontab()).toEqual([OLD_CHECKIN_CRON]);
+  });
+
   test("Schreiben der Einheiten scheitert: Fehler write, crontab unberührt", async () => {
     const fk = fakeLinux({ failWrite: true, crontab: [OLD_CHECKIN_CRON] });
     const r = await setUpTimer("smart-checkin", fk.deps);
@@ -341,11 +389,22 @@ describe("setUpTimer mit systemd", () => {
     expect(fk.crontab()).toEqual([OLD_CHECKIN_CRON]);
   });
 
-  test("Aufräumen der crontab scheitert: gemeldet als Doppellauf, nicht still", async () => {
+  test("Aufräumen der crontab scheitert: Timer wieder abgeschaltet, nur cron gilt, gemeldet", async () => {
     const fk = fakeLinux({ failCrontabWrite: true, crontab: [OLD_CHECKIN_CRON] });
     const r = await setUpTimer("smart-checkin", fk.deps);
     expect(r.ok ? null : r.failure).toBe("cron-cleanup");
+    expect(fk.calls.slice(-2)).toEqual(["crontab -", "disable --now tybo-smart-checkin.timer"]);
+    expect(fk.timers.get("tybo-smart-checkin.timer")).toEqual({ active: false, enabled: false });
+    expect(fk.crontab()).toEqual([OLD_CHECKIN_CRON]);
+    expect(fk.lines.join("\n")).toContain(timerFailureMessage("cron-cleanup", "smart-checkin"));
+  });
+
+  test("Aufräumen der crontab und Abschalten scheitern: gemeldet als Doppellauf mit Befehl, nicht still", async () => {
+    const fk = fakeLinux({ failCrontabWrite: true, failDisable: true, crontab: [OLD_CHECKIN_CRON] });
+    const r = await setUpTimer("smart-checkin", fk.deps);
+    expect(r.ok ? null : r.failure).toBe("cron-cleanup-double");
     expect(fk.lines.join("\n")).toContain("startet doppelt");
+    expect(fk.lines.join("\n")).toContain("systemctl --user disable --now tybo-smart-checkin.timer");
   });
 
   test("crontab nicht lesbar: nichts geändert; nicht installiert zählt als leer", async () => {
@@ -368,7 +427,7 @@ describe("setUpTimer mit systemd", () => {
 
   test("kein Zeitplan-Dienst: abgelehnt, nichts geändert", async () => {
     const fk = fakeLinux();
-    for (const s of ["telegram-relay", "health-check", "cloudflare-tunnel"] as const) {
+    for (const s of ["telegram-relay", "software-update", "cloudflare-tunnel"] as const) {
       const r = await setUpTimer(s, fk.deps);
       expect(r.ok ? null : r.failure).toBe("not-a-timer");
     }
@@ -434,5 +493,114 @@ describe("setUpTimer ohne systemd (cron)", () => {
     const r = await setUpTimer("morning-briefing", fk.deps);
     expect(r.ok && r.action).toBe("written");
     expect(fk.crontab()!.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #568: Nachtcheck als Timer, Zeitzone aus USER_TIMEZONE
+// ---------------------------------------------------------------------------
+
+describe("Zeitzone der Timer (Issue #568)", () => {
+  const HEALTH = serviceDefinition("health-check");
+
+  test("timerTimeZone: gültig, fehlend, ungültig, andere Schreibweise", () => {
+    expect(timerTimeZone("Europe/Berlin")).toEqual({ zone: "Europe/Berlin", warning: null });
+    expect(timerTimeZone(" UTC ")).toEqual({ zone: "UTC", warning: null });
+    expect(timerTimeZone("europe/berlin")).toEqual({ zone: "Europe/Berlin", warning: null });
+    expect(timerTimeZone(undefined)).toEqual({ zone: null, warning: null });
+    expect(timerTimeZone("")).toEqual({ zone: null, warning: null });
+    for (const bad of ["Mars/Olympus", "+01:00", "Europe/Berlin; rm -rf", "Europe/../etc", "Europe Berlin"]) {
+      const r = timerTimeZone(bad);
+      expect(r.zone).toBeNull();
+      expect(r.warning).toContain("keine gültige Zeitzone");
+    }
+  });
+
+  test("Nachtcheck im Katalog: Linux-Timer täglich 03:30, unter PM2 als Zeitplan", () => {
+    expect(HEALTH.linux).toBe("timer");
+    expect(HEALTH.pm2Schedule).toBe(true);
+    expect(serviceDefinition("smart-checkin").pm2Schedule).toBeUndefined();
+    expect(serviceDefinition("software-update").linux).toBeUndefined();
+    const unit = serviceUnit(HEALTH, MACHINE);
+    expect(unit).toContain(`ExecStart=${MACHINE.bun} --no-env-file src/routine-run.ts --id ai.tybo.health-check -- ${MACHINE.bun} run src/health-check.ts`);
+    expect(unit).toContain(`StandardError=append:${ROOT}/logs/health-check.error.log`);
+    expect(routineIdAllowed("ai.tybo.health-check", EMPTY_ROUTINES_CONFIG)).toBe(true);
+  });
+
+  test("Timer-Datei trägt die Zeitzone in jedem OnCalendar, ohne Zeitzone ein Kommentar zur Systemzeit", () => {
+    const berlin = timerUnit(HEALTH, SCHEDULE, "Europe/Berlin");
+    expect(berlin.split("\n").filter(l => l.startsWith("OnCalendar="))).toEqual(["OnCalendar=*-*-* 03:30:00 Europe/Berlin"]);
+    expect(berlin).toContain("# Zeitzone aus USER_TIMEZONE");
+    const checkin = timerUnit(CHECKIN, SCHEDULE, "America/New_York");
+    expect(checkin.split("\n").filter(l => l.startsWith("OnCalendar="))).toEqual(["OnCalendar=*-*-* 10:30:00 America/New_York", "OnCalendar=*-*-* 14:00:00 America/New_York"]);
+    expect(timerUnit(serviceDefinition("wartung"), SCHEDULE, "Europe/Berlin")).toContain("OnCalendar=Sun *-*-* 03:15:00 Europe/Berlin");
+    const system = timerUnit(HEALTH, SCHEDULE);
+    expect(system).toContain("OnCalendar=*-*-* 03:30:00\n");
+    expect(system).toContain("# Zeitzone des Systems (USER_TIMEZONE fehlt oder ist ungültig)");
+    expect(() => timerUnit(HEALTH, SCHEDULE, "Europe/Berlin\nExecStart=x")).toThrow(UnitError);
+  });
+
+  test("setUpTimer: Zeitzone aus USER_TIMEZONE, unabhängig von der Zeitzone des Systems", async () => {
+    const savedTz = process.env.TZ;
+    process.env.TZ = "America/Los_Angeles";
+    try {
+      const fk = fakeLinux();
+      const r = await setUpTimer("health-check", { ...fk.deps, userTimeZone: () => "Europe/Berlin" });
+      expect(r.ok && r.action).toBe("written");
+      expect(fk.files.get(join(UNITS, "tybo-health-check.timer"))).toContain("OnCalendar=*-*-* 03:30:00 Europe/Berlin\n");
+      expect(fk.lines.join("\n")).toContain("Zeitzone: Europe/Berlin");
+      expect(fk.calls).toEqual(["daemon-reload", "enable tybo-health-check.timer", "restart tybo-health-check.timer"]);
+    } finally {
+      if (savedTz === undefined) delete process.env.TZ;
+      else process.env.TZ = savedTz;
+    }
+  });
+
+  test("setUpTimer: fehlende USER_TIMEZONE heißt Systemzeit ohne Warnung, ungültige warnt", async () => {
+    const missing = fakeLinux();
+    await setUpTimer("health-check", { ...missing.deps, userTimeZone: () => undefined });
+    expect(missing.files.get(join(UNITS, "tybo-health-check.timer"))).toContain("OnCalendar=*-*-* 03:30:00\n");
+    expect(missing.lines.join("\n")).toContain("Zeitzone: die des Systems");
+    expect(missing.lines.join("\n")).not.toContain("keine gültige Zeitzone");
+
+    const invalid = fakeLinux();
+    const r = await setUpTimer("health-check", { ...invalid.deps, userTimeZone: () => "Mitteleuropa" });
+    expect(r.ok).toBe(true);
+    expect(invalid.files.get(join(UNITS, "tybo-health-check.timer"))).toContain("OnCalendar=*-*-* 03:30:00\n");
+    expect(invalid.lines.join("\n")).toContain("USER_TIMEZONE „Mitteleuropa“ ist keine gültige Zeitzone");
+  });
+
+  test("geänderte Zeitzone schreibt den Timer neu", async () => {
+    const fk = fakeLinux();
+    await setUpTimer("health-check", { ...fk.deps, userTimeZone: () => "UTC" });
+    fk.calls.length = 0;
+    const r = await setUpTimer("health-check", { ...fk.deps, userTimeZone: () => "Europe/Berlin" });
+    expect(r.ok && r.action).toBe("written");
+    expect(fk.files.get(join(UNITS, "tybo-health-check.timer"))).toContain("03:30:00 Europe/Berlin");
+  });
+
+  test("cron (ohne systemd) bleibt in der Zeitzone des Systems", async () => {
+    const fk = fakeLinux({ systemd: false });
+    await setUpTimer("health-check", { ...fk.deps, userTimeZone: () => "Europe/Berlin" });
+    expect(fk.crontab()!).toHaveLength(1);
+    expect(fk.crontab()![0].startsWith("30 3 * * * ")).toBe(true);
+    expect(fk.crontab()![0]).not.toContain("Europe/Berlin");
+  });
+
+  test("readUserTimeZone liest USER_TIMEZONE aus der .env des Projekts", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tybo-tz-"));
+    try {
+      expect(readUserTimeZone(dir)).toBeUndefined();
+      writeFileSync(join(dir, ".env"), "USER_NAME=Alex\nUSER_TIMEZONE=\"Europe/Berlin\"\n");
+      expect(readUserTimeZone(dir)).toBe("Europe/Berlin");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("PM2-Zeitplan: genau ein cron-Ausdruck, sonst UnitError", () => {
+    expect(pm2CronExpression(HEALTH, SCHEDULE)).toBe("30 3 * * *");
+    expect(pm2CronExpression(serviceDefinition("wartung"), SCHEDULE)).toBe("15 3 * * 0");
+    expect(() => pm2CronExpression(CHECKIN, SCHEDULE)).toThrow(UnitError);
   });
 });

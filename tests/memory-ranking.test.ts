@@ -8,6 +8,7 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { getMemoryContext } from "../src/lib/memory";
+import { FACT_DATE_NOTE } from "../src/lib/memory/context";
 import { resetStore } from "../src/lib/store";
 import { pad, useMemoryTable, type MemoryTableOptions, type Row } from "./memory-fixture";
 
@@ -54,7 +55,7 @@ function rpcVectors(vectors: Record<string, number[]>) {
 
 /** Labels der Fakten in der Reihenfolge des Kontexts */
 function factOrder(context: string): string[] {
-  return [...context.matchAll(/^- (Fakt \d\d):/gm)].map(m => m[1]);
+  return [...context.matchAll(/^- \[[^\]]+\] (Fakt \d\d):/gm)].map(m => m[1]);
 }
 
 const GOAL_SECTION = "**Active Goals:**\n1. Sprachkurs abschließen\n2. Zwölf Bücher lesen\n3. Balkon bepflanzen";
@@ -112,11 +113,11 @@ describe("Gedächtnis-Kontext über den Gedächtnis-Dienst mit Supabase", () => 
 
   test("unter Budget mit Suchtext: alle Fakten neueste zuerst, keine Embedding-Anfrage, kein Hinweis", async () => {
     const fake = table({
-      rows: [{ type: "fact", content: "Alex mag Tee" }, { type: "fact", content: "Urlaub in Italien" }, ...GOALS],
+      rows: [{ type: "fact", content: "Alex mag Tee", created_at: "2026-03-01T12:00:00.000Z" }, { type: "fact", content: "Urlaub in Italien", created_at: "2026-04-01T12:00:00.000Z" }, ...GOALS],
       factVectors: rpcVectors({ "1": [1, 0] }),
     });
     const context = await getMemoryContext(QUESTION);
-    expect(context).toBe(`**Known Facts:**\n- Urlaub in Italien\n- Alex mag Tee\n\n${GOAL_SECTION}`);
+    expect(context).toBe(`**Known Facts:**\n${FACT_DATE_NOTE}\n- [2026-04-01] Urlaub in Italien\n- [2026-03-01] Alex mag Tee\n\n${GOAL_SECTION}`);
     expect(fake.embeddingRequests()).toEqual([]);
     expect(fake.factVectorRequests()).toEqual([]);
   });
@@ -138,7 +139,8 @@ describe("Gedächtnis-Kontext über den Gedächtnis-Dienst mit Supabase", () => 
     const context = await getMemoryContext(QUESTION);
     expect(factOrder(context)).toHaveLength(10);
     expect(context.endsWith(`\n${NOTE(10, 12)}`)).toBe(true);
-    expect(context.startsWith("**Known Facts:**\n- Fakt 11: ")).toBe(true);
+    expect(factOrder(context)[0]).toBe("Fakt 11");
+    expect(context.startsWith(`**Known Facts:**\n${FACT_DATE_NOTE}\n- [`)).toBe(true);
   });
 
   test("nur Ziele: nur der Zielabschnitt; nichts gespeichert: leerer Text", async () => {

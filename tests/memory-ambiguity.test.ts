@@ -351,8 +351,8 @@ describe("Supabase", () => {
     const ids = ["6f1c2e1a-8b7d-4c3e-9a2b-1d0e5f4a3b21", "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"];
     const fake = useMemoryTable({
       rows: [
-        { id: ids[0], type: "goal", content: "Bericht A", completed: false },
-        { id: ids[1], type: "goal", content: "Bericht B", completed: false },
+        { id: ids[0], type: "goal", content: "Bericht A" },
+        { id: ids[1], type: "goal", content: "Bericht B" },
       ],
     });
     cleanups.push(() => fake.restore());
@@ -362,11 +362,11 @@ describe("Supabase", () => {
     const [choice] = await memoryChoices();
     expect(JSON.parse(choice.ref!)).toEqual(ids);
     expect(choice.options.every(o => o.key.length <= 32)).toBe(true);
-    expect(fake.table.every(r => r.completed === false)).toBe(true);
+    expect(fake.table.every(r => r.type === "goal")).toBe(true);
     await decideChoice(choice.id, "e1", "telegram");
-    expect(fake.table.map(r => [r.content, r.completed])).toEqual([
-      ["Bericht A", false],
-      ["Bericht B", true],
+    expect(fake.table.map(r => [r.content, r.type])).toEqual([
+      ["Bericht A", "goal"],
+      ["Bericht B", "completed_goal"],
     ]);
     const patch = fake.tableRequests().find(r => r.method === "PATCH")!;
     expect(patch.url.searchParams.get("id")).toBe(`eq.${ids[1]}`);

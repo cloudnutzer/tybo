@@ -753,6 +753,8 @@ const NOTICE_SOURCES = {
   rueckfrage: "Rückfrage",
   // Telefonanrufe: Zusammenfassung und Auftrag (Issue #366)
   anruf: "Anruf",
+  // Sprachagenten: Testlauf und Löschen (Issue #492)
+  sprachagent: "Sprachagent",
   // Bot-interne Meldungen ohne Telegram (Issue #227): Neustart, Credit-Guard
   system: "System",
   // Meldung nach dem Telefonat (Issue #259): was gemerkt wurde
@@ -834,6 +836,11 @@ function commandFill(command) {
 const FILE_ID_PATTERN =/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** Vorschau nur für diese Bildtypen (wie die Server-Route mit ?inline=1) */
 const PREVIEW_TYPES = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp", gif: "image/gif" };
+/** Zum Abspielen im Chat, wie MEDIA_TYPES in src/web/files.ts */
+const MEDIA_TAGS = {
+  mp3: "audio", m4a: "audio", wav: "audio", ogg: "audio", oga: "audio", opus: "audio", flac: "audio",
+  mp4: "video", m4v: "video", mov: "video", webm: "video",
+};
 
 /** Absender als Text: bekannte deutsch, unbekannte roh, ohne Angabe „Meldung". */
 function noticeSourceLabel(source) {
@@ -936,6 +943,17 @@ function previewType(file) {
   return type && file.mime === type ? type : null;
 }
 
+/** "audio" oder "video", wenn Endung und festgehaltener Typ zusammenpassen, sonst null */
+function mediaTag(file) {
+  const match = /\.([a-z0-9]+)$/i.exec(String(file.name || ""));
+  const tag = match ? MEDIA_TAGS[match[1].toLowerCase()] : undefined;
+  return tag && String(file.mime || "").split("/")[0] === tag ? tag : null;
+}
+
+function isHtmlFile(file) {
+  return /\.html?$/i.test(String(file.name || "")) && file.mime === "text/html";
+}
+
 /** Blatt mit Eselsohr, gezeichnet wie die übrigen Icons */
 function fileIcon() {
   if (typeof document.createElementNS !== "function") return null;
@@ -960,14 +978,36 @@ function fileIcon() {
 function fileCard(file) {
   if (!file || typeof file !== "object" || typeof file.id !== "string" || !FILE_ID_PATTERN.test(file.id)) return null;
   const href = "/api/files/" + encodeURIComponent(file.id);
-  return fileCardElement(file, href, previewType(file) ? href + "?inline=1" : null);
+  const inlineHref = href + "?inline=1";
+  const tag = mediaTag(file);
+  if (tag) {
+    const player = document.createElement(tag);
+    player.className = "file-media";
+    player.setAttribute("controls", "");
+    player.setAttribute("preload", tag === "video" ? "metadata" : "none");
+    player.setAttribute("src", inlineHref);
+    player.setAttribute("aria-label", String(file.name) + " abspielen");
+    return fileCardElement(file, href, null, [], player);
+  }
+  if (isHtmlFile(file)) {
+    const open = document.createElement("a");
+    open.className = "quiet-button file-open";
+    open.setAttribute("href", inlineHref);
+    open.setAttribute("target", "_blank");
+    open.setAttribute("rel", "noopener");
+    open.setAttribute("aria-label", String(file.name) + " öffnen");
+    open.textContent = "Öffnen";
+    return fileCardElement(file, href, null, [open]);
+  }
+  return fileCardElement(file, href, previewType(file) ? inlineHref : null);
 }
 
 /**
  * Karte mit Name, Größe, Herunterladen und, wenn previewHref gesetzt ist, der
- * Vorschau darüber; extra: weitere Elemente vor „Herunterladen"
+ * Vorschau darüber; extra: weitere Elemente vor „Herunterladen"; player:
+ * Audio oder Video über der Karte
  */
-function fileCardElement(file, href, previewHref, extra) {
+function fileCardElement(file, href, previewHref, extra, player) {
   const name = typeof file.name === "string" && file.name ? file.name : "Datei";
   const wrap = document.createElement("div");
   wrap.className = "file";
@@ -979,6 +1019,7 @@ function fileCardElement(file, href, previewHref, extra) {
     img.setAttribute("loading", "lazy");
     wrap.appendChild(img);
   }
+  if (player) wrap.appendChild(player);
   const card = document.createElement("div");
   card.className = "file-card";
   const icon = fileIcon();

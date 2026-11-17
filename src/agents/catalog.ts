@@ -22,6 +22,7 @@
  * Katalog (wie zuvor der switch in getAgentConfig).
  */
 
+import { claudeMissing } from "../lib/claude-availability";
 import { BRAND } from "../brand";
 import { readFileSync, statSync } from "fs";
 import { mkdir, readFile, writeFile } from "fs/promises";
@@ -416,7 +417,7 @@ export function getCatalogAgentConfig(raw: string, opts: AgentConfigOptions = {}
   const { BASE_CONTEXT, withoutStaticConsultation } = require("./prompt-parts") as typeof import("./prompt-parts");
   if (agent.origin === "builtin") {
     const config = builtinConfig(name);
-    let systemPrompt = withLongTaskRules(agent.systemPrompt);
+    let systemPrompt = withJobAvailability(withLongTaskRules(agent.systemPrompt));
     // Nur der Code-Prompt verliert seine feste Liste, ein gespeicherter bleibt wortgleich
     if (!hints && agent.promptSource === "code") systemPrompt = withoutStaticConsultation(systemPrompt);
     if (name === "general" && hints) systemPrompt += customInvokeHint(data);
@@ -429,7 +430,7 @@ export function getCatalogAgentConfig(raw: string, opts: AgentConfigOptions = {}
     : "";
   return {
     name,
-    systemPrompt: `${BASE_CONTEXT}\n\n${agent.systemPrompt}${invoke}`,
+    systemPrompt: withJobAvailability(`${BASE_CONTEXT}\n\n${agent.systemPrompt}${invoke}`),
     model: general.model,
     ...(general.effort ? { effort: general.effort } : {}),
   };
@@ -450,6 +451,18 @@ function withLongTaskRules(prompt: string): string {
   const stale = staleLongTaskRules(LONG_TASK_RULES);
   if (stale.test(prompt)) return prompt.replace(stale, () => LONG_TASK_RULES);
   return `${prompt}\n\n${LONG_TASK_RULES}\n`;
+}
+
+/**
+ * Ohne Claude Code (Issue #566, src/lib/claude-availability.ts) gibt es
+ * keine Hintergrund-Jobs: die Job-Regel weicht im Laufzeit-Prompt dem
+ * Hinweis, Arbeit auf mehrere Turns zu verteilen. Gespeicherte Prompts
+ * bleiben unverändert.
+ */
+function withJobAvailability(prompt: string): string {
+  if (!claudeMissing()) return prompt;
+  const { withoutJobRule } = require("./prompt-parts") as typeof import("./prompt-parts");
+  return withoutJobRule(prompt);
 }
 
 /** Erkennt den Block aus dem Code mit beliebigen Minutenwerten */

@@ -61,6 +61,11 @@ export interface TelegramHistory {
   hasMore: boolean;
 }
 
+export interface TelegramConversationLookup {
+  /** false: lastActivity nicht auffrischen */
+  activity?: boolean;
+}
+
 export interface TelegramSource {
   listConversations(): Promise<TelegramConversationList>;
   /**
@@ -68,8 +73,13 @@ export interface TelegramSource {
    * Die Löschvorschau nennt Topic-Namen nur bei dieser Chat-ID (Issue #51).
    */
   groupChatId?(): string | null;
-  /** Eintrag aus dem Bestand; null bei unbekannter ID */
-  getConversation(id: string): Promise<TelegramConversation | null>;
+  /**
+   * Eintrag aus dem Bestand; null bei unbekannter ID. Mit activity: false
+   * ohne Abfrage der letzten Aktivität (Issue #684): lastActivity ist dann der
+   * zuletzt bekannte Stand oder null. Für Aufrufer, die nur wissen wollen, ob
+   * es das Gespräch gibt, wie es heißt, wem es gehört und ob es geschlossen ist.
+   */
+  getConversation(id: string, lookup?: TelegramConversationLookup): Promise<TelegramConversation | null>;
   /** null bei unbekannter ID; before ist ein geprüfter ISO-Zeitpunkt */
   history(id: string, before?: string): Promise<TelegramHistory | null>;
 }

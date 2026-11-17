@@ -4,7 +4,7 @@
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { parseStartArgs, resolveJobTarget, runJobCli, type JobCliOptions } from "../src/lib/jobs/cli";
 import { claudeCommand, jobPrompt, startJob, type StartInput } from "../src/lib/jobs/runner";
@@ -109,6 +109,32 @@ describe("startJob", () => {
     expect(status).toMatchObject({ version: 1, title: given.title, phase: "running", target: { topicId: 443 }, maxHours: 6, model: "claude-test", fullAccess: false });
     expect(status.watcher?.pid).toBe(41_000);
     expect(deps.sent).toEqual([]);
+  });
+
+  test("Werkzeugregeln (Issue #493) stehen im Status; ohne Angabe fehlen sie", async () => {
+    const deps = fakeDeps(root);
+    deps.spawnWatcher = runningWatcher(deps);
+    const result = await startJob(input({ allowedTools: ["WebSearch"], deniedTools: ["Edit(./config/**)"] }), deps);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(await readStatus(root, result.id)).toMatchObject({ allowedTools: ["WebSearch"], deniedTools: ["Edit(./config/**)"], fullAccess: false });
+    const plain = await startJob(input(), deps);
+    if (!plain.ok) throw new Error("nicht gestartet");
+    const status = (await readStatus(root, plain.id))!;
+    expect("allowedTools" in status || "deniedTools" in status).toBe(false);
+  });
+
+  test("eigener Arbeitsordner (Issue #493): steht im Status; fehlt er, ist er relativ oder kommt --full-access dazu, startet nichts", async () => {
+    const deps = fakeDeps(root);
+    deps.spawnWatcher = runningWatcher(deps);
+    const work = join(root, "arbeitsordner");
+    mkdirSync(work, { recursive: true });
+    const result = await startJob(input({ workDir: work }), deps);
+    if (!result.ok) throw new Error("nicht gestartet");
+    expect(await readStatus(root, result.id)).toMatchObject({ workDir: work, fullAccess: false });
+    expect(await startJob(input({ workDir: join(root, "fehlt") }), deps)).toMatchObject({ ok: false });
+    expect(await startJob(input({ workDir: "relativ" }), deps)).toMatchObject({ ok: false });
+    expect(await startJob(input({ workDir: work, fullAccess: true }), deps)).toMatchObject({ ok: false, error: expect.stringContaining("nie mit --full-access") });
   });
 
   test("Wächter lässt sich nicht starten: Status „nicht gestartet“ und genau eine Meldung im Zielgespräch", async () => {

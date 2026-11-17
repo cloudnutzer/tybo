@@ -21,6 +21,13 @@
  * Seiten-Generatoren, ffmpeg, Sprach-Brücke. Scheitert etwas, kommt sofort
  * eine Meldung (`bun run notify --source software-update`).
  *
+ * Nach jedem `--apply` (auch wenn nichts neu kam oder nur ein Teil
+ * klappte) prüft der Lauf die Dienste aus "dienste" in config/wartung.json
+ * (Issue #486, src/lib/maintenance/services.ts): läuft einer älter als
+ * installiert, startet er ihn neu und prüft nach. Ohne Liste wird kein
+ * Dienst angefasst; der Bot selbst nur über restart:request. Nachts,
+ * mit --smoke und mit --dry-run startet nie ein Dienst neu.
+ *
  * Läuft auf Wunsch täglich um 03:00 als launchd-Dienst ai.tybo.software-update
  * (`bun run setup:launchd -- --service software-update`; nicht in „all“, weil
  * es fremde Software verändert). Das Ergebnis landet in
@@ -41,6 +48,8 @@ import { join } from "path";
 import { PROJECT_ROOT } from "./lib/env";
 import { atomicWriteFile } from "./lib/atomic-file";
 import { parakeetAvailability } from "./lib/speech/parakeet";
+import { isNewer, parseVersion } from "./lib/version";
+import { serviceProblems, serviceReportLines, type ServiceCheckRun } from "./lib/maintenance/services";
 
 export const UPDATE_STATE_FILE = join(PROJECT_ROOT, "data", "software-update.json");
 
@@ -72,6 +81,8 @@ export interface UpdateState {
   steps: StepResult[];
   /** Prüfung nach dem Update; fehlt, wenn nichts aktualisiert wurde */
   smoke?: SmokeResult[];
+  /** Dienst-Versionen nach --apply (Issue #486); fehlt ohne Dienste in config/wartung.json */
+  services?: ServiceCheckRun;
 }
 
 type Env = Record<string, string | undefined>;
@@ -119,21 +130,7 @@ export function failReason(r: RunResult): string {
   return (lines[lines.length - 1] ?? `Exit ${r.code}`).slice(0, 120);
 }
 
-/** Erste Versionsnummer in einer Ausgabe wie „2.1.293 (Claude Code)“ oder „codex-cli 0.159.2“ */
-export function parseVersion(text: string): string | undefined {
-  return text.match(/\d+\.\d+(?:\.\d+)?(?:[-+.][0-9A-Za-z.-]+)?/)?.[0];
-}
-
-/** Ist a neuer als b? Nur die Zahlen vor einem Zusatz zählen */
-export function isNewer(a: string, b: string): boolean {
-  const n = (v: string) => v.split(/[-+]/)[0].split(".").map(Number);
-  const [x, y] = [n(a), n(b)];
-  for (let i = 0; i < Math.max(x.length, y.length); i++) {
-    const d = (x[i] ?? 0) - (y[i] ?? 0);
-    if (d) return d > 0;
-  }
-  return false;
-}
+export { isNewer, parseVersion };
 
 export interface VersionTool {
   name: string;
@@ -240,6 +237,11 @@ export interface UpdateDeps {
   latestBun?: () => Promise<string | null>;
   /** Prüfung als eigener Prozess; Standard: `bun run src/software-update.ts --smoke` */
   smoke?: () => Promise<SmokeResult[]>;
+  /**
+   * Dienst-Versionen nach --apply, mit Neustart veralteter Dienste; null
+   * ohne Dienste. Ohne Angabe keine Dienstprüfung (main() setzt die echte).
+   */
+  services?: () => Promise<ServiceCheckRun | null>;
 }
 
 const failStep = (name: string) => (err: unknown): StepResult => ({ name, status: "fail", detail: String(err).slice(0, 120) });
@@ -261,7 +263,9 @@ export async function runUpdates(mode: UpdateMode = "nightly", deps: UpdateDeps 
   }
   const changed = steps.some(s => s.status === "updated" || (s.status === "fail" && mode === "apply"));
   const smoke = changed ? await (deps.smoke ?? (() => smokeInChild(runner)))().catch(err => [{ name: "Prüfung", ok: false, detail: String(err).slice(0, 120) }]) : undefined;
-  return { version: 1, mode, startedAt, finishedAt: now().toISOString(), steps, ...(smoke ? { smoke } : {}) };
+  // bei jedem --apply, auch ohne neue Pakete und nach Teilupdates
+  const services = mode === "apply" && deps.services ? await deps.services().catch((err): ServiceCheckRun => ({ mode: "neustart", startedAt: now().toISOString(), finishedAt: now().toISOString(), status: "fehler", services: [], error: String(err).slice(0, 120) })) : null;
+  return { version: 1, mode, startedAt, finishedAt: now().toISOString(), steps, ...(smoke ? { smoke } : {}), ...(services ? { services } : {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -374,17 +378,27 @@ export const REMINDER_WEEKDAY = 0;
 export function notificationText(state: UpdateState, weekday: number): string | null {
   const broken = (state.smoke ?? []).filter(s => !s.ok);
   const updated = state.steps.filter(s => s.status === "updated").map(stepVersions);
+  const services = serviceReportLines(state.services);
   if (broken.length) {
     return [
       "⚠️ Nach dem Software-Update ist etwas kaputt",
       updated.length ? `Aktualisiert: ${updated.join(", ")}` : "",
       ...broken.map(b => `❌ ${b.name}: ${b.detail}`),
+      ...services,
       "Die alten Versionen sind noch da (kein brew cleanup). Sag mir Bescheid, dann schaue ich es mir an.",
     ].filter(Boolean).join("\n");
   }
   if (state.mode === "apply") {
     const ok = (state.smoke ?? []).map(s => s.name).join(", ");
-    return [`✅ Software-Update eingespielt: ${updated.join(", ") || "nichts zu tun"}`, ok ? `Geprüft: ${ok}` : ""].filter(Boolean).join("\n");
+    const failed = state.steps.filter(s => s.status === "fail");
+    const servicesBad = !!state.services && (state.services.status !== "ok" || serviceProblems(state.services).length > 0);
+    const head = failed.length || servicesBad ? "⚠️ Software-Update mit Problemen" : "✅ Software-Update eingespielt";
+    return [
+      `${head}: ${updated.join(", ") || "nichts eingespielt"}`,
+      ...failed.map(s => `❌ ${describeStep(s)}`),
+      ok ? `Geprüft: ${ok}` : "",
+      ...services,
+    ].filter(Boolean).join("\n");
   }
   const available = state.steps.filter(s => s.status === "available");
   if (weekday === REMINDER_WEEKDAY && available.length) {
@@ -419,6 +433,7 @@ async function main(argv: string[]): Promise<number> {
     console.log("  brew: brew update, brew outdated (nur prüfen)");
     console.log("--apply: bun upgrade, brew update, brew upgrade (ohne cleanup)");
     console.log("danach, wenn etwas aktualisiert wurde: --smoke");
+    console.log("nach --apply immer: Dienste aus config/wartung.json prüfen, veraltete neu starten (Bot nur über restart:request)");
     return 0;
   }
   if (argv.includes("--smoke")) {
@@ -428,10 +443,13 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
   const mode: UpdateMode = argv.includes("--apply") ? "apply" : "nightly";
-  const state = await runUpdates(mode);
+  const { checkConfiguredServices } = await import("./lib/maintenance/services");
+  const { realServiceDeps } = await import("./lib/maintenance/service-deps");
+  const state = await runUpdates(mode, { services: () => checkConfiguredServices(PROJECT_ROOT, realServiceDeps(PROJECT_ROOT), "neustart") });
   console.log(`[${state.finishedAt}] Software-Updates (${mode === "apply" ? "einspielen" : "nachts"})`);
   for (const s of state.steps) console.log(describeStep(s));
   for (const s of state.smoke ?? []) console.log(`${s.ok ? "✅" : "❌"} ${s.name}: ${s.detail}`);
+  for (const line of serviceReportLines(state.services)) console.log(line);
   // Der Bot läuft noch mit dem alten Bun: Neustart nach der laufenden Antwort
   if (state.steps.some(s => s.name === "Bun" && s.status === "updated")) {
     await run(["bun", "run", "restart:request", "Bun-Update eingespielt"], { timeoutMs: 30_000 });

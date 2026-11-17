@@ -16,6 +16,8 @@ import {
   pm2FailureMessage,
   pm2ProcessNames,
   pm2StartCommand,
+  BOT_PM2_KILL_TIMEOUT_MS,
+  BOT_PM2_OPTIONS,
   realPm2Deps,
   savePm2,
   SUPABASE_DELETE_TIMEOUT_MS,
@@ -79,12 +81,14 @@ function fakePm2(running: string[], options: FakeOptions = {}) {
 }
 
 describe("pm2StartCommand", () => {
-  test("Bot: alle PM2-Optionen vor „--“, dahinter nur bun run <Einstieg>", () => {
+  test("Bot: alle PM2-Optionen vor „--“ samt --kill-timeout 10000, dahinter nur bun run <Einstieg>", () => {
     const cmd = pm2StartCommand("telegram-relay", ROOT, ["pm2"]);
     const sep = cmd.indexOf("--");
     const log = join(ROOT, "logs", "telegram-relay.log");
-    expect(cmd.slice(0, sep)).toEqual(["pm2", "start", "bun", "--name", BOT, "--output", log, "--error", log, "--merge-logs"]);
+    expect(cmd.slice(0, sep)).toEqual(["pm2", "start", "bun", "--name", BOT, "--kill-timeout", "10000", "--output", log, "--error", log, "--merge-logs"]);
     expect(cmd.slice(sep + 1)).toEqual(["run", join(ROOT, "src", "bot.ts")]);
+    expect(BOT_PM2_OPTIONS).toEqual(["--kill-timeout", String(BOT_PM2_KILL_TIMEOUT_MS)]);
+    expect(BOT_PM2_KILL_TIMEOUT_MS).toBe(10_000);
   });
 
   test("Supabase: --no-autorestart und Frist, Hülle mit --state, dann tybo datenbank start", () => {
@@ -116,6 +120,10 @@ describe("configurePM2Service", () => {
     expect(await configurePM2Service("telegram-relay", pm2.deps)).toEqual({ ok: true, service: "telegram-relay", name: BOT, replaced: false });
     expect(pm2.verbs()).toEqual(["jlist", `start ${BOT}`]);
     expect([...pm2.procs]).toEqual([BOT]);
+    // Die Frist zum Beenden steht im echten Aufruf vor „--“ (Issue #564)
+    const start = pm2.calls.find(c => c[1] === "start")!;
+    expect(start.slice(start.indexOf("--kill-timeout"), start.indexOf("--kill-timeout") + 2)).toEqual(["--kill-timeout", "10000"]);
+    expect(start.indexOf("--kill-timeout")).toBeLessThan(start.indexOf("--"));
   });
 
   test("vorhandener Eintrag: erst delete, dann start; genau ein Prozess", async () => {

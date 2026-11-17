@@ -158,7 +158,7 @@ describe("speechTurnOptions", () => {
       expect(settingsSchema.safeParse({ speech: { model } }).success).toBe(false);
     }
     expect(settingsSchema.safeParse({ speech: { effort: "medium" } }).success).toBe(true);
-    expect(settingsSchema.safeParse({ speech: { effort: "max" } }).success).toBe(false);
+    expect(settingsSchema.safeParse({ speech: { effort: "ultra" } }).success).toBe(false);
     expect(settingsSchema.safeParse({ speech: {} }).success).toBe(true);
   });
 });

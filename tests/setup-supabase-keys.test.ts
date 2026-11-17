@@ -128,7 +128,12 @@ describe("tybo pruefen: Datenbank", () => {
       };
       const ctx = await makeCtx({ env: `SUPABASE_URL=${FAKE.supabaseUrl}\n${line}\n`, overrides: { fetch } });
       await collectReport({ ctx: { ...ctx, providers: providers(fetch) }, steps: [], specials: [databaseCheck] });
-      expect(seen.map(s => new URL(s.url).pathname)).toEqual(["/rest/v1/messages", "/rest/v1/memory"]);
+      // messages und memory, danach nur die Schemaprobe (Issue #560): Strukturfragen mit limit=0 und das Verzeichnis
+      expect(seen.slice(0, 2).map(s => new URL(s.url).pathname)).toEqual(["/rest/v1/messages", "/rest/v1/memory"]);
+      for (const { url } of seen.slice(2)) {
+        const u = new URL(url);
+        expect(u.searchParams.get("limit") === "0" || u.pathname === "/rest/v1/").toBe(true);
+      }
       for (const { headers } of seen) {
         expect(headers.get("apikey")).toBe(key);
         expect(headers.get("authorization")).toBe(bearer ? `Bearer ${key}` : null);

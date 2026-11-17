@@ -4,9 +4,16 @@
  * Ein PhoneCaller kann zweierlei: einen Anruf beim Nutzer auslösen (dial)
  * und das Protokoll eines Anrufs abfragen (transcript). Heute gibt es einen
  * Anbieter: ElevenLabs Conversational AI, das über eine bei ElevenLabs
- * hinterlegte Twilio-Nummer wählt. Die Umgebungsvariablen bleiben die alten
+ * hinterlegte Nummer wählt. Die Umgebungsvariablen bleiben die alten
  * (ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID, ELEVENLABS_PHONE_NUMBER_ID,
  * USER_PHONE_NUMBER).
+ *
+ * Art der Nummer (Issue #511): ELEVENLABS_PHONE_PROVIDER, ohne Wert "twilio"
+ * wie bisher (POST /twilio/outbound-call), "sip_trunk" für eine Nummer am
+ * SIP-Trunk, etwa über die eigene Vermittlung (POST /sip-trunk/outbound-call).
+ * Der SIP-Aufruf kennt kein max_duration_seconds, die Höchstdauer setzt dort
+ * die Vermittlung; der erste Satz geht als conversation_config_override mit.
+ * Ein anderer Wert gilt als nicht eingerichtet: dann wird nicht gewählt.
  *
  * Das Protokoll kennt drei Zustände, die der Aufrufer unterscheiden muss:
  * - "pending": das Gespräch läuft noch oder wird noch verarbeitet, oder die
@@ -60,6 +67,16 @@ export interface PhoneCaller {
 
 const REQUIRED_ENV = ["ELEVENLABS_API_KEY", "ELEVENLABS_AGENT_ID", "ELEVENLABS_PHONE_NUMBER_ID", "USER_PHONE_NUMBER"] as const;
 
+export type PhoneProviderKind = "twilio" | "sip_trunk";
+
+/** Art der Nummer aus ELEVENLABS_PHONE_PROVIDER; null bei ungültigem Wert */
+export function phoneProviderKind(env: Env): PhoneProviderKind | null {
+  const raw = env.ELEVENLABS_PHONE_PROVIDER?.trim().toLowerCase() ?? "";
+  if (raw === "" || raw === "twilio") return "twilio";
+  if (raw === "sip_trunk") return "sip_trunk";
+  return null;
+}
+
 /**
  * Ob Anrufe eingerichtet sind (alle vier Variablen gesetzt). Hier statt in
  * index.ts, damit Werkzeug, Check-in und Briefing es ohne den Bot-Einstieg
@@ -94,34 +111,53 @@ export interface ElevenLabsCallerOptions {
   timeoutMs?: number;
 }
 
-/** ElevenLabs Conversational AI mit Twilio-Nummer */
+/** ElevenLabs Conversational AI mit Twilio-Nummer oder SIP-Trunk */
 export function createElevenLabsCaller(options: ElevenLabsCallerOptions = {}): PhoneCaller {
   const env = options.env ?? process.env;
   const doFetch: Fetch = options.fetch ?? ((url, init) => fetch(url, init));
   const timeoutMs = options.timeoutMs ?? PROVIDER_TIMEOUT_MS;
   const value = (name: (typeof REQUIRED_ENV)[number]) => env[name]?.trim() ?? "";
 
+  // Ungültige Art zählt wie eine fehlende Einstellung: lieber nicht wählen als über den falschen Weg
+  const missing = (): string[] => [
+    ...REQUIRED_ENV.filter(name => !value(name)),
+    ...(phoneProviderKind(env) === null ? ["ELEVENLABS_PHONE_PROVIDER"] : []),
+  ];
+
   return {
-    missing: () => REQUIRED_ENV.filter(name => !value(name)),
+    missing,
 
     async dial(request) {
-      const absent = REQUIRED_ENV.filter(name => !value(name));
+      const absent = missing();
       if (absent.length > 0) return { ok: false, error: `nicht eingerichtet (${absent.join(", ")})` };
+      const kind = phoneProviderKind(env) ?? "twilio";
+      const dynamic_variables = { ...request.variables, tybo_call_ref: request.ref };
+      const base = {
+        agent_id: value("ELEVENLABS_AGENT_ID"),
+        agent_phone_number_id: value("ELEVENLABS_PHONE_NUMBER_ID"),
+        to_number: value("USER_PHONE_NUMBER"),
+      };
+      const body =
+        kind === "sip_trunk"
+          ? {
+              ...base,
+              conversation_initiation_client_data: {
+                dynamic_variables,
+                conversation_config_override: { agent: { first_message: request.greeting } },
+              },
+            }
+          : {
+              ...base,
+              max_duration_seconds: MAX_CALL_SECONDS,
+              first_message: request.greeting,
+              conversation_initiation_client_data: { dynamic_variables },
+            };
       let response: Response;
       try {
-        response = await doFetch(`${ELEVENLABS_API}/twilio/outbound-call`, {
+        response = await doFetch(`${ELEVENLABS_API}/${kind === "sip_trunk" ? "sip-trunk" : "twilio"}/outbound-call`, {
           method: "POST",
           headers: { "xi-api-key": value("ELEVENLABS_API_KEY"), "Content-Type": "application/json" },
-          body: JSON.stringify({
-            agent_id: value("ELEVENLABS_AGENT_ID"),
-            agent_phone_number_id: value("ELEVENLABS_PHONE_NUMBER_ID"),
-            to_number: value("USER_PHONE_NUMBER"),
-            max_duration_seconds: MAX_CALL_SECONDS,
-            first_message: request.greeting,
-            conversation_initiation_client_data: {
-              dynamic_variables: { ...request.variables, tybo_call_ref: request.ref },
-            },
-          }),
+          body: JSON.stringify(body),
           signal: AbortSignal.timeout(timeoutMs),
         });
       } catch (err) {

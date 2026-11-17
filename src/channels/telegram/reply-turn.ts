@@ -17,6 +17,15 @@ import { ABORT_REPLY, SHUTDOWN_ABORT_REPLY, type TurnQuestion } from "../../lib/
 import { isAbortError } from "../../lib/execution-context";
 import { turnInfoCollector } from "../../lib/turn-collector";
 import type { FinishedTurn } from "../../lib/turn-finish";
+import { logErrorMasked } from "../../lib/telegram-token-mask";
+
+/**
+ * Antwort, wenn der Turn mit einem Fehler endet (Issue #565, Wortlaut nach
+ * R1-38): deutsch und mit dem nächsten Schritt, denn bei einem Dauerfehler
+ * hilft „noch einmal“ allein nicht weiter
+ */
+export const TELEGRAM_TURN_FAILED_TEXT =
+  "Das hat nicht geklappt. Versuch es noch einmal. Kommt das öfter: im Terminal tybo pruefen oder in der WebUI Einstellungen, Status.";
 
 /** Angaben, mit denen der Kanal den Turn startet (askWithProgress, src/app/bot-turns.ts) */
 export interface TelegramTurnRun {
@@ -58,7 +67,8 @@ export interface TelegramReplyInput<Ctx> {
 
 export function createTelegramReply<Ctx>(deps: TelegramReplyDeps<Ctx>): (input: TelegramReplyInput<Ctx>) => Promise<void> {
   const now = deps.now ?? Date.now;
-  const logError = deps.logError ?? ((message, error) => console.error(message, error));
+  // Ohne Token im Log (Issue #526)
+  const logError = deps.logError ?? logErrorMasked;
   const abortText = () => (deps.isShuttingDown() ? SHUTDOWN_ABORT_REPLY : ABORT_REPLY);
 
   return async ({ ctx, chatId, userMessage, agentName, topicId, threads }) => {
@@ -107,7 +117,7 @@ export function createTelegramReply<Ctx>(deps: TelegramReplyDeps<Ctx>): (input: 
         return;
       }
       logError("[Telegram] Antwort fehlgeschlagen:", error);
-      await deps.reply(ctx, "Something went wrong. Please try again.");
+      await deps.reply(ctx, TELEGRAM_TURN_FAILED_TEXT);
     } finally {
       typing.stop();
       deps.afterTurn(chatId, topicId);

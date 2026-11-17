@@ -23,6 +23,9 @@
  * übergebene Fabrik genau einen Bot, danach sofort der Output-Guard (Issue
  * #52), dann die Agenten-Identitäten und Rückfragen. start(onReady) startet das Polling
  * und ruft onReady genau einmal aus onStart (Ziele fortsetzen, Issue #190).
+ * Scheitert das Polling (401, 409), fängt startAfterFirstSweep den Fehler
+ * (Issue #562, telegram-intake.ts). Beim Polling erreicht deleteWebhook nie
+ * Telegram, auch nicht beim ersten Start: tybo verdrängt keinen anderen Bot.
  *
  * Ohne Telegram ruft das Modul die Fabrik nie auf und macht keinen
  * Netzaufruf: keine Agenten-Bots (auch nicht bei übrig gebliebenen
@@ -45,6 +48,8 @@ import { createTelegramChoices, type TelegramChoices } from "./telegram-choices"
 import { createTelegramVoiceSender } from "./voice-message";
 import { resolveRuntimeProfile } from "./runtime-profile";
 import { rightsFromChatMember, type TelegramTopicApi } from "../web/topics";
+import { safeErrorMessage } from "./telegram-token-mask";
+import { superviseTelegramIntake, type IntakeEvent, type TelegramStartOptions } from "./telegram-intake";
 
 type Env = Record<string, string | undefined>;
 type Log = (line: string) => void;
@@ -123,8 +128,14 @@ export interface TelegramRuntime {
   typing(chatId: string | number): Promise<void>;
   /** Agenten-Bots anmelden (getMe je Token); ohne Telegram nichts */
   initialize(): Promise<void>;
-  /** Polling bzw. Webhook-Listener starten, onReady genau einmal nach dem Start; ohne Telegram sofort */
-  start(onReady: () => unknown): Promise<void>;
+  /**
+   * Polling bzw. Webhook-Listener starten, onReady genau einmal je Laufzeit
+   * nach dem Start; ohne Telegram sofort. Beim Polling (Issue #562): nie
+   * deleteWebhook, options.onPolling nach jedem angenommenen getUpdates
+   */
+  start(onReady: () => unknown, options?: TelegramStartOptions): Promise<void>;
+  /** Bricht bei stop() ab; wartende Wiederholungen des Eingangs enden damit */
+  readonly stopSignal: AbortSignal;
   /** Port des Webhook-Listeners, solange er offen ist; sonst null */
   webhookPort(): number | null;
   /** Eingang relay: Update in dieselben Handler wie beim Polling; null vor der Anmeldung, nach stop() und in anderen Wegen */
@@ -150,11 +161,11 @@ export interface HandlerFailure {
 
 /**
  * Logzeile für einen Fehler in einem Telegram-Handler: Kennung des Updates
- * und Fehlermeldung, nie der Context mit Nachrichtentext oder Token.
+ * und Fehlermeldung, nie der Context mit Nachrichtentext oder Token. Auch
+ * die Meldung selbst kann die API-Adresse samt Token tragen (Issue #526).
  */
 export function handlerFailureLine(failure: HandlerFailure): string {
-  const { error } = failure;
-  const reason = error instanceof Error ? error.message : String(error);
+  const reason = safeErrorMessage(failure.error);
   const update = failure.ctx?.update?.update_id ?? "?";
   return `Telegram-Handler fehlgeschlagen (Update ${update}): ${reason}`;
 }
@@ -210,6 +221,22 @@ export function createTelegramRuntime(deps: TelegramRuntimeDeps): TelegramRuntim
   let relayOpen = false;
   let stopped = false;
   let readyFired = false;
+  const stopController = new AbortController();
+  // Issue #562: grammY ruft in jedem bot.start() deleteWebhook. Damit fiele
+  // der Webhook eines anderen Bots (Server) weg, schon beim ersten Start;
+  // deshalb beantwortet diese Schicht den Aufruf immer selbst, ohne Netz. Ein
+  // gesetzter Webhook bleibt stehen, getUpdates endet dann mit 409, und die
+  // Aufsicht versucht es später wieder. Ein angenommenes getUpdates meldet,
+  // dass der Eingang wirklich läuft
+  let onPolling: (() => void) | null = null;
+  if (intake.mode === "polling") {
+    bot.api.config.use(async (prev, method, payload, signal) => {
+      if (method === "deleteWebhook") return { ok: true, result: true } as Awaited<ReturnType<typeof prev>>;
+      const result = await prev(method, payload, signal);
+      if (method === "getUpdates" && result.ok && !stopped) onPolling?.();
+      return result;
+    });
+  }
   const once = (onReady: () => unknown) => {
     if (!readyFired) {
       readyFired = true;
@@ -253,7 +280,8 @@ export function createTelegramRuntime(deps: TelegramRuntimeDeps): TelegramRuntim
       initialized ??= agents.initialize();
       return initialized;
     },
-    start(onReady) {
+    stopSignal: stopController.signal,
+    start(onReady, options) {
       if (intake.mode === "off") return Promise.resolve(once(onReady));
       if (intake.mode === "relay") {
         return bot.init().then(
@@ -275,13 +303,12 @@ export function createTelegramRuntime(deps: TelegramRuntimeDeps): TelegramRuntim
           return once(onReady);
         });
       }
-      let ready = false;
+      onPolling = options?.onPolling ?? null;
+      // onStart kommt vor dem ersten getUpdates: online heißt hier angemeldet, nicht konfliktfrei
       return bot.start({
         onStart: (botInfo: UserFromGetMe) => {
           log(`Bot online as @${botInfo.username}`);
-          if (ready) return;
-          ready = true;
-          void onReady();
+          once(onReady);
         },
       });
     },
@@ -290,6 +317,7 @@ export function createTelegramRuntime(deps: TelegramRuntimeDeps): TelegramRuntim
     stop() {
       stopped = true;
       relayOpen = false;
+      stopController.abort();
       if (intake.mode === "off" || intake.mode === "relay") return;
       if (intake.mode === "webhook") {
         // Laufende Anfragen nicht abwarten; Telegram stellt Unbeantwortetes erneut zu
@@ -408,15 +436,25 @@ const reasonOf = (error: unknown) => (error instanceof Error ? error.message : S
  * Start nach der ersten Ablauf-Prüfung der Rückfragen (Issue #228): erst
  * wenn sie fertig ist (auch wenn sie scheitert), startet die Laufzeit, und
  * erst danach setzt onReady die Ziele fort. Sonst läuft ein Ziel schon, während
- * abgelaufene Rückfragen noch als offen gelten
+ * abgelaufene Rückfragen noch als offen gelten.
+ *
+ * Fehler beim Start (Issue #562) fängt die Aufsicht aus telegram-intake.ts:
+ * 409 und Anderes mit wachsender Pause, 401 ohne neuen Versuch; der Prozess
+ * lebt weiter, onReady läuft genau einmal. Wirft nie.
  */
 export async function startAfterFirstSweep(
-  runtime: Pick<TelegramRuntime, "start">,
+  runtime: Pick<TelegramRuntime, "start" | "stopSignal">,
   firstSweep: Promise<unknown>,
   onReady: () => unknown,
+  options: { report?(event: IntakeEvent): unknown; log?: Log; sleep?(ms: number, signal: AbortSignal): Promise<void>; now?(): number } = {},
 ): Promise<void> {
   await firstSweep.catch(() => {});
-  await runtime.start(onReady);
+  await superviseTelegramIntake({
+    start: (ready, startOptions) => runtime.start(ready, startOptions),
+    onReady,
+    signal: runtime.stopSignal,
+    ...options,
+  });
 }
 
 function createWebOnlyRuntime(log: Log, deps: TelegramRuntimeDeps): TelegramRuntime {
@@ -435,8 +473,10 @@ function createWebOnlyRuntime(log: Log, deps: TelegramRuntimeDeps): TelegramRunt
     sendWithKeyboardAsAgent: (_agent, chatId) => refuse("Agenten-Nachricht", chatId),
   };
   let started = false;
+  const stopController = new AbortController();
   return {
     telegram: false,
+    stopSignal: stopController.signal,
     bot: null,
     agents,
     // Ohne api und Besitzer: Register, Ablauf-Prüfung und Speichern, nichts nachzuziehen
@@ -459,6 +499,8 @@ function createWebOnlyRuntime(log: Log, deps: TelegramRuntimeDeps): TelegramRunt
     },
     webhookPort: () => null,
     relayIntake: () => null,
-    stop() {},
+    stop() {
+      stopController.abort();
+    },
   };
 }

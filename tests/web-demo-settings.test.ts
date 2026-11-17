@@ -38,7 +38,7 @@ test("GET /api/settings: Beispielstand mit geerbten Werten; PATCH wirkt nur im S
   expect(body.settings.agents.research).toEqual({ model: "claude-sonnet-5" });
   expect(body.effective.agents.research.model).toEqual({ value: "claude-sonnet-5", source: "settings" });
   expect(body.inherited.research.model).toEqual({ value: "claude-opus-5-5", source: "code" });
-  expect(body.effortLevels).toEqual(["low", "medium", "high", "xhigh"]);
+  expect(body.effortLevels).toEqual(["low", "medium", "high", "xhigh", "max"]);
 
   const patched = await api("/api/settings", "PATCH", { agents: { research: { model: null }, general: { effort: "low" } } });
   expect(patched.status).toBe(200);

@@ -2,8 +2,11 @@
  * Routinen-Zentrale (Issue #284, Entscheidung 0025): alle zeitgesteuerten
  * Dienste und Dauerdienste, nur lesend.
  *
- * Plattform: launchd nur unter macOS, sonst PM2, wenn `pm2` im PATH ist;
- * sonst available: false. Alles Äußere steckt in RoutinesDeps (Muster
+ * Plattform: launchd nur unter macOS. Unter Linux (Issue #568) die
+ * systemd-Timer und -Dienste tybo-* (wenn der Rechner mit systemd läuft)
+ * zusammen mit den PM2-Prozessen tybo-* (wenn `pm2` im PATH ist); sonst
+ * available: false. systemd-Routinen mit Wrapper bekommen ihren Verlauf aus
+ * data/routines/ai.tybo.<dienst>.json wie unter launchd. Alles Äußere steckt in RoutinesDeps (Muster
  * LaunchdDeps in src/setup/services/launchd.ts), Tests reichen Attrappen herein
  * und rufen nie echtes launchctl, plutil oder pm2 auf. Die PM2-CLI ruft auch
  * der echte Betrieb nie auf (siehe sources/pm2-rpc.ts).
@@ -18,8 +21,10 @@ import { parseRuns, runsFile, safeRoutineId, type RoutineRun } from "./runs";
 import { nextRun } from "./schedule";
 import { readLaunchdRoutines } from "./sources/launchd";
 import { readPm2Routines } from "./sources/pm2";
+import { readSystemdRoutines } from "./sources/systemd";
+import { launchdLabel } from "../service-names";
 import { pm2RpcSocketPath, queryPm2Daemon, type Pm2Query } from "./sources/pm2-rpc";
-import type { Routine, RoutineHistory, RoutineList, RunResult } from "./types";
+import type { Routine, RoutineHistory, RoutineList, RoutineSource, RunResult } from "./types";
 
 export type { Routine, RoutineHistory, RoutineList, RoutineState, RoutineSource } from "./types";
 
@@ -36,6 +41,10 @@ export interface RoutinesDeps {
   which(cmd: string): string | null;
   /** Prozessliste vom laufenden PM2-Daemon, ohne PM2-CLI; startet nie einen Daemon */
   pm2Query(): Promise<Pm2Query>;
+  /** Linux: läuft der Rechner mit systemd (/run/systemd/system)? Fehlt: nein (Issue #568) */
+  systemdBooted?(): boolean;
+  /** Ordner der systemd-Benutzereinheiten; fehlt: ~/.config/systemd/user */
+  systemdUnitDir?: string;
   /** Jetzt in ms (nächster Lauf, Issue #285) */
   now(): number;
   /** Zeitzone für Kalender-Zeitpläne; fehlt: die des Systems */
@@ -56,6 +65,15 @@ export function sortRoutines(routines: Routine[]): Routine[] {
   return [...routines].sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name, "de") : a.kind === "scheduled" ? -1 : 1));
 }
 
+/**
+ * Kennung des Verlaufs in data/routines/: launchd das Label; systemd
+ * (Issue #568) ai.tybo.<dienst>, denn der Wrapper läuft dort mit derselben
+ * Kennung wie unter launchd; PM2 hat keinen Verlauf.
+ */
+export function runsIdOf(r: Pick<Routine, "id" | "name" | "source">): string {
+  return r.source === "systemd" ? launchdLabel(r.name) : r.id;
+}
+
 /** Alle Läufe einer Routine aus data/routines/<id>.json, älteste zuerst; [] ohne Protokoll */
 export function readRoutineRuns(deps: Pick<RoutinesDeps, "projectRoot" | "readFile">, id: string): RoutineRun[] {
   if (!safeRoutineId(id)) return [];
@@ -68,7 +86,7 @@ export function readRoutineRuns(deps: Pick<RoutinesDeps, "projectRoot" | "readFi
  * nicht geladen oder unbekannt heißt null, die Anzeige sagt warum.
  */
 function withRuns(r: Routine, deps: RoutinesDeps): Routine {
-  const runs = readRoutineRuns(deps, r.id);
+  const runs = readRoutineRuns(deps, runsIdOf(r));
   const lastRun = runs.length ? runs[runs.length - 1] : null;
   const lastStart = lastRun ? Date.parse(lastRun.startedAt) : NaN;
   const next =
@@ -88,11 +106,25 @@ export async function listRoutines(deps: RoutinesDeps): Promise<RoutineList> {
     const routines = result.routines.map(r => withRuns(r, deps));
     return { available: true, source: "launchd", routines: sortRoutines(routines), notes: note ? [note, ...result.notes] : result.notes };
   }
-  if (deps.which("pm2")) {
-    const result = await readPm2Routines({ query: deps.pm2Query });
-    return { available: true, source: "pm2", routines: sortRoutines(result.routines), notes: result.notes };
+  const systemd = deps.platform === "linux" && deps.systemdBooted?.() === true;
+  const pm2 = !!deps.which("pm2");
+  if (!systemd && !pm2) return { available: false, source: null, routines: [], notes: [] };
+  const routines: Routine[] = [];
+  const notes: string[] = [];
+  const sources: RoutineSource[] = [];
+  if (systemd) {
+    const result = await readSystemdRoutines({ unitDir: deps.systemdUnitDir ?? join(deps.home, ".config", "systemd", "user"), listDir: deps.listDir, readFile: deps.readFile, run: deps.run });
+    routines.push(...result.routines.map(r => withRuns(r, deps)));
+    notes.push(...result.notes);
+    sources.push("systemd");
   }
-  return { available: false, source: null, routines: [], notes: [] };
+  if (pm2) {
+    const result = await readPm2Routines({ query: deps.pm2Query });
+    routines.push(...result.routines);
+    notes.push(...result.notes);
+    sources.push("pm2");
+  }
+  return { available: true, source: sources[0], sources, routines: sortRoutines(routines), notes };
 }
 
 /**
@@ -116,7 +148,7 @@ export async function routineHistory(deps: RoutinesDeps, query: string, by: "id"
   }
   const mask = (tail: string[]): string[] => (secrets ? tail.map(line => maskSecrets(line, secrets)) : tail.length ? [TAIL_HIDDEN] : []);
   const fallbackLog = routine.errorLogPath ?? routine.logPath ?? undefined;
-  const runs = (routine.source === "launchd" ? readRoutineRuns(deps, routine.id) : [])
+  const runs = (routine.source !== "pm2" ? readRoutineRuns(deps, runsIdOf(routine)) : [])
     .reverse()
     .map(run => ({ ...run, tail: mask(run.tail), ...(run.logPath ?? fallbackLog ? { logPath: run.logPath ?? fallbackLog } : {}) }));
   return { routine, runs, home: deps.home };
@@ -157,6 +189,8 @@ export function defaultRoutinesDeps(projectRoot: string, env: Record<string, str
     readFile: readOrNull,
     which: cmd => Bun.which(cmd),
     pm2Query: () => queryPm2Daemon(pm2RpcSocketPath(process.platform, env.PM2_HOME || join(home, ".pm2"))),
+    systemdBooted: () => existsSync("/run/systemd/system"),
+    systemdUnitDir: join(env.XDG_CONFIG_HOME || join(home, ".config"), "systemd", "user"),
     now: () => Date.now(),
     secrets: () => projectSecretsOrThrow(projectRoot, env),
   };

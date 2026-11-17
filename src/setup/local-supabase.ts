@@ -14,16 +14,18 @@
  *      über die Adressen im Heimnetz probieren; ist etwas offen oder nicht
  *      prüfbar, wird gestoppt (Schutz-Stopp, Erfolg wird nachgeprüft)
  *   3. supabase status -o json: Adressen und Schlüssel
- *   4. Bilder-Ordner vorab prüfen (ein öffentlicher führt zum Abbruch, bevor
- *      das Schema ihn umstellt), dann SCHEMA_FILES per SqlRunner, dann
- *      PostgREST das Schema neu laden lassen
+ *   4. Fehlende SCHEMA_FILES wie bei tybo datenbank start einspielen:
+ *      applyMissingMigrations prüft unter derselben Sperre zuerst Historie
+ *      und Bilder-Ordner, dann folgt der Nachlauf. Öffentliche Ordner führen
+ *      vor der ersten Datei zum Abbruch. Danach PostgREST neu laden lassen
  *   5. Bilder-Ordner privat anlegen (bucketSql wie in der Cloud)
  *   6. .env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY,
  *      nur was abweicht
  *   7. Verbindungstest (mit kurzem Warten, bis die REST-API das Schema kennt)
  *
- * Wiederholbar: Läuft schon alles, ist start schnell und ändert nichts, das
- * Schema ist wiederholbar, die .env bleibt, wenn nichts abweicht.
+ * Wiederholbar: Läuft schon alles, ist start schnell und ändert nichts, vom
+ * Schema läuft nur, was die Historie nicht kennt, die .env bleibt, wenn
+ * nichts abweicht.
  *
  * Schlüssel und DB_URL erscheinen nie in Meldungen, Fortschritt oder Log:
  * alle Sätze stehen fest in diesem Code, Ausgaben der CLI und Fehler von
@@ -38,7 +40,7 @@
  */
 
 import { readFileSync } from "node:fs";
-import { chmod, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { connect } from "node:net";
 import { networkInterfaces, totalmem } from "node:os";
 import { join, resolve } from "node:path";
@@ -49,7 +51,9 @@ import { readSetupEnv, type CommandResult, type SetupContext } from "./context";
 import type { ApplyResult, RunReport, SetupValues } from "./model";
 import { trackSafetyWork, writeEnv } from "./steps/common";
 import { isSupabaseCloudUrl } from "./supabase-management";
-import { bucketSql, isValidBucketName, RELOAD_SCHEMA_SQL, SCHEMA_FILES } from "./supabase-schema";
+import { applyMissingMigrations, type LocalMigrationBlock } from "./local-migrations";
+import { schemaFileLabel } from "../lib/schema-probe";
+import { bucketSql, isValidBucketName, RELOAD_SCHEMA_SQL, stripOuterTransaction } from "./supabase-schema";
 
 // ---------------------------------------------------------------------------
 // Feste Werte
@@ -137,6 +141,12 @@ const TOTAL = 7;
 export interface SqlSession {
   /** Führt eine Datei aus (mehrere Anweisungen, ohne Parameter) */
   file(path: string): Promise<void>;
+  /**
+   * Datei ohne ihre eigenen BEGIN/COMMIT-Zeilen, danach die Anweisungen in
+   * after, alles in einer Transaktion (Issue #560): scheitert etwas, gilt
+   * nichts davon
+   */
+  fileInTransaction(path: string, after: string[]): Promise<void>;
   query(text: string): Promise<Array<Record<string, unknown>>>;
   /** Schließt die Verbindung; wirft nie */
   close(): Promise<void>;
@@ -162,6 +172,13 @@ export const bunSqlRunner: SqlRunner = (dbUrl, signal) => {
   return {
     async file(path) {
       await sql.file(path);
+    },
+    async fileInTransaction(path, after) {
+      const body = stripOuterTransaction(await readFile(path, "utf8"));
+      await sql.begin(async tx => {
+        await tx.unsafe(body).simple();
+        for (const statement of after) await tx.unsafe(statement);
+      });
     },
     async query(text) {
       return [...(await sql.unsafe(text))] as Array<Record<string, unknown>>;
@@ -544,7 +561,7 @@ export function localPlan(values: SetupValues): string[] {
     `Prüfen: Docker installiert und gestartet, Supabase-CLI ${SUPABASE_CLI_VERSION} (lädt Bun beim ersten Mal selbst), Arbeitsspeicher. Installiert wird nichts.`,
     "Supabase in Docker starten, aus dem Ordner supabase/ des Projekts, ohne Dienste, die tybo nicht braucht. Beim ersten Mal lädt Docker einige GB, das dauert einige Minuten.",
     `Prüfen, dass Supabase nur auf diesem Rechner erreichbar ist, nicht aus dem Heimnetz: eigenes Docker-Netz ${LOCAL_NETWORK}, das alle Ports an 127.0.0.1 bindet, nach dem Start die Bindungen nachsehen und die Ports aus dem Heimnetz probieren.`,
-    "Tabellen einspielen (db/schema.sql und db/migrations), wiederholbar.",
+    "Tabellen einspielen (db/schema.sql und db/migrations), nur was noch nicht verbucht ist.",
     "Privaten Bilder-Ordner anlegen (SUPABASE_ASSETS_BUCKET, sonst tybo-assets).",
     `SUPABASE_URL (${LOCAL_SUPABASE_URL}), SUPABASE_SERVICE_ROLE_KEY und SUPABASE_ANON_KEY in die .env schreiben.`,
   ];
@@ -645,18 +662,29 @@ export async function runSupabaseLocal(values: SetupValues, ctx: SetupContext, r
 
   // 4. und 5. Schema und Bilder-Ordner, eine Sitzung, zuverlässig geschlossen
   const session = deps.sql(parsed.dbUrl, signal);
-  let stage: "bucket-check" | "schema" | "reload" | "bucket" = "bucket-check";
+  let stage: "schema" | "reload" | "bucket" = "schema";
   try {
     report({ at: 4, total: TOTAL, label: "Spiele die Tabellen ein" });
-    // Vorab: ein öffentlicher Ordner führt zum Abbruch, bevor das Schema ihn umstellt
-    const before = await session.query(bucketStateSql(bucket));
-    if (signal.aborted) return abortedAfterStart();
-    if (before[0]?.public === true) return fail(publicBucketText());
-    stage = "schema";
-    for (const file of SCHEMA_FILES) {
-      if (signal.aborted) return abortedAfterStart();
-      report({ at: 4, total: TOTAL, label: "Spiele die Tabellen ein", detail: file });
-      await session.file(join(root, file));
+    // Derselbe gesperrte Weg wie beim Datenbankstart, einschließlich der
+    // Vorbedingungen; bei Historienlücken bleibt die Verbuchung bis zum
+    // Abschluss des nötigen Nachlaufs offen.
+    const migrated = await applyMissingMigrations({
+      session,
+      root,
+      now: () => ctx.now(),
+      signal,
+      bucket,
+      reload: false,
+      sleep: (ms, s) => ctx.sleep(ms, s),
+      onWait: () => report({ at: 4, total: TOTAL, label: "Spiele die Tabellen ein", detail: MIGRATION_WAIT_TEXT }),
+      onFile: file => report({ at: 4, total: TOTAL, label: "Spiele die Tabellen ein", detail: file }),
+    });
+    if (signal.aborted || (!migrated.ok && migrated.aborted)) return abortedAfterStart();
+    if (!migrated.ok && migrated.blocked) return fail(migrationBlockText(migrated.blocked) + " Die .env ist unverändert.");
+    if (!migrated.ok && migrated.busy) return fail(`Die Tabellen ließen sich nicht einspielen: ${MIGRATION_BUSY} Die .env ist unverändert. Die Einrichtung danach erneut starten.`);
+    if (!migrated.ok) {
+      const which = migrated.failed ? ` Gescheitert ist ${schemaFileLabel(migrated.failed)}; diese Transaktion ist zurückgenommen. Der nächste Versuch setzt anhand der Historie fort und wiederholt bei einer Lücke den nötigen Nachlauf.` : "";
+      return fail(`Die Tabellen ließen sich nicht einspielen.${which} Die .env ist unverändert. Die Einrichtung erneut starten; bleibt der Fehler, Supabase mit ${cliHint("stop --workdir " + root)} anhalten und neu einrichten (die Daten bleiben).`);
     }
     stage = "reload";
     await session.query(RELOAD_SCHEMA_SQL);
@@ -667,7 +695,7 @@ export async function runSupabaseLocal(values: SetupValues, ctx: SetupContext, r
     const rows = await session.query(bucketSql(bucket));
     if (signal.aborted) return abortedAfterStart();
     const isPublic = rows[0]?.public;
-    if (isPublic === true) return fail(publicBucketText());
+    if (isPublic === true) return fail(publicBucketText(bucket) + " Die .env ist unverändert.");
     if (isPublic !== false) return fail("Der Bilder-Ordner ließ sich nicht prüfen. Die Einrichtung erneut starten. Die .env ist unverändert.");
   } catch {
     if (signal.aborted) return abortedAfterStart();
@@ -675,7 +703,7 @@ export async function runSupabaseLocal(values: SetupValues, ctx: SetupContext, r
     const what =
       stage === "schema"
         ? "Die Tabellen ließen sich nicht einspielen."
-        : stage === "bucket" || stage === "bucket-check"
+        : stage === "bucket"
           ? "Der Bilder-Ordner ließ sich nicht prüfen oder anlegen (läuft der Storage-Dienst?)."
           : "Die REST-API ließ sich nicht neu laden.";
     return fail(`${what} Die .env ist unverändert. Die Einrichtung erneut starten; bleibt der Fehler, Supabase mit ${cliHint("stop --workdir " + root)} anhalten und neu einrichten (die Daten bleiben).`);
@@ -780,14 +808,15 @@ export async function dockerLoginHint(ctx: SetupContext): Promise<string> {
   }
 }
 
-/** Zustand eines Bilder-Ordners, ohne ihn anzulegen (keine Zeile: gibt es nicht) */
-export function bucketStateSql(name: string): string {
-  if (!isValidBucketName(name)) throw new Error("Ungültiger Name für den Bilder-Ordner");
-  return `select public from storage.buckets where id = '${name}';`;
+function publicBucketText(bucket: string): string {
+  return "Der Bilder-Ordner „" + bucket + "“ ist in der lokalen Supabase öffentlich. tybo stellt ihn nicht still um, damit bestehende öffentliche Bildlinks erhalten bleiben. Den Ordner und seine Bildlinks prüfen; erst nach einer bewussten Umstellung auf privat erneut starten.";
 }
 
-function publicBucketText(): string {
-  return "Der Bilder-Ordner aus SUPABASE_ASSETS_BUCKET ist in der lokalen Supabase öffentlich. tybo braucht einen privaten und stellt ihn nicht still um: einen anderen Namen in SUPABASE_ASSETS_BUCKET eintragen, dann die Einrichtung erneut starten. Die .env ist unverändert.";
+function migrationBlockText(blocked: LocalMigrationBlock): string {
+  const reason = blocked.reason === "public-bucket"
+    ? publicBucketText(blocked.bucket)
+    : "Der Bilder-Ordner „" + blocked.bucket + "“ ließ sich nicht prüfen. Den Storage-Dienst prüfen und erneut starten.";
+  return reason + " Es wurde keine Migrationsdatei eingespielt oder verbucht.";
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,6 +1055,9 @@ async function databaseStart(o: DatabaseCommandOptions, studio: boolean): Promis
     err(exposedText(guard, root));
     return 1;
   }
+  // Fehlende Migrationen nach einem Update (Issue #560), erst nach Start und Schutzprüfung
+  const migrated = await syncLocalMigrations(o, retry);
+  if (migrated !== 0) return migrated;
   out(`Supabase läuft auf diesem Rechner: ${LOCAL_SUPABASE_URL}`);
   const after = await runningContainers(ctx);
   if (studio) {
@@ -1034,6 +1066,67 @@ async function databaseStart(o: DatabaseCommandOptions, studio: boolean): Promis
     out(`Studio läuft noch (${LOCAL_STUDIO_URL}). Ausschalten: ${DB_CLI} stop, dann ${DB_CLI} start.`);
   }
   return 0;
+}
+
+/**
+ * Spielt fehlende Dateien aus SCHEMA_FILES ein (src/setup/local-migrations.ts).
+ * Die Adresse der Datenbank kommt still aus supabase status (nie in eine
+ * Ausgabe); 0 bei Erfolg, sonst der Exit-Code
+ */
+/** Ein anderer Lauf (Setup oder Datenbankstart) hält die Sperre der Migrationen */
+const MIGRATION_WAIT_TEXT = "Warte, bis ein anderer Lauf (tybo setup datenbank oder tybo datenbank start) seine Migrationen eingespielt hat.";
+const MIGRATION_BUSY = "ein anderer Lauf (tybo setup datenbank oder tybo datenbank start) spielt seit über zehn Minuten Migrationen ein, darum ist hier nichts eingespielt.";
+
+async function syncLocalMigrations(o: DatabaseCommandOptions, retry: string): Promise<number> {
+  const { ctx, out, err, signal } = o;
+  const deps = o.deps ?? localDeps(ctx);
+  const root = ctx.root;
+  const status = await ctx.run(supabaseCli(["status", "--workdir", root, "-o", "json"]), { timeoutMs: STATUS_TIMEOUT_MS, signal, cwd: root, env: cliEnv() });
+  if (status.aborted || signal?.aborted) {
+    err("Abgebrochen. Supabase läuft, fehlende Migrationen sind nicht geprüft.");
+    return EXIT_ABORTED;
+  }
+  const parsed = status.code === 0 ? parseStatus(status.stdout) : null;
+  if (!parsed || "problem" in parsed) {
+    err(`Supabase läuft, aber supabase status antwortet nicht lesbar: fehlende Migrationen sind nicht geprüft. Erneut: ${retry}`);
+    return 1;
+  }
+  const session = deps.sql(parsed.dbUrl, signal ?? new AbortController().signal);
+  try {
+    const result = await applyMissingMigrations({
+      session,
+      root,
+      now: () => ctx.now(),
+      signal,
+      sleep: (ms, s) => ctx.sleep(ms, s),
+      onWait: () => out(MIGRATION_WAIT_TEXT),
+      onFile: file => out(`Spiele Migration ein: ${schemaFileLabel(file)}`),
+    });
+    if (!result.ok && result.aborted) {
+      err("Abgebrochen. Supabase läuft; der nächste Start setzt anhand der Historie fort. Bei einer Historienlücke wiederholt er auch schon eingespielte Dateien.");
+      return EXIT_ABORTED;
+    }
+    if (!result.ok && result.blocked) {
+      err(migrationBlockText(result.blocked));
+      return 1;
+    }
+    if (!result.ok && result.busy) {
+      err(`Supabase läuft, aber ${MIGRATION_BUSY} Erneut: ${retry}`);
+      return 1;
+    }
+    if (!result.ok) {
+      const what = result.failed
+        ? `die Migration ${schemaFileLabel(result.failed)} ließ sich nicht einspielen und verbuchen (beides ist zurückgenommen)`
+        : "die Liste der eingespielten Migrationen ließ sich nicht lesen";
+      const done = result.applied.length ? ` Bereits eingespielt: ${result.applied.map(schemaFileLabel).join(", ")}. Bei einer Historienlücke ist deren Verbuchung noch offen; der nächste Start wiederholt den nötigen Nachlauf.` : "";
+      err(`Supabase läuft, aber ${what}.${done} Erneut: ${retry}; bleibt der Fehler, die Datei im SQL-Editor von Studio (${retry} --studio) ausführen, dort steht die Meldung von Postgres.`);
+      return 1;
+    }
+    if (result.applied.length) out(`${result.applied.length === 1 ? "1 Migration" : `${result.applied.length} Migrationen`} eingespielt.`);
+    return 0;
+  } finally {
+    await session.close();
+  }
 }
 
 async function databaseStop(o: DatabaseCommandOptions): Promise<number> {

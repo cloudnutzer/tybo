@@ -1,7 +1,9 @@
 /**
  * `tybo dienste` (Issue #369, Linux seit #370): tybo-Dienste einrichten,
  * unter macOS mit launchd, unter Linux Bot und Supabase mit PM2 und
- * Check-in und Briefing als systemd-Timer (ohne systemd cron).
+ * Check-in, Briefing, Wartung und Nachtcheck (seit #568) als systemd-Timer
+ * (ohne systemd cron, den Nachtcheck dann unter PM2 als Zeitplan, wenn pm2
+ * installiert ist).
  * `bun run setup:launchd` ist derselbe Befehl, damit bleibt
  * `bun run setup:launchd -- --service <name>` gültig.
  *
@@ -9,16 +11,26 @@
  *   tybo dienste all | <dienst>       auch als --service all | --service <dienst>
  *   tybo dienste help
  *
- * „all“ lässt software-update weg und nimmt supabase nur bei lokaler
+ * „all“ lässt software-update und wartung weg und nimmt supabase nur bei lokaler
  * SUPABASE_URL mit (selectServices). Unveränderte, geladene Dienste bleiben
  * unberührt. Projektordner und .env kommen vom Aufrufer (Installationsordner
  * bzw. TYBO_ROOT), nie aus dem Arbeitsverzeichnis. `bun run setup:services`
  * ist seit #370 derselbe Befehl.
  *
  * Linux: „all“ nimmt nur Dienste mit Linux-Weg im Katalog (telegram-relay,
- * smart-checkin, morning-briefing, bei lokaler Datenbank supabase). PM2-
+ * smart-checkin, morning-briefing, health-check, bei lokaler Datenbank
+ * supabase). Der Nachtcheck läuft nie doppelt, auch bei Fehlern: mit
+ * systemd als Timer (vorher wird geprüft, ob er unter PM2 läuft oder in
+ * dessen Sicherung steht; ist das nicht lesbar, entsteht kein Timer; ein
+ * PM2-Eintrag wird nach dem Timer entfernt und sofort gesichert, ein nur
+ * gesicherter aus der Sicherung gestrichen; scheitert eins davon, wird der
+ * Timer wieder abgeschaltet), ohne systemd unter PM2 oder, ohne
+ * antwortendes pm2, als cron-Zeile, aber nur, wenn PM2 ihn weder führt noch
+ * gesichert hat (pm2-schedule.ts). PM2-
  * Dienste starten nur, wenn das installierte pm2 antwortet; danach einmal
- * `pm2 save`. Ist der Bot schon als systemd-Benutzerdienst eingerichtet
+ * `pm2 save`, nach einem entfernten Prozess `pm2 save --force` (sonst bliebe
+ * bei leerer Liste die alte Sicherung stehen und `pm2 resurrect` holte den
+ * Prozess zurück). Ist der Bot schon als systemd-Benutzerdienst eingerichtet
  * (tybo setup autostart; Unit-Datei oder geladener Dienst), startet PM2
  * keinen zweiten und muss dafür nicht installiert sein; antwortet
  * systemctl --user nicht, startet ebenfalls keiner (Fehler). Windows: keine
@@ -33,10 +45,11 @@
 import { join } from "node:path";
 import { BRAND } from "../../brand";
 import { SERVICE_NAMES, serviceDefinition, type ServiceName } from "../../lib/services/catalog";
-import { BOT_SERVICE, systemdUnitFile } from "../../lib/service-names";
+import { BOT_SERVICE, pm2Name, systemdUnitFile } from "../../lib/service-names";
 import { systemdBooted, systemdUnitPath, systemdUnitState } from "../../../setup/configure-systemd";
 import { selectServices, setUpService, type LaunchdDeps, type LaunchdOutcome } from "./launchd";
-import { LINUX_SERVICES_HINT, setUpTimer, type LinuxDeps } from "./linux";
+import { disableTimer, LINUX_SERVICES_HINT, setUpTimer, type LinuxDeps } from "./linux";
+import { findPm2Schedule, removePm2Schedule, removeSavedPm2Schedule, setUpPm2Schedule } from "./pm2-schedule";
 import { configurePM2Service, pm2Installed, savePm2, type Pm2Deps, type Pm2Service } from "./pm2";
 
 export interface ServicesCommandOptions {
@@ -55,9 +68,10 @@ export function servicesUsage(): string {
     `${BRAND.cli} dienste <Dienst>        nur diesen Dienst; auch --service <Dienst>`,
     "",
     `Dienste: ${SERVICE_NAMES.join(", ")}, all`,
-    "all lässt software-update weg und nimmt supabase nur mit, wenn SUPABASE_URL auf dieses Gerät zeigt.",
+    "all lässt software-update und wartung weg und nimmt supabase nur mit, wenn SUPABASE_URL auf dieses Gerät zeigt.",
     "Unveränderte, schon geladene Dienste werden nicht neu geladen.",
-    "macOS: launchd. Linux: Bot und Supabase unter PM2, Check-in und Briefing als systemd-Timer (ohne systemd: cron).",
+    "macOS: launchd. Linux: Bot und Supabase unter PM2, Check-in, Briefing, Wartung und Nachtcheck als systemd-Timer in der Zeitzone aus USER_TIMEZONE.",
+    "Linux ohne systemd: Nachtcheck unter PM2 als Zeitplan (ohne pm2: cron), die übrigen Routinen als cron-Zeilen.",
   ].join("\n");
 }
 
@@ -151,16 +165,67 @@ async function runLinux(request: string, selected: ServiceName[], options: Servi
   const needsPm2 = chosen.some(viaPm2);
   const pm2Ready = needsPm2 && (await pm2Installed(pm2));
   if (needsPm2 && !pm2Ready) err("PM2 fehlt oder antwortet nicht. Installieren mit: npm install -g pm2");
+  // Ohne systemd: Dienste mit pm2Schedule unter PM2, sofern es antwortet (sonst cron)
+  const withSystemd = timers.exists(timers.runDir);
+  const schedulePm2 = !withSystemd && chosen.some(service => serviceDefinition(service).pm2Schedule) && (pm2Ready || (await pm2Installed(pm2)));
 
   const results = new Map<ServiceName, LinuxResult>();
   let pm2Changed = false;
+  // Änderungen an PM2 seit der letzten Sicherung
+  let pm2Unsaved = false;
+  // Ein Prozess ist aus PM2 verschwunden: die Liste auch leer sichern (pm2 save --force)
+  let pm2Removed = false;
+  // Eine Sicherung ist gescheitert: keine spätere, sonst fehlte ein zurückgenommener Zeitplan auch dort
+  let saveFailed = false;
   for (const service of chosen) {
     const def = serviceDefinition(service);
     if (!def.linux) {
       err(def.kind === "external" ? `${service} richtet ${BRAND.name} nicht ein.` : `${service} gibt es nur unter macOS.`);
       results.set(service, "failed");
+    } else if (def.linux === "timer" && def.pm2Schedule && schedulePm2) {
+      const outcome = await setUpPm2Schedule(service, timers, pm2);
+      const removed = !outcome.ok && outcome.pm2Removed === true;
+      pm2Changed ||= outcome.ok || removed;
+      pm2Unsaved ||= outcome.ok || removed;
+      pm2Removed ||= removed;
+      results.set(service, outcome.ok ? "ok" : "failed");
     } else if (def.linux === "timer") {
-      results.set(service, (await setUpTimer(service, timers)).ok ? "ok" : "failed");
+      // Vor jedem neuen Zeitplan prüfen, ob derselbe Dienst unter PM2 läuft oder gesichert ist (über den
+      // Socket, auch wenn die PM2-CLI fehlt: das beendet den Daemon nicht); unklar heißt kein neuer
+      const pm2Entry = def.pm2Schedule ? await findPm2Schedule(service, pm2, timers, withSystemd ? "Kein Timer eingerichtet" : "Keine cron-Zeile eingerichtet") : "none";
+      if (!withSystemd && pm2Entry !== "none") {
+        // Ohne systemd und ohne antwortende PM2-CLI lässt sich der PM2-Eintrag nicht entfernen: keine cron-Zeile dazu
+        if (pm2Entry !== "failed") {
+          const name = pm2Name(service);
+          timers.log(`\n  ✗ ${service}: ${name} steht unter PM2 (läuft oder ist gesichert), aber pm2 antwortet nicht. Keine cron-Zeile eingerichtet, sonst liefe der Dienst doppelt. pm2 reparieren und erneut einrichten, oder den Eintrag mit „pm2 delete ${name}“ und „pm2 save --force“ entfernen.`);
+        }
+        results.set(service, "failed");
+        continue;
+      }
+      if (def.pm2Schedule && !withSystemd) out(`\n  ${service}: PM2 fehlt, darum als cron-Zeile.`);
+      let ok = pm2Entry !== "failed" && (await setUpTimer(service, timers)).ok;
+      if (ok && pm2Entry === "present") {
+        if (!(await removePm2Schedule(service, pm2, line => timers.log(line)))) {
+          // Der PM2-Eintrag bleibt: Timer wieder abschalten, sonst liefe der Dienst doppelt
+          await disableTimer(service, timers);
+          ok = false;
+        } else if (await savePm2(pm2, { force: true })) {
+          // Erst gesichert ist der PM2-Zeitplan wirklich weg (sonst holte pm2 resurrect ihn neben den Timer zurück)
+          pm2Changed = true;
+          pm2Unsaved = false;
+          pm2Removed = false;
+        } else {
+          // Die Sicherung nennt ihn weiter: Timer wieder abschalten, damit nach dem Hochfahren nur PM2 gilt
+          saveFailed = true;
+          await disableTimer(service, timers, `die gesicherte PM2-Liste nennt ${pm2Name(service)} weiter, er startet wieder, sobald PM2 neu startet (pm2 resurrect). Bis dahin läuft der Dienst nicht. Erneut einrichten, wenn pm2 save wieder geht.`);
+          ok = false;
+        }
+      } else if (ok && pm2Entry === "saved" && !removeSavedPm2Schedule(service, pm2, timers)) {
+        // Die Sicherung nennt ihn weiter: Timer wieder abschalten, sonst kämen beim Hochfahren beide
+        await disableTimer(service, timers, `die gesicherte PM2-Liste nennt ${pm2Name(service)} weiter.`);
+        ok = false;
+      }
+      results.set(service, ok ? "ok" : "failed");
     } else if (service === BOT_SERVICE && botSystemd === "unknown") {
       err(`Ob der Bot schon als systemd-Benutzerdienst läuft, ist unklar: systemctl --user antwortet nicht. PM2 startet keinen zweiten. Als normaler Benutzer in einer Anmeldesitzung erneut ausführen.`);
       results.set(service, "failed");
@@ -175,11 +240,12 @@ async function runLinux(request: string, selected: ServiceName[], options: Servi
     } else {
       const outcome = await configurePM2Service(service as Pm2Service, pm2);
       pm2Changed ||= outcome.ok;
+      pm2Unsaved ||= outcome.ok;
       results.set(service, outcome.ok ? "ok" : "failed");
     }
   }
 
-  const saved = !pm2Changed || (await savePm2(pm2));
+  const saved = !saveFailed && (!pm2Unsaved || (await savePm2(pm2, { force: pm2Removed })));
   const named = (want: LinuxResult) => chosen.filter(service => results.get(service) === want);
   out("");
   out(`Eingerichtet: ${countWord(named("ok").length)}`);

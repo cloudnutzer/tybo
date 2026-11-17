@@ -6,11 +6,19 @@
  * - frisch (buildPromptContext): alles, dazu der Kontext für die
  *   Fallback-Kette (src/lib/fallback/chain.ts), falls der Motor scheitert
  * - fortgesetzt (buildResumePrompt): die Session kennt den Rest schon, also
- *   nur Zeit, Kanal, neue Merk-Einträge, Suchtreffer und die Nachricht
+ *   nur Zeit, Kanal, neue Merk-Einträge, passende Fakten, Suchtreffer und die
+ *   Nachricht
  *
  * Regeln (docs/topic-sessions.md F-2/F-3): Der Verlauf kommt nur aus dem
  * eigenen Topic (Direktchat und General zählen als ein Topic ohne Nummer).
  * Die semantische Suche läuft bei jeder Nachricht und über alle Topics.
+ * Fakten (Issue #523): Der fortgesetzte Prompt bringt höchstens FOLLOW_UP_FACTS
+ * passende Fakten, die die Session noch nicht kennt, aus demselben Suchvektor wie
+ * die Treffer; was gezeigt wurde, meldet er über onFactsShown, gespeichert wird es
+ * erst nach einem gelungenen Lauf (chat-turn.ts, session-manager.ts).
+ * Der feste Kern (memory/core.ts, Issue #522) steht nur im frischen Prompt und
+ * im Fallback-Kontext, neben dem Profil und außerhalb des Budgets der
+ * Ähnlichkeitssuche; gelesen wird er jedes Mal, also ohne Neustart aktuell.
  * Kanalregeln stehen in beiden Formen, weil eine Session zwischen Telegram
  * und Browser wechseln kann; ohne Angabe gilt Telegram. Wen der Agent fragen
  * darf, steht nur im erzeugten Abschnitt (formatConsultationRules): der feste
@@ -23,6 +31,7 @@ import { getAgentConfigOrGeneral, getUserProfile } from "../agents";
 import type { AgentConfig } from "../agents/types";
 import {
   DEFAULT_PROMPT_CHANNEL,
+  factLookupSection,
   FALLBACK_SYSTEM_PROMPT,
   formatChannelRules,
   formatConsultationRules,
@@ -36,10 +45,12 @@ import {
 import { formatOverridesSection } from "./agent-overrides";
 import { formatConversationContext } from "./conversation-context";
 import { getKnowledgeContext } from "./knowledge-base";
-import { getMemoryContext } from "./memory";
-import { memoryDelta } from "./memory/context";
+import { getMemorySelection } from "./memory";
+import { FACT_DATE_NOTE, factIdsOf, factLine, memoryDeltaSelection, type MemorySelection } from "./memory/context";
+import { followUpSearch } from "./memory/follow-up";
+import { coreForPrompt } from "./memory/core";
 import { storeOr } from "./store";
-import type { Message } from "./store/types";
+import type { FactWish, HitsWithFacts, MemoryItem, Message } from "./store/types";
 import { QUESTION_TAG_SECTION } from "./turn-questions";
 
 export type { PromptChannel } from "../agents/prompt-parts";
@@ -50,9 +61,16 @@ const RECENT_LIMIT = 10;
 const SIMILAR_LIMIT = 5;
 /** Länge eines Suchtreffers im Prompt, danach "..." */
 const SIMILAR_MAX_CHARS = 300;
+/** So viele neue Fakten höchstens je Folgenachricht; bei weniger Treffern weniger */
+const FOLLOW_UP_FACTS = 5;
+/** Mehr anfragen, als gezeigt werden: Fakten aus MEMORY_UPDATES fallen danach heraus */
+const FOLLOW_UP_FACT_SPARE = 5;
 
 /** Trenner zwischen den Abschnitten des Prompts */
 const SECTION_BREAK = "\n\n---\n\n";
+
+/** Überschrift des festen Kerns im Prompt */
+const CORE_SECTION = "USER CORE (confirmed by the user)";
 
 export interface PromptContextOptions {
   userMessage: string;
@@ -70,6 +88,10 @@ export interface ResumePromptOptions {
   /** Beginn der Session (ms): Merk-Einträge danach kommen in den Prompt */
   sinceMs?: number;
   channel?: PromptChannel;
+  /** Fakten, die die Session schon kennt */
+  shownFactIds?: string[];
+  /** Bekommt die Fakten, die die Session mit diesem Prompt kennt; verbucht wird nach dem Lauf */
+  onFactsShown?: (ids: string[]) => void;
 }
 
 export interface PromptContext {
@@ -77,6 +99,8 @@ export interface PromptContext {
   fullPrompt: string;
   /** Kontext für die Fallback-Kette (fallback/chain.ts), wenn der Motor scheitert */
   fallbackContext: string;
+  /** Fakten, die dieser Prompt zeigt */
+  shownFactIds?: string[];
 }
 
 /** Woher der Builder seine Angaben holt; Tests reichen Fakes herein */
@@ -86,13 +110,18 @@ export interface PromptSources {
   overrides(name: string): string;
   consultation(name: string): string;
   profile(): Promise<string>;
-  memory(userMessage: string): Promise<string>;
+  /** Fester Kern; ohne Kern leer */
+  core(): Promise<string>;
+  /** Als Text, wenn die Quelle die gezeigten Fakten nicht nennt */
+  memory(userMessage: string): Promise<string | MemorySelection>;
   knowledge(userMessage: string): Promise<string>;
   /** Letzte Nachrichten des Topics, älteste zuerst; topicId null heißt ohne Topic */
   recent(chatId: string, limit: number, topicId: number | null): Promise<Message[]>;
   similar(chatId: string, query: string, limit: number): Promise<Message[]>;
+  /** Treffer für eine Folgenachricht samt Fakten aus demselben Suchvektor */
+  followUp(chatId: string, query: string, limit: number, facts: FactWish): Promise<HitsWithFacts>;
   /** Neue oder geänderte Merk-Einträge seit since, schon als Zeilen */
-  memorySince(since: Date): Promise<string>;
+  memorySince(since: Date): Promise<string | MemorySelection>;
   now(): Date;
   timeZone(): string;
 }
@@ -103,11 +132,13 @@ export const defaultPromptSources: PromptSources = {
   overrides: formatOverridesSection,
   consultation: name => formatConsultationRules(name),
   profile: getUserProfile,
-  memory: userMessage => getMemoryContext(userMessage),
+  core: () => coreForPrompt(),
+  memory: userMessage => getMemorySelection(userMessage),
   knowledge: userMessage => getKnowledgeContext(userMessage),
   recent: (chatId, limit, topicId) => storeOr([], store => store.messages.recent(chatId, limit, topicId)),
   similar: (chatId, query, limit) => storeOr([], store => store.messages.search(chatId, query, limit)),
-  memorySince: async since => memoryDelta(await storeOr([], store => store.memory.changedSince(since))),
+  followUp: followUpSearch,
+  memorySince: async since => memoryDeltaSelection(await storeOr([], store => store.memory.changedSince(since))),
   now: () => new Date(),
   timeZone: promptTimeZone,
 };
@@ -133,6 +164,15 @@ function similarSection(hits: Message[], timeZone: string): string[] {
   return [`## SEMANTIC SEARCH RESULTS\nOlder messages that are close in meaning to the current one:\n${lines.join("\n")}`];
 }
 
+/** Antwort einer Quelle einheitlich; als reiner Text nennt sie keine Fakten */
+const asSelection = (value: string | MemorySelection): MemorySelection => (typeof value === "string" ? { context: value, factIds: [] } : value);
+
+/** Fakten einer Folgenachricht als Abschnitt; ohne Fakten leer */
+function followUpFactsSection(facts: MemoryItem[]): string[] {
+  if (facts.length === 0) return [];
+  return [`## RELEVANT FACTS\nStored facts that may fit this message and were not shown earlier in this session:\n${FACT_DATE_NOTE}\n${facts.map(factLine).join("\n")}`];
+}
+
 /** Ein Fehler der Quelle zählt wie "nichts gefunden" */
 function orEmpty<T>(read: () => Promise<T>, empty: T): Promise<T> {
   return read().catch(() => empty);
@@ -140,21 +180,29 @@ function orEmpty<T>(read: () => Promise<T>, empty: T): Promise<T> {
 
 /**
  * Prompt für die Folgenachricht einer laufenden Session (docs/topic-sessions.md
- * F-1/F-3). System-Prompt, Profil, Gedächtnis und Verlauf hat die Session
- * schon; neu sind Zeit, Kanal, Merk-Einträge seit sinceMs und frische Treffer.
+ * F-1/F-3). System-Prompt, Profil, Kern, Gedächtnis und Verlauf hat die Session
+ * schon; neu sind Zeit, Kanal, Merk-Einträge seit sinceMs, passende Fakten und
+ * frische Treffer.
  */
 export async function buildResumePrompt(opts: ResumePromptOptions, sources: Partial<PromptSources> = {}): Promise<string> {
   const s = withDefaults(sources);
   const timeZone = s.timeZone();
-  const [hits, updates] = await Promise.all([
-    orEmpty(() => s.similar(opts.chatId, opts.userMessage, SIMILAR_LIMIT), [] as Message[]),
+  const known = opts.shownFactIds ?? [];
+  const wish: FactWish = { limit: FOLLOW_UP_FACTS + FOLLOW_UP_FACT_SPARE, excludeIds: known };
+  const [found, delta] = await Promise.all([
+    orEmpty(() => s.followUp(opts.chatId, opts.userMessage, SIMILAR_LIMIT, wish), { messages: [], facts: [] } as HitsWithFacts),
     opts.sinceMs ? orEmpty(() => s.memorySince(new Date(opts.sinceMs!)), "") : Promise.resolve(""),
   ]);
+  const { context: updates, factIds: updatedIds } = asSelection(delta);
+  const shown = new Set([...known, ...updatedIds]);
+  const facts = (found.facts ?? []).filter(fact => !shown.has(String(fact.id))).slice(0, FOLLOW_UP_FACTS);
+  opts.onFactsShown?.([...new Set([...shown, ...factIdsOf(facts)])]);
   return [
     ...section("CURRENT TIME", formatPromptTime(s.now(), timeZone)),
     formatChannelRules(opts.channel ?? DEFAULT_PROMPT_CHANNEL),
     ...section("MEMORY UPDATES", updates ? `Facts and goals added since this session began:\n${updates}` : ""),
-    ...similarSection(hits, timeZone),
+    ...followUpFactsSection(facts),
+    ...similarSection(found.messages, timeZone),
     `## USER MESSAGE\n${opts.userMessage}`,
   ].join(SECTION_BREAK);
 }
@@ -169,18 +217,22 @@ export async function buildPromptContext(opts: PromptContextOptions, sources: Pa
   const timeZone = s.timeZone();
   const { userMessage, chatId, agentName } = opts;
 
-  const [profile, memory, recent, hits, knowledge] = await Promise.all([
+  const [profile, core, selection, recent, hits, knowledge] = await Promise.all([
     s.profile(),
+    orEmpty(() => s.core(), ""),
     s.memory(userMessage),
     // Nur das eigene Topic: ohne Topic null (nicht undefined), sonst kämen Forum-Topics dazu
     s.recent(chatId, RECENT_LIMIT, opts.topicId ?? null),
     orEmpty(() => s.similar(chatId, userMessage, SIMILAR_LIMIT), [] as Message[]),
     orEmpty(() => s.knowledge(userMessage), ""),
   ]);
+  const { context: memory, factIds: shownFactIds } = asSelection(selection);
   const conversation = formatConversationContext(recent, s.now());
   const overrides = s.overrides(agentName);
   const similar = similarSection(hits, timeZone);
-  const systemPrompt = s.agent(agentName)?.systemPrompt ?? FALLBACK_SYSTEM_PROMPT;
+  const agent = s.agent(agentName);
+  const systemPrompt = agent?.systemPrompt ?? FALLBACK_SYSTEM_PROMPT;
+  const lookup = factLookupSection(agent?.allowedTools);
   // Darf der Agent niemanden fragen, steht das ausdrücklich da, auch gegen Weiterleitungsvorschläge im Prompt
   const consultation = s.consultation(agentName) || NO_CONSULTATION_RULES;
 
@@ -189,12 +241,14 @@ export async function buildPromptContext(opts: PromptContextOptions, sources: Pa
     ...(overrides ? [overrides] : []),
     formatChannelRules(opts.channel ?? DEFAULT_PROMPT_CHANNEL),
     ...section("USER PROFILE", profile),
+    ...section(CORE_SECTION, core),
     ...section("CURRENT TIME", formatPromptTime(s.now(), timeZone)),
     ...section("MEMORY", memory),
     ...section("KNOWLEDGE BASE", knowledge),
     ...section("RECENT CONVERSATION", conversation),
     ...similar,
     ...(consultation ? [consultation] : []),
+    ...(lookup ? [lookup] : []),
     MEMORY_TAGS_SECTION,
     // Rückfragen mit Knöpfen (Issue #336)
     QUESTION_TAG_SECTION,
@@ -206,11 +260,12 @@ export async function buildPromptContext(opts: PromptContextOptions, sources: Pa
   const fallbackContext = [
     ...(overrides ? [overrides] : []),
     ...section("USER PROFILE", profile),
+    ...section(CORE_SECTION, core),
     ...section("MEMORY (facts & goals)", memory),
     ...section("KNOWLEDGE BASE", knowledge),
     ...section("RECENT CONVERSATION", conversation),
     ...similar,
   ].join("\n\n");
 
-  return { fullPrompt, fallbackContext };
+  return { fullPrompt, fallbackContext, shownFactIds };
 }

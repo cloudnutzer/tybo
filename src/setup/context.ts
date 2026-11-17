@@ -112,6 +112,12 @@ export interface SetupContext {
    */
   noModelCalls?: boolean;
   /**
+   * Nur im Prüfbericht (Issue #567): PATH des Bot-Diensts. Claude CLI und
+   * Motoren werden dann damit gefragt (claudeRunContext, engineItem), in
+   * jedem Abschnitt gleich. Fehlt er, gilt der PATH dieser Shell.
+   */
+  enginePath?: string;
+  /**
    * Einrichtung läuft im Browser (Issue #231): der Assistent belegt dann den
    * Port der WebUI, ein Test über HTTPS träfe ihn statt tybo.
    */

@@ -10,8 +10,9 @@
  * Speichertest über getStore() gibt es nicht mehr, er las dieselbe Tabelle
  * ein zweites Mal.
  *
- * Dienste stehen in ./services.ts, lokales Hören und Telefonhörer in
- * ./speech.ts (Issue #372), beide mit Runner, Projektordner und .env des
+ * Der Standard-Motor (Issue #567) steht in ./engine.ts, Dienste in
+ * ./services.ts, lokales Hören und Telefonhörer in ./speech.ts (Issue #372),
+ * alle mit Runner, Projektordner und .env des
  * Berichts. Claude Code für den Telefonhörer mit CLAUDE_PATH, CLAUDE_AUTH und
  * ANTHROPIC_API_KEY aus der .env des Projekts, nicht aus der Shell.
  */
@@ -20,13 +21,17 @@ import { BRAND } from "../../brand";
 import { legacyDatabaseNotice } from "../../lib/legacy-database-notice";
 import type { EngineStatus } from "../../lib/engines/check";
 import { supabaseHeaders } from "../../lib/supabase-keys";
+import { probeSchema, schemaFileLabel, SCHEMA_REPAIR_COMMAND, type SchemaProbeResult } from "../../lib/schema-probe";
 import type { CallModelDeps } from "../../lib/voice-brain/call-model";
 import { checkChannels } from "../channels";
 import type { SetupContext } from "../context";
 import { presentValue } from "../model";
 import { claudeRunContext, type Finding, type SpecialCheck } from "./report";
+import { engineCheck } from "./engine";
 import { serviceFindings } from "./services";
 import { callFinding, speechFindings } from "./speech";
+import { describeStatus, fetchRelayStatus } from "../../lib/sip-relay/status";
+import { currentIntakeView, intakeStatePath } from "../../lib/telegram-intake";
 
 type Env = Record<string, string>;
 
@@ -46,6 +51,8 @@ export const telegramCheck: SpecialCheck = {
     const found: Finding[] = [];
     const main = await ctx.providers.telegramGetMe(env.TELEGRAM_BOT_TOKEN.trim());
     found.push({ label: "Verbindung", status: main.ok ? "pass" : "fail", detail: main.message });
+    const intake = await intakeFinding(ctx.root);
+    if (intake) found.push(intake);
     const agents = Object.keys(env)
       .filter(name => name.startsWith(AGENT_TOKEN_PREFIX) && presentValue(env, name))
       .sort();
@@ -58,11 +65,38 @@ export const telegramCheck: SpecialCheck = {
   },
 };
 
-/** messages muss lesbar sein, memory sollte es; dazu der Hinweis auf alte Datenbank-Einstellungen */
+const INTAKE_HINT = {
+  conflict: "Den zweiten Bot mit demselben Token anhalten (docs/troubleshooting.md, „Zwei Bots laufen gleichzeitig“).",
+  unauthorized: `Token in der .env korrigieren, dann ${BRAND.name} bewusst neu starten; den neuen Token übernimmt der laufende Bot nicht von selbst.`,
+  other: "Netz und Erreichbarkeit von Telegram prüfen; der Bot versucht es selbst wieder.",
+} as const;
+
+/**
+ * Zustand des Telegram-Eingangs (Issue #562) aus data/telegram-intake.json,
+ * geschrieben vom laufenden Bot. Fragt Telegram nicht selbst (kein
+ * getUpdates, das störte den Bot). Ohne Datei oder wenn der schreibende
+ * Prozess nicht mehr läuft: keine Zeile.
+ */
+export async function intakeFinding(root: string, alive?: (pid: number) => boolean): Promise<Finding | null> {
+  const view = await currentIntakeView(intakeStatePath(root), alive);
+  if (!view) return null;
+  if (view.state === "ok") return { label: "Eingang", status: "pass", detail: "läuft (laut dem laufenden Bot)" };
+  return { label: "Eingang", status: "fail", detail: `${view.message} ${INTAKE_HINT[view.state]}` };
+}
+
+/**
+ * messages muss lesbar sein, memory sollte es; dazu der Hinweis auf alte
+ * Datenbank-Einstellungen und die Schemaprobe (Issue #560): fehlt eine Datei
+ * aus SCHEMA_FILES sicher, ist die Zeile „Schema“ ein Fehler. Die Probe läuft
+ * auch, wenn messages scheitert: Fehlen die Grundtabelle (db/schema.sql) oder
+ * die Leserechte (20261021_base_grants.sql), nennt die Zeile „Schema“ Datei
+ * und Befehl. Bei Netz- oder Schlüsselfehlern ist die Probe nicht prüfbar und
+ * bleibt dann still; den Fehler zeigt schon die Zeile „Verbindung“.
+ */
 export const databaseCheck: SpecialCheck = {
   id: "datenbank",
   section: "Datenbank",
-  async run({ ctx, env }) {
+  async run({ ctx, env, signal }) {
     const found: Finding[] = [];
     const legacy = legacyDatabaseNotice(env);
     if (legacy) found.push({ label: "Alte Einstellung", status: "warn", detail: legacy });
@@ -75,9 +109,48 @@ export const databaseCheck: SpecialCheck = {
     const messages = await ctx.providers.supabaseQuery(url, key);
     found.push({ label: "Verbindung", status: messages.ok ? "pass" : "fail", detail: messages.message });
     if (messages.ok) found.push(await memoryTable(ctx, url, key));
+    const schema = await probeSchema({
+      url,
+      key,
+      signal,
+      fetch: (target, init) => ctx.fetch(target, { headers: init.headers, signal: init.signal, timeoutMs: SCHEMA_TIMEOUT_MS }),
+    });
+    if (messages.ok || schema.state === "missing") found.push(...schemaFindings(schema));
     return found;
   },
 };
+
+const SCHEMA_TIMEOUT_MS = 8_000;
+/** Unter der Kürzung des Berichts (300 Zeichen je Zeile), damit kein Dateiname verloren geht */
+const SCHEMA_DETAIL_MAX = 240;
+
+/**
+ * Zeilen „Schema“: fehlende Dateien als Fehler, der Befehl zuerst; passt die
+ * Liste nicht in eine Zeile, folgen Zeilen „Schema (weiter)“. Nicht prüfbar
+ * ist eine Warnung.
+ */
+export function schemaFindings(result: SchemaProbeResult): Finding[] {
+  if (result.state === "ok") return [{ label: "Schema", status: "pass", detail: "alle Migrationen eingespielt" }];
+  if (result.state === "unknown") {
+    const files = result.unchecked.length ? ` (${result.unchecked.length} Dateien)` : "";
+    return [{ label: "Schema", status: "warn", detail: `nicht prüfbar${files}: ${result.reason}` }];
+  }
+  const names = result.missing.map(schemaFileLabel);
+  const head = `Nachholen mit ${SCHEMA_REPAIR_COMMAND}. Es ${names.length === 1 ? "fehlt 1 Datei" : `fehlen ${names.length} Dateien`}: `;
+  const details: string[] = [];
+  let current = head;
+  for (const name of names) {
+    const sep = current === head || current === "" ? "" : ", ";
+    if (current.length + sep.length + name.length > SCHEMA_DETAIL_MAX && current !== head && current !== "") {
+      details.push(current);
+      current = name;
+    } else current += sep + name;
+  }
+  details.push(current);
+  const lines: Finding[] = details.map((detail, i) => ({ label: i === 0 ? "Schema" : "Schema (weiter)", status: "fail", detail }));
+  if (result.unchecked.length) lines.push({ label: "Schema (weiter)", status: "warn", detail: `außerdem nicht prüfbar: ${result.unchecked.length} Dateien (${result.unchecked[0].reason})` });
+  return lines;
+}
 
 async function memoryTable(ctx: SetupContext, url: string, key: string): Promise<Finding> {
   const label = "Tabelle memory";
@@ -169,7 +242,27 @@ export function callCheck(deps: Partial<CallModelDeps> = {}): SpecialCheck {
   };
 }
 
+/**
+ * SIP-Vermittlung (Issue #511): nur lesen, per SSH über ctx.run. Kein
+ * Zustand, keine Meldung; die Einmal-Meldung bei Ausfall schickt
+ * `bun run sip-zustand`. Ohne SIP_VERMITTLUNG_SSH übersprungen.
+ */
+export const sipRelayCheck: SpecialCheck = {
+  id: "sip-vermittlung",
+  section: "Sprache",
+  async run({ ctx, env }) {
+    const status = await fetchRelayStatus(env, async (cmd, timeoutMs) => {
+      const r = await ctx.run(cmd, { timeoutMs });
+      return { code: r.code, stdout: r.stdout, timedOut: r.timedOut === true };
+    });
+    const detail = describeStatus(status);
+    const label = "SIP-Vermittlung";
+    if (status.state === "nicht-eingerichtet") return [{ label, status: "skip", detail: "Übersprungen: nicht eingerichtet (SIP_VERMITTLUNG_SSH)" }];
+    return [{ label, status: status.state === "registriert" ? "pass" : "fail", detail }];
+  },
+};
+
 /** Alle Spezialprüfungen in der Reihenfolge des Berichts */
 export function defaultSpecials(options: { callModel?: Partial<CallModelDeps> } = {}): SpecialCheck[] {
-  return [telegramCheck, databaseCheck, servicesCheck, extrasCheck, speechCheck, callCheck(options.callModel)];
+  return [engineCheck, telegramCheck, databaseCheck, servicesCheck, extrasCheck, speechCheck, callCheck(options.callModel), sipRelayCheck];
 }

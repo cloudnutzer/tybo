@@ -366,6 +366,8 @@ fetch_tybo() {
       die "Branch $branch ließ sich nicht umstellen. Von Hand: cd $target_q && git reset --hard origin/$branch"
   else
     say "aktualisiere $target_dir"
+    # Stand vor dem Pull, damit finish() Änderungen in db/ über alle neuen Commits sieht
+    old_head=$(git -C "$target_dir" rev-parse HEAD 2>/dev/null || true)
     git -C "$target_dir" pull --ff-only origin "$branch" ||
       die "git pull ist fehlgeschlagen. Meldung oben lesen; Stand anzeigen mit: cd $target_q && git status"
   fi
@@ -385,6 +387,15 @@ finish() {
   if [ "$mode" = update ] || [ "$mode" = rebuild ]; then
     commit=$(git -C "$target_dir" rev-parse --short HEAD 2>/dev/null || printf '?')
     say "Aktualisiert auf $commit. Läuft tybo schon, einmal neu starten: cd $target_q && bun run restart:request \"Update\""
+    # Neue Migrationen (Issue #560): db/ zwischen altem und neuem Stand verglichen. Ist das
+    # nicht feststellbar (kein alter Stand, Fehler von git), lieber den Hinweis zeigen
+    db_changed=1
+    if [ -n "${old_head:-}" ] && git -C "$target_dir" diff --quiet "$old_head" HEAD -- db 2>/dev/null; then
+      db_changed=0
+    fi
+    if [ "$db_changed" = 1 ]; then
+      say "Die Datenbank bekommt neue Migrationen. Vor dem Neustart einspielen: cd $target_q && tybo setup datenbank"
+    fi
   elif [ "$run_setup" = 1 ] && have_tty; then
     say "tybo ist installiert. Jetzt startet die Einrichtung (tybo setup)."
     # Direkt mit bun: das Shebang-Flag --no-env-file greift hier nicht von selbst.

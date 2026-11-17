@@ -1,0 +1,151 @@
+; SIP-Wege der Vermittlung (Issue #511). Erzeugt aus vorlagen/; enthält
+; Zugangsdaten, deshalb nur für Asterisk lesbar.
+;
+; Es gibt keinen anonymen Endpunkt: Eine Anfrage, die keinem Endpunkt
+; zugeordnet werden kann, beantwortet Asterisk mit einer Anmelde-Aufforderung
+; ohne zu verraten, ob es den Namen gibt. REFER ist nicht geladen.
+
+[global]
+type = global
+user_agent = sip-vermittlung
+; hält die TLS-Verbindung zu easybell offen
+keep_alive_interval = 30
+
+; Folgeverbindungen: Ist die Verbindung zu ElevenLabs schon zu, gehen ACK, BYE
+; und Co. über eine neue TLS-Verbindung an den Contact aus der Antwort,
+; <ip>.hosts.rtc.elevenlabs.io. Dort zeigt ElevenLabs ein Zertifikat für
+; *.hosts.rtc.elevenlabs.io. Asterisk prüft den Namen (verify_server) und nimmt
+; Wildcard-Zertifikate nur mit allow_wildcard_certs an. Dass dabei der Name
+; des Contacts gilt und nicht der der ersten Verbindung, leistet der
+; pjproject-Patch im Image (image/, README.md „Folgeverbindungen“).
+[transport-tls]
+type = transport
+protocol = tls
+bind = 0.0.0.0:{{SIP_TLS_PORT}}
+cert_file = /zertifikat/fullchain.pem
+priv_key_file = /zertifikat/privkey.pem
+ca_list_file = /etc/ssl/certs/ca-certificates.crt
+method = tlsv1_2
+verify_server = yes
+allow_wildcard_certs = yes
+verify_client = no
+require_client_cert = no
+
+{{UDP_TRANSPORT}}
+
+; ---------------------------------------------------------------------------
+; easybell: Registrierung mit dem SIP-Zugang des Nutzers. Eingehende Anrufe
+; ordnet Asterisk über den Parameter line= im Contact der Registrierung zu,
+; nicht über Absender oder Benutzername.
+; ---------------------------------------------------------------------------
+[easybell-auth]
+type = auth
+auth_type = userpass
+username = {{EASYBELL_BENUTZER}}
+password = {{EASYBELL_PASSWORT}}
+
+[easybell-reg]
+type = registration
+transport = {{EASYBELL_TRANSPORT_NAME}}
+outbound_auth = easybell-auth
+server_uri = {{EASYBELL_SERVER_URI}}
+client_uri = sip:{{EASYBELL_BENUTZER}}@{{EASYBELL_REGISTRAR}}
+contact_user = eingang
+expiration = 600
+retry_interval = 60
+forbidden_retry_interval = 600
+fatal_retry_interval = 600
+max_retries = 1000000
+line = yes
+endpoint = easybell
+
+[easybell]
+type = aor
+contact = {{EASYBELL_SERVER_URI}}
+
+[easybell]
+type = endpoint
+transport = {{EASYBELL_TRANSPORT_NAME}}
+context = von-easybell
+aors = easybell
+outbound_auth = easybell-auth
+identify_by = ip
+from_user = {{EASYBELL_BENUTZER}}
+from_domain = {{EASYBELL_REGISTRAR}}
+disallow = all
+allow = alaw
+direct_media = no
+media_encryption = {{EASYBELL_MEDIENSCHUTZ}}
+rtp_symmetric = yes
+force_rport = yes
+trust_id_inbound = yes
+trust_id_outbound = no
+send_pai = no
+allow_transfer = no
+allow_subscribe = no
+dtmf_mode = rfc4733
+
+; ---------------------------------------------------------------------------
+; ElevenLabs, Richtung hin: die Vermittlung ruft den SIP-Trunk an und meldet
+; sich mit Digest an (Zugangsdaten aus den Einstellungen der Nummer bei
+; ElevenLabs, Abschnitt eingehend). Nimmt selbst nichts an.
+; ---------------------------------------------------------------------------
+[elevenlabs-ein-auth]
+type = auth
+auth_type = userpass
+username = {{ELEVENLABS_EIN_BENUTZER}}
+password = {{ELEVENLABS_EIN_PASSWORT}}
+
+[elevenlabs]
+type = aor
+contact = {{ELEVENLABS_URI}}
+
+[elevenlabs]
+type = endpoint
+transport = transport-tls
+context = gesperrt
+aors = elevenlabs
+outbound_auth = elevenlabs-ein-auth
+identify_by = ip
+from_domain = {{SIP_HOSTNAME}}
+disallow = all
+allow = alaw
+direct_media = no
+media_encryption = sdes
+rtp_symmetric = yes
+trust_id_inbound = no
+trust_id_outbound = yes
+send_pai = yes
+allow_transfer = no
+allow_subscribe = no
+dtmf_mode = rfc4733
+
+; ---------------------------------------------------------------------------
+; ElevenLabs, Richtung her: /anruf. Zugeordnet nur über den Benutzernamen der
+; Digest-Anmeldung (identify_by = auth_username verlangt, dass der Endpunkt
+; so heißt wie der Benutzername); erst nach gültigem Passwort geht es in den
+; Wählplan, und der wählt nur die Positivliste.
+; ---------------------------------------------------------------------------
+[elevenlabs-aus-auth]
+type = auth
+auth_type = userpass
+username = {{ELEVENLABS_AUS_BENUTZER}}
+password = {{ELEVENLABS_AUS_PASSWORT}}
+
+[{{ELEVENLABS_AUS_BENUTZER}}]
+type = endpoint
+transport = transport-tls
+context = von-elevenlabs
+auth = elevenlabs-aus-auth
+identify_by = auth_username
+disallow = all
+allow = alaw
+direct_media = no
+media_encryption = sdes
+rtp_symmetric = yes
+force_rport = yes
+trust_id_inbound = no
+trust_id_outbound = no
+allow_transfer = no
+allow_subscribe = no
+dtmf_mode = rfc4733

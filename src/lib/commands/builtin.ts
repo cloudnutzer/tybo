@@ -5,7 +5,7 @@
  *
  * /goal (Issue #76) steht seit dem Umzug auch hier, Texte wortgleich.
  * Die Gedächtnis-Befehle (/remember, /recall und Co., Issue #333) stehen in
- * ./memory.ts, /tasks (Issue #337) in ./tasks.ts. /credit (in Telegram auch
+ * ./memory.ts, /kern (Issue #522) in ./core.ts, /tasks (Issue #337) in ./tasks.ts. /credit (in Telegram auch
  * „credit" ohne Schrägstrich) und /plan zeigen seit Issue #346 in allen
  * Kanälen den Stand aus src/lib/spend/credit.ts.
  */
@@ -30,9 +30,11 @@ import {
   threadsEnabled,
   type Thread,
 } from "../threads/store";
-import { MEMORY_COMMANDS } from "./memory";
+import { MEMORY_COMMAND_TEXT, MEMORY_COMMANDS } from "./memory";
 import { TASKS_COMMAND } from "./tasks";
 import { CALL_COMMAND } from "./phone";
+import { CORE_COMMAND } from "./core";
+import { VOICE_AGENT_COMMAND, VOICE_AGENTS_LIST_COMMAND } from "./voice-agents";
 import { createCommandRegistry } from "./registry";
 import { ALL_CHANNELS, type CommandContext, type CommandDefinition } from "./types";
 
@@ -82,6 +84,7 @@ Beim Session-Ende schlage ich Merk-Eintraege und Routinen selbst per Buttons vor
 **Wissen:**
 goals · memory · /tasks - gespeicherte Ziele, Fakten, offene Fragen
 /remember <fakt> · /forget <text> - Fakt merken bzw. vergessen
+/kern - fester Kern: steht bei jedem Start einer Session im Prompt · /kern entwurf · /kern setzen <text> · /kern loeschen
 /track <ziel> [| deadline: <frist>] · /done <text> · /cancel <text> - gespeichertes Ziel anlegen, erledigen, streichen
 /faeden - offene Faeden: meine Fragen, auf die noch eine Antwort fehlt
 /faeden zu <nr> - Faden schliessen · /faeden alle - auch die geschlossenen der letzten 7 Tage
@@ -92,12 +95,19 @@ goals · memory · /tasks - gespeicherte Ziele, Fakten, offene Fragen
 **Sonstiges:**
 /jobs - Hintergrund-Jobs: laufende und zuletzt beendete
 /voice <text> - Antwort als Sprachnachricht · /anruf [anlass] - ich rufe dich an
+/sprachagent - Sprachagenten aus Rezepten: liste (auch /sprachagenten) · testen <kennung> · loeschen <kennung> · link <kennung>
 /credit - Verbrauch (Claude-Abo, Motoren) · /plan - Limit und Reset-Tag`;
 
 const markdown = { format: "markdown" } as const;
 
 async function runGoals(ctx: CommandContext): Promise<void> {
-  const goals = await ctx.services.listGoals();
+  let goals: string;
+  try {
+    goals = await ctx.services.listGoals();
+  } catch (e) {
+    console.log(`[gedaechtnis] /goals fehlgeschlagen (${e instanceof Error ? e.name : typeof e}, ${ctx.channel})`);
+    return ctx.reply(MEMORY_COMMAND_TEXT.goalsUnreadable);
+  }
   await ctx.reply(`**Active Goals:**\n${goals}`, { format: "markdown", plainFallback: `Active Goals:\n${goals}` });
 }
 
@@ -329,22 +339,24 @@ async function runHelp(ctx: CommandContext): Promise<void> {
 
 async function runStop(ctx: CommandContext): Promise<void> {
   const { sessionKey, services } = ctx;
-  const activeGoal = await services.getGoal(sessionKey);
-  if (activeGoal?.status === "active") {
+  // Vor dem Pausieren festhalten: getGoal liefert das gespeicherte Objekt,
+  // pauseGoal ändert es (sonst fehlte "Ziel pausiert" in der Antwort, Issue #563)
+  const goalWasActive = (await services.getGoal(sessionKey))?.status === "active";
+  if (goalWasActive) {
     await services.pauseGoal(sessionKey, "Vom User gestoppt (/stop)");
   }
   // Board-Sitzung (Issue #75): der laufende Beitrag wird fertig, danach Schluss;
   // erst ein zweites /stop bricht hart ab
   if (services.requestBoardStop?.(sessionKey) === "requested") {
     await ctx.reply(
-      activeGoal?.status === "active" ? `${BOARD_TEXT.stopRequested} Ziel pausiert (/goal weiter setzt fort).` : BOARD_TEXT.stopRequested
+      goalWasActive ? `${BOARD_TEXT.stopRequested} Ziel pausiert (/goal weiter setzt fort).` : BOARD_TEXT.stopRequested
     );
     return;
   }
   const killed = services.abortEngineCalls(sessionKey);
   const parts: string[] = [];
   if (killed > 0) parts.push(`${killed} laufende Verarbeitung${killed > 1 ? "en" : ""} abgebrochen`);
-  if (activeGoal?.status === "active") parts.push("Ziel pausiert (/goal weiter setzt fort)");
+  if (goalWasActive) parts.push("Ziel pausiert (/goal weiter setzt fort)");
   await ctx.reply(parts.length > 0 ? `⏹️ ${parts.join(", ")}.` : COMMAND_TEXT.nothingToStop);
 }
 
@@ -558,6 +570,8 @@ export const MOTOR_TEXT = {
   fileInvalid: "config/settings.json ist ungültig, der Motor wurde nicht geändert. Bitte die Datei reparieren oder löschen.",
   notSaved: "Der Motor konnte nicht gespeichert werden.",
   newSession: "Das beginnt eine neue Session, das Gedächtnis bleibt.",
+  /** Claude Code nicht bereit (Issue #567): wer dann antwortet, entscheidet die Kette der Ersatzmodelle */
+  claudeNotReady: `Bis das behoben ist, antworten höchstens Ersatzmodelle, falls eingerichtet. Mehr zeigt ${BRAND.cli} pruefen.`,
 } as const;
 
 const MOTOR_SOURCE_TEXT = {
@@ -582,7 +596,10 @@ async function runMotor(ctx: CommandContext): Promise<void> {
   const notReadyNote = (engine: string) => {
     const status = list.find(e => e.engine === engine);
     if (!status || status.ready) return "";
-    return `\n${status.label} ist gerade nicht bereit${status.message ? ` (${status.message})` : ""}, bis dahin antwortet ${label("claude")}.`;
+    const why = status.message ? ` (${status.message})` : "";
+    // Claude Code ist selbst der Rückfallmotor (Issue #567): dann gibt es kein „bis dahin antwortet Claude Code“
+    if (engine === "claude") return `\n${status.label} ist gerade nicht bereit${why}. ${MOTOR_TEXT.claudeNotReady}`;
+    return `\n${status.label} ist gerade nicht bereit${why}, bis dahin antwortet ${label("claude")}.`;
   };
 
   if (!arg) {
@@ -732,6 +749,8 @@ export const BUILTIN_COMMANDS: readonly CommandDefinition[] = [
   { name: "goals", aliases: [], bareWords: ["goals"], description: "Gespeicherte Ziele", args: "none", channels: ALL_CHANNELS, run: runGoals },
   // Gedächtnis (Issue #333): /remember, /forget, /memory, /track, /done, /cancel, /recall
   ...MEMORY_COMMANDS,
+  // Fester Kern im Prompt (Issue #522)
+  CORE_COMMAND,
   {
     name: "learn",
     aliases: [],
@@ -824,6 +843,9 @@ export const BUILTIN_COMMANDS: readonly CommandDefinition[] = [
   },
   // Anruf übers Telefonnetz (Issue #367)
   CALL_COMMAND,
+  // Sprachagenten aus Rezepten (Issue #492); /sprachagenten zeigt ohne Argument die Liste
+  VOICE_AGENT_COMMAND,
+  VOICE_AGENTS_LIST_COMMAND,
 ];
 
 export const commandRegistry = createCommandRegistry(BUILTIN_COMMANDS);

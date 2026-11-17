@@ -4,7 +4,9 @@
 // und Dienste sind Attrappen.
 import { describe, expect, test } from "bun:test";
 import { startBackground, type BackgroundServices } from "../src/app/bot-start";
-import { createBotNotices } from "../src/lib/bot-notices";
+import { createBotNotices, type BotNotices } from "../src/lib/bot-notices";
+import type { SendAndRecordInput, SendAndRecordResult } from "../src/lib/outbox";
+import type { SchemaProbeResult } from "../src/lib/schema-probe";
 import { DRAIN_INTERVAL_MS } from "../src/lib/embedding";
 import type { AlertMeta } from "../src/lib/routines/alerts";
 
@@ -12,7 +14,7 @@ interface RoutineMenu {
   offerStatus?: "sent" | "none" | "unknown";
 }
 
-function setup(overrides: Partial<BackgroundServices> = {}, env: Record<string, string | undefined> = {}, menu: RoutineMenu = {}) {
+function setup(overrides: Partial<BackgroundServices> = {}, env: Record<string, string | undefined> = {}, menu: RoutineMenu = {}, notices?: BotNotices) {
   const events: string[] = [];
   const plainAlerts: { text: string; meta: unknown }[] = [];
   const offers: { conversation: unknown; id: string; text: string }[] = [];
@@ -21,6 +23,9 @@ function setup(overrides: Partial<BackgroundServices> = {}, env: Record<string, 
   const lines: string[] = [];
   let threadDeps: Parameters<BackgroundServices["startThreadReminders"]>[0] | undefined;
   const services: Partial<BackgroundServices> = {
+    // Nie die echte Claude CLI (Issue #566)
+    inspectClaude: async () => ({ engine: "claude", checked: true, installed: true, loggedIn: true }),
+    getSettings: () => ({}),
     checkEmbedding: async () => (events.push("checkEmbedding"), { ok: false, message: "Anbieter weicht ab" }) as never,
     drainEmbeddings: async () => (events.push("drain"), { state: "fertig", written: 2, rejected: 0 }) as never,
     syncChunks: async () => null,
@@ -42,7 +47,7 @@ function setup(overrides: Partial<BackgroundServices> = {}, env: Record<string, 
   const background = startBackground({
     root: "/srv/tybo",
     env,
-    notices: createBotNotices({ telegram: () => false, send: async () => ({ ok: true }) as never, sendStatusMessage: async () => {}, dmChatId: () => "" }),
+    notices: notices ?? createBotNotices({ telegram: () => false, send: async () => ({ ok: true }) as never, sendStatusMessage: async () => {}, dmChatId: () => "" }),
     choices: { sweep: async () => (sweeps++, events.push("sweep"), [{ id: "x" }]) } as never,
     routineChoices: { offerMenu: async (conversation: unknown, id: string, text: string) => (offers.push({ conversation, id, text }), { status: menu.offerStatus ?? "none" }) } as never,
     postWeb: async () => false,
@@ -169,5 +174,79 @@ describe("startBackground: Versandweg der Routinen-Wache ausgelöst", () => {
     await s.watch().send("Wetter läuft wieder", { kind: "recovered", id: "ai.tybo.wetter" });
     expect(s.offers).toHaveLength(1);
     expect(s.plainAlerts).toHaveLength(2);
+  });
+});
+
+// Issue #560: Schemaprobe beim Start, genau eine Meldung über den Meldeweg (Outbox)
+describe("startBackground: fehlende Migrationen", () => {
+  const SUPABASE = { SUPABASE_URL: "https://beispiel.supabase.co", SUPABASE_SERVICE_ROLE_KEY: "sb_secret_attrappe" };
+
+  function withProbe(result: SchemaProbeResult | null, options: { telegram?: boolean; record?: SendAndRecordResult } = {}) {
+    const sent: SendAndRecordInput[] = [];
+    const direct: string[] = [];
+    const probed: unknown[] = [];
+    const notices = createBotNotices({
+      telegram: () => options.telegram ?? false,
+      send: async input => (sent.push(input), options.record ?? (options.telegram ? { sent: true, recorded: true } : { sent: false, recorded: true })),
+      sendStatusMessage: async (_chat, text) => void direct.push(text),
+      dmChatId: () => (options.telegram ? "4242" : ""),
+    });
+    const s = setup({ probeSchema: async env => (probed.push(env), result) }, SUPABASE, {}, notices);
+    return { ...s, sent, direct, probed };
+  }
+
+  test("mehrere fehlende Dateien ergeben genau eine Meldung, ohne Telegram für die WebUI festgehalten", async () => {
+    const s = withProbe({ state: "missing", missing: ["db/migrations/20261018_scheduled_tasks_lease.sql", "db/migrations/20261031_memory_archive.sql"], unchecked: [] });
+    await tick();
+    expect(s.probed).toHaveLength(1);
+    expect(s.sent).toHaveLength(1);
+    expect(s.sent[0].text).toContain("20261018_scheduled_tasks_lease.sql");
+    expect(s.sent[0].text).toContain("20261031_memory_archive.sql");
+    expect(s.sent[0].text).toContain("tybo setup datenbank");
+    expect(s.sent[0].source).toBe("system");
+    expect(s.sent[0].chatId).toBe("web");
+    expect(s.lines.filter(l => l.startsWith("WARN [schema] ACHTUNG"))).toHaveLength(1);
+    expect(s.lines.some(l => l.includes("nicht zugestellt"))).toBe(false);
+    // Kein Zeitgeber wiederholt die Probe
+    for (const t of s.timers) t.run();
+    await tick();
+    expect(s.probed).toHaveLength(1);
+    expect(s.sent.filter(i => i.text?.includes("Migration"))).toHaveLength(1);
+  });
+
+  test("mit Telegram: eine Meldung an den Direktchat (die Outbox hält sie auch für die WebUI fest)", async () => {
+    const s = withProbe({ state: "missing", missing: ["db/migrations/20261031_memory_facts_search.sql"], unchecked: [] }, { telegram: true });
+    await tick();
+    expect(s.sent).toHaveLength(1);
+    expect(s.sent[0].text).toContain("eine Migration");
+    expect(s.direct).toEqual([]);
+  });
+
+  test("vollständiges Schema: keine Meldung, nur eine Logzeile", async () => {
+    const s = withProbe({ state: "ok" });
+    await tick();
+    expect(s.sent).toEqual([]);
+    expect(s.lines).toContain("[schema] alle Migrationen eingespielt");
+  });
+
+  test("nicht prüfbar: keine Meldung, Warnung im Log", async () => {
+    const s = withProbe({ state: "unknown", reason: "Datenbank nicht erreichbar", unchecked: [] });
+    await tick();
+    expect(s.sent).toEqual([]);
+    expect(s.lines).toContain("WARN [schema] nicht prüfbar: Datenbank nicht erreichbar");
+  });
+
+  test("ohne Telegram und mit gescheitertem Festhalten: Rückfall ist das Log, ohne Wiederholung", async () => {
+    const s = withProbe({ state: "missing", missing: ["db/schema.sql"], unchecked: [] }, { record: { sent: false, recorded: false, error: { kind: "record", message: "messages fehlt" } } });
+    await tick();
+    expect(s.sent).toHaveLength(1);
+    expect(s.lines.filter(l => l.startsWith("WARN [schema] ACHTUNG"))).toHaveLength(1);
+    expect(s.lines).toContain("WARN [schema] Meldung an den Nutzer nicht zugestellt, der Hinweis steht nur hier im Log");
+  });
+
+  test("ohne Supabase fragt die echte Probe nichts", async () => {
+    const { BACKGROUND_SERVICES } = await import("../src/app/bot-start");
+    expect(await BACKGROUND_SERVICES.probeSchema({})).toBeNull();
+    expect(await BACKGROUND_SERVICES.probeSchema({ SUPABASE_URL: "https://x.supabase.co" })).toBeNull();
   });
 });

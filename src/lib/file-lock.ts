@@ -125,6 +125,11 @@ export async function acquireFileLock(path: string, opts: FileLockOptions = {}):
   }
 }
 
+/** Ein Versuch ohne Warten (bricht veraltete Sperren auf); null, wenn ein lebender Besitzer sie hält. */
+export async function tryAcquireFileLock(path: string, opts: FileLockOptions = {}): Promise<LockOwner | null> {
+  return tryLock(path, resolve(opts));
+}
+
 /** Gibt die Sperre frei, aber nur die eigene. false: dort liegt eine fremde oder keine. */
 export async function releaseFileLock(path: string, me: LockOwner): Promise<boolean> {
   const current = await readLockOwner(path);

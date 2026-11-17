@@ -25,7 +25,8 @@ import { CLOCK_TIME_PATTERN } from "./proactive/clock";
 import { CALL_STT_CHOICES, CALL_TTS_CHOICES, CLONE_ENGINE_IDS, CLONE_VOICE_ID_PATTERN, ELEVENLABS_MODELS, SPEECH_LANGUAGE_PATTERN, STT_IDS, TELEGRAM_TTS_CHOICES, TTS_IDS } from "./speech/ids";
 import { VOICE_PATTERN } from "./speech/types";
 
-export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh"] as const;
+// max seit 15.11.2026 (Fable 5.2 Max als Standard), die Claude CLI kennt --effort max
+export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type EffortLevel = (typeof EFFORT_LEVELS)[number];
 
 export type AuxKind = "claude" | "openrouter" | "ollama";
@@ -80,8 +81,8 @@ export const DEFAULT_OPENCODE_PERMISSION: OpenCodePermission = "auto";
 export const SELECTABLE_ENGINES = ["claude", "codex", "opencode", "api"] as const;
 export type SelectableEngine = (typeof SELECTABLE_ENGINES)[number];
 
-/** Effort für Codex: dieselben Stufen wie Claude, zusätzlich max */
-export const CODEX_EFFORT_LEVELS = [...EFFORT_LEVELS, "max"] as const;
+/** Effort für Codex: dieselben Stufen wie Claude (seit 15.11.2026 auch dort mit max) */
+export const CODEX_EFFORT_LEVELS = EFFORT_LEVELS;
 
 /** Wie MODEL in engines/codex.ts: was dort als -m durchgeht */
 const codexModelName = modelName.regex(/^[A-Za-z0-9][\w.:/-]*$/, "ungültiger Modellname");
@@ -145,6 +146,8 @@ export const settingsSchema = z.object({
       threads: auxSpec.optional(),
       "call-summary": auxSpec.optional(),
       checkin: auxSpec.optional(),
+      "voice-training": auxSpec.optional(),
+      "voice-wizard": auxSpec.optional(),
     })
     .optional(),
   fallback: z

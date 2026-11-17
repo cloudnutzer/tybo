@@ -12,7 +12,7 @@ tybo den Kontext bei jeder Nachricht neu auf (klassischer Pfad, siehe F-6).
 ## Grundidee: Session statt Prompt-Neubau
 
 Ohne Sessions geht jede Nachricht als vollständiger Prompt an Claude:
-System-Prompt, Profil, Memory, Verlauf, Suchtreffer und die Nachricht selbst,
+System-Prompt, Profil, Kern (`/kern`), Memory, Verlauf, Suchtreffer und die Nachricht selbst,
 mehrere tausend Tokens, auch für ein „Hallo".
 
 Mit Sessions gilt:
@@ -23,6 +23,17 @@ Mit Sessions gilt:
   Prompt: aktuelle Zeit, neue Suchtreffer, Memory-Änderungen seit
   Session-Start und die Nachricht (`buildResumePrompt()` in
   `src/lib/prompt-builder.ts`).
+- **Kern:** steht nur im vollen Prompt. Eine Änderung mit `/kern` greift ab
+  der nächsten frischen Session ohne Neustart, `/new` erzwingt das sofort. Die
+  laufende Session behält ihren Stand.
+- **Fakten bei Folgenachrichten:** höchstens fünf passende Fakten, die die
+  Session noch nicht kennt. Sie kommen aus demselben Suchvektor wie die Treffer
+  in den Nachrichten (`search-memory`), ohne weiteren Aufruf beim Anbieter; ohne
+  Vektor oder ohne Treffer aus einer Textsuche, die mindestens zwei gemeinsame
+  Wörter verlangt. Was die Session kennt, steht in `data/sessions.json` unter
+  `shownFactIds`: der erste Prompt, die Merk-Einträge und die Fakten der
+  Folgenachrichten, verbucht erst nach einem gelungenen Lauf. Eine neue Session
+  (`/new`, verlorene Session, anderer Motor oder anderes Modell) beginnt neu.
 - **Verdichtung:** übernimmt die CLI selbst (Auto-Compact). Prompt Caching
   greift über die ganze Session.
 
@@ -100,6 +111,8 @@ von beiden Claude-Aufrufen in `src/bot.ts` genutzt):
 1. **Memory nach Relevanz.** Ziele immer, Fakten nach Relevanz zur Nachricht
    sortiert und auf ein Zeichenbudget begrenzt (`MEMORY_CONTEXT_CHARS`).
    Auf Supabase ist das Ranking lexikalisch (Wortüberlappung plus Aktualität).
+   Jeder Fakt trägt sein Anlagedatum, das Budget zählt es mit; ein Vorbehalt
+   im Prompt sagt, dass ältere Stände überholt sein können.
 2. **Knowledge Base.** Passende Einträge kommen in den Kontext.
 3. **Semantische Suche bei jeder Nachricht**, ohne Filter für kurze
    Nachrichten.

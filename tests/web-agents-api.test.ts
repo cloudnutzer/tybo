@@ -442,7 +442,7 @@ describe("POST /api/agents", () => {
     const ctx = await server();
     let res = await ctx.api("/api/agents", "POST", { ...planer, effort: "turbo" });
     expect(res.status).toBe(400);
-    expect((await res.json()).error).toBe("Ungültige Einstellungen: effort (erlaubt: low, medium, high, xhigh)");
+    expect((await res.json()).error).toBe("Ungültige Einstellungen: effort (erlaubt: low, medium, high, xhigh, max)");
     res = await ctx.api("/api/agents", "POST", { ...planer, model: 42 });
     expect(res.status).toBe(400);
     expect(existsSync(paths.file)).toBe(false);

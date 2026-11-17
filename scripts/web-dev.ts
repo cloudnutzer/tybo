@@ -52,6 +52,14 @@
  * Browsers, nur so kommt „Test senden" an. Push braucht einen sicheren
  * Kontext: im Browser http://127.0.0.1:<Port> oder http://localhost:<Port>.
  *
+ * Sprachagenten (Issue #495): Bereich /sprachagenten mit Beispielagenten im
+ * Speicher (src/web/demo-voice-agents.ts), die Gesprächsseite bekommt eine
+ * SDK-Attrappe (src/web/demo-voice-sdk.ts) statt des eingecheckten SDK,
+ * nichts geht an den Anbieter. Der Wizard „Neu“ (Issue #515) läuft gegen
+ * src/web/demo-voice-agent-wizard.ts: Vorschlag, Bauen und Hörprobe ohne
+ * Anbieter und ohne Job, gesteuert über Wörter im Satz (siehe dort). Dauer
+ * je Phase nach dem Bauen: WEB_DEV_WIZARD_STEP_MS (Standard 2000).
+ *
  * Beenden mit Ctrl+C oder: pkill -f scripts/web-dev.ts
  * Importiert src/bot.ts nicht, auch nicht über Umwege (tests/web-public.test.ts).
  */
@@ -77,6 +85,9 @@ import {
   startDemoServer,
   withDemoAutoTitle,
 } from "../src/web/demo";
+import { createDemoVoiceAgents } from "../src/web/demo-voice-agents";
+import { createDemoVoiceAgentWizard } from "../src/web/demo-voice-agent-wizard";
+import { DEMO_VOICE_AGENT_SDK } from "../src/web/demo-voice-sdk";
 import { createFakeChat } from "../src/web/fake-chat";
 import { createWebServer } from "../src/web/server";
 import { UploadStore } from "../src/web/uploads";
@@ -137,6 +148,14 @@ if (process.env.WEB_DEV_DEMO === "1") {
   }
   // Aktivität neuer Topics (automatischer Titel, Issue #30) an offene Seitenleisten
   const listeners = new Set<(event: TelegramLiveEvent) => void>();
+  // Sprachagenten (Issue #495): Verwaltung und Gesprächsroute als Attrappe, nie config/voice-agents des Checkouts
+  const demoVoiceAgents = createDemoVoiceAgents({ origin: () => `http://${result.config.host}:${result.config.port}` });
+  // Wizard (Issue #515): Attrappe im Speicher, fertige Agenten landen in der Liste oben
+  const demoWizard = createDemoVoiceAgentWizard({
+    register: demoVoiceAgents.register,
+    taken: demoVoiceAgents.has,
+    ...(process.env.WEB_DEV_WIZARD_STEP_MS ? { stepMs: Number(process.env.WEB_DEV_WIZARD_STEP_MS) } : {}),
+  });
   const server = await createWebServer(result.config, {
     sessionFile: join(dataRoot, "web-sessions.json"),
     // Terminal-Zugang (Issue #59): eigene Datei, nie data/cli-token des Bots
@@ -185,6 +204,11 @@ if (process.env.WEB_DEV_DEMO === "1") {
     uploads: new UploadStore({ dir: join(dataRoot, "web-dev", "uploads") }),
     // Web Push (Issue #225): nur mit WEB_DEV_PUSH=1, eigene Abo-Datei, nie data/web des Bots
     push: await devPush(join(dataRoot, "web-dev", "push-subscriptions.json")),
+    // Gesprächsseite /sa/<kennung> (Issue #495): SDK-Attrappe statt des echten SDK, kein Anbieter
+    voiceAgentSdkScript: DEMO_VOICE_AGENT_SDK,
+    voiceAgentSessions: demoVoiceAgents.sessions,
+    voiceAgentAdmin: demoVoiceAgents.admin,
+    voiceAgentWizard: demoWizard,
   });
   console.log(`[web] WebUI läuft auf ${server.url}`);
   stop = () => server.stop();

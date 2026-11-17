@@ -10,11 +10,13 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { SYSTEMD_UNIT } from "../setup/configure-systemd";
 import type { SetupContext } from "../src/setup/context";
+import { collectReport, reportExitCode, stepLine } from "../src/setup/checks/report";
+import { servicesCheck } from "../src/setup/checks/specials";
 import { LOCAL_SUPABASE_URL } from "../src/setup/local-supabase";
 import { autostartPlan, autostartStep, lingerFailed, lingerHint, SYSTEMD_UNREACHABLE } from "../src/setup/steps/autostart";
 import { runSetupMode } from "../src/setup/web-mode";
 import { cleanup, FAKE, FULL_ENV, leakedSecrets, makeCtx } from "./setup-fixture";
-import { linuxCtx, started, systemdRun } from "./systemd-fixture";
+import { CURRENT_UNIT, linuxCtx, OLD_UNIT, started, systemdRun } from "./systemd-fixture";
 import { runWith, scripted } from "./setup-terminal-fixture";
 import { CODE, PROFILE } from "./setup-web-fixture";
 
@@ -30,6 +32,7 @@ describe("Einrichten als systemd-Benutzerdienst", () => {
     const unitPath = join(ctx.systemdUserDir, "tybo-telegram-relay.service");
     const unit = await readFile(unitPath, "utf8");
     expect(unit).toContain("\nRestart=always\n");
+    expect(unit).toContain("\nKillMode=process\n");
     expect(unit).toMatch(/\nEnvironment=PATH=[^\n]*:\/home\/alex\/\.local\/bin:/);
     expect(unit).toContain(`\nWorkingDirectory=${ctx.root}\n`);
     expect(unit).toContain(`\nStandardOutput=append:${ctx.root}/logs/telegram-relay.log\n`);
@@ -38,6 +41,23 @@ describe("Einrichten als systemd-Benutzerdienst", () => {
     // PM2 wird nur gefragt, ob dort schon ein Bot steht, nie gestartet
     expect(ctx.run.calls.some(c => c.startsWith("pm2 start") || c.startsWith("npx"))).toBe(false);
     expect(ctx.run.calls.some(c => c.includes("sudo"))).toBe(false);
+  });
+
+  test("CODEX_PATH aus der .env (Issue #566): dessen Ordner im PATH der Unit, Pfadprüfung wie bei Claude", async () => {
+    const ctx = await linuxCtx({}, { env: "CODEX_PATH=/opt/codex/bin/codex\n" });
+    const r = await autostartStep.apply!({}, ctx);
+    expect(r.ok).toBe(true);
+    const unit = await readFile(join(ctx.systemdUserDir, "tybo-telegram-relay.service"), "utf8");
+    const path = /^Environment=PATH=(.*)$/m.exec(unit)![1].split(":");
+    expect(path).toContain("/opt/codex/bin");
+    expect(path).toContain("/home/alex/.local/bin");
+    expect(ctx.run.calls).not.toContain("which codex");
+
+    const unsafe = await linuxCtx({}, { env: "CODEX_PATH=/opt/mein codex/codex\n" });
+    const bad = await autostartStep.apply!({}, unsafe);
+    expect(bad.ok).toBe(false);
+    expect(existsSync(join(unsafe.systemdUserDir, "tybo-telegram-relay.service"))).toBe(false);
+    expect(unsafe.run.calls).not.toContain("systemctl --user enable --now tybo-telegram-relay");
   });
 
   test("ohne Linger und ohne Berechtigung: genau der Hinweis mit dem sudo-Befehl, Dienst läuft", async () => {
@@ -125,7 +145,7 @@ describe("Einrichten als systemd-Benutzerdienst", () => {
     const r = await autostartStep.apply!({}, ctx);
     expect(r.ok).toBe(true);
     expect(started(ctx.run)).toEqual(["systemctl --user daemon-reload", "systemctl --user enable --now tybo-telegram-relay"]);
-    expect(await readFile(join(ctx.systemdUserDir, "tybo-telegram-relay.service"), "utf8")).toBe("[Service]\n");
+    expect(await readFile(join(ctx.systemdUserDir, "tybo-telegram-relay.service"), "utf8")).toBe(CURRENT_UNIT);
   });
 
   test("enable scheitert: feste Meldung ohne Befehlsausgabe", async () => {
@@ -510,5 +530,165 @@ describe("Browser: Auswahl bis „Fertig“", () => {
     expect(await mode.done).toBe(0);
     expect(mode.logs.join("\n")).toContain("systemd startet tybo neu");
     expect(started(ctx.run)).toEqual([]);
+  });
+});
+
+/**
+ * Issue #561: Dienstdatei von vor KillMode=process. tybo setup autostart
+ * trägt die Zeile ein und lädt neu, ohne den Bot neu zu starten; tybo pruefen
+ * warnt nur und ändert nichts. systemctl ist die Attrappe aus
+ * systemd-fixture.ts, die den wirksamen KillMode aus Datei und Drop-ins liest.
+ */
+describe("Alte Dienstdatei ohne KillMode=process", () => {
+  const RUNNING = { loaded: true, active: true, enabled: true } as const;
+  const unitFile = (ctx: SetupContext) => join(ctx.systemdUserDir, "tybo-telegram-relay.service");
+  const killLines = (text: string) => text.match(/^KillMode=.*$/gm) ?? [];
+
+  test("Status: offen als Hinweis mit dem Befehl zum Nachziehen, im Bericht nur Warnung", async () => {
+    const ctx = await linuxCtx(RUNNING, { unit: OLD_UNIT });
+    const s = await autostartStep.status(ctx);
+    expect(s.state).toBe("teilweise");
+    expect(s.advisory).toBe(true);
+    expect(s.detail).toContain("KillMode=control-group");
+    expect(s.detail).toContain("Nachziehen mit: tybo setup autostart");
+    expect(s.items).toEqual([expect.objectContaining({ label: "Hintergrund-Jobs", ok: false, fix: "tybo setup autostart" })]);
+    expect(stepLine(autostartStep, s).status).toBe("warn");
+    // Status liest nur
+    expect(started(ctx.run)).toEqual([]);
+    expect(await readFile(unitFile(ctx), "utf8")).toBe(OLD_UNIT);
+  });
+
+  test("Status: Linger aus und alte Datei: beide Punkte, Linger bleibt ein Fehler im Bericht", async () => {
+    const ctx = await linuxCtx({ ...RUNNING, linger: "no" }, { unit: OLD_UNIT });
+    const s = await autostartStep.status(ctx);
+    expect(s.advisory).toBeUndefined();
+    expect(s.items?.map(i => i.label)).toEqual(["Linger", "Hintergrund-Jobs"]);
+    expect(stepLine(autostartStep, s).status).toBe("fail");
+  });
+
+  test("Nachziehen: Zeile unter [Service], Rest der Datei bleibt, daemon-reload, kein Neustart", async () => {
+    const ctx = await linuxCtx(RUNNING, { unit: OLD_UNIT });
+    const r = await autostartStep.apply!({}, ctx);
+    expect(r.ok).toBe(true);
+    expect(r.changed).toEqual([unitFile(ctx)]);
+    expect(r.message).toContain("KillMode=process");
+    expect(r.message).toContain("lief dabei weiter");
+    // Nur neu geladen: kein enable, kein restart, kein start
+    expect(started(ctx.run)).toEqual(["systemctl --user daemon-reload"]);
+    const after = await readFile(unitFile(ctx), "utf8");
+    expect(killLines(after)).toEqual(["KillMode=process"]);
+    // Bisheriger Inhalt unverändert, nur die zwei Zeilen (Kommentar und Einstellung) gleich nach [Service]
+    const lines = after.split("\n");
+    const at = lines.indexOf("[Service]");
+    expect(lines[at + 2]).toBe("KillMode=process");
+    expect([...lines.slice(0, at + 1), ...lines.slice(at + 3)].join("\n")).toBe(OLD_UNIT);
+    expect(ctx.run.world.killMode).toBe("process");
+    expect((await autostartStep.status(ctx)).state).toBe("erledigt");
+  });
+
+  test("Wiederholbar: ein zweiter Lauf ändert nichts und lädt nicht neu", async () => {
+    const ctx = await linuxCtx(RUNNING, { unit: OLD_UNIT });
+    await autostartStep.apply!({}, ctx);
+    const once = await readFile(unitFile(ctx), "utf8");
+    ctx.run.calls.length = 0;
+    const again = await autostartStep.apply!({}, ctx);
+    expect(again).toEqual({ ok: true, message: "Autostart ist schon eingerichtet, nichts geändert.", changed: [] });
+    expect(started(ctx.run)).toEqual([]);
+    expect(await readFile(unitFile(ctx), "utf8")).toBe(once);
+  });
+
+  test("daemon-reload scheitert: ehrlich offen, Wiederholung trägt die Zeile nicht doppelt ein", async () => {
+    const ctx = await linuxCtx({ ...RUNNING, reloadFails: true }, { unit: OLD_UNIT });
+    const r = await autostartStep.apply!({}, ctx);
+    expect(r.ok).toBe(false);
+    expect(r.running).toBe(true);
+    expect(r.message).toContain("daemon-reload schlug fehl");
+    expect(r.message).toContain("Erneut: tybo setup autostart");
+    expect(ctx.run.world.killMode).toBe("control-group");
+    ctx.run.world.reloadFails = false;
+    const again = await autostartStep.apply!({}, ctx);
+    expect(again.ok).toBe(true);
+    expect(killLines(await readFile(unitFile(ctx), "utf8"))).toEqual(["KillMode=process"]);
+    expect(ctx.run.world.killMode).toBe("process");
+  });
+
+  test("eigener KillMode in der Datei bleibt; Hinweis statt Änderung", async () => {
+    const own = OLD_UNIT.replace("Restart=always\n", "Restart=always\nKillMode=mixed\n");
+    const ctx = await linuxCtx(RUNNING, { unit: own });
+    const r = await autostartStep.apply!({}, ctx);
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain("setzt selbst KillMode=mixed");
+    expect(started(ctx.run)).toEqual([]);
+    expect(await readFile(unitFile(ctx), "utf8")).toBe(own);
+  });
+
+  test("Drop-in setzt einen anderen Wert: wirksamer Wert zählt, Datei bleibt, Hinweis auf systemctl --user cat", async () => {
+    const ctx = await linuxCtx(RUNNING, { unit: true });
+    await mkdir(`${unitFile(ctx)}.d`, { recursive: true });
+    await writeFile(join(`${unitFile(ctx)}.d`, "override.conf"), "[Service]\nKillMode=control-group\n");
+    const s = await autostartStep.status(ctx);
+    expect(s.items?.map(i => i.label)).toEqual(["Hintergrund-Jobs"]);
+    const r = await autostartStep.apply!({}, ctx);
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain("Drop-in");
+    expect(r.message).toContain("systemctl --user cat tybo-telegram-relay");
+    expect(await readFile(unitFile(ctx), "utf8")).toBe(CURRENT_UNIT);
+  });
+
+  test("Drop-in setzt KillMode=process: gilt als erledigt, Datei bleibt unberührt", async () => {
+    const ctx = await linuxCtx(RUNNING, { unit: OLD_UNIT });
+    await mkdir(`${unitFile(ctx)}.d`, { recursive: true });
+    await writeFile(join(`${unitFile(ctx)}.d`, "jobs.conf"), "[Service]\nKillMode=process\n");
+    expect((await autostartStep.status(ctx)).state).toBe("erledigt");
+    expect((await autostartStep.apply!({}, ctx)).changed).toEqual([]);
+    expect(await readFile(unitFile(ctx), "utf8")).toBe(OLD_UNIT);
+  });
+
+  test("gestoppter Dienst mit alter Datei: starten, dann nachziehen", async () => {
+    const ctx = await linuxCtx({}, { unit: OLD_UNIT });
+    const r = await autostartStep.apply!({}, ctx);
+    expect(r.ok).toBe(true);
+    expect(started(ctx.run)).toEqual(["systemctl --user daemon-reload", "systemctl --user enable --now tybo-telegram-relay", "systemctl --user daemon-reload"]);
+    expect(killLines(await readFile(unitFile(ctx), "utf8"))).toEqual(["KillMode=process"]);
+  });
+
+  test("Datei ohne Abschnitt [Service]: nichts geschrieben, Hinweis", async () => {
+    const ctx = await linuxCtx(RUNNING, { unit: "[Unit]\nDescription=x\n" });
+    const r = await autostartStep.apply!({}, ctx);
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain("fehlt der Abschnitt [Service]");
+    expect(await readFile(unitFile(ctx), "utf8")).toBe("[Unit]\nDescription=x\n");
+  });
+});
+
+describe("tybo pruefen mit alter Dienstdatei (Issue #561)", () => {
+  const RUNNING = { loaded: true, active: true, enabled: true } as const;
+
+  async function report(unit: string) {
+    const ctx = await linuxCtx(RUNNING, { env: FULL_ENV, unit });
+    const r = await collectReport({ ctx, steps: [autostartStep], specials: [servicesCheck] });
+    return { ctx, r };
+  }
+
+  test("sonst gesund: Warnung mit Befehl im Schritt und bei den Diensten, Exit 0, nichts geändert", async () => {
+    const { ctx, r } = await report(OLD_UNIT);
+    expect(r.lines.filter(l => l.status === "fail")).toEqual([]);
+    expect(reportExitCode(r)).toBe(0);
+    const step = r.lines.find(l => l.section === "Einrichtung" && l.label === autostartStep.title)!;
+    expect(step.status).toBe("warn");
+    expect(step.detail).toContain("tybo setup autostart");
+    const jobs = r.lines.find(l => l.label === "telegram-relay (Hintergrund-Jobs)")!;
+    expect(jobs).toMatchObject({ section: "Dienste", status: "warn" });
+    expect(jobs.detail).toContain("KillMode=control-group");
+    expect(jobs.detail).toContain("Nachziehen ohne Neustart: tybo setup autostart");
+    // rein lesend
+    expect(started(ctx.run)).toEqual([]);
+    expect(await readFile(join(ctx.systemdUserDir, "tybo-telegram-relay.service"), "utf8")).toBe(OLD_UNIT);
+  });
+
+  test("aktuelle Dienstdatei: keine Zeile zu Hintergrund-Jobs, Schritt bestanden", async () => {
+    const { r } = await report(CURRENT_UNIT);
+    expect(r.lines.some(l => l.label.includes("Hintergrund-Jobs"))).toBe(false);
+    expect(r.lines.find(l => l.label === autostartStep.title)?.status).toBe("pass");
   });
 });

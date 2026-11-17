@@ -37,8 +37,8 @@ import {
   type OpenCodePermission,
 } from "../settings";
 import { subprocessEnv } from "../subprocess-env";
-import type { ToolUse, TurnTools } from "../turn-tools";
-import { registerEngineCall, unregisterEngineCall, type EngineProc } from "./calls";
+import { bashToolUse, type ToolUse, type TurnTools } from "../turn-tools";
+import { engineShutdownStarted, registerEngineCall, trackEngineProcess, trackEngineTermination, unregisterEngineCall, type EngineProc } from "./calls";
 import { superviseRun, type RunControl } from "./lifecycle";
 import { codexErrorKind, createLineReader, redactCodexDiagnostic, signalProcessGroup, type CodexRuntime } from "./codex";
 import type { Engine, EngineErrorKind, EngineRequest, EngineResult, EngineUsage } from "./types";
@@ -96,8 +96,6 @@ export type OpenCodeEvent =
   | { type: "step_finish"; sessionId?: string; usage?: EngineUsage; costUsd?: number }
   | { type: "error"; sessionId?: string; error: OpenCodeError }
   | { type: "unknown"; sessionId?: string };
-
-const MAX_COMMAND_CHARS = 2000;
 
 const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
 const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
@@ -157,7 +155,7 @@ export function openCodeToolUse(tool: string, rawInput: unknown): { tools: ToolU
     case "bash": {
       const command = str(input.command);
       return {
-        tools: [command ? { name: "Bash", command: command.slice(0, MAX_COMMAND_CHARS) } : { name: "Bash" }],
+        tools: [bashToolUse(command)],
         step: command ? { name: "Bash", input: command } : { name: "Bash" },
       };
     }
@@ -616,8 +614,16 @@ const terminating = new WeakSet<object>();
 export function terminateOpenCodeProcess(proc: EngineProc, rt: OpenCodeRuntime = runtime): void {
   if (terminating.has(proc)) return;
   terminating.add(proc);
+  // Bis zum SIGKILL verfolgt, auch nach der Abmeldung im Register (Issue #561)
+  const done = trackEngineTermination(proc);
   rt.signal(proc, "SIGINT");
-  const timer = rt.setTimeout(() => rt.signal(proc, "SIGKILL"), OPENCODE_KILL_GRACE_MS);
+  const timer = rt.setTimeout(() => {
+    try {
+      rt.signal(proc, "SIGKILL");
+    } finally {
+      done();
+    }
+  }, OPENCODE_KILL_GRACE_MS);
   (timer as { unref?: () => void } | undefined)?.unref?.();
 }
 
@@ -696,6 +702,8 @@ const VERSION_ABORTED = "Versionsprüfung von OpenCode abgebrochen";
 const VERSION_TIMED_OUT = "OpenCode hat seine Version nicht rechtzeitig genannt (opencode --version)";
 
 function probeVersion(cwd: string): VersionProbe {
+  // Issue #561: nach Beginn des Beendens startet keine Prüfung mehr
+  if (engineShutdownStarted()) return { result: Promise.resolve({ ok: false, aborted: true, message: VERSION_ABORTED }), cancel: () => {} };
   const rt = runtime;
   let proc: ReturnType<typeof rt.spawn>;
   try {
@@ -711,6 +719,8 @@ function probeVersion(cwd: string): VersionProbe {
   } catch {
     return { result: Promise.resolve({ ok: false, errorKind: "not_installed", message: OPENCODE_NOT_INSTALLED }), cancel: () => {} };
   }
+  // Issue #561: das Beenden des Bots beendet auch diesen Prozess und wartet, bis er wirklich weg ist
+  trackEngineProcess(proc, (p) => terminateOpenCodeProcess(p, rt));
   let cancelled = false;
   let onCancel = () => {};
   const cancelledPromise = new Promise<{ kind: "aborted" }>((resolve) => (onCancel = () => resolve({ kind: "aborted" })));
@@ -779,6 +789,7 @@ export const OPENCODE_MODELS_TEXT = {
   failed: "opencode models endete mit einem Fehler",
   empty: "OpenCode nennt keine Modelle",
   tooLarge: "opencode models liefert zu viel Ausgabe",
+  shutdown: "tybo wird beendet, OpenCode wird nicht mehr gefragt",
 } as const;
 
 export type OpenCodeModelsResult = { ok: true; models: string[] } | { ok: false; error: string };
@@ -813,6 +824,8 @@ export function parseOpenCodeModels(stdout: string): string[] {
  * Modell-Liste der WebUI (src/web/models.ts).
  */
 export async function listOpenCodeModels(): Promise<OpenCodeModelsResult> {
+  // Issue #561: nach Beginn des Beendens startet keine Abfrage mehr
+  if (engineShutdownStarted()) return { ok: false, error: OPENCODE_MODELS_TEXT.shutdown };
   const rt = runtime;
   const cwd = process.env.GO_PROJECT_ROOT || process.cwd();
   let proc: ReturnType<typeof rt.spawn>;
@@ -829,6 +842,8 @@ export async function listOpenCodeModels(): Promise<OpenCodeModelsResult> {
   } catch {
     return { ok: false, error: OPENCODE_MODELS_TEXT.notInstalled };
   }
+  // Issue #561: das Beenden des Bots beendet die Abfrage samt Kindern und wartet auf ihr Ende
+  trackEngineProcess(proc, (p) => terminateOpenCodeProcess(p, rt));
   const stderr = discardStream(proc.stderr as ReadableStream<Uint8Array>);
   const stdout = readCapped(proc.stdout as ReadableStream<Uint8Array>, OPENCODE_MODELS_MAX_OUTPUT);
   const done = stdout.result.then(async (r) =>

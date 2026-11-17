@@ -14,6 +14,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { createServerRoutes, deployRef, SERVER_BODY_LIMIT, UNKNOWN_REVISION, type DeployRun, type ServerRoutesDeps } from "../src/app/server-routes";
 import { setChoicesFileForTests, type ChoiceConversation } from "../src/lib/choices";
+import { ClaudeUnavailableError } from "../src/lib/claude-availability";
 import { createPhoneLedger, type PhoneLedger } from "../src/lib/phone/ledger";
 import type { PhoneCaller, TranscriptLine, TranscriptResult } from "../src/lib/phone/provider";
 import { createPhoneService, PHONE_TEXT, WAIT_MS, type PhoneService, type TranscriptDelivery } from "../src/lib/phone/service";
@@ -325,6 +326,28 @@ describe("/webhook/elevenlabs", () => {
     ]);
   });
 
+  test("agent_id und Gesprächsbeginn gehen an die Nachlauf-Weiche (Issue #496), ungültige Werte fallen weg", async () => {
+    const metas: unknown[] = [];
+    const { call } = routesWith(env, {
+      transcripts: () => ({ receiveTranscript: async (_id, _lines, meta) => (metas.push(meta), "accepted") }),
+    });
+    const withMeta = (data: Record<string, unknown>) =>
+      JSON.stringify({ type: "post_call_transcription", data: { conversation_id: "conv-1", transcript: [{ role: "user", message: "Hallo" }], ...data } });
+    expect((await call(postCall(withMeta({ agent_id: " agent_7 ", metadata: { start_time_unix_secs: 1_762_590_600 } })))).status).toBe(200);
+    expect((await call(postCall(withMeta({})))).status).toBe(200);
+    expect((await call(postCall(withMeta({ agent_id: 7, metadata: { start_time_unix_secs: "gestern" } })))).status).toBe(200);
+    expect(metas).toEqual([{ agentId: "agent_7", startedAt: 1_762_590_600_000 }, {}, {}]);
+  });
+
+  test("Weiche wirft (Zuordnung unklar): 500, ElevenLabs stellt erneut zu", async () => {
+    const { call, logs } = routesWith(env, {
+      transcripts: () => ({ receiveTranscript: async () => { throw new Error("Zuordnung des Gesprächs unklar"); } }),
+    });
+    const { status } = await call(postCall(transcriptEvent()));
+    expect(status).toBe(500);
+    expect(logs.join("\n")).toContain("Protokoll nicht übernommen");
+  });
+
   test("fehlende, falsche und fremde Signatur: 401, nichts übergeben", async () => {
     const { call, received } = routesWith(env);
     const body = transcriptEvent();
@@ -429,7 +452,7 @@ interface PhoneHarness {
   /** Abfrage beim Anbieter: Ergebnis je Aufruf, Standard noch laufend; wait hält sie an */
   poll: { result: TranscriptResult; wait: Promise<void> | null; calls: number };
   /** Zusammenfassung wartet, bis gate erfüllt ist (null: sofort) */
-  gate: { wait: Promise<void> | null; fail: boolean };
+  gate: { wait: Promise<void> | null; fail: boolean; disabled?: boolean };
   /** Uhr des Dienstes; null: echte Zeit */
   clock: { at: number | null };
   /** Wartezeiten des Dienstes: held hält sie an, next gibt die wartenden frei, release alle und hebt held auf */
@@ -475,6 +498,7 @@ function phoneHarness(ledgerPath: string, options: { inbound?: boolean } = {}): 
       h.summaries.push(transcript);
       if (h.gate.wait) await h.gate.wait;
       if (h.gate.fail) throw new Error("Aux-Modell nicht erreichbar");
+      if (h.gate.disabled) throw new ClaudeUnavailableError("Keine Zusammenfassung: Claude fehlt.");
       return "Folien für Freitag besprochen.";
     },
     findTask: async () => null,
@@ -601,6 +625,24 @@ describe("Doppelzustellung (Anrufdienst und Anrufliste)", () => {
     h.pause.release();
     await h.service.idle();
     expect(summaryNotes(h)).toHaveLength(1);
+    h.service.stop();
+  });
+
+  test("Issue #566: Zusammenfassung abgeschaltet: 200 statt 500 (keine erneute Zustellung), Anfang des Protokolls mit Grund, kein zweiter Versuch", async () => {
+    const h = phoneHarness(join(dir, "data", "phone-calls.json"));
+    const ref = await heldCall(h);
+    h.gate.disabled = true;
+    const routes = routesFor(h);
+    expect(await deliver(routes)).toEqual({ status: 200, body: { ok: true } });
+    h.pause.release();
+    await h.service.idle();
+    expect(h.summaries).toHaveLength(1);
+    expect(h.notes).toHaveLength(1);
+    expect(h.notes[0]).toContain("Alex: Bitte bereite die Folien");
+    expect(h.notes[0]).toContain("Keine Zusammenfassung: Claude fehlt.");
+    expect(h.ledger.get(ref)).toMatchObject({ stage: "closed", note: "Zusammenfassung abgeschaltet" });
+    expect((await deliver(routes)).body.skipped).toBe("schon bearbeitet");
+    expect(h.summaries).toHaveLength(1);
     h.service.stop();
   });
 

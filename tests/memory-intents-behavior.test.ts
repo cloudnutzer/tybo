@@ -201,7 +201,7 @@ describe("processIntents: DONE, CANCEL, FORGET mit null oder einem Treffer", () 
 describe("Gedächtnis-Kontext ohne Datenbank", () => {
   test("Fakten und Ziele im Wortlaut des Prompts", async () => {
     await processIntents("[REMEMBER: Alex mag Tee] [GOAL: Mehr lesen]");
-    expect(await getMemoryContext("Was mag Alex?")).toBe("**Known Facts:**\n- Alex mag Tee\n\n**Active Goals:**\n1. Mehr lesen");
+    expect(await getMemoryContext("Was mag Alex?")).toMatch(/^\*\*Known Facts:\*\*\n_.+_\n- \[\d{4}-\d{2}-\d{2}\] Alex mag Tee\n\n\*\*Active Goals:\*\*\n1\. Mehr lesen$/);
   });
 
   test("leer: leerer Text", async () => {

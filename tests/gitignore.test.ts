@@ -26,6 +26,12 @@ const SECRETS = [".env", ".env.local", ".env.server", "data/.env", "src/.env.tes
 
 const OWN_SETTINGS = [
   "config/profile.md",
+  "config/kern.md",
+  "config/kern.md.vorher",
+  "config/kern.md.lock",
+  "config/kern.md.0f3c.tmp",
+  "data/kern-entwurf.json",
+  "data/kern-entwurf.json.lock",
   "config/schedule.json",
   "config/agent-overrides.json",
   "config/settings.json",
@@ -37,10 +43,13 @@ const OWN_SETTINGS = [
   "config/reminders.json",
   "config/checkin-state.json",
   "config/irgendwas-state.json",
+  "config/voice-agents/jarvis.json",
 ];
 
 const STATE = [
   "bot.lock",
+  "bot.lock.0f3c.tmp",
+  "bot.lock.break-0123456789abcdef",
   "session-state.json",
   "memory.json",
   "memory.json.sqlite",
@@ -51,6 +60,7 @@ const STATE = [
   "CLAUDE.local.md",
   "data/restart-requested",
   "data/jobs/x/status.json",
+  "data/voice-agents/jarvis/state.json",
   "logs/telegram-relay.log",
   "uploads/bild.jpg",
   "temp/x.txt",
@@ -73,8 +83,12 @@ const PRIVATE_WEB = ["docs/foto-fit-worker.js", "docs/voice-bridge-reference/pag
 const VISIBLE = [
   ".env.example",
   "config/profile.example.md",
+  "config/kern.example.md",
   "config/topics.example.json",
   "config/routines.example.json",
+  "config/voice-agents.example/anrufannahme.json",
+  "config/voice-agents.example/jarvis.json",
+  "config/voice-agents.example/verhandlungstrainer.json",
   "config/mcp-servers.json",
   "src/bot.ts",
   "tests/gitignore.test.ts",

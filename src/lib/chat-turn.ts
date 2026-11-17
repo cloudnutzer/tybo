@@ -9,6 +9,7 @@
  */
 
 import { firstTextSnippet, MAX_RUN_STEPS, type RunStep } from "./claude";
+import { CLAUDE_NOT_INSTALLED_NOTICE } from "./claude/start-failure";
 import { getEngine, forgetEngineCheck, DEFAULT_ENGINE, type EngineErrorKind, type EngineId, type EngineRequest, type EngineResult } from "./engines";
 import {
   resolveEngine,
@@ -46,6 +47,7 @@ import { getSettings } from "./settings";
 import { bookRunOutcome } from "./spend/credit";
 import type { TurnTools } from "./turn-tools";
 import { stallPhaseLogText, stallPhaseUserText, type StallPhase } from "./stream-phase";
+import { engineTimeoutLogLine, TIMEOUT_NO_FALLBACK } from "./log-lines";
 import { renderQuestionTags, scanForQuestion, type FoundQuestion } from "./turn-questions";
 import type { AskOffer, AskOfferOutcome, TypedAnswer } from "./ask-choices";
 import type { ChoiceConversation } from "./choices";
@@ -460,6 +462,8 @@ export async function prepareClaudeCall(
   fullPrompt: string;
   fallbackContext: string;
   memoryWatermark: number;
+  /** Fakten, die die Session mit diesem Prompt kennt; verbucht erst nach einem gelungenen Lauf */
+  shownFactIds?: string[];
 }> {
   const d = resolveDeps(deps);
   // Modell der Session: Agenten-Modell nur für Claude, sonst das des Motors oder "" (Issue #125)
@@ -473,11 +477,16 @@ export async function prepareClaudeCall(
   if (session?.engineSessionId && session.engine === engine) {
     // Fallback context stays empty here on purpose: if the resume call fails
     // we retry with a fresh full prompt first, which fills it properly.
+    let shownFactIds = session.shownFactIds;
     const fullPrompt = await d.buildResumePrompt({
       userMessage,
       chatId,
       sinceMs: session.memoryWatermark ?? session.startedAt,
       ...(channel ? { channel } : {}),
+      shownFactIds: shownFactIds ?? [],
+      onFactsShown: (ids) => {
+        shownFactIds = ids;
+      },
     });
     return {
       sessionKey,
@@ -485,6 +494,7 @@ export async function prepareClaudeCall(
       fullPrompt,
       fallbackContext: "",
       memoryWatermark,
+      ...(shownFactIds ? { shownFactIds } : {}),
     };
   }
 
@@ -495,14 +505,14 @@ export async function prepareClaudeCall(
     if (expired && d.shouldDistill(expired)) void d.distillSession(expired);
   }
 
-  const { fullPrompt, fallbackContext } = await d.buildPromptContext({
+  const { fullPrompt, fallbackContext, shownFactIds } = await d.buildPromptContext({
     userMessage,
     chatId,
     agentName,
     topicId,
     ...(channel ? { channel } : {}),
   });
-  return { sessionKey, resumeId: undefined, fullPrompt, fallbackContext, memoryWatermark };
+  return { sessionKey, resumeId: undefined, fullPrompt, fallbackContext, memoryWatermark, ...(shownFactIds ? { shownFactIds } : {}) };
 }
 
 /**
@@ -513,6 +523,8 @@ export async function prepareClaudeCall(
  * true nur, wenn der Zeiger auf genau diese Session gespeichert wurde.
  * epoch: sessionEpoch vor dem Turn; wurde der Schlüssel seitdem mit /new
  * zurückgesetzt, bleibt die alte Session verworfen (Issue #189).
+ * shownFactIds: Fakten, die die Session nach diesem Lauf kennt (Issue #523). Sie
+ * gelten erst hier als gezeigt, ein gescheiterter Lauf verbucht also nichts.
  */
 export async function finalizeClaudeSession(
   sessionKey: string,
@@ -521,7 +533,8 @@ export async function finalizeClaudeSession(
   memoryWatermark?: number,
   model?: string,
   deps?: Partial<ChatTurnDeps>,
-  epoch?: number
+  epoch?: number,
+  shownFactIds?: string[]
 ): Promise<boolean> {
   const d = resolveDeps(deps);
   if (!d.isSessionModeEnabled()) return false;
@@ -544,7 +557,7 @@ export async function finalizeClaudeSession(
     resolvedModel = stored.model;
   }
   if (epoch !== undefined && d.sessionEpoch(sessionKey) !== epoch) return false;
-  return await d.recordSessionTurn(sessionKey, agentName, resolvedModel, result.engine, result.sessionId, memoryWatermark, epoch);
+  return await d.recordSessionTurn(sessionKey, agentName, resolvedModel, result.engine, result.sessionId, memoryWatermark, epoch, shownFactIds);
 }
 
 /** Überschrift, unter der TurnOptions.turnHint am Prompt hängt */
@@ -617,6 +630,14 @@ function isEngineUnavailable(result: EngineResult): boolean {
     !result.timedOut &&
     (result.errorKind === "auth" || result.errorKind === "not_installed")
   );
+}
+
+/**
+ * Claude Code ließ sich nicht starten, weil das Programm fehlt (Issue #565):
+ * kein neuer Versuch ohne Resume, die Fallback-Kette antwortet
+ */
+function isClaudeMissing(result: EngineResult): boolean {
+  return result.engine === "claude" && result.isError && !result.aborted && !result.timedOut && result.errorKind === "not_installed";
 }
 
 /** Fortsetzen auf dem Motor api scheiterte an der Sitzung (errorKind context): nie ein Abbruch oder Zeitlimit */
@@ -727,7 +748,7 @@ async function runTurn(mode: TurnMode, opts: TurnOptions): Promise<string> {
   // Assemble the prompt (topic-isolated conversation, memory, knowledge base,
   // semantic search on every message): see lib/prompt-builder. In resume
   // mode the prompt is slim: the Claude session already holds the context.
-  let { sessionKey, resumeId, fullPrompt, fallbackContext, memoryWatermark } =
+  let { sessionKey, resumeId, fullPrompt, fallbackContext, memoryWatermark, shownFactIds } =
     await prepareClaudeCall(userMessage, chatId, agentName, topicId, sessionModel(current.model), d, engineId, opts.channel);
   // Fortsetzungs-Prompt ist schlank; ein Wechsel auf einen anderen Motor braucht den vollen
   let promptIsFull = !resumeId;
@@ -820,7 +841,8 @@ async function runTurn(mode: TurnMode, opts: TurnOptions): Promise<string> {
   };
 
   const rebuildFullPrompt = async () => {
-    ({ fullPrompt, fallbackContext } = await d.buildPromptContext({
+    // Neue Session: Sie kennt nur, was der volle Prompt zeigt
+    ({ fullPrompt, fallbackContext, shownFactIds } = await d.buildPromptContext({
       userMessage,
       chatId,
       agentName,
@@ -879,6 +901,10 @@ async function runTurn(mode: TurnMode, opts: TurnOptions): Promise<string> {
       await sink.finish();
       return ABORT_REPLY;
     }
+  } else if (isClaudeMissing(result)) {
+    // Ohne Programm hilft auch eine frische Session nicht (Issue #565): die
+    // Session bleibt, nur der volle Kontext wird für das Ersatzmodell gebaut
+    if (!promptIsFull) await rebuildFullPrompt();
   } else if (resumeId && !result.timedOut && (result.isError || !result.text)) {
     // Resume can fail (session file gone, CLI updated, context limit):
     // reset the session and retry once with a fresh full prompt. Not after a
@@ -896,9 +922,10 @@ async function runTurn(mode: TurnMode, opts: TurnOptions): Promise<string> {
     }
   }
 
-  // Ein anderer Motor als Claude hat geantwortet: nachgewiesen wieder bereit,
-  // ein späterer Ausfall wird erneut gemeldet (eine positive Vorprüfung allein reicht nicht)
-  if (result.engine !== "claude" && !result.isError && !result.timedOut) markEngineRecovered(conversationKey, result.engine);
+  // Der Motor hat geantwortet: nachgewiesen wieder bereit, ein späterer Ausfall
+  // wird erneut gemeldet (eine positive Vorprüfung allein reicht nicht). Gilt
+  // auch für Claude Code, dessen fehlendes Programm einmal gemeldet wird (Issue #565)
+  if (!result.isError && !result.timedOut) markEngineRecovered(conversationKey, result.engine);
 
   // Die getippte Nachricht hat eine offene Rückfrage beantwortet (Motor api):
   // im Register schließen, noch unter der Sperre des Gesprächs, damit ein
@@ -920,7 +947,8 @@ async function runTurn(mode: TurnMode, opts: TurnOptions): Promise<string> {
     memoryWatermark,
     sessionModel(current.model),
     d,
-    epoch
+    epoch,
+    shownFactIds
   );
 
   // Track session ID for HITL task creation (if Claude asks a question with buttons);
@@ -944,12 +972,16 @@ async function runTurn(mode: TurnMode, opts: TurnOptions): Promise<string> {
   // Zeitlimit: kein Fallback, der Auftrag liefe sonst doppelt (Issue #179).
   // Stattdessen der Stand als Antwort, nicht zusätzlich als Hinweis.
   if (result.timedOut) {
+    // Text aus log-lines.ts: der Nachtcheck zählt genau diese Zeile (Issue #568)
     console.warn(
-      `${label} timeout${result.timeoutKind ? `/${result.timeoutKind}` : ""}, kein Fallback ` +
-        `(steps=${result.steps?.length ?? "unbekannt"}, sessionId=${result.sessionId ? "ja" : "nein"}` +
-        `${result.stallPhase ? `, phase: ${stallPhaseLogText(result.stallPhase)}` : ""})`
+      engineTimeoutLogLine(
+        label,
+        result.timeoutKind,
+        `steps=${result.steps?.length ?? "unbekannt"}, sessionId=${result.sessionId ? "ja" : "nein"}` +
+          `${result.stallPhase ? `, phase: ${stallPhaseLogText(result.stallPhase)}` : ""}`
+      )
     );
-    await d.log("warn", "bot", `${label} timeout, kein Fallback`, {
+    await d.log("warn", "bot", `${label} timeout, ${TIMEOUT_NO_FALLBACK}`, {
       timedOut: true,
       ...(result.timeoutKind ? { timeoutKind: result.timeoutKind } : {}),
       ...(result.stoppedAfterMs !== undefined ? { stoppedAfterMs: result.stoppedAfterMs } : {}),
@@ -987,7 +1019,7 @@ async function runTurn(mode: TurnMode, opts: TurnOptions): Promise<string> {
   // Fehler oder leere Antwort: die Fallback-Kette springt ein
   if (result.isError || !result.text) {
     console.error(
-      `${label} error (text=${result.text?.length || 0} chars): [content omitted]`
+      `${label} error (text=${result.text?.length || 0} chars${result.errorKind ? `, errorKind=${result.errorKind}` : ""}): [content omitted]`
     );
     await d.log("warn", "bot", `${label} failed, using fallback LLM`, {
       error: result.text?.substring(0, 200),
@@ -995,8 +1027,12 @@ async function runTurn(mode: TurnMode, opts: TurnOptions): Promise<string> {
       engine: result.engine,
       ...(result.errorKind ? { errorKind: result.errorKind } : {}),
     });
-    // Nur bei anderen Motoren: Claude-Ausfälle bleiben still wie bisher
+    // Andere Motoren mit Hinweis; Claude-Ausfälle bleiben still wie bisher,
+    // außer wenn das Programm fehlt: das meldet sich einmal je Gespräch (Issue #565)
     if (result.engine !== "claude") await sink.notice(engineFailedNotice(result.engine, result.errorKind));
+    else if (isClaudeMissing(result) && shouldNotifyUnavailable(conversationKey, "claude", "run")) {
+      await sink.notice(CLAUDE_NOT_INSTALLED_NOTICE);
+    }
 
     // Was das Fallback-Modell an Werkzeugen nutzte, ist nicht bekannt
     reportTools(undefined);

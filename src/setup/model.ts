@@ -109,6 +109,12 @@ export interface StatusItem {
   detail: string;
   /** Konkrete Anleitung, wenn etwas fehlt (etwa ein Befehl) */
   fix?: string;
+  /**
+   * Nur ein Hinweis (Issue #566): fehlt etwas, ist es kein Fehler und zählt
+   * weder für den Zustand noch für das Ergebnis des Tests, etwa Claude
+   * Code, wenn ein anderer Motor eingestellt ist
+   */
+  optional?: boolean;
 }
 
 export interface StepStatus {
@@ -117,6 +123,12 @@ export interface StepStatus {
   detail: string;
   fields: FieldState[];
   items?: StatusItem[];
+  /**
+   * Nur ein Hinweis (Issue #561): der Schritt ist offen, damit „tybo setup“
+   * ihn anbietet, im Prüfbericht zählt er aber als Warnung, auch als
+   * Pflichtschritt.
+   */
+  advisory?: boolean;
 }
 
 export interface TestResult {

@@ -5,9 +5,11 @@
  * bleiben: user_name, current_time, call_reason, memory, recent_telegram.
  * Gedächtnis und letzte Nachrichten kommen aus dem Speicher (ohne Datenbank
  * leer); scheitert das Lesen, steht ein Platzhalter da, der Anruf geht
- * trotzdem raus.
+ * trotzdem raus. Gekürzt wird das Gedächtnis nur um ganze Einträge, der
+ * Vorbehalt zu den Daten der Fakten bleibt (Issue #519).
  */
 
+import { fitMemoryContext } from "../memory/context";
 import type { CallRecord } from "./ledger";
 
 export const MEMORY_MAX_CHARS = 1_000;
@@ -45,7 +47,7 @@ export async function callVariables(call: Pick<CallRecord, "reason" | "userName"
   let memory = "";
   let recent = "";
   try {
-    memory = (await source.memory()).slice(0, MEMORY_MAX_CHARS);
+    memory = fitMemoryContext(await source.memory(), MEMORY_MAX_CHARS);
   } catch {
     // Platzhalter unten
   }

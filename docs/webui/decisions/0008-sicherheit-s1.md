@@ -19,3 +19,16 @@ sondern drei Ideen, umgesetzt in unserem Ablauf:
    die übliche Arbeitsweise (curl, Deploys, APIs) davon lebt. Ehrliche Grenze: Die
    `.env` bleibt lesbar; der Schutz hält vor allem die übliche Injection
    `env | curl …` ab.
+
+## Nachtrag 05.11.2026: nur noch Inhalte aus dem Netz (Issue #525)
+
+Entschieden von: Maintainer. Punkt 2 fragte zu oft nach, vor allem wegen
+`gh` gegen die eigenen Repos. Seitdem gilt als fremd nur, was aus dem Netz
+kommt: Web-Werkzeuge und Suche, Mail und andere lesende MCP-Werkzeuge,
+`curl`, `wget` und Co., `gh` gegen fremde oder nicht erkennbare Repos sowie
+hochgeladene Dateien und Fotos. Dateien auf diesem Rechner zählen nicht mehr,
+auch außerhalb des Projekts, und `gh` gegen ein Repo der Konten aus
+`TYBO_TRUSTED_GITHUB_OWNERS` (ohne Wert: keines) ebenfalls nicht. Im Zweifel
+bleibt es ein Vorschlag; ein Befehl mit mehreren Teilen zählt als fremd,
+sobald ein Teil fremd ist. Das Tor selbst bleibt unverändert, auch dass eine
+unbekannte Werkzeugliste direkt angewendet wird.

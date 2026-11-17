@@ -35,6 +35,13 @@
  * frühere Datei ohne SUPABASE_URL ließ spätere Supabase-Tests am Platzhalter
  * scheitern. Gewählt wird erst beim ersten getStore() im Test, mit dessen
  * Umgebung.
+ *
+ * Ebenso gilt vor jedem Test das Beenden als nicht begonnen (Issue #561):
+ * abortAllEngineCalls sperrt danach jede Motor-Prüfung, und viele Dateien
+ * rufen es zum Aufräumen auf.
+ *
+ * Und Claude gilt vor jedem Test als nicht geprüft (Issue #566): ein Test,
+ * der „Claude fehlt“ setzt, schaltete sonst später Nebenaufgaben ab.
  */
 
 import { beforeEach } from "bun:test";
@@ -43,6 +50,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GIB } from "../src/lib/agent-capacity";
 import { resetCallRecapsForTests } from "../src/lib/call-recap";
+import { resetClaudeAvailabilityForTests } from "../src/lib/claude-availability";
+import { resetEngineShutdownForTests } from "../src/lib/engines/calls";
 import { resetAgentCapacity } from "../src/lib/execution-context";
 import { resetStore } from "../src/lib/store";
 import { resetSupabaseClient } from "../src/lib/supabase";
@@ -80,8 +89,18 @@ if (!process.env.MEMORY_FILE_PATH) {
 if (!process.env.BUDGET_DB_PATH) {
   process.env.BUDGET_DB_PATH = join(mkdtempSync(join(tmpdir(), "tybo-test-spend-")), "api-budget.sqlite");
 }
+// Zeitzone immer gesetzt, nie gelöscht: Unter bun 1.3 (CI) bleibt die
+// Zeitzone nach einem `delete process.env.TZ` für den Rest des Prozesses
+// stehen, ein späteres Setzen wirkt nicht mehr. Tests, die TZ sichern und
+// zurückstellen (store-switch, Zeitstempel im Verlauf), löschten sie sonst
+// bei leerem TZ, und je nach Reihenfolge der Dateien sahen spätere Tests mit
+// Europe/Berlin weiter UTC. UTC entspricht der Zeitzone der CI.
+if (!process.env.TZ) process.env.TZ = "UTC";
 resetAgentCapacity({ totalmem: TEST_TOTALMEM });
 beforeEach(() => {
+  resetEngineShutdownForTests();
+  // Issue #566: „Claude fehlt“ aus einem Test schaltet sonst in späteren Dateien Nebenaufgaben ab
+  resetClaudeAvailabilityForTests();
   resetCallRecapsForTests();
   resetCallTurnsForTests();
   resetStore();

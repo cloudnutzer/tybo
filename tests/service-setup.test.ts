@@ -13,7 +13,8 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { setUpService, type LaunchdDeps } from "../src/setup/services/launchd";
 import { runUninstallCommand, type UninstallDeps } from "../src/setup/services/uninstall";
-import { launchdFindings, pm2Findings } from "../src/setup/checks/services";
+import { launchdFindings, localSupabaseFindings, pm2Findings } from "../src/setup/checks/services";
+import { LOCAL_SUPABASE_URL } from "../src/setup/local-supabase";
 import { readRestartRequest } from "../src/lib/restart-request";
 import type { CommandResult, CommandRunner } from "../src/setup/context";
 import { PROJECT_ROOT } from "../src/setup/context";
@@ -497,9 +498,30 @@ describe("pruefen: launchd-Dienste", () => {
     expect((await verifyLaunchd(`42\t0\t${NEW}-alt`))[0].detail).toBe("Nicht eingerichtet");
   });
 
-  test("geladen mit Exit 0 wartet auf den Zeitplan; Exit-Code ungleich 0: Warnung", async () => {
-    expect((await verifyLaunchd(`-\t0\t${NEW}`))[0]).toEqual({ label: "telegram-relay", status: "pass", detail: "Geladen, letzter Exit 0 (wartet auf den Zeitplan)" });
-    expect((await verifyLaunchd(`-\t1\t${NEW}`))[0]).toEqual({ label: "telegram-relay", status: "warn", detail: "Geladen, letzter Exit-Code 1" });
+  test("Issue #567: der Bot (Dauerdienst) geladen ohne Prozess ist ein Fehler, bei Exit 0 wie ungleich 0", async () => {
+    const hint = "tybo antwortet so nicht. Ursache in logs/telegram-relay.error.log, Abhilfe in docs/troubleshooting.md unter „Bot-Dienst startet nicht (macOS)“";
+    expect((await verifyLaunchd(`-\t0\t${NEW}`))[0]).toEqual({ label: "telegram-relay", status: "fail", detail: `Geladen, läuft aber nicht (letzter Exit-Code 0), ${hint}` });
+    expect((await verifyLaunchd(`-\t1\t${NEW}`))[0]).toEqual({ label: "telegram-relay", status: "fail", detail: `Geladen, läuft aber nicht (letzter Exit-Code 1), ${hint}` });
+    expect((await verifyLaunchd(`-\t-\t${NEW}`))[0]).toMatchObject({ status: "fail", detail: expect.stringContaining("letzter Exit-Code unbekannt") });
+  });
+
+  test("Zeitdienste unverändert: Exit 0 wartet auf den Zeitplan, sonst Warnung", async () => {
+    const run = fakeRun({ "launchctl list": { stdout: `-\t0\tai.tybo.smart-checkin\n-\t1\tai.tybo.morning-briefing\n` } });
+    const ctx = await makeCtx({ overrides: { run } });
+    expect(await launchdFindings(ctx, ["smart-checkin", "morning-briefing"])).toEqual([
+      { label: "smart-checkin", status: "pass", detail: "Geladen, letzter Exit 0 (wartet auf den Zeitplan)" },
+      { label: "morning-briefing", status: "warn", detail: "Geladen, letzter Exit-Code 1" },
+    ]);
+  });
+
+  test("Supabase-Einmalstart unverändert: ohne Prozess mit Exit 0 erfolgreich, sonst Warnung", async () => {
+    const lines = async (exit: string) => {
+      const run = fakeRun({ "launchctl list": { stdout: `-\t${exit}\tai.tybo.supabase\n` }, "docker ps": { stdout: "supabase_db_tybo" } });
+      const ctx = await makeCtx({ overrides: { run } });
+      return localSupabaseFindings(ctx, { SUPABASE_URL: LOCAL_SUPABASE_URL });
+    };
+    expect((await lines("0"))[0]).toEqual({ label: "supabase (Autostart)", status: "pass", detail: "Eingerichtet, letzter Aufruf erfolgreich (Exit 0)" });
+    expect((await lines("1"))[0]).toMatchObject({ label: "supabase (Autostart)", status: "warn" });
   });
 
   test("launchctl list scheitert: Fehler", async () => {
@@ -585,7 +607,7 @@ describe("Namen und Erkennung", () => {
     expect(launchdLabel("watchdog")).toBe("ai.tybo.watchdog");
     expect(pm2Name("watchdog")).toBe("tybo-watchdog");
     expect(Object.keys(serviceNames).sort()).toEqual(
-      ["BOT_SERVICE", "SUPABASE_SERVICE", "SUPABASE_START_STATE", "LAUNCHD_PREFIX", "PM2_PREFIX", "findLaunchctlLine", "isServicePlist", "labelInLaunchctlList", "launchdLabel", "pm2Name", "systemdUnit", "systemdUnitFile"].sort()
+      ["BOT_SERVICE", "HEALTH_SERVICE_ID", "SUPABASE_SERVICE", "SUPABASE_START_STATE", "LAUNCHD_PREFIX", "PM2_PREFIX", "findLaunchctlLine", "isServicePlist", "labelInLaunchctlList", "launchdLabel", "pm2Name", "systemdUnit", "systemdUnitFile"].sort()
     );
     expect(serviceNames.systemdUnitFile("telegram-relay")).toBe("tybo-telegram-relay.service");
   });

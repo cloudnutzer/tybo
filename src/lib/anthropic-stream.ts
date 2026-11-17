@@ -284,6 +284,7 @@ export function streamText(blocks: StreamBlock[]): string {
 /** USD pro Million Tokens: Eingabe, Ausgabe, Cache-Lesen, Cache-Schreiben */
 const PRICES: Record<string, [number, number, number, number]> = {
   "claude-sonnet-5-5": [2, 10, 0.2, 2.5],
+  "claude-fable-5-2": [8, 40, 0.2, 10],
   "claude-opus-5-5": [4, 20, 0.4, 5],
 };
 

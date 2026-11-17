@@ -710,7 +710,7 @@ test("Container-Namen passen zum project_id tybo", () => {
 });
 
 describe("über den Einstieg tybo (wie unter launchd, Ausgabe = logs/supabase.log)", () => {
-  test("datenbank start und status: Schlüssel aus der CLI-Ausgabe erscheinen weder auf stdout noch stderr; nie launchctl, pm2 oder supabase status", async () => {
+  test("datenbank start und status: Schlüssel aus der CLI-Ausgabe erscheinen weder auf stdout noch stderr; nie launchctl oder pm2, supabase status nur still beim Start (Migrationen)", async () => {
     const f = fakeLocal({
       "supabase start": { stdout: `API URL: ${LOCAL_SUPABASE_URL}\nsecret key: ${LOCAL_SECRETS[0]}\nDB URL: ${LOCAL_SECRETS[5]}`, stderr: `anon key: ${LOCAL_SECRETS[1]}` },
       "docker system": { stdout: "Local Volumes space usage:\n\nVOLUME NAME LINKS SIZE\nsupabase_db_tybo 1 1GB\n" },
@@ -719,12 +719,15 @@ describe("über den Einstieg tybo (wie unter launchd, Ausgabe = logs/supabase.lo
     const lines: string[] = [];
     const io = { root: ctx.root, out: (l: string) => lines.push(l), err: (l: string) => lines.push(l), setup: { ctx, onInterrupt: () => () => {} } };
     expect(await runTybo({ args: ["datenbank", "start"], env: {}, ...io })).toBe(0);
+    const afterStart = f.trail().length;
+    expect(f.trail().filter(n => n === "supabase status")).toHaveLength(1);
     expect(await runTybo({ args: ["datenbank", "status"], env: {}, ...io })).toBe(0);
     const text = lines.join("\n");
     for (const secret of LOCAL_SECRETS) expect(text.includes(secret)).toBe(false);
+    expect(text).not.toContain("postgresql://");
     expect(text).toContain("Supabase läuft auf diesem Rechner");
     expect(f.run.calls.some(c => ["launchctl", "pm2", "npx"].includes(c.cmd[0]))).toBe(false);
-    expect(f.trail()).not.toContain("supabase status");
+    expect(f.trail().slice(afterStart)).not.toContain("supabase status");
   });
 });
 

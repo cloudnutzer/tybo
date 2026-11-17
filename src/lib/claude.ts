@@ -19,6 +19,11 @@
  * Ist apiKey eingestellt, aber kein Schlüssel da, startet kein Prozess:
  * callClaude und callClaudeStreaming liefern ein Fehlerergebnis (der übliche
  * Fallback greift), runClaudeWithTimeout wirft.
+ *
+ * Fehlt die CLI (Issue #565): unter Linux wirft schon der Start (ENOENT),
+ * unter macOS endet caffeinate mit 127. callClaude und callClaudeStreaming
+ * liefern in beiden Fällen ein Fehlerergebnis mit errorKind "not_installed",
+ * runClaudeWithTimeout wirft den Startfehler wie bisher.
  */
 
 import { spawn } from "bun";
@@ -34,6 +39,13 @@ import { PRINT_MODE_DISALLOWED_TOOLS, subprocessEnv } from "./subprocess-env";
 import { toolUsesFromEvent, type TurnTools } from "./turn-tools";
 import { runClaudeProcess, STOP_GRACE_MS, type ClaudeProcessOutcome, type ClaudeRuntime } from "./claude/process";
 import { isClaudeErrorResponse, judgeClaudeResult } from "./claude/result";
+import {
+  classifyExit,
+  classifySpawnError,
+  startFailureLogText,
+  type ClaudeStartFailure,
+} from "./claude/start-failure";
+import type { EngineErrorKind } from "./engines/types";
 import {
   finishStreamReading,
   parseStreamLine,
@@ -62,7 +74,7 @@ export interface ClaudeOptions {
   resumeSessionId?: string;
   /** Modell; ohne Angabe DEFAULT_CLAUDE_MODEL */
   model?: string;
-  /** Denkaufwand (low, medium, high, xhigh); ohne Angabe defaultEffort(model) */
+  /** Denkaufwand (low, medium, high, xhigh, max); ohne Angabe defaultEffort(model) */
   effort?: string;
   /** Freigegebene Werkzeuge (--allowedTools) */
   allowedTools?: string[];
@@ -103,6 +115,11 @@ export interface ClaudeResult {
   /** Antworttext; leer bei Abbruch und Zeitlimit */
   text: string;
   isError: boolean;
+  /**
+   * Nur bei einem gescheiterten Start (Issue #565): "not_installed", wenn das
+   * Programm fehlt, sonst "other". Andere Fehler tragen kein errorKind.
+   */
+  errorKind?: Extract<EngineErrorKind, "not_installed" | "other">;
   /** Session für ein späteres --resume */
   sessionId?: string;
   /**
@@ -162,6 +179,7 @@ export interface PlainClaudeRunOptions {
 
 /** Programm der Claude-CLI; die Umgebungsvariable CLAUDE_PATH ersetzt es */
 const cliProgram = process.env.CLAUDE_PATH || "claude";
+const customCliPath = !!process.env.CLAUDE_PATH;
 const homeDir = homeDirectory();
 /** Gesamtzeit eines Aufrufs ohne eigene Angabe: fünf Minuten */
 const DEFAULT_CALL_TIMEOUT_MS = 5 * 60_000;
@@ -201,6 +219,7 @@ const realClock: ClaudeClock = {
   clearInterval: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),
   terminate: terminateProcessTree,
   stopGraceMs: STOP_GRACE_MS,
+  os: process.platform,
 };
 
 let clock: ClaudeClock = realClock;
@@ -260,6 +279,23 @@ function cliEnv(cwd: string): Record<string, string> {
   return { ...subprocessEnv({ cwd, home: homeDir, conversationKey: currentExecution()?.key }), HOME: homeDir, PATH: process.env.PATH || "" };
 }
 
+/**
+ * Diagnose eines gescheiterten Starts (Issue #565): Wurf beim Start oder
+ * Exit-Code 127 ohne Ausgabe (macOS, caffeinate fand claude nicht). Nur nach
+ * Abbruch und Zeitlimit geprüft: die gehen vor.
+ */
+function startFailureOf(run: ClaudeProcessOutcome, cwd: string): ClaudeStartFailure | undefined {
+  if (run.startError !== undefined) return classifySpawnError(run.startError, { cwd, customPath: customCliPath });
+  return classifyExit(run.exitCode, run.stdout, { customPath: customCliPath });
+}
+
+/** Fehlerergebnis eines gescheiterten Starts; Text und Log nur aus kontrollierten Feldern */
+function startFailedResult(failure: ClaudeStartFailure, where: string): ClaudeResult {
+  const detail = startFailureLogText(failure);
+  console.error(`[${where}] Start fehlgeschlagen: ${detail}`);
+  return { text: `Claude Code konnte nicht gestartet werden (${detail}).`, isError: true, errorKind: failure.kind };
+}
+
 /** Lauf ohne verwertbare Ausgabe (Lese- oder Schreibfehler) */
 const failedCall = (): ClaudeResult => ({ text: "", isError: true });
 
@@ -288,7 +324,7 @@ export async function callClaude(request: ClaudeOptions): Promise<ClaudeResult> 
   if (blocked) return blocked;
   const run = await runClaudeProcess(
     {
-      command: keepAwakeCommand([cliProgram, ...printModeFlags(format, request, model)]),
+      command: keepAwakeCommand([cliProgram, ...printModeFlags(format, request, model)], clock.os),
       cwd: workDir,
       env: cliEnv(workDir),
       input: request.prompt,
@@ -302,6 +338,8 @@ export async function callClaude(request: ClaudeOptions): Promise<ClaudeResult> 
     if (!request.quiet) console.error(`[Claude] Zeitlimit nach ${Math.round(limitMs / 1000)}s (Modell ${model}), Prozessbaum beendet`);
     return { text: "", isError: true, timedOut: true };
   }
+  const startFailure = startFailureOf(run, workDir);
+  if (startFailure) return startFailedResult(startFailure, "Claude");
   if (run.readError !== undefined || run.inputError !== undefined) return failedCall();
   if (format === "json") return jsonResult(run.stdout, workDir);
   // Textformat: kein CLI-Signal, nur das Textmuster
@@ -354,9 +392,14 @@ export async function runClaudeWithTimeout(prompt: string, timeoutMs: number, ex
   const toolFlags = extra.allowedTools ? ["--allowedTools", extra.allowedTools.join(",")] : [];
   const flags = ["-p", "--output-format", "text", ...toolFlags, "--disallowedTools", PRINT_MODE_DISALLOWED_TOOLS.join(",")];
   const run = await runClaudeProcess(
-    { command: keepAwakeCommand([cliProgram, ...flags]), cwd: workDir, env: cliEnv(workDir), input: prompt, timeoutMs },
+    { command: keepAwakeCommand([cliProgram, ...flags], clock.os), cwd: workDir, env: cliEnv(workDir), input: prompt, timeoutMs },
     runtime()
   );
+  // Startfehler wie bisher als Wurf (Issue #565), mit kontrollierter Logzeile
+  if (run.startError !== undefined) {
+    console.error(`[Claude] Start fehlgeschlagen: ${startFailureLogText(classifySpawnError(run.startError, { cwd: workDir, customPath: customCliPath }))}`);
+    throw run.startError;
+  }
   if (run.readError !== undefined) throw run.readError;
   checkAborted();
   if (run.limit) throw new Error("Timeout");
@@ -400,7 +443,7 @@ export async function callClaudeStreaming(request: ClaudeStreamOptions): Promise
 
   const run = await runClaudeProcess(
     {
-      command: keepAwakeCommand([cliProgram, ...printModeFlags("stream-json", request, model)]),
+      command: keepAwakeCommand([cliProgram, ...printModeFlags("stream-json", request, model)], clock.os),
       cwd: workDir,
       env: cliEnv(workDir),
       input: request.prompt,
@@ -420,6 +463,9 @@ export async function callClaudeStreaming(request: ClaudeStreamOptions): Promise
   // Auch ein Lesefehler nach dem Zeitlimit bleibt ein Zeitlimit: sonst
   // startete chat-turn einen frischen Resume-Versuch mit neuem Zeitfenster
   if (run.limit) return { ...timeoutResult(run, outcome, tools, phase, model), ...spent };
+  // Ohne Lauf keine Ausgabe, kein Leser-Ergebnis: nur die Diagnose (Issue #565)
+  const startFailure = outcome.text || outcome.sessionId ? undefined : startFailureOf(run, workDir);
+  if (startFailure) return { ...startFailedResult(startFailure, "Claude streaming"), ...spent };
   if (run.readError !== undefined || run.inputError !== undefined) {
     console.error("[Claude streaming] Fehler:", run.readError ?? run.inputError);
     if (run.stderr) console.error("[Claude streaming] stderr:", run.stderr.substring(0, 500));

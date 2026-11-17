@@ -39,6 +39,8 @@ export interface ClaudeRuntime {
   terminate: (proc: EngineProc) => void;
   /** So lange wird nach dem Beenden höchstens noch auf stdout, stderr und das Prozessende gewartet */
   stopGraceMs: number;
+  /** Betriebssystem: entscheidet über Wachhalten (caffeinate) und eigene Prozessgruppe; Tests setzen es */
+  os: NodeJS.Platform;
 }
 
 /** Wartezeit nach dem Beenden: deutlich länger als der SIGKILL-Nachlauf (1,5 Sekunden) */
@@ -83,24 +85,42 @@ export interface ClaudeProcessOutcome {
   lastActivityAt: number;
   /** stderr, parallel gelesen, so weit bis zum Abschluss gekommen; leer bei Lesefehler auf stderr */
   stderr: string;
+  /** Exit-Code des Prozesses; null, wenn unbekannt (Signal, nicht abgewartet, nie gestartet) */
+  exitCode: number | null;
+  /**
+   * Der Start selbst ist gescheitert (Issue #565), etwa ENOENT, weil das
+   * Programm nicht im PATH liegt. Dann lief nichts: kein Register-Eintrag,
+   * keine Zeitlimits, stdout und stderr leer.
+   */
+  startError?: unknown;
 }
 
 /**
  * Ein Lauf der Claude-CLI. Wirft nur, wenn die Ausführung schon vor dem Start
- * oder bis zur Anmeldung abgebrochen wurde (AbortError) oder der Start selbst
- * scheitert; ein bereits gestarteter Prozess wird dann beendet.
+ * oder bis zur Anmeldung abgebrochen wurde (AbortError); ein bereits
+ * gestarteter Prozess wird dann beendet. Scheitert der Start selbst (unter
+ * Linux etwa ENOENT, wenn claude nicht im PATH liegt), kommt ein Ergebnis mit
+ * startError zurück (Issue #565), kein Wurf.
  */
 export async function runClaudeProcess(spec: ClaudeProcessSpec, rt: ClaudeRuntime): Promise<ClaudeProcessOutcome> {
   checkAborted();
-  const proc = rt.spawn({
-    detached: startsOwnGroup(),
-    cmd: spec.command,
-    cwd: spec.cwd,
-    env: spec.env,
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  const start = () =>
+    rt.spawn({
+      detached: startsOwnGroup(rt.os),
+      cmd: spec.command,
+      cwd: spec.cwd,
+      env: spec.env,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+  let proc: ReturnType<typeof start>;
+  try {
+    proc = start();
+  } catch (err) {
+    const at = rt.now();
+    return { stdout: "", aborted: false, startedAt: at, lastActivityAt: at, stderr: "", exitCode: null, startError: err };
+  }
   const terminate = () => {
     try {
       rt.terminate(proc);
@@ -191,5 +211,6 @@ export async function runClaudeProcess(spec: ClaudeProcessSpec, rt: ClaudeRuntim
     startedAt,
     lastActivityAt,
     stderr: end.stderr,
+    exitCode: end.exitCode,
   };
 }

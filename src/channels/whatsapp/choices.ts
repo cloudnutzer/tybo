@@ -13,8 +13,9 @@
  */
 import { Api } from "grammy";
 import { telegramConfigured } from "../../lib/channels";
-import { setMemoryAsker } from "../../lib/memory";
-import { createMemoryAsker } from "../../lib/memory/choices";
+import { setMemoryAsker, setMemoryFailureNotice } from "../../lib/memory";
+import { createMemoryAsker, createMemoryChoices } from "../../lib/memory/choices";
+import { sendAndRecord } from "../../lib/outbox";
 import { createReviewNotifier } from "../../lib/review-choices";
 import { setReviewNotifier } from "../../lib/session-distill";
 import { createTelegramChoices, type ChoiceEditApi, type TelegramChoicesDeps } from "../../lib/telegram-choices";
@@ -22,7 +23,7 @@ import { createTelegramChoices, type ChoiceEditApi, type TelegramChoicesDeps } f
 type Env = Record<string, string | undefined>;
 
 /** Prozessweite Anmeldungen; Tests ersetzen sie */
-export const WHATSAPP_CHOICE_INSTALLERS = { setReviewNotifier, setMemoryAsker };
+export const WHATSAPP_CHOICE_INSTALLERS = { setReviewNotifier, setMemoryAsker, setMemoryFailureNotice };
 
 export interface WhatsAppChoiceOptions {
   /** Bot-API zum Nachziehen der Knöpfe; Standard grammY mit TELEGRAM_BOT_TOKEN */
@@ -32,7 +33,7 @@ export interface WhatsAppChoiceOptions {
   installers?: Partial<typeof WHATSAPP_CHOICE_INSTALLERS>;
 }
 
-/** Richtet beide Zustellwege im Gateway-Prozess ein */
+/** Richtet die Zustellwege im Gateway-Prozess ein, dazu die Meldung über nicht gespeicherte Ziele (Issue #518) */
 export function installWhatsAppChoices(env: Env, options: WhatsAppChoiceOptions = {}): void {
   const install = { ...WHATSAPP_CHOICE_INSTALLERS, ...options.installers };
   const telegram = telegramConfigured(env);
@@ -45,4 +46,5 @@ export function installWhatsAppChoices(env: Env, options: WhatsAppChoiceOptions 
   const ways = { sendChoice: (choice: Parameters<typeof choices.sendChoice>[0]) => choices.sendChoice(choice) };
   install.setReviewNotifier(createReviewNotifier(ways));
   install.setMemoryAsker(createMemoryAsker(ways));
+  install.setMemoryFailureNotice(createMemoryChoices({ sendAndRecord: options.send ?? (input => sendAndRecord(input)), dmChatId: () => (telegram ? env.TELEGRAM_USER_ID!.trim() : undefined) }).failureNotice);
 }

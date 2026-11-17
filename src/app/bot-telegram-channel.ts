@@ -47,6 +47,7 @@ import { downloadTelegramFile, type MediaInboxDeps } from "../channels/telegram/
 import { createTelegramReply } from "../channels/telegram/reply-turn";
 import { createTypingIndicator, sendResponse } from "../channels/telegram/send";
 import { createUpdateScope } from "../channels/telegram/update-scope";
+import { logErrorMasked } from "../lib/telegram-token-mask";
 
 type Env = Record<string, string | undefined>;
 
@@ -208,7 +209,7 @@ export function wireTelegramChannel(deps: BotTelegramChannelDeps) {
       isShuttingDown: deps.isShuttingDown,
       typing,
       now: () => Date.now(),
-      logError: (message, err) => console.error(message, err),
+      logError: logErrorMasked,
     },
     callbacks: {
       toolApproval: expiredApprovalButtons(owner),

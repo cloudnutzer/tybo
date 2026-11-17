@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import * as fileLock from "../src/lib/file-lock";
 import { proactiveExitCode, runProactive, type ProactiveDeps } from "../src/lib/proactive/deliver";
 import type { SendAndRecordInput } from "../src/lib/outbox";
 import { CLAIM_MAX_MS, readProactiveState } from "../src/lib/proactive/state";
@@ -271,14 +272,19 @@ describe("Ablauf im Prozess", () => {
     test("lebender Lauf A behält die Reservierung, B sendet nicht, gesendet wird einmal", async () => {
       const t = setup();
       const a = runProactive("checkin", t.compose, { ...t.base, renewMs: 5 });
-      await t.composing;
-      t.advance(past);
-      // A erneuert weiter, auch nach CLAIM_MAX_MS: die Erneuerung trägt die vorgestellte Uhrzeit
-      const renewed = t.now().toISOString();
-      await until(async () => (await readProactiveState(join(dir, "state.json"))).checkin.claim?.renewedAt === renewed);
-      const b = await runProactive("checkin", async () => ({ text: "B" }), { ...t.base, renewMs: 0 });
-      expect(b).toEqual({ status: "skipped", reason: "busy" });
-      t.release();
+      try {
+        await t.composing;
+        t.advance(past);
+        // A erneuert weiter, auch nach CLAIM_MAX_MS: die Erneuerung trägt die vorgestellte Uhrzeit
+        const renewed = t.now().toISOString();
+        await until(async () => (await readProactiveState(join(dir, "state.json"))).checkin.claim?.renewedAt === renewed);
+        const b = await runProactive("checkin", async () => ({ text: "B" }), { ...t.base, renewMs: 0 });
+        expect(b).toEqual({ status: "skipped", reason: "busy" });
+      } finally {
+        // Auch wenn eine Erwartung scheitert: A freigeben, sonst hinge der Lauf
+        // samt Erneuerung bis zum Ende des Testprozesses und bremste spätere Dateien
+        t.release();
+      }
       expect(await a).toEqual({ status: "sent" });
       expect(t.sends).toEqual(["A"]);
       const s = await readProactiveState(join(dir, "state.json"));
@@ -286,15 +292,69 @@ describe("Ablauf im Prozess", () => {
       expect(s.checkin.lastSentAt).toBe(new Date(new Date(NOON).getTime() + past).toISOString());
     });
 
+    // Nachstellung aus PR #510: Dauert ein Sperrdurchlauf länger als renewMs, stauten sich die
+    // Erneuerungen vor der Sperre (bis zu 1304), und B bekam nach 10 s failed/state statt busy.
+    // Das Tor ersetzt die langsame Sperre, die Takte eine Wartezeit: mehr Zeit ändert das Ergebnis nicht.
+    test("langsame Sperre: Erneuerungen stauen sich nicht, B bekommt busy, nach dem Lauf keine weitere", async () => {
+      const t = setup();
+      const ticks = async (n: number) => { for (let i = 0; i < n; i++) await new Promise(r => setTimeout(r, 1)); };
+      const realAcquire = fileLock.acquireFileLock;
+      let slow = false;
+      let waiting = 0;
+      let most = 0;
+      let opened!: () => void;
+      const lockGate = new Promise<void>(r => { opened = r; });
+      let reached!: () => void;
+      const blocked = new Promise<void>(r => { reached = r; });
+      const spy = spyOn(fileLock, "acquireFileLock").mockImplementation(async (path, opts) => {
+        if (slow) {
+          most = Math.max(most, ++waiting);
+          reached();
+          await lockGate;
+          waiting--;
+        }
+        return realAcquire(path, opts);
+      });
+      try {
+        const a = runProactive("checkin", t.compose, { ...t.base, renewMs: 1 });
+        try {
+          await t.composing;
+          slow = true;
+          await blocked;
+          // setInterval hätte hier bei jedem Takt eine weitere Erneuerung vor die Sperre gestellt
+          await ticks(50);
+          expect(most).toBe(1);
+          slow = false;
+          opened();
+          const b = await runProactive("checkin", async () => ({ text: "B" }), { ...t.base, renewMs: 0 });
+          expect(b).toEqual({ status: "skipped", reason: "busy" });
+        } finally {
+          slow = false;
+          opened();
+          t.release();
+        }
+        expect(await a).toEqual({ status: "sent" });
+        expect(t.sends).toEqual(["A"]);
+        const calls = spy.mock.calls.length;
+        await ticks(20);
+        expect(spy.mock.calls.length).toBe(calls);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
     test("hängender Lauf A wird übernommen und sendet danach nicht mehr", async () => {
       const t = setup();
       // A erneuert nicht (hängt)
       const a = runProactive("checkin", t.compose, { ...t.base, renewMs: 0 });
-      await t.composing;
-      t.advance(past);
-      const b = await runProactive("checkin", async () => ({ text: "B" }), { ...t.base, renewMs: 0 });
-      expect(b).toEqual({ status: "sent" });
-      t.release();
+      try {
+        await t.composing;
+        t.advance(past);
+        const b = await runProactive("checkin", async () => ({ text: "B" }), { ...t.base, renewMs: 0 });
+        expect(b).toEqual({ status: "sent" });
+      } finally {
+        t.release();
+      }
       expect(await a).toEqual({ status: "skipped", reason: "overtaken" });
       expect(t.sends).toEqual(["B"]);
       const s = await readProactiveState(join(dir, "state.json"));
@@ -314,14 +374,17 @@ describe("Ablauf im Prozess", () => {
         ...base,
         send: async input => { sends.push(input.text); entered(); await gate; return { sent: true, recorded: true }; },
       });
-      await sending;
-      clock += past;
-      const b = await runProactive("checkin", async () => ({ text: "B" }), {
-        ...base,
-        send: async input => { sends.push(input.text); return { sent: true, recorded: true }; },
-      });
-      expect(b).toEqual({ status: "skipped", reason: "busy" });
-      release();
+      try {
+        await sending;
+        clock += past;
+        const b = await runProactive("checkin", async () => ({ text: "B" }), {
+          ...base,
+          send: async input => { sends.push(input.text); return { sent: true, recorded: true }; },
+        });
+        expect(b).toEqual({ status: "skipped", reason: "busy" });
+      } finally {
+        release();
+      }
       expect(await a).toEqual({ status: "sent" });
       expect(sends).toEqual(["A"]);
     });

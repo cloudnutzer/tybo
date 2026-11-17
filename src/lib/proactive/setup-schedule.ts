@@ -45,6 +45,8 @@ import { proactiveConfig } from "./config";
 export interface SetupInterval {
   hour?: number;
   minute?: number;
+  /** Wochentag, 0 = Sonntag bis 6 = Samstag (wie launchd Weekday); fehlt: jeden Tag */
+  weekday?: number;
 }
 
 /** Ein fester Termin: eine Startzeit, Stunde und Minute gesetzt */

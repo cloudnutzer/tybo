@@ -12,6 +12,7 @@ import { reserveBudget, settleBudget } from "./lib/daily-budget";
  *   - Historie: jeder Turn per saveMessage (type voice_call)
  *   - Denkauftrag: POST /process an den laufenden Bot, Antwort kommt in Telegram
  *   - Anlass:  ausgehende Anrufe aus der Anrufliste des Bots (src/lib/phone/bridge-note.ts)
+ *   - Rezepte: Kopf x-tybo-rezept, was ein Gespraech bekommt, bestimmt die Stufe (src/lib/voice-bridge/recipes.ts)
  *
  * Start: bun run src/voice-bridge.ts   (launchd: ai.tybo.voice-bridge)
  */
@@ -22,8 +23,9 @@ import { loadEnv } from "./lib/env";
 await loadEnv(join(process.cwd(), ".env"));
 
 // Dynamische Imports: erst nach loadEnv, weil die Module process.env beim Laden lesen.
-const { deepThinkText, handleBridge } = await import("./lib/voice-bridge/bridge");
-const { stripTags } = await import("./lib/voice-brain/tags");
+const { deepThinkText, errorLabel, handleBridge } = await import("./lib/voice-bridge/bridge");
+const { createRecipeResolver } = await import("./lib/voice-bridge/recipes");
+const { spokenText } = await import("./lib/voice-brain/tags");
 const { createVoiceContext, VOICE_CONTEXT_TTL_MS } = await import("./lib/voice-brain/context");
 const { voiceAgentName } = await import("./lib/voice-agent-name");
 type BridgeEnv = import("./lib/voice-bridge/bridge").BridgeEnv;
@@ -73,7 +75,7 @@ if (!env.VOICE_BRIDGE_TOKEN) console.error("[voice-bridge] VOICE_BRIDGE_TOKEN fe
 if (!env.VOICE_ALLOWED_CALLERS) console.error("[voice-bridge] Keine Rufnummer freigeschaltet (VOICE_ALLOWED_CALLERS oder USER_PHONE_NUMBER): alle Anrufe werden abgewiesen");
 
 // ---------------------------------------------------------------------------
-// Kontext: einmal pro Gespraech (10 Min Cache), nicht pro Turn
+// Kontext: Profil und Verlauf einmal pro Gespraech (10 Min Cache), Memory frisch je Anfrage
 // ---------------------------------------------------------------------------
 
 const voiceContext = createVoiceContext({
@@ -118,24 +120,22 @@ async function runLocalTool(name: string, input: Record<string, unknown>): Promi
 const reviewChoices = createTelegramChoices({ api: new Api(process.env.TELEGRAM_BOT_TOKEN || ""), owner: CHAT_ID });
 setReviewNotifier(createReviewNotifier({ sendChoice: (choice) => reviewChoices.sendChoice(choice) }));
 // Auswahl bei mehrdeutigen DONE/CANCEL/FORGET (Issue #316): Frage ins Register, den Klick beantwortet der Bot
-const { setMemoryAsker } = await import("./lib/memory");
-const { createMemoryAsker } = await import("./lib/memory/choices");
+const { setMemoryAsker, setMemoryFailureNotice } = await import("./lib/memory");
+const { createMemoryAsker, createMemoryChoices } = await import("./lib/memory/choices");
+const { sendAndRecord } = await import("./lib/outbox");
 setMemoryAsker(createMemoryAsker({ sendChoice: (choice) => reviewChoices.sendChoice(choice) }));
+// Nicht gespeicherte Ziele (Issue #518): Meldung im Direktchat
+setMemoryFailureNotice(createMemoryChoices({ sendAndRecord: (input) => sendAndRecord(input), dmChatId: () => CHAT_ID || undefined }).failureNotice);
 
 async function persistTurn(userText: string, assistantRaw: string, tools: TurnTools): Promise<void> {
   if (!CHAT_ID) return;
-  // Intent-Tags weg (siehe bridge.ts) und v3-Audio-Tags wie [excited] oder [thoughtful],
-  // die ElevenLabs dem LLM fuer eleven_v3 nahelegt; die gehoeren in den Ton, nicht in die Historie.
-  const spokenText = stripTags(assistantRaw)
-    .replace(/\[[a-z][a-z ,'-]{1,30}\]/gi, "")
-    .replace(/[ \t]{2,}/g, " ")
-    .trim();
+  const spoken = spokenText(assistantRaw);
   await saveMessage({ chat_id: CHAT_ID, role: "user", content: userText, metadata: { type: "voice_call", agent: "general" } });
-  if (spokenText) {
-    await saveMessage({ chat_id: CHAT_ID, role: "assistant", content: spokenText, metadata: { type: "voice_call", agent: "general" } });
+  if (spoken) {
+    await saveMessage({ chat_id: CHAT_ID, role: "assistant", content: spoken, metadata: { type: "voice_call", agent: "general" } });
   }
   const outcome = await processVoiceIntents(assistantRaw, tools, CHAT_ID).catch((err) => {
-    console.error("[voice-bridge] processIntents:", err);
+    console.error(`[voice-bridge] processIntents: ${errorLabel(err)}`);
     return "none" as const;
   });
   if (outcome === "applied") voiceContext.invalidate(CHAT_ID); // neue Fakten beim naechsten Gespraech sofort dabei
@@ -147,14 +147,21 @@ async function persistTurn(userText: string, assistantRaw: string, tools: TurnTo
 
 async function deepThink(question: string): Promise<void> {
   const text = deepThinkText(question, voiceAgentName(env));
-  if (!GATEWAY_SECRET || !CHAT_ID) throw new Error("GATEWAY_SECRET and TELEGRAM_USER_ID required for deep thinking");
+  if (!GATEWAY_SECRET || !CHAT_ID) {
+    // Der Fehler selbst landet ohne Text im Log (errorLabel)
+    console.error("[voice-bridge] Denkauftrag braucht GATEWAY_SECRET und TELEGRAM_USER_ID");
+    throw new Error("Denkauftrag nicht eingerichtet");
+  }
   const res = await fetch(BOT_PROCESS_URL, {
     method: "POST",
     headers: { "content-type": "application/json", ...(GATEWAY_SECRET ? { authorization: `Bearer ${GATEWAY_SECRET}` } : {}) },
     body: JSON.stringify({ text, chatId: CHAT_ID }),
   });
-  if (!res.ok) throw new Error(`Bot /process ${res.status}: ${await res.text()}`);
-  console.log(`[voice-bridge] Denkauftrag an ${BRAND.name} uebergeben: ${question.slice(0, 80)}`);
+  if (!res.ok) {
+    console.error(`[voice-bridge] Denkauftrag: Bot /process antwortet ${res.status}`);
+    throw new Error("Denkauftrag abgelehnt");
+  }
+  console.log(`[voice-bridge] Denkauftrag an ${BRAND.name} uebergeben`);
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +169,7 @@ async function deepThink(question: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 const hooks: BridgeHooks = { loadContext, localTools, runLocalTool, persistTurn, deepThink,
+  resolveRecipe: createRecipeResolver({ token: env.VOICE_BRIDGE_TOKEN }),
   callNote: (ids) => callNote(phoneLedger, ids),
   reserveRequest: () => { const id = reserveBudget("voice", Number(process.env.VOICE_REQUEST_RESERVATION_USD || "1")); return (actualUsd?: number) => settleBudget(id, actualUsd); },
 };
@@ -174,7 +182,7 @@ Bun.serve({
   async fetch(req) {
     const started = Date.now();
     const res = await handleBridge(req, env, hooks, (p) => {
-      p.catch((err) => console.error("[voice-bridge] Hintergrund:", err));
+      p.catch((err) => console.error(`[voice-bridge] Hintergrund: ${errorLabel(err)}`));
     });
     if (new URL(req.url).pathname.endsWith("/chat/completions")) {
       console.log(`[voice-bridge] Turn gestartet (${res.status}) nach ${Date.now() - started} ms`);

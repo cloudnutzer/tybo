@@ -75,6 +75,7 @@
  */
 
 import { randomBytes } from "crypto";
+import { isClaudeUnavailable } from "../claude-availability";
 import { listChoices, type Choice, type ChoiceConversation, type ChoiceHandler, type CreateChoiceInput } from "../choices";
 import type { CallRecord, CallStage, PhoneLedger } from "./ledger";
 import { transcriptText, type PhoneCaller, type TranscriptLine } from "./provider";
@@ -431,7 +432,9 @@ export function createPhoneService(deps: PhoneServiceDeps): PhoneService {
    * Empfangenes Protokoll zusammenfassen (received nach summarized). Je
    * Kennung läuft höchstens ein Versuch, wer währenddessen kommt, bekommt
    * dessen Ausgang. Wirft, wenn summarize scheitert; der Eintrag bleibt dann
-   * received. fallback: Ersatztext statt Modell (nach der Frist).
+   * received. fallback: Ersatztext statt Modell (nach der Frist). Ist die
+   * Zusammenfassung abgeschaltet (ClaudeUnavailableError, Issue #566), gilt
+   * sofort der Anfang des Protokolls mit Grund, ohne Wiederholung.
    */
   function summarizeReceived(ref: string, fallback = false): Promise<boolean> {
     const active = summarizing.get(ref);
@@ -440,8 +443,18 @@ export function createPhoneService(deps: PhoneServiceDeps): PhoneService {
       const call = ledger.get(ref);
       if (!call || call.stage !== "received") return false;
       const transcript = call.transcript ?? "";
-      const summary = fallback ? fallbackSummary(transcript) : await deps.summarize(transcript);
-      return advance(ref, ["received"], "summarized", { summary, ...(fallback ? { note: "Zusammenfassung gescheitert" } : {}) }) !== null;
+      if (fallback) return advance(ref, ["received"], "summarized", { summary: fallbackSummary(transcript), note: "Zusammenfassung gescheitert" }) !== null;
+      let summary: string;
+      try {
+        summary = await deps.summarize(transcript);
+      } catch (err) {
+        if (!isClaudeUnavailable(err)) throw err;
+        // Abgeschaltet (Issue #566): kein neuer Versuch, der Nutzer bekommt den Anfang des Protokolls mit Grund
+        log(`[phone] ${ref}: Zusammenfassung abgeschaltet (Claude fehlt), Anfang des Protokolls statt Zusammenfassung`);
+        const disabled = `${transcript.slice(0, FALLBACK_SUMMARY_CHARS)}\n\n(${err.message})`;
+        return advance(ref, ["received"], "summarized", { summary: disabled, note: "Zusammenfassung abgeschaltet" }) !== null;
+      }
+      return advance(ref, ["received"], "summarized", { summary }) !== null;
     })().finally(() => summarizing.delete(ref));
     summarizing.set(ref, job);
     return job;

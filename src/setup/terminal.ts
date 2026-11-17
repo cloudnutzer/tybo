@@ -71,6 +71,7 @@ import { checkStep, existingFieldValues, getStep, SETUP_STEPS, setupOverview } f
 import { probeCleanupWarning, probeMark, probeRunning, waitForProbes } from "./semantic-search";
 import { autostartPlan, MANAGER_LABEL, type AutostartManager } from "./steps/autostart";
 import { pendingSafetyWarnings, waitForEnvWrites, waitForSafetyWork } from "./steps/common";
+import { setupEngine } from "./engine";
 
 export { SetupAbort } from "./prompt";
 
@@ -168,7 +169,7 @@ export function formatRunEvent(e: RunEvent): string {
 
 function printItems(out: SafeOut, items: StatusItem[] | undefined, indent = "    ") {
   for (const item of items ?? []) {
-    out.line(`${indent}${item.ok ? "ok " : "!! "} ${item.label}: ${item.detail}`);
+    out.line(`${indent}${item.ok ? "ok " : item.optional ? "-- " : "!! "} ${item.label}: ${item.detail}`);
     // Abhilfe auch bei ok: ein Hinweis wie die fehlende Git-Verbindung (Issue #305)
     if (item.fix) out.line(`${indent}    So geht's: ${item.fix}`);
   }
@@ -1000,6 +1001,19 @@ async function runMode(run: SetupRun, args: SetupArgs): Promise<number> {
     const outcome = await run.runStep(step, `Schritt ${i + 1} von ${todo.length}: `, chosen.includes(step.id));
     run.outcomes.set(step.id, outcome);
     if (outcome === "übersprungen") skipped.push(step.id);
+    // Issue #566: Voraussetzungen offen, und der Motor ist Claude Code. Wer kein Claude-Konto will,
+    // wählt den Motor im Schritt Modelle; der kommt deshalb gleich danach, die Gesamtprüfung prüft neu
+    if (step.id === "voraussetzungen" && outcome === "übersprungen" && (await setupEngine(run.ctx)).engine === "claude") {
+      const at = todo.findIndex(s => s.id === "modelle");
+      if (at > i + 1) todo.splice(i + 1, 0, ...todo.splice(at, 1));
+      else if (at < 0) {
+        const models = run.findStep("modelle");
+        if (models) todo.splice(i + 1, 0, models);
+      }
+      out.line();
+      out.line("  Ohne Claude-Konto geht es mit einem anderen Motor, etwa Codex. Der Schritt Modelle kommt als nächster;");
+      out.line("  die Voraussetzungen prüft die Gesamtprüfung am Ende mit dem gewählten Motor noch einmal.");
+    }
     if (step.id === "telegram") {
       const channels = await run.channels();
       if (channels.telegram.state !== "ok" && channels.webui.state !== "ok") {

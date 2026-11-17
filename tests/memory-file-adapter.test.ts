@@ -5,7 +5,7 @@
  * gleiche Texte sind über IDs unterscheidbar, gleichzeitige Prozesse
  * verlieren nichts. Supabase ohne Netz gegen memory-fixture.ts.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -201,17 +201,17 @@ describe("Treffer und Änderung per ID (Supabase)", () => {
   }
 
   const ROWS: Row[] = [
-    { type: "goal", content: "Bericht A", completed: false },
-    { type: "goal", content: "Bericht erledigt", completed: true },
+    { type: "goal", content: "Bericht A" },
+    { type: "completed_goal", content: "Bericht erledigt" },
     { type: "fact", content: "Bericht über Tee" },
-    { type: "goal", content: "Bericht B", completed: false },
+    { type: "goal", content: "Bericht B" },
   ];
 
   test("matchingGoals: nur offene Ziele, älteste zuerst, limit in der Abfrage", async () => {
     const fake = table(ROWS);
     expect((await getStore().memory.matchingGoals("bericht", 10)).map(r => r.content)).toEqual(["Bericht A", "Bericht B"]);
     const query = fake.tableRequests().at(-1)!.url.searchParams;
-    expect([query.get("type"), query.get("completed"), query.get("order"), query.get("limit")]).toEqual(["eq.goal", "eq.false", "created_at.asc", "10"]);
+    expect([query.get("type"), query.get("order"), query.get("limit")]).toEqual(["eq.goal", "created_at.asc", "10"]);
     expect((await getStore().memory.matchingGoals("bericht", 1)).map(r => r.content)).toEqual(["Bericht A"]);
     expect((await getStore().memory.matchingFacts("BERICHT", 10)).map(r => r.content)).toEqual(["Bericht über Tee"]);
   });
@@ -220,8 +220,8 @@ describe("Treffer und Änderung per ID (Supabase)", () => {
     const fake = table(ROWS);
     const [a, b] = await getStore().memory.matchingGoals("bericht", 10);
     expect(await getStore().memory.completeGoalById(String(b.id))).toBe(true);
-    expect(fake.table.find(r => r.id === b.id)).toMatchObject({ completed: true, completed_at: expect.any(String) });
-    expect(fake.table.find(r => r.id === a.id)).toMatchObject({ completed: false });
+    expect(fake.table.find(r => r.id === b.id)).toMatchObject({ type: "completed_goal", completed_at: expect.any(String) });
+    expect(fake.table.find(r => r.id === a.id)).toMatchObject({ type: "goal" });
     expect(await getStore().memory.completeGoalById(String(b.id))).toBe(false);
     expect(await getStore().memory.cancelGoalById(String(b.id))).toBe(false);
     const fact = fake.table.find(r => r.type === "fact")!;
@@ -240,12 +240,14 @@ describe("Treffer und Änderung per ID (Supabase)", () => {
     expect(fake.table.some(r => r.type === "fact")).toBe(false);
   });
 
-  test("Fehler der Datenbank: leer bzw. false", async () => {
+  test("Fehler der Datenbank: bei Zielen ein Fehler statt „kein Treffer“, bei Fakten false", async () => {
     const fake = useMemoryTable({ rows: ROWS, failTable: true });
-    cleanups.push(() => fake.restore());
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    cleanups.push(() => fake.restore(), () => error.mockRestore());
     resetStore();
-    expect(await getStore().memory.matchingGoals("bericht", 10)).toEqual([]);
-    expect(await getStore().memory.completeGoalById("1")).toBe(false);
+    await expect(getStore().memory.matchingGoals("bericht", 10)).rejects.toThrow("Supabase: Ziele suchen gescheitert");
+    await expect(getStore().memory.completeGoalById("1")).rejects.toThrow("Supabase: Ziel erledigen gescheitert");
+    await expect(getStore().memory.cancelGoalById("1")).rejects.toThrow("Supabase: Ziel streichen gescheitert");
     expect(await getStore().memory.deleteFactById("3")).toBe(false);
   });
 });

@@ -13,7 +13,7 @@ import { runTybo } from "../scripts/tybo";
 import { SYSTEMD_UNIT_FILE } from "../setup/configure-systemd";
 import { collectReport, formatReport, reportExitCode, stepLine, type SpecialCheck } from "../src/setup/checks/report";
 import { callCheck, databaseCheck, defaultSpecials, extrasCheck, servicesCheck, telegramCheck } from "../src/setup/checks/specials";
-import type { CommandResult, RunOptions } from "../src/setup/context";
+import type { CommandResult, RunOptions, SetupContext } from "../src/setup/context";
 import { LOCAL_SUPABASE_URL } from "../src/setup/local-supabase";
 import { createProviders } from "../src/setup/providers";
 import { prerequisitesStep } from "../src/setup/steps/prerequisites";
@@ -21,6 +21,10 @@ import type { SetupStep, StepId, StepStatus } from "../src/setup/model";
 import { CLI_REQUIRED_FLAGS } from "../src/lib/voice-brain/backends/claude-cli";
 import type { CallModelDeps } from "../src/lib/voice-brain/call-model";
 import { cleanup, FAKE, fakeRun, FULL_ENV, leakedSecrets, makeCtx } from "./setup-fixture";
+import { fakeDb, fakeFetch } from "./schema-probe-fixture";
+import { schemaFindings } from "../src/setup/checks/specials";
+import { SCHEMA_FILES } from "../src/setup/supabase-schema";
+import type { SchemaFileName } from "../src/lib/schema-probe";
 
 afterAll(cleanup);
 
@@ -222,6 +226,39 @@ describe("Spezialprüfungen ohne Doppelprüfung", () => {
     expect(reportExitCode(report)).toBe(1);
   });
 
+  test("Telegram-Eingang (Issue #562): 409 und 401 des laufenden Bots als Fehlerzeile, Exit 1, kein Abruf von Updates", async () => {
+    const ctx = await makeCtx({ env: FULL_ENV });
+    await mkdir(join(ctx.root, "data"), { recursive: true });
+    const state = (s: string, message: string, pid = process.pid) =>
+      writeFile(join(ctx.root, "data", "telegram-intake.json"), JSON.stringify({ state: s, message, since: "2026-11-12T09:00:00.000Z", pid }));
+    const conflict = "Telegram: Ein anderer Bot nutzt denselben Token (409). Telegram-Eingang pausiert, nächster Versuch in 60 Sekunden.";
+    await state("conflict", conflict);
+    let report = await collectReport({ ctx, steps: [], specials: [telegramCheck] });
+    const line = () => report.lines.find(l => l.section === "Telegram" && l.label === "Eingang");
+    expect(line()?.status).toBe("fail");
+    expect(line()?.detail).toStartWith(conflict);
+    expect(line()?.detail).toContain("Zwei Bots laufen gleichzeitig");
+    expect(reportExitCode(report)).toBe(1);
+    expect(ctx.providers.calls.map(c => c.method)).toEqual(["telegramGetMe"]);
+
+    await state("unauthorized", "Telegram lehnt den Token ab (401). Telegram-Eingang aus, bis der Token stimmt.");
+    report = await collectReport({ ctx, steps: [], specials: [telegramCheck] });
+    expect(line()?.status).toBe("fail");
+    expect(line()?.detail).toContain("bewusst neu starten");
+    expect(reportExitCode(report)).toBe(1);
+    expect(formatReport(report).join("\n")).not.toContain(FAKE.token);
+
+    await state("ok", "Telegram-Eingang läuft.");
+    report = await collectReport({ ctx, steps: [], specials: [telegramCheck] });
+    expect(line()?.status).toBe("pass");
+    expect(reportExitCode(report)).toBe(0);
+
+    // Zustand eines beendeten Prozesses: keine Zeile
+    await state("conflict", conflict, 2 ** 22 + 12345);
+    report = await collectReport({ ctx, steps: [], specials: [telegramCheck] });
+    expect(line()).toBeUndefined();
+  });
+
   test("lokale Supabase: messages wird einmal gelesen, Schritt und Spezialprüfung teilen das Ergebnis", async () => {
     const env = `WEB_ENABLED=true\nWEB_PASSWORD=${FAKE.webPassword}\nSUPABASE_URL=${LOCAL_SUPABASE_URL}\nSUPABASE_SERVICE_ROLE_KEY=${FAKE.serviceKey}\n`;
     const urls: string[] = [];
@@ -233,10 +270,15 @@ describe("Spezialprüfungen ohne Doppelprüfung", () => {
     const report = await collectReport({ ctx, steps: [databaseStep], specials: [databaseCheck] });
     expect(ctx.providers.calls.filter(c => c.method === "supabaseQuery")).toHaveLength(1);
     expect(ctx.providers.calls.some(c => c.method === "supabaseWriteProbe")).toBe(false);
-    expect(urls).toEqual([`${LOCAL_SUPABASE_URL}/rest/v1/memory?select=id&limit=1`]);
+    // memory einmal; danach nur die Schemaprobe (Issue #560): Strukturfragen mit limit=0 und das Verzeichnis der Schnittstelle
+    expect(urls[0]).toBe(`${LOCAL_SUPABASE_URL}/rest/v1/memory?select=id&limit=1`);
+    expect(urls.slice(1).every(u => u.endsWith("&limit=0") || u === `${LOCAL_SUPABASE_URL}/rest/v1/`)).toBe(true);
+    expect(new Set(urls).size).toBe(urls.length);
+    // Die Attrappe liefert für das Verzeichnis kein OpenAPI: Funktionen nicht prüfbar, Warnung
     expect(report.lines.filter(l => l.section === "Datenbank").map(l => [l.label, l.status])).toEqual([
       ["Verbindung", "pass"],
       ["Tabelle memory", "pass"],
+      ["Schema", "warn"],
     ]);
   });
 
@@ -245,9 +287,59 @@ describe("Spezialprüfungen ohne Doppelprüfung", () => {
     const ctx = await makeCtx({ env: WEB_ONLY, overrides: { fetch: async url => (urls.push(url), new Response("", { status: 200 })) } });
     ctx.providers.results.supabaseQuery = { ok: false, message: "Supabase ist nicht erreichbar." };
     const report = await collectReport({ ctx, steps: [], specials: [databaseCheck] });
-    expect(report.lines.find(l => l.section === "Datenbank")).toEqual({ section: "Datenbank", label: "Verbindung", status: "fail", detail: "Supabase ist nicht erreichbar." });
-    expect(urls).toEqual([]);
+    expect(report.lines.filter(l => l.section === "Datenbank")).toEqual([{ section: "Datenbank", label: "Verbindung", status: "fail", detail: "Supabase ist nicht erreichbar." }]);
+    // Nur die Schemaprobe fragt noch (Issue #560); ohne sicheren Befund keine Zeile „Schema“
+    expect(urls.filter(u => !u.endsWith("&limit=0") && !u.endsWith("/rest/v1/"))).toEqual([]);
     expect(reportExitCode(report)).toBe(1);
+  });
+
+  test("Schema vollständig (Issue #560): Zeile „Schema“ bestanden", async () => {
+    const ctx = await makeCtx({ env: WEB_ONLY, overrides: { fetch: async (url, r) => fakeFetch(fakeDb())(url, { headers: r?.headers ?? {}, signal: r?.signal ?? new AbortController().signal }) } });
+    const report = await collectReport({ ctx, steps: [], specials: [databaseCheck] });
+    expect(report.lines.find(l => l.label === "Schema")).toEqual({ section: "Datenbank", label: "Schema", status: "pass", detail: "alle Migrationen eingespielt" });
+    expect(reportExitCode(report)).toBe(0);
+  });
+
+  test("fehlt das Merkmal von 20261018_scheduled_tasks_lease.sql: Fehler mit Dateiname und Befehl, Exit 1", async () => {
+    const db = fakeDb(["db/migrations/20261018_scheduled_tasks_lease.sql"]);
+    const ctx = await makeCtx({ env: WEB_ONLY, overrides: { fetch: async (url, r) => fakeFetch(db)(url, { headers: r?.headers ?? {}, signal: r?.signal ?? new AbortController().signal }) } });
+    const report = await collectReport({ ctx, steps: [], specials: [databaseCheck] });
+    const line = report.lines.find(l => l.label === "Schema");
+    expect(line?.status).toBe("fail");
+    expect(line?.detail).toBe("Nachholen mit tybo setup datenbank. Es fehlt 1 Datei: 20261018_scheduled_tasks_lease.sql");
+    expect(reportExitCode(report)).toBe(1);
+  });
+
+  test("Datenbank antwortet nicht auf die Schemaprobe: Warnung „nicht prüfbar“, keine fehlende Datei", async () => {
+    const ctx = await makeCtx({ env: WEB_ONLY, overrides: { fetch: async () => Promise.reject(new TypeError("fetch failed")) } });
+    const report = await collectReport({ ctx, steps: [], specials: [databaseCheck] });
+    expect(report.lines.find(l => l.label === "Schema")).toEqual({ section: "Datenbank", label: "Schema", status: "warn", detail: "nicht prüfbar: Datenbank nicht erreichbar" });
+    expect(reportExitCode(report)).toBe(0);
+  });
+
+  test("alle Migrationen fehlen: jeder Name und der Befehl bleiben trotz Kürzung auf 300 Zeichen im Bericht", async () => {
+    // Ohne Rechte (20261021_base_grants.sql) wären die Spalten nicht prüfbar; hier fehlt alles andere
+    const gone = SCHEMA_FILES.filter(f => f !== "db/schema.sql" && f !== "db/migrations/20261021_base_grants.sql") as SchemaFileName[];
+    const db = fakeDb(gone);
+    const ctx = await makeCtx({ env: WEB_ONLY, overrides: { fetch: async (url, r) => fakeFetch(db)(url, { headers: r?.headers ?? {}, signal: r?.signal ?? new AbortController().signal }) } });
+    const report = await collectReport({ ctx, steps: [], specials: [databaseCheck] });
+    const text = formatReport(report).join("\n");
+    for (const file of gone) expect(text).toContain(file.slice(file.lastIndexOf("/") + 1));
+    expect(text).toContain("tybo setup datenbank");
+    expect(text).not.toContain("…");
+    const lines = report.lines.filter(l => l.label.startsWith("Schema"));
+    expect(lines.length).toBeGreaterThan(1);
+    expect(lines.every(l => l.status === "fail" && l.detail.length <= 300)).toBe(true);
+  });
+
+  test("schemaFindings: lange Listen auf mehrere Zeilen, nichts geht verloren", () => {
+    const missing = [...SCHEMA_FILES];
+    const lines = schemaFindings({ state: "missing", missing, unchecked: [{ file: "db/schema.sql", reason: "Zeitüberschreitung" }] });
+    expect(lines[0].label).toBe("Schema");
+    expect(lines[0].detail.startsWith("Nachholen mit tybo setup datenbank. Es fehlen 12 Dateien: ")).toBe(true);
+    const joined = lines.map(l => l.detail).join(" ");
+    for (const file of missing) expect(joined).toContain(file.slice(file.lastIndexOf("/") + 1));
+    expect(lines.at(-1)).toEqual({ label: "Schema (weiter)", status: "warn", detail: "außerdem nicht prüfbar: 1 Dateien (Zeitüberschreitung)" });
   });
 
   test("fehlende Tabelle memory ist eine Warnung, kein Fehler", async () => {
@@ -453,8 +545,8 @@ describe("Telefonhörer mit der Umgebung des Projekts", () => {
 });
 
 describe("tybo pruefen", () => {
-  async function pruefen(env: string, args: string[] = ["pruefen"], extra: Record<string, string> = {}) {
-    const ctx = await makeCtx({ env });
+  async function pruefen(env: string, args: string[] = ["pruefen"], extra: Record<string, string> = {}, fetch?: SetupContext["fetch"]) {
+    const ctx = await makeCtx({ env, ...(fetch ? { overrides: { fetch } } : {}) });
     // launchctl list liefert ein leeres Ergebnis; jeder andere launchctl-Aufruf wäre ein Fehler im Test
     const fakeRun = ctx.run;
     const commands: string[][] = [];
@@ -493,6 +585,20 @@ describe("tybo pruefen", () => {
     expect(methods).not.toContain("claudeProbe");
     expect(r.commands.filter(c => c[0] === "launchctl").every(c => c[1] === "list")).toBe(true);
     expect(leakedSecrets(r.out)).toEqual([]);
+  });
+
+  test("Issue #560: fehlt 20261018_scheduled_tasks_lease.sql, endet tybo pruefen mit Exit 1 und nennt Datei und Befehl", async () => {
+    const env = `WEB_ENABLED=true\nWEB_PASSWORD=${FAKE.webPassword}\nSUPABASE_URL=${FAKE.supabaseUrl}\nSUPABASE_SERVICE_ROLE_KEY=${FAKE.serviceKey}\n`;
+    const signal = new AbortController().signal;
+    const complete = await pruefen(env, ["pruefen"], {}, async (url, r) => fakeFetch(fakeDb())(url, { headers: r?.headers ?? {}, signal: r?.signal ?? signal }));
+    const gap = await pruefen(env, ["pruefen"], {}, async (url, r) => fakeFetch(fakeDb(["db/migrations/20261018_scheduled_tasks_lease.sql"]))(url, { headers: r?.headers ?? {}, signal: r?.signal ?? signal }));
+    expect(complete.out.some(l => l.includes("Schema: alle Migrationen eingespielt"))).toBe(true);
+    const line = gap.out.find(l => l.includes("Schema:"));
+    expect(line).toContain("✗");
+    expect(line).toContain("20261018_scheduled_tasks_lease.sql");
+    expect(line).toContain("tybo setup datenbank");
+    expect(gap.code).toBe(1);
+    expect(leakedSecrets(gap.out)).toEqual([]);
   });
 
   test("Pflichtschritt fehlt: Exit 1", async () => {

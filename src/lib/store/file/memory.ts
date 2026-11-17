@@ -14,10 +14,17 @@
  *
  * Teiltext-Suchen vergleichen ohne Rücksicht auf Groß- und Kleinschreibung.
  * Vektoren gibt es hier keine (factVectors: null).
+ *
+ * Archivierte Fakten (Issue #520) bleiben in der Liste, mit archivedAt; außer
+ * archivedFacts und restoreFact sieht und ändert sie keine Methode.
+ *
+ * Einen Text mit Geheimnis speichern addFact und rewriteFact nicht (Issue #524).
  */
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { updateJsonState } from "../../json-state";
+import { containsSecret } from "../../memory/secrets";
+import { factTerms, rankFactsByTerms } from "../fact-search";
 import type { MemoryStore } from "../ports";
 import type { MemoryItem } from "../types";
 
@@ -25,6 +32,8 @@ interface StoredFact {
   id: string;
   text: string;
   createdAt?: string;
+  revisedAt?: string;
+  archivedAt?: string;
 }
 
 interface StoredGoal {
@@ -80,7 +89,11 @@ const factItem = (fact: StoredFact): MemoryItem => ({
   type: "fact",
   content: fact.text,
   ...(fact.createdAt ? { created_at: fact.createdAt } : {}),
+  ...(fact.revisedAt ? { revised_at: fact.revisedAt } : {}),
+  ...(fact.archivedAt ? { archived_at: fact.archivedAt } : {}),
 });
+
+const isActive = (fact: StoredFact) => !fact.archivedAt;
 
 const goalItem = (goal: StoredGoal & { id: string }): MemoryItem => ({
   id: goal.id,
@@ -118,17 +131,53 @@ export function fileMemory(path: () => string): MemoryStore {
     return true;
   };
   const firstGoal = (memory: Memory, searchText: string) => memory.goals.findIndex(goal => contains(goal.text, searchText));
-  const firstFact = (memory: Memory, searchText: string) => memory.facts.findIndex(fact => contains(fact.text, searchText));
+  const firstFact = (memory: Memory, searchText: string) => memory.facts.findIndex(fact => isActive(fact) && contains(fact.text, searchText));
+  /** Nicht archivierter Fakt mit dieser ID und diesem Text */
+  const expectedFact = (memory: Memory, id: string, expected: string) => memory.facts.find(fact => fact.id === id && isActive(fact) && fact.text === expected);
 
   return {
-    addFact: content =>
-      change(memory => {
-        if (!memory.facts.some(fact => fact.text === content)) {
+    addFact: content => {
+      if (containsSecret(content)) return Promise.resolve(false);
+      return change(memory => {
+        if (!memory.facts.some(fact => isActive(fact) && fact.text === content)) {
           memory.facts.push({ id: randomUUID(), text: content, createdAt: new Date().toISOString() });
         }
         return true;
+      });
+    },
+    facts: () => change(memory => memory.facts.filter(isActive).map(factItem)),
+    archivedFacts: () =>
+      change(memory =>
+        memory.facts
+          .filter(fact => !isActive(fact))
+          .sort((a, b) => String(b.archivedAt).localeCompare(String(a.archivedAt)))
+          .map(factItem),
+      ),
+    archiveFact: (id, expected) =>
+      change(memory => {
+        const fact = expectedFact(memory, id, expected);
+        if (!fact) return "conflict" as const;
+        fact.archivedAt = new Date().toISOString();
+        return "changed" as const;
       }),
-    facts: () => change(memory => memory.facts.map(factItem)),
+    restoreFact: id =>
+      change(memory => {
+        const fact = memory.facts.find(candidate => candidate.id === id && !isActive(candidate));
+        if (!fact) return "conflict" as const;
+        delete fact.archivedAt;
+        fact.revisedAt = new Date().toISOString();
+        return "changed" as const;
+      }),
+    rewriteFact: (id, expected, content) => {
+      if (containsSecret(content)) return Promise.resolve("secret" as const);
+      return change(memory => {
+        const fact = expectedFact(memory, id, expected);
+        if (!fact) return "conflict" as const;
+        fact.text = content;
+        fact.revisedAt = new Date().toISOString();
+        return "changed" as const;
+      });
+    },
     deleteFact: searchText => change(memory => dropFact(memory, firstFact(memory, searchText))),
     addGoal: (content, deadline) => {
       let due: string | undefined;
@@ -149,16 +198,22 @@ export function fileMemory(path: () => string): MemoryStore {
       change(memory => {
         const cutoff = since.getTime();
         return [
-          ...memory.facts.filter(fact => after(fact.createdAt, cutoff)).map(factItem),
+          ...memory.facts.filter(fact => isActive(fact) && (after(fact.createdAt, cutoff) || after(fact.revisedAt, cutoff))).map(factItem),
           ...memory.goals.filter(goal => after(goal.createdAt, cutoff)).map(goalItem),
         ];
       }),
     factVectors: async () => null,
     matchingFacts: (searchText, limit) =>
-      change(memory => memory.facts.filter(fact => contains(fact.text, searchText)).slice(0, limit).map(factItem)),
+      change(memory => memory.facts.filter(fact => isActive(fact) && contains(fact.text, searchText)).slice(0, limit).map(factItem)),
     matchingGoals: (searchText, limit) =>
       change(memory => memory.goals.filter(goal => contains(goal.text, searchText)).slice(0, limit).map(goalItem)),
-    deleteFactById: id => change(memory => dropFact(memory, memory.facts.findIndex(fact => fact.id === id))),
+    searchFacts: (query, limit, options = {}) =>
+      change(memory => {
+        const exclude = new Set(options.excludeIds ?? []);
+        const candidates = memory.facts.filter(fact => isActive(fact) && !exclude.has(fact.id)).map(factItem);
+        return rankFactsByTerms(candidates, factTerms(query), limit, options.minTerms);
+      }),
+    deleteFactById: id => change(memory => dropFact(memory, memory.facts.findIndex(fact => fact.id === id && isActive(fact)))),
     completeGoalById: id => change(memory => takeGoal(memory, memory.goals.findIndex(goal => goal.id === id), true)),
     cancelGoalById: id => change(memory => takeGoal(memory, memory.goals.findIndex(goal => goal.id === id), false)),
   };

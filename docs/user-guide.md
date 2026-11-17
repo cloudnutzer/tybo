@@ -166,6 +166,31 @@ aktuellen Nachricht relevantesten aus. Mit `/learn <URL oder Text>`
 destillierst du eine externe Quelle direkt in die Knowledge Base, die jeder
 Agent im Kontext hat.
 
+### Fester Kern
+
+Fakten kommen nach Ähnlichkeit zur ersten Nachricht in den Prompt, eine Regel
+oder Vorliebe kann also fehlen, wenn das Thema gerade ein anderes ist. Der Kern
+ist eine kurze Übersicht von etwa 1.500 Zeichen (höchstens 2.000), die immer
+dabei ist: wer du bist, wie du arbeitest, woran du hauptsächlich arbeitest.
+
+- `/kern` zeigt ihn, in Telegram, im Browser und im Terminal.
+- `/kern entwurf` fasst deine aktiven Fakten auf dem Aux-Modell zu einem
+  Vorschlag zusammen und legt ihn mit den Knöpfen „Übernehmen" und „Verwerfen"
+  vor. Ohne Klick ändert sich nichts. Änderst du den Kern vorher, ist der
+  Entwurf überholt und wird nicht mehr übernommen.
+- `/kern setzen <text>` nimmt deinen eigenen Text, auch mehrzeilig. Zu langer
+  Text wird abgelehnt, nicht gekürzt, ebenso ein Text mit Passwort oder Schlüssel.
+- `/kern loeschen` entfernt ihn. Ohne Kern verhält sich tybo wie zuvor.
+
+Der Kern steht in `config/kern.md` (Vorlage `config/kern.example.md`), die Datei
+gehört dir und darf auch von Hand geändert werden. Die vorige Fassung liegt in
+`config/kern.md.vorher`. Er steht neben `config/profile.md`, `tybo setup profil`
+fasst ihn nicht an.
+
+Er gilt ab der nächsten frischen Session, ohne Neustart; `/new` erzwingt das im
+aktuellen Gespräch sofort. Die Ersatzmodelle bekommen ihn auch. Sprach-Brücke,
+Telefonhörer und Anrufe bekommen ihn nicht.
+
 ### Agenten anpassen, direkt aus Telegram (`/agent`)
 
 Du musst keine Code-Dateien anfassen, um einen Agenten umzuerziehen:
@@ -189,9 +214,9 @@ Antworten kommen auf Deutsch.
 
 | Befehl | Wirkung |
 |---|---|
-| `/remember <Fakt>` | Fakt dauerhaft speichern |
+| `/remember <Fakt>` | Fakt dauerhaft speichern; Passwörter und Schlüssel lehnt er ab, sie gehören in die `.env` |
 | `/forget <Text>` | Ersten gespeicherten Fakt loeschen, der den Text enthaelt |
-| `/memory` oder `/facts` | Alle gespeicherten Fakten anzeigen |
+| `/memory` oder `/facts` | Alle gespeicherten Fakten anzeigen, Passwörter und Schlüssel maskiert |
 | `/track <Ziel>` | Ziel anlegen, mit Frist: `/track <Ziel> \| deadline: <Frist>` (etwa `morgen`, `2026-12-01`) |
 | `/done <Text>` | Erstes passendes Ziel als erledigt markieren |
 | `/cancel <Text>` | Erstes passendes Ziel verwerfen |
@@ -252,6 +277,7 @@ Haupt-Bot, und Mentions bleiben normale Nachrichten an den Topic-Agenten.
 |---|---|
 | `/help` | Spickzettel aller Befehle im Chat |
 | `/tasks` | Offene Human-in-the-Loop-Aufgaben anzeigen |
+| `/kern` | Festen Kern zeigen (siehe [Fester Kern](#fester-kern)); `/kern entwurf`, `/kern setzen <text>`, `/kern loeschen` |
 | `/faeden` | Offene Fäden: tybos Fragen, auf die noch deine Antwort fehlt (siehe Konzept oben) |
 | `/faeden zu <nr>` / `/faeden alle` | Faden schließen / auch die geschlossenen der letzten 7 Tage |
 | `/erinnerungen` | Offene Erinnerungen aller Gespräche mit Kennung (siehe [Erinnerungen](erinnerungen.md)) |
@@ -259,6 +285,7 @@ Haupt-Bot, und Mentions bleiben normale Nachrichten an den Topic-Agenten.
 | `/credit` | Verbrauch deines Agent-SDK-Credits im aktuellen Abrechnungszyklus |
 | `/plan` | Erkannter/konfigurierter Plan-Ceiling des Credit Guards |
 | `/voice <Text>` | Antwort zusaetzlich als Sprachnachricht |
+| `/sprachagent` | Sprachagenten aus Rezepten: `liste` (auch `/sprachagenten`), `testen <kennung>`, `loeschen <kennung>` mit Rückfrage, `link <kennung>` (siehe [Sprachagenten](sprechen.md#befehl-sprachagent)) |
 
 Faellt Claude aus und ein Fallback-Modell will ein schreibendes Tool nutzen
 (Datei senden, Deploy), fragt der Bot vorher per Button um Erlaubnis; ohne

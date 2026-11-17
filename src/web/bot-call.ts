@@ -226,7 +226,7 @@ export function callIntents(gateDeps?: Partial<IntentGateDeps>) {
  * Vorschläge. null, wenn nichts gemerkt und nichts vorgeschlagen wurde.
  */
 export function callMemoryNotice(applied: ProcessedIntents[], staged: number): string | null {
-  const sum: Required<Omit<ProcessedIntents, "asked" | "remindersAdded">> = { goalsAdded: [], goalsCompleted: [], goalsCancelled: [], factsAdded: [], factsRemoved: [], knowledgeAdded: [] };
+  const sum: Required<Omit<ProcessedIntents, "asked" | "remindersAdded" | "goalsFailed" | "goalChangesFailed" | "factsRefused">> = { goalsAdded: [], goalsCompleted: [], goalsCancelled: [], factsAdded: [], factsRemoved: [], knowledgeAdded: [] };
   for (const p of applied) for (const k of Object.keys(sum) as Array<keyof typeof sum>) sum[k].push(...(p[k] ?? []));
   // Erinnerungen aus [REMIND:] (Issue #322), mit Zeitpunkt in USER_TIMEZONE
   const reminders = applied.flatMap(p => p.remindersAdded ?? []);

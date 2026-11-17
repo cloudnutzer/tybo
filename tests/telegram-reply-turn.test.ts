@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createTelegramReply, type TelegramReplyDeps } from "../src/channels/telegram/reply-turn";
+import { createTelegramReply, TELEGRAM_TURN_FAILED_TEXT, type TelegramReplyDeps } from "../src/channels/telegram/reply-turn";
 import { createTurnFinish } from "../src/lib/turn-finish";
 import { ABORT_REPLY, SHUTDOWN_ABORT_REPLY, resolveStreamingLimits, runStreamingTurn, type ChatTurnDeps, type TurnQuestion } from "../src/lib/chat-turn";
 import type { AskOffer, AskOfferOutcome } from "../src/lib/ask-choices";
@@ -312,6 +312,21 @@ describe("Telegram: Antwort und Rückfrage (ohne bot.ts)", () => {
     await s.reply({ ctx, chatId: GROUP, topicId: 7, userMessage: "x", agentName: "research", threads: true });
     expect(s.saved).toEqual([READABLE]);
     expect(s.events).toEqual([`send:research:${GROUP}:7:${READABLE}`, "offer", `threads:${GROUP}:7`, "after"]);
+  });
+
+  test("Turn wirft: deutsche Fehlermeldung mit nächstem Schritt (Issue #565)", async () => {
+    const s = setup({
+      afterTurn: () => {
+        throw Object.assign(new Error("Executable not found in $PATH"), { code: "ENOENT" });
+      },
+    });
+    replies = [{ text: "egal" }];
+    await s.reply({ ctx, chatId: DM, userMessage: "x", agentName: "general" });
+    expect(s.events).toEqual([`reply:nachricht:${TELEGRAM_TURN_FAILED_TEXT}`, "after"]);
+    expect(TELEGRAM_TURN_FAILED_TEXT).toBe(
+      "Das hat nicht geklappt. Versuch es noch einmal. Kommt das öfter: im Terminal tybo pruefen oder in der WebUI Einstellungen, Status."
+    );
+    expect(TELEGRAM_TURN_FAILED_TEXT).not.toMatch(/something went wrong|please/i);
   });
 
   test("offer() wirft trotzdem: Antwort bleibt, keine Fehlermeldung, die Fäden laufen", async () => {

@@ -4,6 +4,7 @@
  * Functions, Embedding-Quote, Log-Fenster über gespeicherte Dateigrößen,
  * hängende Jobs, Schwärzen von Geheimnissen.
  */
+import { EDGE_FALLBACK_PREFIX, engineTimeoutLogLine, fallbackTryLogLine } from "../src/lib/log-lines";
 import { describe, expect, test } from "bun:test";
 import {
   countLogIssues,
@@ -174,18 +175,23 @@ describe("Log-Fenster ohne Zeitstempel pro Zeile", () => {
     ]);
   });
 
-  test("zählt die Muster aus Bot- und Fehler-Log", () => {
+  test("zählt die Muster aus Bot- und Fehler-Log; Zeilen aus den Funktionen, mit denen der Bot sie schreibt (Issue #568)", () => {
     const text = [
-      "[Claude streaming] timeout (idle) after 1020s, last activity 910s ago",
-      "Claude streaming timeout/idle, kein Fallback (steps=8, sessionId=ja)",
-      "🔄 Fallback: trying OpenRouter (anthropic/claude-opus-5.5) with 32 tools...",
-      "[saveMessage] Edge Function store-telegram-message: HTTP 401, Direkt-Insert ohne Embedding",
+      engineTimeoutLogLine("Claude streaming", "idle", "steps=8, sessionId=ja"),
+      engineTimeoutLogLine("Codex", undefined, "steps=2, sessionId=nein"),
+      fallbackTryLogLine("OpenRouter", "minimax/minimax-m2.7"),
+      fallbackTryLogLine("Ollama", "qwen3:8b"),
+      fallbackTryLogLine("Ollama", "qwen3:8b"),
+      `${EDGE_FALLBACK_PREFIX} store-telegram-message: HTTP 401, Direkt-Insert ohne Embedding`,
       "[web] Modellliste: Ollama ist nicht erreichbar",
+      // Alte Texte, die der Bot nicht mehr schreibt, zählen nicht
+      "🔄 Fallback: trying OpenRouter (anthropic/claude-opus-5.5) with 32 tools...",
     ].join("\n");
     expect(Object.fromEntries(countLogIssues(text))).toEqual({
-      "timeout (idle)": 1,
-      "kein Fallback": 1,
-      "Fallback OpenRouter": 1,
+      "Zeitlimit (idle)": 1,
+      Zeitlimit: 1,
+      "Ersatzmodell OpenRouter": 1,
+      "Ersatzmodell Ollama": 2,
       "saveMessage ohne Embedding": 1,
     });
   });

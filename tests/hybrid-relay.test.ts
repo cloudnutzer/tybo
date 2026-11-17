@@ -833,14 +833,14 @@ describe("Rückfragen über beide Rechner", () => {
   test("Frage des Rechners, Klick beim Server: weitergeleitet und dort genau einmal entschieden", async () => {
     const { server, peer, choice, decided } = await peerQuestion();
     await server.feed(clickUpdate(choiceCallbackData(choice.id, "ja")));
-    await waitFor(() => decided.length > 0);
+    // Die Antwort auf den Klick kommt vom Rechner, erst nach der Entscheidung
+    // und dem Nachziehen der Knöpfe. Darauf warten statt auf eine feste Pause.
+    await waitFor(() => peer.calls.some(c => c.method === "answerCallbackQuery"));
     await Bun.sleep(20);
     expect(decided).toEqual([`${choice.id}:ja`]);
     expect(server.fetches()).toBe(1);
     expect(server.seen).toEqual([]);
     expect(server.calls).toEqual([]);
-    // Die Antwort auf den Klick kommt vom Rechner
-    expect(peer.calls.some(c => c.method === "answerCallbackQuery")).toBe(true);
   });
 
   test("Rechner nicht gesund: Frage bleibt offen, der Klick bekommt den Hinweis, kein Abgelaufen", async () => {

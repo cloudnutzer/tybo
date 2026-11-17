@@ -162,11 +162,14 @@ describe("Laden", () => {
     expect(errorSpy).toHaveBeenCalledTimes(invalid.length);
   });
 
-  test("max gilt nur für Codex, nicht für Claude-Agenten (Issue #125)", () => {
+  // Bis 15.11.2026 galt max nur für Codex (Issue #125); seit Fable 5.2 Max auch für Claude
+  test("max gilt für Codex und für Claude-Agenten, ultra für keinen", () => {
     put(JSON.stringify({ engine: { codex: { effort: "max" } } }));
     expect(getSettings()).toEqual({ engine: { codex: { effort: "max" } } });
     put(JSON.stringify({ agents: { research: { effort: "max" } } }));
-    expect(getSettings()).toEqual({ engine: { codex: { effort: "max" } } });
+    expect(getSettings()).toEqual({ agents: { research: { effort: "max" } } });
+    put(JSON.stringify({ agents: { research: { effort: "ultra" } } }));
+    expect(getSettings()).toEqual({ agents: { research: { effort: "max" } } });
     expect(errorSpy).toHaveBeenCalledTimes(1);
   });
 
@@ -182,7 +185,7 @@ describe("ungültige Datei", () => {
     ["kein JSON", "{ nicht json"],
     ["leerer Modellname", JSON.stringify({ defaults: { model: "  " } })],
     ["leerer Agenten-Modellname", JSON.stringify({ agents: { research: { model: "" } } })],
-    ["unbekannter Effort", JSON.stringify({ defaults: { effort: "max" } })],
+    ["unbekannter Effort", JSON.stringify({ defaults: { effort: "ultra" } })],
     // Unbekannte Kennungen und Aliasse sind seit Issue #49 gültig und werden ignoriert (tests/agent-settings.test.ts)
     ["ungültige Agenten-Kennung", JSON.stringify({ agents: { "Hacker!": { model: "a" } } })],
     ["Aux ohne Doppelpunkt", JSON.stringify({ aux: { judge: "claude-opus-5" } })],
@@ -266,7 +269,7 @@ describe("Schreiben", () => {
     const before = readFileSync(file, "utf-8");
     await expect(writeSettings({ defaults: { model: "" } })).rejects.toThrow();
     await expect(writeSettings({ aux: { judge: "ohne-art" } })).rejects.toThrow();
-    await expect(writeSettings({ defaults: { effort: "max" as never } })).rejects.toThrow();
+    await expect(writeSettings({ defaults: { effort: "ultra" as never } })).rejects.toThrow();
     expect(readFileSync(file, "utf-8")).toBe(before);
     expect(getSettings().defaults?.model).toBe("gut");
   });

@@ -3,7 +3,15 @@
  * Nachtcheck (`bun run health`): prüft die wichtigen Funktionen von tybo und
  * schickt einen kurzen Report mit ✅ / ⚠️ / ❌ je Punkt über die Outbox
  * (Telegram und WebUI). Läuft täglich um 03:30 als launchd-Dienst
- * ai.tybo.health-check (Dienstkatalog src/lib/services/catalog.ts).
+ * ai.tybo.health-check, unter Linux (Issue #568) als systemd-Timer
+ * tybo-health-check in der Zeitzone aus USER_TIMEZONE, ohne systemd unter
+ * PM2 (Dienstkatalog src/lib/services/catalog.ts).
+ *
+ * Ob der Bot läuft, sagen zwei Zeilen (src/lib/health/bot-alive.ts): der
+ * Dienstverwalter (launchd, systemd, PM2) und der Health-Port des Bots
+ * (127.0.0.1, HEALTH_PORT). Steht der Bot, ist das ❌ im Bericht; der
+ * Bericht geht wie jede Nacht genau einmal über die Outbox, ohne Telegram
+ * nur in die WebUI, die mit dem Bot steht und ihn erst danach zeigt.
  *
  * Anlass: vom 9. bis 30.9.2026 lehnte die Edge Function store-telegram-message
  * den Bot mit 401 ab, saveMessage schrieb still ohne Embedding. Die Prüfung
@@ -17,7 +25,7 @@
  *
  *   bun run health               prüfen und Report senden
  *   bun run health --no-send     nur ausgeben
- *   bun run health --no-model    ohne Mini-Aufruf an Haiku
+ *   bun run health --no-model    ohne Mini-Aufruf an Haiku (Motor nur Version und Anmeldung)
  *
  * Exit-Code: 0 Report gesendet bzw. ausgegeben (auch mit Problemen), 1 Senden scheiterte.
  */
@@ -29,15 +37,29 @@ import { loadEnv, PROJECT_ROOT } from "./lib/env";
 import { atomicWriteFile } from "./lib/atomic-file";
 import { supabaseHeaders } from "./lib/supabase-keys";
 import { findLaunchctlLine, LAUNCHD_PREFIX, BOT_SERVICE } from "./lib/service-names";
+import { countLogIssues } from "./lib/log-lines";
+import { BOT_HEALTH_CHECK, BOT_PROCESS_CHECK, checkBotProcess, checkHealthPort, type BotAliveDeps } from "./lib/health/bot-alive";
+import { pm2RpcSocketPath, queryPm2Daemon } from "./lib/routines/sources/pm2-rpc";
+import { checkEngineLine, claudeProbeEnv, ENGINE_CHECK, probeClaude, type EngineLineDeps } from "./lib/health/engine";
 import { isSecretName } from "./lib/subprocess-env";
 import { loadWebConfig } from "./web/config";
 import type { JobStatus } from "./lib/jobs/store";
 import { UPDATE_STATE_FILE, type UpdateState } from "./software-update";
+import { formatBytes, loadMaintenanceState, type MaintenanceRun, type MaintenanceStateRead } from "./lib/maintenance/run";
+import { checkConfiguredServices, serviceLine, type ServiceCheckRun, type ServiceDeps } from "./lib/maintenance/services";
+import { realServiceDeps } from "./lib/maintenance/service-deps";
+import { detectScheduledService, realDetectDeps, type ScheduledServiceState } from "./setup/services/detect";
+import { BRAND } from "./brand";
 import { readRoutinesSummary, type RoutinesSummary } from "./lib/routines/alerts";
 import { defaultRoutinesDeps, listRoutines } from "./lib/routines/catalog";
 import { whenText } from "./lib/routines/format";
 import { summarizePunctuality, type PunctualSummary } from "./lib/routines/punctual";
 import { systemTimeZone } from "./lib/routines/schedule";
+import { evaluateTokenScan, scanLogsForTokens } from "./lib/log-token-scan";
+import { telegramTokensFromEnv } from "./lib/telegram-token-mask";
+import { outboxDelivered } from "./lib/channels";
+import type { SendAndRecordInput, SendAndRecordResult } from "./lib/outbox";
+import { describeStatus, fetchRelayStatus, STATUS_TIMEOUT_MS, type CommandRunner as RelayRunner, type RelayStatus } from "./lib/sip-relay/status";
 
 // ---------------------------------------------------------------------------
 // Typen und Rahmen
@@ -63,15 +85,23 @@ export const EMBEDDING_MIN_RATIO = 0.9;
 export const MIN_FREE_BYTES = 10 * 1024 ** 3;
 /** Unter diesem freien Platz ⚠️ */
 export const WARN_FREE_BYTES = 25 * 1024 ** 3;
+/** Unter diesem Anteil freier Platte ❌ bzw. ⚠️ */
+export const MIN_FREE_PERCENT = 5;
+export const WARN_FREE_PERCENT = 15;
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** Software-Updates: älter als das ⚠️ (Dienst läuft täglich) */
 const UPDATE_MAX_AGE_MS = 3 * DAY_MS;
+/** Wartung: älter als das ⚠️ (Dienst läuft wöchentlich) */
+export const MAINTENANCE_MAX_AGE_MS = 8 * DAY_MS;
+/** Längste Fehlerangabe einer Wartung im Report */
+const MAINTENANCE_ERRORS_MAX = 200;
 /** Laufende Jobs gelten erst so lange nach ihrer Frist als hängend */
 const JOB_GRACE_MS = 15 * 60 * 1000;
 const STATE_FILE = join(PROJECT_ROOT, "data", "health-check-state.json");
 const HEALTH_SERVICE = "health-check";
 const TUNNEL_SERVICE = "cloudflare-tunnel";
 const UPDATE_SERVICE = "software-update";
+const MAINTENANCE_SERVICE = "wartung";
 
 const ICON: Record<CheckStatus, string> = { ok: "✅", warn: "⚠️", fail: "❌", na: "–" };
 
@@ -228,23 +258,6 @@ function plistExists(service: string): boolean {
   return existsSync(join(process.env.HOME ?? "", "Library", "LaunchAgents", `${LAUNCHD_PREFIX}${service}.plist`));
 }
 
-async function checkBotProcess(): Promise<CheckResult> {
-  const name = "Bot-Prozess";
-  if (process.platform !== "darwin") return { name, status: "na", detail: "nur macOS (launchd)" };
-  const line = findLaunchctlLine(await launchctlList(), BOT_SERVICE);
-  if (!line) return { name, status: "fail", detail: "ai.tybo.telegram-relay nicht geladen", hint: "tybo setup autostart" };
-  const [entry] = parseLaunchctlList(line);
-  if (!entry?.pid) {
-    return {
-      name,
-      status: "fail",
-      detail: `geladen, läuft aber nicht (letzter Exit ${entry?.lastExit ?? "?"})`,
-      hint: "logs/telegram-relay.error.log ansehen",
-    };
-  }
-  return { name, status: "ok", detail: `läuft (PID ${entry.pid})` };
-}
-
 async function checkTunnel(): Promise<CheckResult> {
   const name = "Cloudflare-Tunnel";
   if (process.platform !== "darwin") return { name, status: "na" };
@@ -283,7 +296,6 @@ async function checkOtherServices(): Promise<CheckResult> {
 // ---------------------------------------------------------------------------
 
 const BOT_LOG = join(PROJECT_ROOT, "logs", "telegram-relay.log");
-const BOT_ERROR_LOG = join(PROJECT_ROOT, "logs", "telegram-relay.error.log");
 
 function ago(ms: number): string {
   const min = Math.round(ms / 60_000);
@@ -369,33 +381,23 @@ function readFrom(path: string, offset: number): string {
   }
 }
 
-/** Muster im Log mit Beschriftung für den Report */
-export const LOG_PATTERNS: { label: string; pattern: RegExp }[] = [
-  { label: "timeout (idle)", pattern: /timeout \(idle\)/ },
-  { label: "kein Fallback", pattern: /kein Fallback/ },
-  { label: "Fallback OpenRouter", pattern: /Fallback: trying OpenRouter/ },
-  { label: "Fallback Ollama", pattern: /Fallback: trying Ollama/ },
-  { label: "saveMessage ohne Embedding", pattern: /\[saveMessage\] Edge Function/ },
-];
+/** Muster und Zählung stehen bei den Log-Zeilen selbst (Issue #568) */
+export { countLogIssues, LOG_PATTERNS } from "./lib/log-lines";
 
-export function countLogIssues(text: string): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const line of text.split("\n")) {
-    for (const { label, pattern } of LOG_PATTERNS) {
-      if (pattern.test(line)) counts.set(label, (counts.get(label) ?? 0) + 1);
-    }
-  }
-  return counts;
-}
-
-async function checkErrorLog(now: number, state: HealthState, nextState: HealthState): Promise<CheckResult> {
+/**
+ * Zeile „Fehler im Log (24h)“: zählt die Muster aus src/lib/log-lines.ts in
+ * logs/telegram-relay.log und logs/telegram-relay.error.log ab dem Stand vor
+ * mindestens 24 Stunden (pickBaseline) und hält in nextState den neuen
+ * Stand fest. root nur für Tests (Issue #568), sonst der Projektordner.
+ */
+export async function checkErrorLog(now: number, state: HealthState, nextState: HealthState, root: string = PROJECT_ROOT): Promise<CheckResult> {
   const name = "Fehler im Log (24h)";
-  const files = [BOT_LOG, BOT_ERROR_LOG].filter(p => existsSync(p));
+  const files = [join(root, "logs", "telegram-relay.log"), join(root, "logs", "telegram-relay.error.log")].filter(p => existsSync(p));
   if (files.length === 0) return { name, status: "na", detail: "keine Logs" };
   const total = new Map<string, number>();
   let since: number | null = now - DAY_MS;
   for (const path of files) {
-    const key = path.slice(PROJECT_ROOT.length + 1);
+    const key = path.slice(root.length + 1);
     const size = statSync(path).size;
     const snaps = state.logs[key] ?? [];
     const base = pickBaseline(snaps, size, now);
@@ -415,8 +417,16 @@ async function checkErrorLog(now: number, state: HealthState, nextState: HealthS
   };
 }
 
+/**
+ * Bot-Token in logs/ (Issue #526): alle Dateien samt .gz-Archiven, Muster
+ * und bekannte Werte; gemeldet werden nur Datei und Anzahl
+ */
+export async function checkTokenInLogs(env: Env, logsDir: string = join(PROJECT_ROOT, "logs")): Promise<CheckResult> {
+  return { name: "Telegram-Token im Log", ...evaluateTokenScan(await scanLogsForTokens(logsDir, telegramTokensFromEnv(env))) };
+}
+
 // ---------------------------------------------------------------------------
-// Telegram, Claude
+// Telegram, Motor
 // ---------------------------------------------------------------------------
 
 async function checkTelegram(env: Env): Promise<CheckResult> {
@@ -434,49 +444,6 @@ async function checkTelegram(env: Env): Promise<CheckResult> {
     };
   }
   return { name, status: "ok", detail: `@${data.result?.username ?? "?"}` };
-}
-
-async function checkClaude(env: Env, withModel: boolean): Promise<CheckResult> {
-  const name = "Claude CLI";
-  const bin = env.CLAUDE_PATH || "claude";
-  const version = await run([bin, "--version"], { timeoutMs: 20_000 }).catch(err => ({ code: -1, stdout: "", stderr: errorText(err) }));
-  if (version.code !== 0) {
-    return { name, status: "fail", detail: "claude --version scheitert", hint: "PATH im Plist und claude --version im Terminal prüfen" };
-  }
-  const v = version.stdout.split(/\s+/)[0] ?? version.stdout;
-  if (!withModel) return { name, status: "ok", detail: v };
-
-  // Mini-Aufruf mit Haiku: ohne MCP, Werkzeuge, Einstellungen und Sitzung, in
-  // einem fremden Ordner (kein CLAUDE.md); TYBO_SUBPROCESS=1 für Hook-Gates
-  const started = Date.now();
-  const call = await run(
-    [
-      bin, "-p", "Antworte nur mit: OK",
-      "--model", "haiku",
-      "--output-format", "json",
-      "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-      "--no-session-persistence", "--disable-slash-commands",
-      "--tools", "", "--setting-sources", "",
-    ],
-    { cwd: tmpdir(), env: { ...process.env, TYBO_SUBPROCESS: "1" }, timeoutMs: CLAUDE_TIMEOUT_MS - 5_000 }
-  );
-  const secs = Math.round((Date.now() - started) / 1000);
-  let parsed: { is_error?: boolean; result?: string; api_error_status?: number | null } | null = null;
-  try {
-    parsed = JSON.parse(call.stdout);
-  } catch {
-    parsed = null;
-  }
-  if (call.code !== 0 || !parsed || parsed.is_error) {
-    const why = parsed?.api_error_status ? `HTTP ${parsed.api_error_status}` : (parsed?.result ?? call.stderr ?? "").slice(0, 100) || `Exit ${call.code ?? "Zeitlimit"}`;
-    return {
-      name,
-      status: "fail",
-      detail: `${v}, Haiku-Aufruf scheitert (${why})`,
-      hint: "Anmeldung/Limit prüfen: echo test | claude -p",
-    };
-  }
-  return { name, status: "ok", detail: `${v}, Haiku antwortet (${secs} s)` };
 }
 
 // ---------------------------------------------------------------------------
@@ -634,6 +601,21 @@ async function checkMemoryTotal(sb: Supa | null): Promise<CheckResult> {
   return { name, status: "ok", detail: `${total} Einträge, alle mit Vektor` };
 }
 
+/**
+ * Messwert für strengeres Merken (Issue #521): Fakten, die in den letzten 7
+ * Tagen dazukamen, die Grenze zählt mit. Nur type=fact, anders als die
+ * Embedding-Zeile, die alle Arten zählt. Archivierte zählen mit: gemessen wird
+ * der Zugang, nicht der Bestand. Eine gescheiterte Abfrage wirft (runCheck
+ * macht daraus ❌), sie erscheint nie als 0.
+ */
+async function checkNewFacts(sb: Supa | null, now: number): Promise<CheckResult> {
+  const name = "Neue Fakten 7 Tage";
+  if (!sb) return { name, status: "na", detail: "ohne Datenbank" };
+  const week = new Date(now - 7 * DAY_MS).toISOString();
+  const total = await countRows(sb, `memory?select=id&type=eq.fact&created_at=gte.${week}`);
+  return { name, status: "ok", detail: plural(total, "neuer Fakt", "neue Fakten") };
+}
+
 // ---------------------------------------------------------------------------
 // Schlüssel für Embeddings und Fallback
 // ---------------------------------------------------------------------------
@@ -739,14 +721,20 @@ export function parseDf(stdout: string): { total: number; available: number } | 
   return { total: Number.isFinite(total) ? total * 1024 : 0, available: available * 1024 };
 }
 
-/** „129 GB von 460 GB frei (28 %)“; unter 25 GB ⚠️, unter 10 GB ❌ */
+/**
+ * „129 GB von 460 GB frei (28 %)“. ⚠️ unter 15 % oder unter 25 GB, ❌ unter
+ * 5 % oder unter 10 GB, je nachdem, was zuerst greift. Verglichen wird der
+ * genaue Anteil, nicht die gerundete Anzeige; ohne bekannte Gesamtgröße
+ * (total 0) zählen nur die GB-Grenzen.
+ */
 export function evaluateDisk(total: number, free: number): CheckResult {
   const name = "Plattenplatz";
   const gb = (b: number) => Math.round(b / 1024 ** 3);
   const detail = total > 0 ? `${gb(free)} GB von ${gb(total)} GB frei (${Math.round((free / total) * 100)} %)` : `${gb(free)} GB frei`;
-  const hint = "aufräumen (logs/, tmp/, Downloads, brew cleanup)";
-  if (free < MIN_FREE_BYTES) return { name, status: "fail", detail: `nur ${detail}`, hint };
-  if (free < WARN_FREE_BYTES) return { name, status: "warn", detail: `nur ${detail}`, hint };
+  const below = (percent: number) => total > 0 && free * 100 < total * percent;
+  const hint = `${BRAND.cli} wartung --dry-run zeigt, was sofort ginge, mit der Summe; darüber hinaus tmp/ und Downloads ansehen`;
+  if (free < MIN_FREE_BYTES || below(MIN_FREE_PERCENT)) return { name, status: "fail", detail: `nur ${detail}`, hint };
+  if (free < WARN_FREE_BYTES || below(WARN_FREE_PERCENT)) return { name, status: "warn", detail: `nur ${detail}`, hint };
   return { name, status: "ok", detail };
 }
 
@@ -789,6 +777,91 @@ async function checkSoftwareUpdate(now: number): Promise<CheckResult> {
     // noch nie gelaufen
   }
   return evaluateSoftwareUpdate(state, now, plistExists(UPDATE_SERVICE));
+}
+
+/**
+ * Dienst-Versionen (Issue #486): Dienste aus "dienste" in
+ * config/wartung.json nur prüfen, nie neu starten. Läuft einer älter als
+ * installiert, ist die Version unbekannt oder läuft er nicht: ⚠️. Ohne
+ * Liste „–“.
+ */
+export function evaluateServiceVersions(run: ServiceCheckRun | null): CheckResult {
+  const name = "Dienst-Versionen";
+  if (!run) return { name, status: "na", detail: "keine Dienste in config/wartung.json" };
+  if (run.error) return { name, status: "warn", detail: run.error, hint: "config/wartung.json prüfen (docs/routinen.md)" };
+  const bad = run.services.filter(r => r.outcome !== "aktuell");
+  if (bad.length === 0) return { name, status: "ok", detail: run.services.map(r => serviceLine(r, "pruefen")).join("; ") };
+  const stale = bad.some(r => r.outcome === "veraltet");
+  return {
+    name,
+    status: "warn",
+    detail: bad.map(r => serviceLine(r, "pruefen")).join("; "),
+    hint: stale ? `${BRAND.cli} wartung oder bun run updates --apply startet veraltete Dienste neu` : "Dienst und config/wartung.json prüfen",
+  };
+}
+
+async function checkServiceVersions(deps: MaintenanceCheckDeps): Promise<CheckResult> {
+  return evaluateServiceVersions(await checkConfiguredServices(deps.root, deps.services, "pruefen"));
+}
+
+/** Fehler eines Wartungslaufs: Abbruch, Posten, Dienste, Meldung */
+function maintenanceErrors(run: MaintenanceRun): string[] {
+  const errors: string[] = [];
+  if (run.error) errors.push(`abgebrochen: ${run.error}`);
+  for (const item of run.items) for (const error of item.errors) errors.push(`${item.title}: ${error}`);
+  if (run.services?.error) errors.push(`Dienste: ${run.services.error}`);
+  for (const service of run.services?.services ?? []) if (service.outcome === "fehler") errors.push(serviceLine(service, run.services!.mode));
+  if (run.notify?.status === "fehlgeschlagen") errors.push(`Meldung nicht gesendet${run.notify.detail ? `: ${run.notify.detail}` : ""}`);
+  if (errors.length === 0 && run.status === "fehler") errors.push("siehe logs/wartung.log");
+  return errors;
+}
+
+/**
+ * Zeile „Wartung“ (Issue #487) aus data/wartung.json und dem Zustand des
+ * Diensts. Die abgeräumte Menge ist die Summe der Posten, nicht freeAfter
+ * minus freeBefore (APFS, andere Programme schreiben gleichzeitig). Eine
+ * fehlende Datei allein heißt nicht „nicht eingerichtet“: der Dienst kann
+ * da sein und noch nie gelaufen sein. Fehlt der Dienst, bleibt die Zeile „–“
+ * wie jeder nicht eingerichtete Teil; Angaben zu einem Lauf von Hand stehen
+ * trotzdem dabei.
+ */
+export function evaluateMaintenance(read: MaintenanceStateRead, schedule: ScheduledServiceState, now: number): CheckResult {
+  const name = "Wartung";
+  if (schedule === "nicht-verfuegbar") return { name, status: "na", detail: "nur unter macOS und Linux" };
+
+  const run = read.status === "ok" ? read.state.lastRun : null;
+  const age = run ? now - Date.parse(run.finishedAt) : 0;
+  const errors = run ? maintenanceErrors(run) : [];
+  const parts: string[] = [];
+  if (run) {
+    const bytes = run.items.reduce((sum, item) => sum + item.bytes, 0);
+    parts.push(`letzter Lauf ${ago(age)}, ${bytes > 0 ? `${formatBytes(bytes)} abgeräumt` : "nichts abgeräumt"}`);
+  } else if (read.status === "ungueltig") {
+    parts.push("data/wartung.json ungültig");
+  }
+  const text = (lead?: string) => {
+    const joined = errors.join("; ");
+    const shown = joined.length > MAINTENANCE_ERRORS_MAX ? `${joined.slice(0, MAINTENANCE_ERRORS_MAX)}…` : joined;
+    return [lead, ...parts].filter(Boolean).join(", ") + (errors.length ? `; Fehler: ${shown}` : "");
+  };
+  const byHand = `${BRAND.cli} wartung startet sie von Hand`;
+
+  if (schedule === "fehlt") return { name, status: "na", detail: text("nicht eingerichtet") };
+  if (schedule === "aus") return { name, status: "warn", detail: text("Dienst eingerichtet, aber nicht aktiv"), hint: `${BRAND.cli} dienste wartung schaltet ihn wieder ein` };
+  if (schedule === "unbekannt") {
+    if (!run && read.status === "fehlt") parts.push("noch kein Lauf");
+    return { name, status: "warn", detail: text("Dienst nicht prüfbar"), hint: `${BRAND.cli} pruefen und logs/wartung.error.log ansehen` };
+  }
+  if (read.status === "fehlt") return { name, status: "warn", detail: "eingerichtet, noch kein Lauf", hint: `läuft sonntags 03:15, ${byHand}` };
+  if (read.status === "ungueltig") return { name, status: "warn", detail: text(), hint: `${byHand} und schreibt die Datei neu` };
+  if (errors.length) return { name, status: "warn", detail: text(), hint: "Details in logs/wartung.log" };
+  if (age > MAINTENANCE_MAX_AGE_MS) return { name, status: "warn", detail: text(), hint: `logs/wartung.error.log ansehen, ${byHand}` };
+  return { name, status: "ok", detail: text() };
+}
+
+async function checkMaintenance(now: number, deps: MaintenanceCheckDeps): Promise<CheckResult> {
+  const [read, schedule] = await Promise.all([loadMaintenanceState(deps.root), deps.schedule()]);
+  return evaluateMaintenance(read, schedule, now);
 }
 
 function pidAlive(pid: number | undefined): boolean {
@@ -855,7 +928,7 @@ export function evaluateRoutines(s: RoutinesSummary): CheckResult {
  */
 export function evaluatePunctuality(s: PunctualSummary, now: number, timeZone: string): CheckResult {
   const name = "Routinen pünktlich";
-  if (!s.available) return { name, status: "na", detail: "nur mit launchd (macOS)" };
+  if (!s.available) return { name, status: "na", detail: "nur mit launchd (macOS) oder systemd (Linux)" };
   const paused = s.paused.length ? `${s.paused.length} pausiert oder nicht geladen` : "";
   // Hinweise der Übersicht: was fehlt, ist ungeprüft, also nie grün und nie „keine Routine“
   const notes = s.notes.map(n => n.replace(/\.$/, "")).join("; ");
@@ -897,40 +970,141 @@ async function checkPunctuality(now: number): Promise<CheckResult> {
   return evaluatePunctuality(summarizePunctuality(list, { now, timeZone, mtime: fileMtime }), now, timeZone);
 }
 
+/**
+ * SIP-Vermittlung (Issue #511) als Zeile im Bericht: ❌ bei Ausfall, – ohne
+ * Einrichtung. Die Einmal-Meldung kommt von `bun run sip-zustand`, nicht von
+ * hier; der Nachtcheck schickt seinen Bericht ohnehin jedes Mal.
+ */
+export function evaluateSipRelay(status: RelayStatus, now: number): CheckResult {
+  const name = "SIP-Vermittlung";
+  const detail = describeStatus(status, now);
+  if (status.state === "nicht-eingerichtet") return { name, status: "na", detail: "nicht eingerichtet" };
+  if (status.state === "registriert") return { name, status: "ok", detail };
+  return { name, status: "fail", detail, hint: "deploy/sip-vermittlung/README.md, Abschnitt Zustand und Meldung" };
+}
+
+async function checkSipRelay(env: Env, now: number, run?: RelayRunner): Promise<CheckResult> {
+  return evaluateSipRelay(await fetchRelayStatus(env, run), now);
+}
+
 // ---------------------------------------------------------------------------
 // Ablauf
 // ---------------------------------------------------------------------------
 
+/** Zugriffe der Prüfungen zu Wartung und Dienst-Versionen; Tests setzen Attrappen ein */
+export interface MaintenanceCheckDeps {
+  root: string;
+  /** Zustand des Diensts ai.tybo.wartung bzw. tybo-wartung */
+  schedule(): Promise<ScheduledServiceState>;
+  services: ServiceDeps;
+}
+
+function realMaintenanceCheckDeps(): MaintenanceCheckDeps {
+  return {
+    root: PROJECT_ROOT,
+    schedule: () => detectScheduledService(MAINTENANCE_SERVICE, realDetectDeps(PROJECT_ROOT)),
+    services: realServiceDeps(PROJECT_ROOT),
+  };
+}
+
+/** Echte Zugriffe für die Zeile „Motor“ (Issue #568); Module erst beim Aufruf laden */
+export function realEngineLineDeps(env: Env = process.env): EngineLineDeps {
+  return {
+    standard: async () => (await import("./lib/engine-choice")).defaultEngineSetting(),
+    check: async engine => (await import("./lib/engines/check")).checkEngine(engine),
+    probeClaude: async () => probeClaude(env.CLAUDE_PATH || "claude", await probeEnvFor(env), (cmd, o) => run(cmd, o)),
+  };
+}
+
+/** Umgebung des Haiku-Probeaufrufs: gefiltert wie jeder Claude-Subprozess (Issue #568) */
+export async function probeEnvFor(env: Env): Promise<Record<string, string>> {
+  const { subprocessEnv } = await import("./lib/subprocess-env");
+  return claudeProbeEnv(subprocessEnv({ env, cwd: tmpdir(), home: env.HOME ?? "" }), env);
+}
+
+/** Echte Zugriffe für „Bot-Prozess“ und „Bot antwortet“ (Issue #568) */
+export function realBotAliveDeps(env: Env = process.env): BotAliveDeps {
+  const home = env.HOME ?? "";
+  return {
+    platform: process.platform,
+    launchctlList,
+    systemdBooted: () => existsSync("/run/systemd/system"),
+    async systemctlShow(unit, properties) {
+      try {
+        const r = await run(["systemctl", "--user", "show", unit, `--property=${properties.join(",")}`]);
+        return { ok: r.code === 0, stdout: r.stdout };
+      } catch {
+        // systemctl fehlt (Bun.spawn wirft bei unbekanntem Befehl)
+        return { ok: false, stdout: "", missing: true };
+      }
+    },
+    pm2Query: () => queryPm2Daemon(pm2RpcSocketPath(process.platform, env.PM2_HOME || join(home, ".pm2"))),
+    fetch: (url, init) => fetch(url, init),
+  };
+}
+
+export interface PlannedCheck {
+  name: string;
+  fn: () => Promise<CheckResult | CheckResult[]>;
+  timeoutMs?: number;
+}
+
+/** Alle Prüfungen in Report-Reihenfolge; gestartet wird noch nichts */
+export function plannedChecks(options: {
+  withModel: boolean;
+  env: Env;
+  now: number;
+  state: HealthState;
+  nextState: HealthState;
+  maintenance: MaintenanceCheckDeps;
+  /** Prozess und Health-Port des Bots; fehlt: echte Zugriffe */
+  alive?: BotAliveDeps;
+  /** Standard-Motor und Probeaufruf; fehlt: echte Zugriffe */
+  engine?: EngineLineDeps;
+}): PlannedCheck[] {
+  const { withModel, env, now, state, nextState, maintenance } = options;
+  const alive = options.alive ?? realBotAliveDeps(env);
+  const engine = options.engine ?? realEngineLineDeps(env);
+  const sb = supabaseFrom(env);
+  return [
+    { name: BOT_PROCESS_CHECK, fn: () => checkBotProcess(alive) },
+    { name: BOT_HEALTH_CHECK, fn: () => checkHealthPort(env, alive) },
+    { name: "Bot-Log frisch", fn: () => checkLogFresh(now) },
+    { name: "Fehler im Log (24h)", fn: () => checkErrorLog(now, state, nextState) },
+    { name: "Telegram-Token im Log", fn: () => checkTokenInLogs(env), timeoutMs: 60_000 },
+    { name: "Telegram", fn: () => checkTelegram(env) },
+    { name: ENGINE_CHECK, fn: () => checkEngineLine(withModel, engine), timeoutMs: CLAUDE_TIMEOUT_MS },
+    { name: "Supabase REST", fn: () => checkSupabaseRest(sb, env) },
+    { name: "Edge Functions", fn: () => checkEdgeFunctions(sb) },
+    { name: "Semantische Suche", fn: () => checkSemanticSearch(sb, env), timeoutMs: 25_000 },
+    { name: "Embeddings", fn: () => checkEmbeddingQuota(sb, now) },
+    { name: "Memory gesamt", fn: () => checkMemoryTotal(sb) },
+    { name: "Neue Fakten 7 Tage", fn: () => checkNewFacts(sb, now) },
+    { name: "OpenAI-Schlüssel (Embeddings)", fn: () => checkOpenAI(env) },
+    { name: "Fallback OpenRouter", fn: () => checkOpenRouter(env) },
+    { name: "Fallback Ollama", fn: () => checkOllama(env) },
+    { name: "WebUI", fn: () => checkWebUI(env) },
+    { name: "SIP-Vermittlung", fn: () => checkSipRelay(env, now), timeoutMs: STATUS_TIMEOUT_MS + 5_000 },
+    { name: "Cloudflare-Tunnel", fn: checkTunnel },
+    { name: "Weitere Dienste", fn: checkOtherServices },
+    { name: "Plattenplatz", fn: checkDisk },
+    { name: "Wartung", fn: () => checkMaintenance(now, maintenance) },
+    { name: "Software-Updates", fn: () => checkSoftwareUpdate(now) },
+    { name: "Dienst-Versionen", fn: () => checkServiceVersions(maintenance), timeoutMs: 60_000 },
+    { name: "Hintergrund-Jobs", fn: () => checkJobs(now) },
+    { name: "Routinen", fn: async () => evaluateRoutines(readRoutinesSummary(PROJECT_ROOT)) },
+    { name: "Routinen pünktlich", fn: () => checkPunctuality(now), timeoutMs: 25_000 },
+  ];
+}
+
 export async function runHealthChecks(options: { withModel: boolean; env?: Env; now?: number }): Promise<{ results: CheckResult[]; state: HealthState }> {
   const env = options.env ?? process.env;
   const now = options.now ?? Date.now();
-  const sb = supabaseFrom(env);
   const state = readState();
   const nextState: HealthState = { logs: { ...state.logs } };
 
-  const groups = await Promise.all([
-    runCheck("Bot-Prozess", checkBotProcess),
-    runCheck("Bot-Log frisch", () => checkLogFresh(now)),
-    runCheck("Fehler im Log (24h)", () => checkErrorLog(now, state, nextState)),
-    runCheck("Telegram", () => checkTelegram(env)),
-    runCheck("Claude CLI", () => checkClaude(env, options.withModel), CLAUDE_TIMEOUT_MS),
-    runCheck("Supabase REST", () => checkSupabaseRest(sb, env)),
-    runCheck("Edge Functions", () => checkEdgeFunctions(sb)),
-    runCheck("Semantische Suche", () => checkSemanticSearch(sb, env), 25_000),
-    runCheck("Embeddings", () => checkEmbeddingQuota(sb, now)),
-    runCheck("Memory gesamt", () => checkMemoryTotal(sb)),
-    runCheck("OpenAI-Schlüssel (Embeddings)", () => checkOpenAI(env)),
-    runCheck("Fallback OpenRouter", () => checkOpenRouter(env)),
-    runCheck("Fallback Ollama", () => checkOllama(env)),
-    runCheck("WebUI", () => checkWebUI(env)),
-    runCheck("Cloudflare-Tunnel", checkTunnel),
-    runCheck("Weitere Dienste", checkOtherServices),
-    runCheck("Plattenplatz", checkDisk),
-    runCheck("Software-Updates", () => checkSoftwareUpdate(now)),
-    runCheck("Hintergrund-Jobs", () => checkJobs(now)),
-    runCheck("Routinen", async () => evaluateRoutines(readRoutinesSummary(PROJECT_ROOT))),
-    runCheck("Routinen pünktlich", () => checkPunctuality(now), 25_000),
-  ]);
+  const checks = plannedChecks({ withModel: options.withModel, env, now, state, nextState, maintenance: realMaintenanceCheckDeps() });
+  const groups = await Promise.all(checks.map(c => runCheck(c.name, c.fn, c.timeoutMs)));
   const results = groups.flat().map(r => ({
     ...r,
     detail: r.detail === undefined ? undefined : redact(r.detail, env),
@@ -939,26 +1113,54 @@ export async function runHealthChecks(options: { withModel: boolean; env?: Env; 
   return { results, state: nextState };
 }
 
-async function main(argv: string[]): Promise<number> {
-  await loadEnv();
+/** Zugriffe eines Nachtcheck-Laufs; Tests setzen Attrappen ein (Issue #568) */
+export interface NightlyDeps {
+  runChecks(withModel: boolean, now: number): Promise<{ results: CheckResult[]; state: HealthState }>;
+  saveState(state: HealthState): Promise<void>;
+  /** Versand über die Outbox (Telegram, falls eingerichtet, und WebUI) */
+  send(input: SendAndRecordInput): Promise<SendAndRecordResult>;
+  timeZone?: string;
+  out(line: string): void;
+  err(line: string): void;
+}
+
+/**
+ * Ein Lauf: prüfen, Bericht bauen, Stand speichern, Bericht genau einmal
+ * senden (außer mit --no-send). Ein stehender Bot ist eine ❌-Zeile in
+ * diesem Bericht, keine eigene Meldung.
+ */
+export async function runNightly(argv: string[], deps: NightlyDeps, now: Date = new Date()): Promise<number> {
   const send = !argv.includes("--no-send");
   const withModel = !argv.includes("--no-model");
-  const now = new Date();
-  const { results, state } = await runHealthChecks({ withModel, now: now.getTime() });
-  const report = formatReport(results, now, process.env.USER_TIMEZONE || undefined);
-  console.log(`[${now.toISOString()}] Nachtcheck`);
-  console.log(report);
-  await atomicWriteFile(STATE_FILE, JSON.stringify(state, null, 2)).catch(err => console.error(`[health] Stand nicht gespeichert: ${errorText(err)}`));
+  const { results, state } = await deps.runChecks(withModel, now.getTime());
+  const report = formatReport(results, now, deps.timeZone);
+  deps.out(`[${now.toISOString()}] Nachtcheck`);
+  deps.out(report);
+  await deps.saveState(state).catch(err => deps.err(`[health] Stand nicht gespeichert: ${errorText(err)}`));
   if (!send) return 0;
 
-  const { defaultOutboxDeps, outboxDelivered, sendAndRecord } = await import("./lib/outbox");
-  const sent = await sendAndRecord({ source: "nachtcheck", text: report, format: "plain" }, defaultOutboxDeps());
+  const sent = await deps.send({ source: "nachtcheck", text: report, format: "plain" });
   if (sent.error || !outboxDelivered(sent)) {
-    console.error(`[health] Report nicht zugestellt: ${redact(sent.error?.message ?? "unbekannt")}`);
+    deps.err(`[health] Report nicht zugestellt: ${redact(sent.error?.message ?? "unbekannt")}`);
     return 1;
   }
-  console.log("[health] Report gesendet");
+  deps.out("[health] Report gesendet");
   return 0;
+}
+
+async function main(argv: string[]): Promise<number> {
+  await loadEnv();
+  return runNightly(argv, {
+    runChecks: (withModel, now) => runHealthChecks({ withModel, now }),
+    saveState: state => atomicWriteFile(STATE_FILE, JSON.stringify(state, null, 2)),
+    send: async input => {
+      const { defaultOutboxDeps, sendAndRecord } = await import("./lib/outbox");
+      return sendAndRecord(input, defaultOutboxDeps());
+    },
+    timeZone: process.env.USER_TIMEZONE || undefined,
+    out: line => console.log(line),
+    err: line => console.error(line),
+  });
 }
 
 if (import.meta.main) {

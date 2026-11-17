@@ -26,8 +26,9 @@ import {
   stopHint,
   SUPABASE_CLI_VERSION,
 } from "../src/setup/local-supabase";
+import { EMPTY_DATABASE_SQL, MIGRATION_LOCK_HELD_SQL, MIGRATION_LOCK_SQL, MIGRATION_UNLOCK_SQL } from "../src/setup/local-migrations";
 import type { RunEvent, SetupValues } from "../src/setup/model";
-import { RELOAD_SCHEMA_SQL, SCHEMA_FILES } from "../src/setup/supabase-schema";
+import { LIST_MIGRATIONS_SQL, MIGRATIONS_TABLE_SQL, migrationName, RELOAD_SCHEMA_SQL, SCHEMA_FILES } from "../src/setup/supabase-schema";
 import { backupsOf, cleanup, FAKE, makeCtx } from "./setup-fixture";
 import { CLI_PREFIX, fakeLocal, LOCAL, LOCAL_SECRETS, OPEN_CONTAINERS, SAFE_CONTAINERS, shortName, statusJson, type FakeLocal } from "./local-supabase-fixture";
 
@@ -192,8 +193,15 @@ describe("Erfolg", () => {
     expect(session.closed).toBe(true);
     expect(session.signal).toBe(s.controller.signal);
     expect(session.ops).toEqual([
+      // Issue #560: Sperre, Historie und Bilder-Ordner prüfen, dann jede Datei mit
+      // Sperrprüfung und Verbuchung (wie tybo datenbank start), Sperre frei
+      `query:${MIGRATION_LOCK_SQL}`,
+      ...MIGRATIONS_TABLE_SQL.split("\n").map(line => `query:${line}`),
+      `query:${LIST_MIGRATIONS_SQL}`,
+      `query:${EMPTY_DATABASE_SQL}`,
       "query:select public from storage.buckets where id = 'tybo-assets';",
-      ...SCHEMA_FILES.map(file => `file:${join(s.ctx.root, file)}`),
+      ...SCHEMA_FILES.flatMap(file => [`file:${join(s.ctx.root, file)}`, `query:${MIGRATION_LOCK_HELD_SQL}`, expect.stringMatching(new RegExp(`'${migrationName(file)}'\\);$`))]),
+      `query:${MIGRATION_UNLOCK_SQL}`,
       `query:${RELOAD_SCHEMA_SQL}`,
       expect.stringContaining("insert into storage.buckets (id, name, public) values ('tybo-assets', 'tybo-assets', false)"),
     ]);
@@ -236,7 +244,7 @@ describe("Erfolg", () => {
     noSecrets(s, r);
   });
 
-  test("zweiter Lauf: dieselben Befehle, .env unverändert, keine neue Sicherung", async () => {
+  test("zweiter Lauf: dieselben Befehle, keine Datei erneut eingespielt, .env unverändert, keine neue Sicherung", async () => {
     const f = fakeLocal();
     const s = await setup({ f });
     expect((await s.run()).ok).toBe(true);
@@ -244,15 +252,23 @@ describe("Erfolg", () => {
     const backups = await backupsOf(s.ctx);
     const firstTrail = f.trail();
     const firstOps = f.sessions[0].ops;
-    // Zweiter Lauf: Bilder-Ordner gibt es jetzt (privat)
-    f.onQuery = text => (text.includes("storage.buckets") ? [{ public: false }] : []);
+    // Verbucht im ersten Lauf (Issue #560)
+    const recorded = firstOps.flatMap(op => {
+      const m = /values \('(\d+)', '([a-z0-9_]+)'\);$/.exec(op);
+      return m ? [{ version: m[1], name: m[2] }] : [];
+    });
+    expect(recorded.map(r => r.name)).toEqual(SCHEMA_FILES.map(migrationName));
+    // Zweiter Lauf: Bilder-Ordner gibt es jetzt (privat), die Historie ist vollständig
+    f.onQuery = text =>
+      text.includes("storage.buckets") ? [{ public: false }] : text === LIST_MIGRATIONS_SQL ? recorded : text === EMPTY_DATABASE_SQL ? [{ empty: false }] : text === MIGRATION_LOCK_SQL ? [{ locked: true }] : [];
     f.run.calls.length = 0;
     const r2 = await s.run();
     expect(r2.ok).toBe(true);
     expect(r2.changed).toEqual([]);
     expect(r2.message).toContain("alles war schon eingerichtet");
     expect(f.trail()).toEqual(firstTrail);
-    expect(f.sessions[1].ops).toEqual(firstOps);
+    expect(f.sessions[1].ops).toEqual(firstOps.filter(op => op.startsWith("query:") && !op.includes("insert into supabase_migrations") && op !== `query:${MIGRATION_LOCK_HELD_SQL}`));
+    expect(f.sessions[1].ops.some(op => op.startsWith("file:"))).toBe(false);
     expect(await envOf(s)).toBe(env);
     expect(await backupsOf(s.ctx)).toEqual(backups);
   });
@@ -550,11 +566,13 @@ describe("Fehlerbilder mit eigenem Satz", () => {
 
   test("öffentlicher Bilder-Ordner: Abbruch vor dem Schema (das ihn sonst still umstellen würde)", async () => {
     const s = await setup();
-    s.f.onQuery = text => (text.startsWith("select public from storage.buckets") ? [{ public: true }] : []);
+    s.f.onQuery = text => (text.startsWith("select public from storage.buckets") ? [{ public: true }] : text === MIGRATION_LOCK_SQL ? [{ locked: true }] : []);
     const r = await s.run();
     expect(r.ok).toBe(false);
     expect(r.message).toContain("öffentlich");
-    expect(s.f.sessions[0].ops).toEqual(["query:select public from storage.buckets where id = 'tybo-assets';"]);
+    expect(s.f.sessions[0].ops[0]).toBe(`query:${MIGRATION_LOCK_SQL}`);
+    expect(s.f.sessions[0].ops.slice(-2)).toEqual(["query:select public from storage.buckets where id = 'tybo-assets';", `query:${MIGRATION_UNLOCK_SQL}`]);
+    expect(s.f.sessions[0].ops.some(op => op.startsWith("file:") || op.includes("insert into supabase_migrations"))).toBe(false);
     expect(s.f.sessions[0].closed).toBe(true);
     expect(await envOf(s)).toBe(BASE_ENV);
   });
@@ -563,7 +581,7 @@ describe("Fehlerbilder mit eigenem Satz", () => {
     const s = await setup();
     s.f.onQuery = text => {
       if (text.includes("insert into storage.buckets")) throw new Error(`relation storage.buckets does not exist ${LOCAL.dbUrl}`);
-      return [];
+      return text === MIGRATION_LOCK_SQL ? [{ locked: true }] : [];
     };
     const r = await s.run();
     expect(r.message).toContain("Der Bilder-Ordner ließ sich nicht prüfen oder anlegen");
@@ -574,7 +592,8 @@ describe("Fehlerbilder mit eigenem Satz", () => {
   test("eigener Name für den Bilder-Ordner; ungültiger Name: nichts gestartet", async () => {
     const own = await setup({ env: `${BASE_ENV}SUPABASE_ASSETS_BUCKET=meine-bilder\n` });
     expect((await own.run()).ok).toBe(true);
-    expect(own.f.sessions[0].ops[0]).toBe("query:select public from storage.buckets where id = 'meine-bilder';");
+    expect(own.f.sessions[0].ops).toContain("query:select public from storage.buckets where id = 'meine-bilder';");
+    expect(own.f.sessions[0].ops).toContain("query:select public from storage.buckets where id = 'tybo-assets';");
     const bad = await setup({ env: `${BASE_ENV}SUPABASE_ASSETS_BUCKET=X'; drop table x;--\n` });
     const r = await bad.run();
     expect(r.ok).toBe(false);

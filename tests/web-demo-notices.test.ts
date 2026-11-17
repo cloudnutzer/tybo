@@ -28,8 +28,9 @@ test("Demo: Meldungen im Verlauf, Bild als Vorschau, HTML nur als Anhang", async
 
     const report = await fetch(`${origin}/api/files/${DEMO_FILES.report.id}?inline=1`);
     expect(report.status).toBe(200);
-    expect(report.headers.get("content-type")).toBe("application/octet-stream");
-    expect(report.headers.get("content-disposition")).toStartWith("attachment;");
+    expect(report.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(report.headers.get("content-disposition")).toStartWith("inline;");
+    expect(report.headers.get("content-security-policy")).toStartWith("sandbox ");
 
     // Live wie aus einem anderen Prozess
     expect(demo.receiveNotice("topic-60", "watchdog", "Alles ruhig")).toBe(true);

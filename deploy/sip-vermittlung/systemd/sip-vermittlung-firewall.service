@@ -1,0 +1,28 @@
+# Lädt die Firewall der SIP-Vermittlung bei jedem Systemstart, bevor Docker
+# Container startet (Issue #511). Einrichtung (README.md, Schritt 5):
+#   sudo cp systemd/sip-vermittlung-firewall.service /etc/systemd/system/
+#   (Pfad in ExecStart anpassen, falls der Ordner woanders liegt)
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now sip-vermittlung-firewall.service
+#
+# Before=docker.service und WantedBy=docker.service: Docker startet erst, wenn
+# dieser Lauf beendet ist. Scheitert er, fehlt die Marke
+# /run/sip-vermittlung/geladen, und container/start.sh lässt Asterisk nicht
+# starten; die übrigen Container auf dem Server sind davon nicht betroffen.
+# PartOf=nftables.service: Ein Neustart von nftables (der flush ruleset
+# ausführt) lädt die Tabelle danach wieder.
+[Unit]
+Description=Firewall der SIP-Vermittlung (nftables-Tabelle sip_vermittlung)
+Wants=network-online.target
+After=network-online.target nftables.service
+Before=docker.service
+PartOf=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/docker/sip-vermittlung/firewall.sh
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target docker.service

@@ -17,8 +17,10 @@
  *   Prozess läuft; startet er nicht (auch als späteres error-Ereignis), 500.
  * - POST /webhook/elevenlabs (optional, ELEVENLABS_WEBHOOK_SECRET):
  *   Protokoll nach einem Anruf, signiert im Kopf ElevenLabs-Signature
- *   (t=<Sekunden>,v0=<HMAC>, höchstens 5 Minuten alt). Weiter an den
- *   Anrufdienst (src/lib/phone/), der es wie ein abgefragtes Protokoll
+ *   (t=<Sekunden>,v0=<HMAC>, höchstens 5 Minuten alt). Mit agent_id und
+ *   Gesprächsbeginn an die Nachlauf-Weiche (Issue #496): Gespräche eines
+ *   Rezept-Agenten legt sie beim Rezept ab und wertet sie dort aus, alles
+ *   andere geht wie bisher an den Anrufdienst (src/lib/phone/), der es wie ein abgefragtes Protokoll
  *   bearbeitet: Zusammenfassung, Verlauf, Rückfrage zum Auftrag. Anrufe, die
  *   tybo nicht gewählt hat, legt er an und fasst sie im Direktchat zusammen.
  *   Doppelte Zustellung sperrt dessen dauerhafte Anrufliste; scheitert die
@@ -59,8 +61,13 @@ export interface ServerRoutesDeps {
   env: Env;
   /** Projektordner; dort liegt deploy.sh */
   root: string;
-  /** Anrufdienst; null, solange er nicht steht */
-  transcripts(): { receiveTranscript(conversationId: string, lines: TranscriptLine[]): Promise<TranscriptDelivery> } | null;
+  /**
+   * Nachlauf-Weiche der Sprachagenten (src/lib/voice-agents/aftercall.ts), die
+   * fremde Agenten an den Anrufdienst weitergibt; null, solange sie nicht steht
+   */
+  transcripts(): {
+    receiveTranscript(conversationId: string, lines: TranscriptLine[], meta?: { agentId?: string; startedAt?: number }): Promise<TranscriptDelivery>;
+  } | null;
   /** Deploy-Skript starten; Standard bash <Skript>, losgelöst */
   startDeploy?(script: string): DeployRun;
   now?(): number;
@@ -193,9 +200,12 @@ export function createServerRoutes(deps: ServerRoutesDeps): ServerRoutes {
     }
     const phone = deps.transcripts();
     if (!phone) return reply(503, { ok: false, error: "Anrufdienst nicht bereit" });
+    const agentId = typeof data.agent_id === "string" && data.agent_id.trim() ? data.agent_id.trim() : undefined;
+    const startSecs = isRecord(data.metadata) ? data.metadata.start_time_unix_secs : undefined;
+    const startedAt = typeof startSecs === "number" && Number.isFinite(startSecs) && startSecs > 0 ? startSecs * 1000 : undefined;
     let outcome: TranscriptDelivery;
     try {
-      outcome = await phone.receiveTranscript(conversationId, linesFromTurns(data.transcript));
+      outcome = await phone.receiveTranscript(conversationId, linesFromTurns(data.transcript), { ...(agentId ? { agentId } : {}), ...(startedAt !== undefined ? { startedAt } : {}) });
     } catch (error) {
       // Eintrag bleibt offen: ElevenLabs stellt erneut zu, die Abfrage läuft weiter
       log(`[server] /webhook/elevenlabs: Protokoll nicht übernommen (${error instanceof Error ? error.message : "Fehler"})`);

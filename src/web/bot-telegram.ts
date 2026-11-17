@@ -13,7 +13,15 @@ import { getTopicConfigChatIds, getTopicMappingForChat } from "../agents/base";
 import { storeOr } from "../lib/store";
 import { onMessageSaved, type MessageSavedListener, type SavedMessageEvent } from "../lib/store/events";
 import { sessionKeyFor } from "../lib/store/message-rules";
-import type { DisplayOnlyPageOptions, DisplayOnlyRow, HistoryOptions, HistoryRow, TopicActivity } from "../lib/store/types";
+import type {
+  DisplayOnlyHead,
+  DisplayOnlyPageOptions,
+  DisplayOnlyRow,
+  HistoryOptions,
+  HistoryRow,
+  TopicActivity,
+  TopicActivityChanges,
+} from "../lib/store/types";
 import { dmChatId, telegramConfigured } from "../lib/channels";
 import { getTopicNames } from "../lib/topic-names";
 import { TopicStateStore, type TopicStateEntry } from "../lib/topic-state";
@@ -24,17 +32,18 @@ import { isChoiceId, pickReplyInfo } from "./store";
 import {
   TELEGRAM_HISTORY_LIMIT,
   isWebMessageId,
-  normalizeIsoTimestamp,
   parseTelegramConversationId,
   telegramTopicConversationId,
   type TelegramApiMessage,
   type TelegramConversation,
   type TelegramConversationList,
+  type TelegramConversationLookup,
   type TelegramLiveEvent,
   type TelegramLiveFeed,
   type TelegramSource,
   type TelegramTopicChangeEvent,
 } from "./telegram";
+import { activitySortKey, createActivityCache, isoOrNull, keyMs, preciseKey } from "./telegram-activity";
 import { topicChanges, type TopicChangeListener } from "./topic-changes";
 
 type Env = Record<string, string | undefined>;
@@ -69,6 +78,15 @@ export interface BotTelegramDeps {
   topicMapping(chatId: string): Record<string, string>;
   history(chatId: string, topicId: number | null, options: HistoryOptions): Promise<HistoryRow[]>;
   activity(chatId: string, sinceDays: number): Promise<TopicActivity[]>;
+  /**
+   * Aktivität ab einem Zeitpunkt, wirft bei Fehlern (Issue #684). Mit ihr
+   * hält die Quelle die letzte Aktivität im Prozess und schreibt sie nur fort
+   * (./telegram-activity); activity wird dann nicht mehr gerufen. Ohne sie
+   * liest jede Liste über activity den ganzen Zeitraum.
+   */
+  activitySince?(chatId: string, since: string): Promise<TopicActivityChanges>;
+  /** Aktuelle Zeit in Millisekunden für den gehaltenen Stand, Standard Date.now */
+  now?(): number;
   /**
    * Topic-Zustand der Gruppe (Issue #29, data/topic-state.json): gelöschte
    * Topics fehlen immer, geschlossene tragen closed. Wirft der Zustand, zeigt
@@ -106,20 +124,6 @@ function topicIdFromSessionKey(sessionKey: string, groupId: string): number | nu
   if (!sessionKey.startsWith(prefix)) return null;
   const rest = sessionKey.slice(prefix.length);
   return TOPIC_KEY_PATTERN.test(rest) ? Number(rest) : null;
-}
-
-/** Mikrosekunden bleiben erhalten, sie dienen als Cursor für ?before= */
-function isoOrNull(value: string | undefined): string | null {
-  if (!value) return null;
-  const precise = normalizeIsoTimestamp(value);
-  if (precise) return precise;
-  const time = Date.parse(value);
-  return Number.isFinite(time) ? new Date(time).toISOString() : null;
-}
-
-/** Einheitlich sechs Nachkommastellen, damit .123Z nicht hinter .123001Z sortiert (Date.parse verliert Mikrosekunden) */
-function activitySortKey(value: string): string {
-  return value.replace(/\.(\d{3})Z$/, ".$1000Z");
 }
 
 function compareTopics(a: TelegramConversation, b: TelegramConversation): number {
@@ -190,7 +194,34 @@ export function createTelegramSource(deps: BotTelegramDeps): TelegramSource {
   const log = deps.log ?? ((m: string) => console.log(`[web] ${m}`));
   const userId = deps.userId && USER_ID_PATTERN.test(deps.userId) ? deps.userId : null;
 
-  async function listConversations(): Promise<TelegramConversationList> {
+  // Letzte Aktivität (Issue #684): mit activitySince im Prozess gehalten und nur fortgeschrieben
+  const cache = deps.activitySince
+    ? createActivityCache({
+        since: deps.activitySince,
+        sinceDays: ACTIVITY_SINCE_DAYS,
+        ...(deps.now ? { now: deps.now } : {}),
+        onStale: e => log(`Telegram-Aktivität nicht aufgefrischt (${e instanceof Error ? e.name : typeof e}), es gilt der Stand von vorher`),
+      })
+    : null;
+  /** Ohne activitySince: der zuletzt gelesene Stand je Chat, für das Nachschlagen ohne Abfrage */
+  const lastRead = new Map<string, TopicActivity[]>();
+
+  async function freshActivity(chatId: string): Promise<TopicActivity[]> {
+    if (cache) return cache.fresh(chatId);
+    const activity = await deps.activity(chatId, ACTIVITY_SINCE_DAYS);
+    lastRead.set(chatId, activity);
+    return activity;
+  }
+
+  function knownActivity(chatId: string): TopicActivity[] {
+    return cache ? cache.known(chatId) : (lastRead.get(chatId) ?? []);
+  }
+
+  /**
+   * Bestand mit letzter Aktivität. fresh nennt die Teile, deren Aktivität
+   * vorher aufgefrischt wird; für die anderen gilt der bekannte Stand ohne Abfrage.
+   */
+  async function conversations(fresh: { dm: boolean; topics: boolean }): Promise<TelegramConversationList> {
     let groupId: string | null = null;
     try {
       groupId = deps.groupId();
@@ -208,11 +239,13 @@ export function createTelegramSource(deps: BotTelegramDeps): TelegramSource {
     };
     const noMap: Record<string, string> = {};
     const noActivity: TopicActivity[] = [];
+    const activityOf = (chatId: string, refresh: boolean) =>
+      refresh ? safe("Aktivität", () => freshActivity(chatId), noActivity) : safe("Aktivität", () => knownActivity(chatId), noActivity);
     const [names, mapping, groupActivity, dmActivity] = await Promise.all([
       groupId ? safe("Namen", () => deps.topicNames(), noMap) : noMap,
       groupId ? safe("Zuordnung", () => deps.topicMapping(groupId!), noMap) : noMap,
-      groupId ? safe("Aktivität", () => deps.activity(groupId!, ACTIVITY_SINCE_DAYS), noActivity) : noActivity,
-      userId ? safe("Aktivität", () => deps.activity(userId, ACTIVITY_SINCE_DAYS), noActivity) : noActivity,
+      groupId ? activityOf(groupId, fresh.topics) : noActivity,
+      userId ? activityOf(userId, fresh.dm) : noActivity,
     ]);
 
     let dm: TelegramConversation | null = null;
@@ -271,10 +304,19 @@ export function createTelegramSource(deps: BotTelegramDeps): TelegramSource {
     return { dm, topics };
   }
 
-  async function getConversation(id: string): Promise<TelegramConversation | null> {
+  function listConversations(): Promise<TelegramConversationList> {
+    return conversations({ dm: true, topics: true });
+  }
+
+  /**
+   * Einzelnes Nachschlagen (Issue #684): frischt höchstens die Aktivität des
+   * einen Chats auf, zu dem das Gespräch gehört; mit activity: false gar keine.
+   */
+  async function getConversation(id: string, lookup: TelegramConversationLookup = {}): Promise<TelegramConversation | null> {
     const ref = parseTelegramConversationId(id);
     if (!ref) return null;
-    const list = await listConversations();
+    const wanted = lookup.activity !== false;
+    const list = await conversations({ dm: wanted && ref.kind === "dm", topics: wanted && ref.kind === "topic" });
     return ref.kind === "dm" ? list.dm : (list.topics.find(t => t.id === id) ?? null);
   }
 
@@ -284,7 +326,8 @@ export function createTelegramSource(deps: BotTelegramDeps): TelegramSource {
     getConversation,
     async history(id: string, before?: string) {
       const ref = parseTelegramConversationId(id);
-      if (!ref || !(await getConversation(id))) return null;
+      // Nur: gibt es das Gespräch? Die letzte Aktivität braucht der Verlauf nicht
+      if (!ref || !(await getConversation(id, { activity: false }))) return null;
       let chatId: string | null;
       let topicId: number | null = null;
       if (ref.kind === "dm") {
@@ -346,8 +389,19 @@ export function liveConversationId(
 export interface DisplayOnlyPollDeps {
   /** created_at der jüngsten Meldung dieser Chats, null ohne Meldung */
   latestAt(chatIds: string[]): Promise<string | null>;
-  /** Meldungen dieser Chats, älteste zuerst (created_at, dann id) */
-  page(chatIds: string[], options: DisplayOnlyPageOptions): Promise<DisplayOnlyRow[]>;
+  /**
+   * Meldungen dieser Chats mit vollem Inhalt, älteste zuerst (created_at,
+   * dann id). Nur nötig ohne heads und rows.
+   */
+  page?(chatIds: string[], options: DisplayOnlyPageOptions): Promise<DisplayOnlyRow[]>;
+  /**
+   * Sparsamer Weg (Issue #684), beide zusammen: heads liefert dieselbe Seite
+   * wie page, aber nur id und created_at; rows die vollen Zeilen zu Zeilen-IDs
+   * daraus, in beliebiger Reihenfolge. Die Abfrage lädt Text und Metadaten
+   * dann nur für Meldungen, die sie noch nicht gesehen hat.
+   */
+  heads?(chatIds: string[], options: DisplayOnlyPageOptions): Promise<DisplayOnlyHead[]>;
+  rows?(chatIds: string[], ids: string[]): Promise<DisplayOnlyRow[]>;
   /** Abstand der Abfragen, Standard 15 Sekunden */
   intervalMs?: number;
   /**
@@ -390,17 +444,6 @@ const DISPLAY_ONLY_MAX_PAGES = 10;
 const DELIVERED_LIMIT = 5000;
 /** So viele Meldungen mit unlesbarem Topic-Zustand hält die Abfrage für einen neuen Versuch */
 const RETRY_LIMIT = 1000;
-
-/** Einheitlich sechs Nachkommastellen für Vergleiche; null bei ungültigem Zeitpunkt */
-function preciseKey(value: string): string | null {
-  const iso = isoOrNull(value);
-  return iso ? activitySortKey(iso) : null;
-}
-
-/** Millisekunden eines Zeitpunkts aus preciseKey */
-function keyMs(key: string): number {
-  return Date.parse(`${key.slice(0, 23)}Z`);
-}
 
 /** Kennung für die Entdopplung: metadata.msgId (vergibt saveMessageWith immer) */
 function dedupKey(metadata: Record<string, unknown> | null | undefined): string | null {
@@ -544,6 +587,9 @@ export function createTelegramLiveFeed(deps: TelegramLiveDeps): TelegramLiveFeed
   }
 
   function startPolling(poll: DisplayOnlyPollDeps): () => void {
+    const lean = poll.heads && poll.rows ? { heads: poll.heads, rows: poll.rows } : null;
+    const fullPage = poll.page;
+    if (!lean && !fullPage) throw new Error("Meldungen brauchen page oder heads und rows");
     /** Zeitpunkt, ab dem die WebUI Meldungen live erwartet (preciseKey) */
     const startKey = preciseKey(poll.now ? poll.now() : new Date().toISOString());
     /**
@@ -590,21 +636,38 @@ export function createTelegramLiveFeed(deps: TelegramLiveDeps): TelegramLiveFeed
       let after = resumeAfter;
       resumeAfter = null;
       for (let pageNo = 0; pageNo < DISPLAY_ONLY_MAX_PAGES && !stopped; pageNo++) {
-        const rows = await poll.page(chatIds, { ...(since ? { since } : {}), ...(after ? { after } : {}), limit: DISPLAY_ONLY_PAGE_SIZE });
+        const options: DisplayOnlyPageOptions = { ...(since ? { since } : {}), ...(after ? { after } : {}), limit: DISPLAY_ONLY_PAGE_SIZE };
+        const rows: DisplayOnlyHead[] = lean ? await lean.heads(chatIds, options) : await fullPage!(chatIds, options);
+        const heads: { rowId: string; key: string; createdAt: string }[] = [];
         for (const row of rows) {
           const rowId = String(row?.id ?? "");
           const key = typeof row?.created_at === "string" ? preciseKey(row.created_at) : null;
-          if (!rowId || !key) continue;
-          after = { createdAt: row.created_at, id: rowId };
+          if (rowId && key) heads.push({ rowId, key, createdAt: row.created_at });
+        }
+        // Inhalt nur für Meldungen, die gleich gemeldet werden könnten: noch nicht gesehen und
+        // nicht still. Erst danach ändert sich der Stand; scheitert das Laden, versucht es
+        // die nächste Abfrage mit denselben Zeilen erneut
+        const full = new Map<string, DisplayOnlyRow>();
+        if (lean) {
+          const wanted = heads.filter(h => !seenRows.has(h.rowId) && !(silentUpTo && h.key <= silentUpTo)).map(h => h.rowId);
+          if (wanted.length > 0) for (const row of await lean.rows(chatIds, wanted)) full.set(String(row?.id ?? ""), row);
+        } else {
+          for (const row of rows as DisplayOnlyRow[]) full.set(String(row?.id ?? ""), row);
+        }
+        for (const { rowId, key, createdAt } of heads) {
+          after = { createdAt, id: rowId };
           if (seenRows.has(rowId)) continue;
           seenRows.set(rowId, keyMs(key));
           if (!watermark || key > watermark) watermark = key;
           if (silentUpTo && key <= silentUpTo) continue;
+          // Zwischen beiden Abfragen gelöscht: nichts zu melden
+          const row = full.get(rowId);
+          if (!row) continue;
           if (row.role !== "user" && row.role !== "assistant") continue;
           if (typeof row.chat_id !== "string" || typeof row.content !== "string") continue;
           const metadata = row.metadata && typeof row.metadata === "object" ? row.metadata : {};
           if (!isDisplayOnlyMetadata(metadata)) continue;
-          const event: SavedMessageEvent = { chatId: row.chat_id, role: row.role, content: row.content, metadata, createdAt: row.created_at };
+          const event: SavedMessageEvent = { chatId: row.chat_id, role: row.role, content: row.content, metadata, createdAt };
           if (await handleSaved(event)) continue;
           retryRows.set(rowId, event);
           if (retryRows.size > RETRY_LIMIT) {
@@ -736,9 +799,11 @@ export function createBotTelegramLive(env: Env, log?: (message: string) => void)
     topicState: chatId => botTopicState.forChat(chatId),
     onTopicChanged: topicChanges.on,
     // Meldungen anderer Prozesse (Pipeline, Briefing, notify) alle 15 Sekunden (Issue #47)
+    // Erst nur id und created_at, der Inhalt nur für neue Meldungen (Issue #684)
     displayOnly: {
       latestAt: chatIds => storeOr(null, store => store.messages.latestDisplayOnlyAt(chatIds)),
-      page: (chatIds, options) => storeOr([], store => store.messages.displayOnlyPage(chatIds, options)),
+      heads: (chatIds, options) => storeOr([], store => store.messages.displayOnlyHeads(chatIds, options)),
+      rows: (chatIds, ids) => storeOr([], store => store.messages.displayOnlyRows(chatIds, ids)),
     },
     log,
   });
@@ -753,6 +818,7 @@ export function createBotTelegram(env: Env, log?: (message: string) => void): Te
     topicMapping: getTopicMappingForChat,
     history: (chatId, topicId, options) => storeOr([], store => store.messages.history(chatId, topicId, options)),
     activity: (chatId, sinceDays) => storeOr([], store => store.messages.topicActivity(chatId, sinceDays)),
+    activitySince: (chatId, since) => storeOr({ activity: [], truncated: false }, store => store.messages.topicActivitySince(chatId, since)),
     topicState: chatId => botTopicState.forChat(chatId),
     log,
   });

@@ -123,13 +123,9 @@ describe("Fixture (mehrere Schritte)", () => {
     expect(r.costUsd).toBeCloseTo(0.025, 10);
   });
 
-  test("webfetch, MCP und Read außerhalb des Projekts gelten als fremd", () => {
+  test("webfetch und MCP gelten als fremd, Read außerhalb des Projekts seit #525 nicht mehr", () => {
     const verdict = classifyTurnTools(r.tools, PROJECT);
-    expect(verdict.status).toBe("foreign");
-    if (verdict.status !== "foreign") return;
-    expect(verdict.reasons).toContain("WebFetch");
-    expect(verdict.reasons).toContain("mcp__gmail__search_threads (Mail)");
-    expect(verdict.reasons).toContain("Read außerhalb des Projekts");
+    expect(verdict).toEqual({ status: "foreign", reasons: ["mcp__gmail__search_threads (Mail)", "WebFetch"] });
   });
 
   test("über Chunks verteilte Zeilen und geteilte UTF-8-Zeichen ergeben dasselbe", () => {
@@ -160,6 +156,7 @@ describe("Werkzeug-Abbildung", () => {
     expect(usesOf("glob", { pattern: "**/*.ts", path: "/var/log" })).toEqual([{ name: "Glob", path: "/var/log" }]);
     expect(usesOf("grep", { pattern: "x" })).toEqual([{ name: "Grep" }]);
     expect(usesOf("bash", { command: "curl https://example.org" })).toEqual([{ name: "Bash", command: "curl https://example.org" }]);
+    expect(usesOf("bash", {})).toEqual([{ name: "Bash" }]);
     expect(usesOf("edit", { filePath: "src/a.ts", oldString: "a", newString: "b" })).toEqual([{ name: "Edit", path: "src/a.ts" }]);
     expect(usesOf("apply_patch", { patchText: "..." })).toEqual([{ name: "Edit" }]);
     expect(usesOf("write", { filePath: "notiz.md", content: "x" })).toEqual([{ name: "Write", path: "notiz.md" }]);
@@ -173,15 +170,19 @@ describe("Werkzeug-Abbildung", () => {
     expect(mcpToolName("_seltsam")).toBe("mcp___seltsam___seltsam");
   });
 
-  test("Einstufung: Web, MCP, Unter-Agent, Pfade außerhalb fremd; Projekt und Bash ohne Netz eigen", () => {
-    const verdict = (name: string, input: object) => classifyTurnTools({ uses: usesOf(name, input), cwd: PROJECT }, PROJECT).status;
+  test("Einstufung: Web, MCP, Unter-Agent und gh gegen fremde Repos fremd; Dateien und Bash ohne Netz eigen", () => {
+    const verdict = (name: string, input: object) =>
+      classifyTurnTools({ uses: usesOf(name, input), cwd: PROJECT }, PROJECT, { githubOwners: ["cloudnutzer"] }).status;
     expect(verdict("webfetch", { url: "https://example.org" })).toBe("foreign");
     expect(verdict("websearch", { query: "x" })).toBe("foreign");
     expect(verdict("task", { prompt: "x" })).toBe("foreign");
     expect(verdict("notion_query_database", {})).toBe("foreign");
     expect(verdict("my_server_with_underscores_tool", {})).toBe("foreign");
-    expect(verdict("read", { filePath: "/etc/hosts" })).toBe("foreign");
-    expect(verdict("grep", { pattern: "x", path: "/var/log" })).toBe("foreign");
+    // Issue #525: Dateien auf diesem Rechner sind nie fremd
+    expect(verdict("read", { filePath: "/etc/hosts" })).toBe("own");
+    expect(verdict("grep", { pattern: "x", path: "/var/log" })).toBe("own");
+    expect(verdict("bash", { command: "gh issue list -R cloudnutzer/tybo" })).toBe("own");
+    expect(verdict("bash", { command: "gh issue list -R fremd/tybo" })).toBe("foreign");
     expect(verdict("read", { filePath: `${PROJECT}/README.md` })).toBe("own");
     expect(verdict("glob", { pattern: "*.ts" })).toBe("own");
     expect(verdict("bash", { command: "ls" })).toBe("own");

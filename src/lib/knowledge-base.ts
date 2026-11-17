@@ -51,11 +51,13 @@ export function knowledgeLine(entry: KnowledgeEntry): string {
 export interface KnowledgeContextDeps {
   /** Suchvektor zur Nachricht; null: nur Vorrang und Text */
   embed?: (text: string) => Promise<ConfiguredEmbedding | null>;
+  /** Wirft, wenn die Einträge nicht lesbar waren (Nachschlagen, #523); für den Prompt reicht leer */
+  strict?: boolean;
 }
 
 /**
  * Abschnitt „Knowledge Base“ für den Prompt; leer ohne Datenbank, ohne
- * Einträge oder bei einem Fehler.
+ * Einträge oder, außer mit strict, bei einem Fehler.
  */
 export async function getKnowledgeContext(userMessage?: string, deps: KnowledgeContextDeps = {}): Promise<string> {
   if (getStore().backend !== "supabase") return "";
@@ -69,10 +71,12 @@ export async function getKnowledgeContext(userMessage?: string, deps: KnowledgeC
       perCategory: CONTEXT_PER_CATEGORY,
       perTerm: CONTEXT_PER_TERM,
       matches: CONTEXT_MATCHES,
+      ...(deps.strict ? { strict: true } : {}),
     });
   };
   const hits = await lookup().catch((err: unknown): KnowledgeHit[] => {
     console.error("[Wissen] Kontext nicht lesbar:", err instanceof Error ? err.name : "Fehler");
+    if (deps.strict) throw err;
     return [];
   });
   const lines = hits.slice(0, CONTEXT_MAX_ENTRIES).map(knowledgeLine);

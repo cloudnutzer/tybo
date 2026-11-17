@@ -54,6 +54,7 @@ import {
   type FetchLike,
   type RegistryTarget,
 } from "../../supabase/functions/_shared/embedding";
+import { maskSecrets } from "./memory/secrets";
 import { syncChunks, type ChunkStore, type ChunkSyncOutcome } from "./message-chunks";
 
 export const REINDEX_TABLES = ["messages", "memory", "knowledge", "assets"] as const;
@@ -87,7 +88,8 @@ export const TABLE_SPECS: Record<ReindexTable, TableSpec> = {
   memory: {
     columns: "id,type,content",
     label: "Erinnerungen",
-    text: row => (row.type === "fact" && str(row.content) ? str(row.content).substring(0, 8000) : null),
+    // Alte Fakten können Geheimnisse enthalten (Issue #524): Der Anbieter bekommt sie nur maskiert
+    text: row => (row.type === "fact" && str(row.content) ? maskSecrets(str(row.content)).substring(0, 8000) : null),
   },
   knowledge: {
     columns: "id,title,content",

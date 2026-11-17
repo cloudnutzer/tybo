@@ -1,0 +1,101 @@
+; Wählplan der SIP-Vermittlung (Issue #511). Erzeugt aus vorlagen/.
+;
+; Eingehend:  easybell -> ElevenLabs, Rufnummer des Anrufers in From,
+;             P-Asserted-Identity und X-Caller-ID.
+; Ausgehend:  ElevenLabs -> easybell, nur Nummern aus der Positivliste.
+; Beide Wege: höchstens {{MAX_GESPRAECHE}} Gespräche gleichzeitig, höchstens
+;             {{MAX_SEKUNDEN}} Sekunden je Gespräch. Rufnummern im Log gekürzt.
+
+[general]
+static = yes
+writeprotect = yes
+autofallthrough = yes
+clearglobalvars = yes
+
+[globals]
+
+; Alles, was keinem Weg zugeordnet ist, endet hier
+[gesperrt]
+exten => _X.,1,Hangup(21)
+exten => _+X.,1,Hangup(21)
+exten => s,1,Hangup(21)
+
+; ---------------------------------------------------------------------------
+; Zähler über beide Richtungen: erst eintragen, dann zählen. Kommen zwei
+; Anrufe zugleich, sehen beide den höheren Stand; im Zweifel wird abgewiesen.
+; ---------------------------------------------------------------------------
+[gespraeche-zaehlen]
+exten => s,1,Set(GROUP(vermittlung)=gespraech)
+ same => n,GotoIf($[${GROUP_COUNT(gespraech@vermittlung)} > {{MAX_GESPRAECHE}}]?voll)
+ same => n,Return()
+ same => n(voll),Log(NOTICE,Abgewiesen: schon {{MAX_GESPRAECHE}} Gespraeche)
+ same => n,Hangup(34)
+
+; Kopfzeilen am Kanal zu ElevenLabs (Pre-Dial-Handler), ARG1 = Anrufer
+[kopfzeilen-elevenlabs]
+exten => s,1,Set(PJSIP_HEADER(add,X-Caller-ID)=${ARG1})
+ same => n,Return()
+
+; ---------------------------------------------------------------------------
+; Eingehend von easybell
+; ---------------------------------------------------------------------------
+[von-easybell]
+exten => eingang,1,Goto(eingang-pruefen,s,1)
+exten => s,1,Goto(eingang-pruefen,s,1)
+exten => _X.,1,Goto(eingang-pruefen,s,1)
+exten => _+X.,1,Goto(eingang-pruefen,s,1)
+
+[eingang-pruefen]
+exten => s,1,Set(TIMEOUT(absolute)={{MAX_SEKUNDEN_GESAMT}})
+ same => n,Set(ROH=${CALLERID(num)})
+ ; Anzeige nicht erlaubt (etwa P-Asserted-Identity mit Privacy: id): Die
+ ; Nummer steht dann zwar in CALLERID(num), darf aber nicht weiter
+ same => n,GotoIf($["${CALLERID(num-pres):0:7}" != "allowed"]?unterdrueckt)
+ same => n,Set(ANRUFER=${FILTER(+0123456789,${ROH})})
+ same => n,GotoIf($["${ANRUFER}" = ""]?unterdrueckt)
+ same => n,GotoIf($["${ANRUFER}" != "${ROH}"]?unterdrueckt)
+ ; Rufnummer in E.164: 00 -> +, 0 -> +49, sonst + davor
+ same => n,ExecIf($["${ANRUFER:0:2}" = "00"]?Set(ANRUFER=+${ANRUFER:2}))
+ same => n,ExecIf($["${ANRUFER:0:1}" = "0"]?Set(ANRUFER=+49${ANRUFER:1}))
+ same => n,ExecIf($["${ANRUFER:0:1}" != "+"]?Set(ANRUFER=+${ANRUFER}))
+ same => n(weiter),Gosub(gespraeche-zaehlen,s,1)
+ same => n,Set(CALLERID(num)=${ANRUFER})
+ same => n,Log(NOTICE,Eingehend von ${ANRUFER:0:6}... an ElevenLabs)
+ ; i: Umleitungen (302) der Gegenstelle nicht folgen
+ same => n,Dial(PJSIP/{{EASYBELL_RUFNUMMER}}@elevenlabs,30,b(kopfzeilen-elevenlabs^s^1(${ANRUFER}))iS({{MAX_SEKUNDEN}}))
+ same => n,Log(NOTICE,Eingehend beendet: ${DIALSTATUS})
+ same => n,Hangup()
+{{UNTERDRUECKT}}
+
+; ---------------------------------------------------------------------------
+; Ausgehend von ElevenLabs (/anruf), nur nach Digest-Anmeldung erreichbar
+; ---------------------------------------------------------------------------
+[von-elevenlabs]
+exten => _X.,1,Set(ROH=${EXTEN})
+ same => n,Goto(ausgang-pruefen,s,1)
+exten => _+X.,1,Set(ROH=${EXTEN})
+ same => n,Goto(ausgang-pruefen,s,1)
+exten => s,1,Log(NOTICE,Ausgehend abgewiesen: kein Ziel)
+ same => n,Hangup(21)
+exten => i,1,Log(NOTICE,Ausgehend abgewiesen: ungueltiges Ziel)
+ same => n,Hangup(21)
+
+[ausgang-pruefen]
+exten => s,1,Set(TIMEOUT(absolute)={{MAX_SEKUNDEN_GESAMT}})
+ same => n,Set(ZIEL=${FILTER(+0123456789,${ROH})})
+ same => n,GotoIf($["${ZIEL}" != "${ROH}"]?abweisen)
+ same => n,ExecIf($["${ZIEL:0:2}" = "00"]?Set(ZIEL=+${ZIEL:2}))
+ same => n,ExecIf($["${ZIEL:0:1}" = "0"]?Set(ZIEL=+49${ZIEL:1}))
+ same => n,ExecIf($["${ZIEL:0:1}" != "+"]?Set(ZIEL=+${ZIEL}))
+{{ERLAUBTE_ZIELE_PRUEFUNG}}
+ same => n(abweisen),Log(NOTICE,Ausgehend abgewiesen: Ziel ${ZIEL:0:6}... nicht in der Positivliste)
+ same => n,Hangup(21)
+ same => n(erlaubt),Gosub(gespraeche-zaehlen,s,1)
+{{WAHLFORMAT}}
+ same => n,Set(CALLERID(num)={{EASYBELL_RUFNUMMER}})
+ same => n,Log(NOTICE,Ausgehend an ${ZIEL:0:6}...)
+ ; i: Umleitungen (302) von easybell nicht folgen, sonst liefe der Anruf
+ ; im Kontext des Endpunkts (von-easybell) weiter
+ same => n,Dial(PJSIP/${WAHL}@easybell,60,iS({{MAX_SEKUNDEN}}))
+ same => n,Log(NOTICE,Ausgehend beendet: ${DIALSTATUS})
+ same => n,Hangup()

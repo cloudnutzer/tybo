@@ -1,0 +1,52 @@
+pjsip: Folgeverbindungen per TLS unter dem Namen des Ziels aufbauen
+
+Gepatcht fuer die SIP-Vermittlung (tybo, Issue #511), siehe ../README.md,
+Abschnitt "Folgeverbindungen". Ein Dialog merkt sich den Namen der ersten
+Verbindung (initial_dest) und nahm ihn bisher fuer SNI und Zertifikatspruefung
+jeder weiteren Anfrage, auch wenn das Ziel (Contact oder erste Route) einen
+eigenen Rechnernamen hat. Jetzt gilt der Name des Ziels; initial_dest bleibt
+nur fuer Ziele, die als IP-Adresse angegeben sind.
+
+--- a/pjsip/src/pjsip/sip_util.c
++++ b/pjsip/src/pjsip/sip_util.c
+@@ -1443,7 +1443,17 @@
+     /* Process the addresses. */
+     stateless_send_transport_cb( stateless_data, tdata, -PJ_EPENDING);
+ }
++
++/* PJ_TRUE, wenn host eine IPv4- oder IPv6-Adresse ist und kein Rechnername */
++static pj_bool_t is_ip_literal(const pj_str_t *host)
++{
++    pj_in_addr addr4;
++    pj_in6_addr addr6;
+ 
++    return pj_inet_pton(pj_AF_INET(), host, &addr4) == PJ_SUCCESS ||
++           pj_inet_pton(pj_AF_INET6(), host, &addr6) == PJ_SUCCESS;
++}
++
+ /*
+  * Send stateless request.
+  * The sending process consists of several stages:
+@@ -1484,6 +1494,22 @@
+     if (tdata->dest_info.addr.count == 0) {
+         /* Copy the destination host name to TX data */
+         if (!tdata->dest_info.name.slen) {
++            pj_strdup(tdata->pool, &tdata->dest_info.name,
++                      &dest_info.addr.host);
++        } else if (!is_ip_literal(&dest_info.addr.host) &&
++                   pj_stricmp(&tdata->dest_info.name, &dest_info.addr.host))
++        {
++            /* Der Name der ersten Verbindung eines Dialogs (initial_dest)
++             * steht nur für ein Ziel ein, das als IP-Adresse angegeben ist.
++             * Hat das Ziel (Contact oder erste Route) einen eigenen
++             * Rechnernamen, etwa <ip>.hosts.example.com, gelten SNI und
++             * Zertifikatsprüfung diesem Namen (RFC 5922).
++             */
++            PJ_LOG(5, (THIS_FILE, "Using next hop name %.*s instead of "
++                       "initial dest %.*s",
++                       (int)dest_info.addr.host.slen, dest_info.addr.host.ptr,
++                       (int)tdata->dest_info.name.slen,
++                       tdata->dest_info.name.ptr));
+             pj_strdup(tdata->pool, &tdata->dest_info.name,
+                       &dest_info.addr.host);
+         } else {

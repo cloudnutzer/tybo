@@ -1,0 +1,13 @@
+; Keine Meldungen der SIP-Bibliothek ins Log: sie enthielten ganze Nachrichten
+; mit Rufnummern (Issue #511)
+[startup]
+type = startup
+log_level = 0
+
+[log_mappings]
+type = log_mappings
+asterisk_error = 0
+asterisk_warning = 2
+asterisk_notice =
+asterisk_verbose =
+asterisk_debug =

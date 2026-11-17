@@ -67,6 +67,8 @@ const defaultDeps: ThreadResolveDeps = {
 
 export type ResolveOutcome =
   | { status: "off" }
+  /** Nebenaufgabe abgeschaltet (Issue #566): Claude fehlt, kein anderes Nebenmodell; kein Fehler, keine Logzeile */
+  | { status: "disabled" }
   | { status: "no-threads" }
   | { status: "none" }
   | { status: "closed"; nrs: number[] }
@@ -170,6 +172,7 @@ export async function resolveThreads(input: ResolveInput, deps: Partial<ThreadRe
   } catch (e) {
     return fail(e instanceof Timeout ? "zeitüberschreitung" : "fehler");
   }
+  if (result.disabled) return { status: "disabled" };
   if (result.isError) return fail("fehler");
   const answered = parseResolveVerdict(result.text);
   if (!answered) return fail("ungültige Antwort");

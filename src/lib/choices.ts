@@ -4,7 +4,7 @@
  * Eine offene Rückfrage mit Knöpfen (Werkzeug-Freigabe, Merk-Vorschlag,
  * /goal "Weiter?", Topic-Zuordnung, Routinen bedienen, Erinnerung an offene Fäden,
  * Auswahl bei mehrdeutigen Merk-Tags, Knöpfe an Erinnerungen und unter
- * proaktiven Meldungen, Rückfragen des Modells, Aufträge aus Anrufen) steht hier genau einmal und wird genau
+ * proaktiven Meldungen, Rückfragen des Modells, Aufträge aus Anrufen, Bereinigung der Fakten, Entwurf für den Kern, Geheimnisse in Fakten, Sprachagenten löschen) steht hier genau einmal und wird genau
  * einmal entschieden, egal ob der Klick aus Telegram, dem Browser oder dem
  * Terminal kommt.
  *
@@ -43,7 +43,7 @@ import { atomicWriteFile } from "./atomic-file";
 // Datenmodell
 // ---------------------------------------------------------------------------
 
-export const CHOICE_KINDS = ["tool", "review", "goal", "topicmap", "routine", "thread", "memory", "reminder", "proactive", "ask", "call"] as const;
+export const CHOICE_KINDS = ["tool", "review", "goal", "topicmap", "routine", "thread", "memory", "reminder", "proactive", "ask", "call", "cleanup", "core", "secret", "sprachagent"] as const;
 export type ChoiceKind = (typeof CHOICE_KINDS)[number];
 
 export const CHOICE_CHANNELS = ["telegram", "web", "terminal"] as const;

@@ -43,7 +43,7 @@ export type JobOutcome =
   | "no_report"
   | "timeout"
   | "stopped"
-  /** Wächter lief nicht mehr (Absturz, Neustart des Rechners) */
+  /** Wächter lief nicht mehr (Absturz, Neustart des Rechners oder des Bots) */
   | "aborted"
   /** Wächter oder Claude ließ sich nicht starten */
   | "start_failed";
@@ -99,6 +99,12 @@ export interface JobStatus {
   effort?: string;
   /** --full-access: bypassPermissions, sonst acceptEdits */
   fullAccess: boolean;
+  /** Zusätzlich erlaubte Werkzeuge (Recherche ohne --full-access, Issue #493) */
+  allowedTools?: string[];
+  /** Zusätzlich gesperrte Werkzeuge und Schreibregeln (Issue #493) */
+  deniedTools?: string[];
+  /** Eigener Arbeitsordner, Claude läuft dort eingeschränkt (Issue #493) */
+  workDir?: string;
   target: JobTarget;
   watcher?: ProcRef;
   claude?: ProcRef;

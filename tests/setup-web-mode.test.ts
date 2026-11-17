@@ -14,6 +14,7 @@ import { runSetupMode, setupPort, startCommandFor, type SetupModeOptions } from 
 import { formatSetupCode } from "../src/setup/web-server";
 import { cleanup, FULL_ENV, fakeRun, makeCtx, root as tmpRoot } from "./setup-fixture";
 import { CODE, PROFILE, type TestCtx } from "./setup-web-fixture";
+import { currentLockOf, spawnFakeBot } from "./bot-lock-fixture";
 
 afterAll(cleanup);
 
@@ -296,12 +297,54 @@ describe("tybo setup --web", () => {
     void interrupt;
   });
 
-  test("läuft schon ein Bot (bot.lock), startet nichts", async () => {
+  test("läuft schon ein Bot (bot.lock mit PID und Startzeit), startet nichts", async () => {
     const ctx = await makeCtx({ env: FULL_ENV });
-    await Bun.write(join(ctx.root, "bot.lock"), String(process.pid));
+    await Bun.write(join(ctx.root, "bot.lock"), currentLockOf(process.pid));
     const err: string[] = [];
     const code = await runTybo({ args: ["setup", "--web"], env: {}, root: ctx.root, out: () => {}, err: line => err.push(line), setup: { ctx, web: { port: 0 } } });
     expect(code).toBe(1);
     expect(err.join("\n")).toContain("tybo läuft schon. Einrichtung im Terminal mit: tybo setup");
+  });
+
+  test("bot.lock da, aber nicht lesbar (Ordner, ohne Leserecht): startet nichts (Issue #564)", async () => {
+    const ctx = await makeCtx({ env: FULL_ENV });
+    const lockPath = join(ctx.root, "bot.lock");
+    const attempt = async () => {
+      const err: string[] = [];
+      const code = await runTybo({ args: ["setup", "--web"], env: {}, root: ctx.root, out: () => {}, err: line => err.push(line), setup: { ctx, web: { port: 0 } } });
+      return { code, err: err.join("\n") };
+    };
+    await mkdir(lockPath);
+    const dir = await attempt();
+    expect(dir.code).toBe(1);
+    expect(dir.err).toContain("tybo läuft schon.");
+    await Bun.$`rmdir ${lockPath}`.quiet();
+
+    // Als root gilt das Leserecht nicht
+    if (process.getuid?.() !== 0) {
+      await writeFile(lockPath, "77");
+      await chmod(lockPath, 0o000);
+      try {
+        const unreadable = await attempt();
+        expect(unreadable.code).toBe(1);
+        expect(unreadable.err).toContain("tybo läuft schon.");
+      } finally {
+        await chmod(lockPath, 0o600);
+      }
+    }
+  });
+
+  test("alte bot.lock nur mit PID eines Bots aus diesem Ordner: startet nichts (Issue #564)", async () => {
+    const ctx = await makeCtx({ env: FULL_ENV });
+    const bot = await spawnFakeBot(ctx.root, "absolute", tmpRoot);
+    try {
+      await Bun.write(join(ctx.root, "bot.lock"), String(bot.pid));
+      const err: string[] = [];
+      const code = await runTybo({ args: ["setup", "--web"], env: {}, root: ctx.root, out: () => {}, err: line => err.push(line), setup: { ctx, web: { port: 0 } } });
+      expect(code).toBe(1);
+      expect(err.join("\n")).toContain("tybo läuft schon.");
+    } finally {
+      await bot.stop();
+    }
   });
 });

@@ -1,6 +1,6 @@
 /**
  * Issue #374: Skripte in package.json geordnet, upgrade und feedback entfernt
- * (E7, E12). Jedes Skript zeigt auf eine vorhandene Datei, die Reihenfolge
+ * (E7, E12), sip-zustand seit Issue #511. Jedes Skript zeigt auf eine vorhandene Datei, die Reihenfolge
  * folgt den Gruppen Betrieb, Aufgaben, Einrichtung, Entwicklung.
  */
 import { describe, expect, test } from "bun:test";
@@ -16,7 +16,7 @@ describe("package.json-Skripte", () => {
       // Betrieb
       "tybo", "start", "vps", "whatsapp", "voice",
       // Aufgaben und Routinen
-      "restart:request", "notify", "job", "checkin", "briefing", "health", "updates",
+      "restart:request", "notify", "nachschlagen", "job", "checkin", "briefing", "health", "sip-zustand", "updates",
       // Einrichtung
       "setup", "setup:launchd", "setup:services", "setup:verify", "setup:google", "uninstall", "test:tools",
       // Entwicklung

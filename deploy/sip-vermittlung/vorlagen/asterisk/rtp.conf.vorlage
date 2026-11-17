@@ -1,0 +1,9 @@
+; Medien der SIP-Vermittlung (Issue #511). Kleiner Portbereich, den
+; erzeugt/firewall.nft freigibt: je Gespräch zwei Kanäle mit RTP und RTCP.
+[general]
+rtpstart = {{RTP_START}}
+rtpend = {{RTP_ENDE}}
+; Pakete nur von der Gegenstelle annehmen, die das Gespräch tatsächlich führt
+strictrtp = yes
+probation = 4
+icesupport = no

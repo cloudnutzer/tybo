@@ -15,6 +15,7 @@ import { renderMarkdown, stripControlTags } from "./markdown";
 import { toSpeakable } from "./speakable";
 import { NOTICE_SOURCE_PATTERN, pickNoticeFile, type NoticeFile } from "./notice";
 import { pickReplyInfo, type Conversation, type NewMessage, type ReplyInfo, type StoredMessage } from "./store";
+import { errorLogFields } from "./error-log";
 
 export const MAX_MESSAGE_CHARS = 200_000;
 export const DEFAULT_KEEPALIVE_MS = 20_000;
@@ -1087,8 +1088,11 @@ export class ChatHub {
         }
       }
     } catch (e) {
-      // Nur der Fehlertyp ins Log: Meldungen können Pfade oder Zugangsdaten enthalten
-      this.log(`Turn in Gespräch ${id} fehlgeschlagen (${e instanceof Error ? e.name : typeof e})`);
+      // Nur Typ, Fehlercode und Systemaufruf ins Log (Issue #565), nie die
+      // Meldung: sie kann Pfade, Nutzerinhalt oder Zugangsdaten enthalten.
+      // Ein fehlendes Claude Code kommt nicht mehr hier an, das meldet der
+      // Chat-Kern auf dem Weg zur Ersatzkette
+      this.log(`Turn in Gespräch ${id} fehlgeschlagen (${errorLogFields(e)})`);
       reply = turn.stopRequested ? { role: "error", text: this.abortText() } : { role: "error", text: TURN_FAILED_TEXT };
     }
     active = false;

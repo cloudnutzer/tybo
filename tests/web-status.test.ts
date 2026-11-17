@@ -352,3 +352,36 @@ describe("Semantische Suche im Status (Issue #166)", () => {
     expect(Object.keys(JSON.parse(text)).sort()).toEqual(["checkedAt", "model", "provider", "state", "target"]);
   });
 });
+
+describe("Telegram-Eingang im Status (Issue #562)", () => {
+  const TOKEN = "123456789:AAFakeTokenForTestsOnly_abcdefghijklmn";
+  const conflict = "Telegram: Ein anderer Bot nutzt denselben Token (409). Telegram-Eingang pausiert, nächster Versuch in 15 Sekunden.";
+
+  test("API: nur bekannte Zustände und Felder, fehlende Methode und Fehler ergeben null", async () => {
+    const body = async (port: StatusPort) => (await createStatusApi(port, () => {}).get()).body as any;
+    const since = "2026-11-12T09:00:00.000Z";
+    expect((await body(fakePort({ telegramIntake: async () => ({ state: "conflict", message: conflict, since, extra: TOKEN } as any) }))).telegramIntake).toEqual({
+      state: "conflict",
+      message: conflict,
+      since,
+    });
+    expect((await body(fakePort({ telegramIntake: async () => ({ state: "komisch", message: "x", since } as any) }))).telegramIntake).toBeNull();
+    expect((await body(fakePort())).telegramIntake).toBeNull();
+    const res = await createStatusApi(fakePort({ telegramIntake: async () => { throw new Error("kaputt"); } }), () => {}).get();
+    expect(res.status).toBe(200);
+    expect((res.body as any).telegramIntake).toBeNull();
+  });
+
+  test("echte Quelle: Zustand dieses Prozesses aus data/telegram-intake.json, fremde PID zählt nicht", async () => {
+    const root = await mkdtemp(join(dir, "eingang-"));
+    const port = createBotStatus({}, { projectRoot: root, gitHead: async () => "0fe4c19\n", readPackageJson: () => "{}" });
+    expect(await port.telegramIntake!()).toBeNull();
+    await mkdir(join(root, "data"), { recursive: true });
+    const write = (pid: number) =>
+      writeFile(join(root, "data", "telegram-intake.json"), JSON.stringify({ state: "conflict", message: conflict, since: "2026-11-12T09:00:00.000Z", pid }));
+    await write(process.pid);
+    expect(await port.telegramIntake!()).toEqual({ state: "conflict", message: conflict, since: "2026-11-12T09:00:00.000Z" });
+    await write(process.pid + 1);
+    expect(await port.telegramIntake!()).toBeNull();
+  });
+});

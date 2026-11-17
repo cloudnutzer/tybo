@@ -1,0 +1,15 @@
+; Logs der SIP-Vermittlung (Issue #511): ohne Gesprächsinhalt, ohne
+; ausführliche Meldungen. Der Wählplan schreibt Rufnummern gekürzt.
+;
+; Asterisk schreibt selbst keine Logdatei, nur auf die Konsole. container/start.sh
+; leitet die Konsole durch container/logfilter.pl: Der kürzt Rufnummern auch in
+; Standardmeldungen (etwa den From-URI einer fehlgeschlagenen Anmeldung) und
+; schreibt erst dann nach logs/messages und ins Docker-Log. Die
+; Absenderadresse für fail2ban bleibt stehen.
+[general]
+dateformat = %F %T
+use_callids = no
+queue_log = no
+
+[logfiles]
+console => notice,warning,error,security

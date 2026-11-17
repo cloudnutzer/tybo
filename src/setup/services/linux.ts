@@ -15,12 +15,16 @@
  * - Gleiche Einheiten, Timer aktiv und aktiviert: nichts tun. Sonst
  *   schreiben, daemon-reload, enable und restart des Timers (restart setzt
  *   geänderte Termine sofort in Kraft; der Dienst selbst startet dabei nicht).
+ *   Scheitert enable oder restart, wird der Timer mit disable --now wieder
+ *   abgeschaltet (auch nach dem Hochfahren); cron-Zeilen und ein PM2-Eintrag
+ *   bleiben dann unberührt.
  * - Keine Termine (leere Check-in-Liste): Timer abschalten und beide
  *   Einheiten löschen, wie die leere Liste unter launchd nie startet.
  * - Erst wenn der Timer steht, verschwinden die eigenen cron-Zeilen dieses
  *   Diensts (# tybo-<dienst> und die frühere Markierung # go-<dienst>);
- *   fremde Zeilen bleiben. Scheitert das Schreiben der crontab, ist das ein
- *   Fehler mit Meldung, nie ein stiller Doppellauf.
+ *   fremde Zeilen bleiben. Scheitert das Schreiben der crontab, wird der
+ *   Timer wieder abgeschaltet und es gilt die cron-Zeile allein (Fehler mit
+ *   Meldung); scheitert auch das, sagt die Meldung „doppelt“ mit Befehl.
  * - Ohne systemd: die eigenen Zeilen des Diensts werden durch die neuen
  *   ersetzt, fremde bleiben; bei gleicher crontab wird nichts geschrieben.
  *   Lässt sich logs/ nicht anlegen, bleibt die crontab unverändert (Fehler).
@@ -28,8 +32,9 @@
  * Damit Timer auch ohne Anmeldung laufen, braucht der Benutzer Linger; fehlt
  * es, nennt die Einrichtung den Befehl dazu, ändert aber nichts.
  *
- * Die Routinen-Übersicht (/routinen, tybo routinen) liest weiter nur
- * launchd und PM2; systemd-Timer erscheinen dort nicht.
+ * Die Routinen-Übersicht (/routinen, tybo routinen, Reiter „Routinen“)
+ * zeigt die Timer seit Issue #568 zusammen mit den PM2-Prozessen, nur
+ * lesend (src/lib/routines/sources/systemd.ts).
  */
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -38,7 +43,8 @@ import { dirname, join } from "node:path";
 import { BRAND } from "../../brand";
 import { setupSchedule } from "../../lib/proactive/setup-schedule";
 import { serviceDefinition, type ServiceName } from "../../lib/services/catalog";
-import { cronLines, isOwnCronLine, serviceUnit, timerSlots, timerUnit, UnitError, type LinuxMachine } from "../../lib/services/systemd";
+import { cronLines, isOwnCronLine, serviceUnit, timerSlots, timerTimeZone, timerUnit, UnitError, type LinuxMachine } from "../../lib/services/systemd";
+import { parseEnvContent } from "../../lib/env-file";
 import { systemdUnit } from "../../lib/service-names";
 import { lingerCommand } from "../../../setup/configure-systemd";
 import { runWithTimeout, type ServiceRun } from "./run";
@@ -58,6 +64,8 @@ export interface LinuxDeps {
   remove(path: string): void;
   mkdir(path: string): void;
   log(line: string): void;
+  /** USER_TIMEZONE aus der .env des Projekts (Issue #568); undefined, wenn sie fehlt */
+  userTimeZone?(): string | undefined;
 }
 
 export type TimerFailure =
@@ -69,10 +77,12 @@ export type TimerFailure =
   | "write"
   | "reload"
   | "enable"
+  | "enable-double"
   | "disable"
   | "crontab-write"
   | "logs-dir"
-  | "cron-cleanup";
+  | "cron-cleanup"
+  | "cron-cleanup-double";
 
 /**
  * unchanged: alles stand schon so; written: Einheiten bzw. cron-Zeilen neu
@@ -106,7 +116,9 @@ export function timerFailureMessage(failure: TimerFailure, service: string): str
     case "reload":
       return "systemctl --user daemon-reload ist gescheitert.";
     case "enable":
-      return `Der Timer ${unit}.timer ließ sich nicht einschalten. Prüfen mit: systemctl --user status ${unit}.timer`;
+      return `Der Timer ${unit}.timer ließ sich nicht einschalten und ist darum wieder abgeschaltet; ein bisheriger Zeitplan (cron, PM2) gilt weiter. Prüfen mit: systemctl --user status ${unit}.timer`;
+    case "enable-double":
+      return `Der Timer ${unit}.timer ließ sich nicht einschalten und auch nicht wieder abschalten: neben einem bisherigen Zeitplan (cron, PM2) kann der Dienst doppelt starten. Abschalten mit: systemctl --user disable --now ${unit}.timer`;
     case "disable":
       return `Der Timer ${unit}.timer ließ sich nicht abschalten. Einheiten unverändert.`;
     case "crontab-write":
@@ -114,13 +126,15 @@ export function timerFailureMessage(failure: TimerFailure, service: string): str
     case "logs-dir":
       return "Der Ordner logs/ im Projektordner ließ sich nicht anlegen; ohne ihn bricht die cron-Zeile ab, bevor die Routine startet. crontab unverändert.";
     case "cron-cleanup":
-      return `Der Timer ${unit}.timer läuft, aber die alten cron-Zeilen ließen sich nicht entfernen: der Dienst startet doppelt. Mit „crontab -e“ die Zeilen mit # go-${service} bzw. # ${unit} löschen.`;
+      return `Die alten cron-Zeilen ließen sich nicht entfernen; ${unit}.timer ist darum wieder abgeschaltet, der Dienst läuft weiter über cron. Mit „crontab -e“ die Zeilen mit # go-${service} bzw. # ${unit} löschen, dann erneut einrichten.`;
+    case "cron-cleanup-double":
+      return `Der Timer ${unit}.timer läuft, aber die alten cron-Zeilen ließen sich nicht entfernen und der Timer nicht wieder abschalten: der Dienst startet doppelt. Mit „crontab -e“ die Zeilen mit # go-${service} bzw. # ${unit} löschen oder den Timer abschalten: systemctl --user disable --now ${unit}.timer`;
   }
 }
 
 const COMMAND_TIMEOUT_MS = 30_000;
 
-async function whichPath(program: string, deps: LinuxDeps): Promise<string | null> {
+export async function whichPath(program: string, deps: Pick<LinuxDeps, "run">): Promise<string | null> {
   const found = await deps.run(["which", program]);
   const path = found.stdout.split("\n")[0]?.trim() ?? "";
   return found.ok && path.startsWith("/") ? path : null;
@@ -146,7 +160,8 @@ const sameLines = (a: string[], b: string[]) => a.length === b.length && a.every
 
 type TimerState = { reachable: false } | { reachable: true; active: boolean; enabled: boolean };
 
-async function timerState(unit: string, deps: LinuxDeps): Promise<TimerState> {
+/** Zustand eines Timers; reachable false, wenn der Benutzer-Manager nicht antwortet */
+export async function timerState(unit: string, deps: Pick<LinuxDeps, "run">): Promise<TimerState> {
   const shown = await deps.run(["systemctl", "--user", "show", `${unit}.timer`, "--property=LoadState,ActiveState,UnitFileState"]);
   if (!shown.ok) return { reachable: false };
   const props = new Map(
@@ -189,10 +204,16 @@ export async function setUpTimer(service: ServiceName, deps: LinuxDeps): Promise
   let wantedService = "";
   let wantedTimer = "";
   let wantedCron: string[] = [];
+  // Zeitzone aus USER_TIMEZONE (Issue #568); cron kennt keine eigene, dort gilt die des Systems
+  const zone = withSystemd ? timerTimeZone(deps.userTimeZone?.()) : { zone: null, warning: null };
+  if (withSystemd && slots.length > 0) {
+    deps.log(`    Zeitzone: ${zone.zone ?? "die des Systems"}`);
+    if (zone.warning) deps.log(`    ! ${zone.warning}`);
+  }
   try {
     if (withSystemd) {
       wantedService = serviceUnit(def, machine);
-      if (slots.length > 0) wantedTimer = timerUnit(def, schedule);
+      if (slots.length > 0) wantedTimer = timerUnit(def, schedule, zone.zone);
     } else {
       wantedCron = cronLines(def, machine, schedule);
     }
@@ -249,8 +270,13 @@ export async function setUpTimer(service: ServiceName, deps: LinuxDeps): Promise
         return fail("write");
       }
       if (!(await deps.run(["systemctl", "--user", "daemon-reload"])).ok) return fail("reload");
-      if (!(await deps.run(["systemctl", "--user", "enable", `${unit}.timer`])).ok) return fail("enable");
-      if (!(await deps.run(["systemctl", "--user", "restart", `${unit}.timer`])).ok) return fail("enable");
+      const enabled = (await deps.run(["systemctl", "--user", "enable", `${unit}.timer`])).ok;
+      if (!enabled || !(await deps.run(["systemctl", "--user", "restart", `${unit}.timer`])).ok) {
+        // Nie zwei Zeitpläne, auch nicht nach dem Hochfahren: den Timer dauerhaft zurücknehmen
+        // (disable --now), der bisherige Zeitplan (cron-Zeile, PM2) gilt weiter
+        if ((await deps.run(["systemctl", "--user", "disable", "--now", `${unit}.timer`])).ok) return fail("enable");
+        return fail("enable-double");
+      }
       action = "written";
       deps.log(`  ✓ Eingerichtet: ${unit}.timer`);
     }
@@ -259,7 +285,13 @@ export async function setUpTimer(service: ServiceName, deps: LinuxDeps): Promise
     const kept = crontab.filter(line => !isOwnCronLine(line, service));
     const removed = crontab.length - kept.length;
     if (removed > 0) {
-      if (!(await writeCrontab(kept, deps))) return fail("cron-cleanup");
+      if (!(await writeCrontab(kept, deps))) {
+        // Ohne Termine läuft kein Timer: es gilt die cron-Zeile allein
+        if (action === "removed" || action === "none") return fail("crontab-write");
+        // Nie zwei Zeitpläne: den Timer wieder abschalten, cron gilt weiter
+        if ((await deps.run(["systemctl", "--user", "disable", "--now", `${unit}.timer`])).ok) return fail("cron-cleanup");
+        return fail("cron-cleanup-double");
+      }
       deps.log(`    Alte cron-Zeilen entfernt: ${removed}`);
     }
     if (action !== "none" && action !== "removed") await lingerHint(deps);
@@ -289,6 +321,22 @@ export async function setUpTimer(service: ServiceName, deps: LinuxDeps): Promise
   return { ok: true, service, via: "cron", action, cronLinesRemoved: replaced };
 }
 
+/**
+ * Schaltet den Timer eines Diensts wieder ab (disable --now), etwa wenn der
+ * frühere Zeitplan unter PM2 nicht weichen will (Issue #568). Die Einheiten
+ * bleiben liegen; die nächste Einrichtung schaltet ihn wieder ein. false:
+ * auch das scheiterte, beide Zeitpläne laufen (mit Meldung).
+ */
+export async function disableTimer(service: ServiceName, deps: Pick<LinuxDeps, "run" | "log">, remaining = "der Dienst läuft weiter unter PM2."): Promise<boolean> {
+  const unit = systemdUnit(service);
+  if ((await deps.run(["systemctl", "--user", "disable", "--now", `${unit}.timer`])).ok) {
+    deps.log(`    ${unit}.timer wieder abgeschaltet; ${remaining}`);
+    return true;
+  }
+  deps.log(`  ✗ ${unit}.timer ließ sich nicht wieder abschalten: der Dienst startet doppelt (Timer und PM2). Abschalten mit: systemctl --user disable --now ${unit}.timer`);
+  return false;
+}
+
 /** Ordner der Benutzereinheiten nach XDG */
 export function userUnitDir(env: Record<string, string | undefined>, home: string): string {
   return join(env.XDG_CONFIG_HOME || join(home, ".config"), "systemd", "user");
@@ -309,8 +357,18 @@ export function realLinuxDeps(root: string, home: string = process.env.HOME || h
     remove: path => rmSync(path, { force: true }),
     mkdir: path => void mkdirSync(path, { recursive: true }),
     log,
+    userTimeZone: () => readUserTimeZone(root),
   };
 }
 
+/** USER_TIMEZONE aus <root>/.env; undefined, wenn Datei oder Wert fehlen */
+export function readUserTimeZone(root: string): string | undefined {
+  try {
+    return parseEnvContent(readFileSync(join(root, ".env"), "utf8")).USER_TIMEZONE || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Kurzer Hinweis für die Ausgabe von tybo dienste */
-export const LINUX_SERVICES_HINT = `Zustand: systemctl --user list-timers 'tybo-*' und pm2 status; /routinen bzw. ${BRAND.cli} routinen zeigt unter Linux nur PM2-Dienste`;
+export const LINUX_SERVICES_HINT = `Zustand: systemctl --user list-timers 'tybo-*' und pm2 status; Übersicht: /routinen bzw. ${BRAND.cli} routinen (Timer und PM2-Dienste)`;

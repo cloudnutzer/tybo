@@ -1,0 +1,48 @@
+; Module der SIP-Vermittlung (Issue #511). Nur, was für zwei SIP-Wege nötig
+; ist: keine Aufnahme, kein CDR/CEL, keine Web-, Manager- oder IAX-Ports.
+; REFER (Weiterleitung) fehlt mit Absicht: res_pjsip_refer ist nicht geladen.
+[modules]
+autoload=no
+
+; Grundlagen
+load => res_sorcery_config.so
+load => res_sorcery_memory.so
+load => res_sorcery_astdb.so
+load => res_timing_timerfd.so
+load => res_security_log.so
+
+; PJSIP
+load => res_pjproject.so
+load => res_pjsip.so
+load => res_pjsip_session.so
+load => chan_pjsip.so
+load => res_pjsip_authenticator_digest.so
+load => res_pjsip_outbound_authenticator_digest.so
+load => res_pjsip_endpoint_identifier_user.so
+load => res_pjsip_outbound_registration.so
+load => res_pjsip_caller_id.so
+load => res_pjsip_header_funcs.so
+load => res_pjsip_sdp_rtp.so
+load => res_pjsip_dtmf_info.so
+load => res_pjsip_rfc3326.so
+load => res_pjsip_nat.so
+load => res_pjsip_pubsub.so
+
+; Medien
+load => res_rtp_asterisk.so
+load => res_srtp.so
+load => codec_alaw.so
+load => bridge_simple.so
+load => bridge_native_rtp.so
+
+; Wählplan
+load => pbx_config.so
+load => app_dial.so
+load => app_exec.so
+load => app_stack.so
+load => app_verbose.so
+load => func_callerid.so
+load => func_groupcount.so
+load => func_logic.so
+load => func_strings.so
+load => func_timeout.so

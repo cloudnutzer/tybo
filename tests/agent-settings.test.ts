@@ -128,14 +128,14 @@ describe("describeAgentModel", () => {
       source: "code",
     });
     expect(describeAgentModel("finance", { getSettings: settings({}), getAgentConfig: noFile })).toEqual({
-      value: "claude-opus-5-5",
+      value: DEFAULT_CLAUDE_MODEL,
       source: "code",
     });
   });
 
   test("der Standardwert greift auch für unbekannte Agenten ohne Konfiguration", () => {
     expect(describeAgentModel("unbekannt", { getSettings: settings({ agents: { research: { model: "x" } } }), getAgentConfig: noFile })).toEqual({
-      value: "claude-opus-5-5",
+      value: DEFAULT_CLAUDE_MODEL,
       source: "code",
     });
   });

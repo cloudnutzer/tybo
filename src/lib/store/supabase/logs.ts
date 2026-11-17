@@ -5,12 +5,16 @@
  * aber event: der Dienstname aus LogStore.write landet deshalb in event.
  * Eine Logzeile darf nie einen Ablauf stören, Fehler bleiben still.
  *
+ * Meldung und Metadaten gehen ohne Telegram-Bot-Token in die Tabelle
+ * (Issue #526), etwa der Absturzbericht samt Stack aus bot.ts.
+ *
  * ping() liest eine id aus messages, der Tabelle, ohne die tybo nicht
  * arbeitet; auch eine leere Tabelle gilt als erreichbar. Es wirft nie.
  */
 import type { LogStore } from "../ports";
 import type { PingResult } from "../types";
 import type { ClientSource } from "./messages";
+import { maskDeep, maskTelegramTokens, telegramTokensFromEnv } from "../../telegram-token-mask";
 
 const LOGS = "logs";
 const PROBE_TABLE = "messages";
@@ -30,7 +34,13 @@ export function supabaseLogs(clientSource: ClientSource): LogStore {
       try {
         const client = clientSource();
         if (!client) return;
-        await client.from(LOGS).insert({ level, event: service, message, metadata });
+        const tokens = telegramTokensFromEnv(process.env);
+        await client.from(LOGS).insert({
+          level,
+          event: service,
+          message: maskTelegramTokens(message, tokens),
+          metadata: metadata === undefined ? undefined : maskDeep(metadata, tokens),
+        });
       } catch {
         // Protokoll ist Beiwerk: lieber eine Zeile verlieren als den Aufrufer stören
       }

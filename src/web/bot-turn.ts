@@ -29,6 +29,7 @@ import { decideChoice } from "../lib/choices";
 import { speechTurnOptions } from "../lib/speech/spoken-turn";
 import { approvalKeyForText, type ToolApprovalPresenter } from "../lib/tool-approval";
 import { CHOICE_SOURCES } from "../lib/telegram-choices";
+import { isTokenRejected } from "../lib/telegram-intake";
 import { consult, type ConsultRequest, type RecentMessages } from "../lib/agent-consult";
 import { createTurnStages, type ConsultRunner, type FinishedTurn, type TurnFinishDeps, type TurnStages } from "../lib/turn-finish";
 import {
@@ -634,6 +635,8 @@ export const MIRROR_PREFIX = MIRROR_PREFIXES.web;
 export const MIRROR_FAILED_TEXT =
   "Die Nachricht konnte nicht nach Telegram gesendet werden. Nichts wurde verarbeitet, bitte noch einmal versuchen.";
 export const TELEGRAM_UNAVAILABLE_TEXT = "Dieses Telegram-Gespräch ist gerade nicht erreichbar (Chat-ID fehlt).";
+/** Hinweis im Browser, wenn Telegram den Token ablehnt (401, Issue #562): der Turn läuft ohne Telegram */
+export const TELEGRAM_REJECTED_TEXT = "Telegram lehnt den Token ab (401). Nachricht und Antwort stehen nur hier in der WebUI.";
 
 /** Direktchat: Telegram-Nutzer-ID oder, ohne Telegram, "web" (WEB_DM_CHAT_ID, Issue #227) */
 const TELEGRAM_USER_ID_PATTERN = /^(\d{1,20}|web)$/;
@@ -1135,12 +1138,17 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
     const { chatId, topicId, sessionKey, agent } = target;
     // Web-Direktchat ohne Telegram (Issue #227) und Denkauftrag aus dem Telefonhörer (Issue #259):
     // kein Spiegeln, keine Antwort in Telegram
-    const mirror = mirrorsToTelegram(chatId) && !noTelegram;
+    let mirror = mirrorsToTelegram(chatId) && !noTelegram;
+    // Lehnt Telegram den Token ab (401, Issue #562), läuft der Turn weiter wie
+    // einer ohne Telegram: Antwort und Freigaben nur in der WebUI, keine
+    // Rückfrage über Telegram. Fäden und Gesprächshinweise bleiben wie sonst
+    let telegramRejected = false;
+    const webOnly = () => noTelegram || telegramRejected;
     const entry: OpenTurn = { sessionKey, committed: false };
     open.set(conversationId, entry);
     // Die Frage selbst kommt über sendChoice in den Verlauf, hier nur der Status
     // Ohne Telegram (Issue #259) kommt die Frage nicht über sendChoice, sondern als abgelegte Meldung
-    const unregister = noTelegram
+    let unregister = noTelegram
       ? registerNoTelegramApprovals(sessionKey, conversationId, ask, endAsk)
       : ask
         ? approvals.register(sessionKey, { conversationId, ask, endAsk, record: false })
@@ -1235,8 +1243,17 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
           }
         } catch (e) {
           if (wasAborted()) return aborted();
-          log(`Spiegeln nach Telegram (${conversationId}) fehlgeschlagen (${errorName(e)})`);
-          return { text: files.length && sentParts > 0 ? MIRROR_PARTIAL_TEXT : MIRROR_FAILED_TEXT, failed: true };
+          if (!isTokenRejected(e)) {
+            log(`Spiegeln nach Telegram (${conversationId}) fehlgeschlagen (${errorName(e)})`);
+            return { text: files.length && sentParts > 0 ? MIRROR_PARTIAL_TEXT : MIRROR_FAILED_TEXT, failed: true };
+          }
+          // Token abgelehnt: Telegram ist für diesen Prozess aus, der Browser bleibt nutzbar
+          log(`Telegram lehnt den Token ab (401), ${conversationId} läuft ohne Telegram weiter`);
+          mirror = false;
+          telegramRejected = true;
+          unregister();
+          unregister = registerNoTelegramApprovals(sessionKey, conversationId, ask, endAsk);
+          await webSink.notice(TELEGRAM_REJECTED_TEXT);
         }
         if (wasAborted()) return aborted();
 
@@ -1296,14 +1313,16 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
                 ...hintOptions(speech, threadHint),
                 // Denkauftrag aus dem Telefonhörer (Issue #260): der Hinweis aufs Gespräch bleibt für den nächsten getippten Turn
                 // und Erinnerungen der Planungswerkzeuge (Motor api) kommen nur in der WebUI an (Issue #348)
-                ...(noTelegram ? { skipCallRecap: true, noTelegram: { conversationId } } : {}),
+                ...(noTelegram ? { skipCallRecap: true } : {}),
+                // Nach 401 (Issue #562) ebenso nur in die WebUI, auch ohne Rückfragen über Telegram
+                ...(webOnly() ? { noTelegram: { conversationId } } : {}),
                 onInfo: i => {
                   turnInfo = i;
                 },
                 onTools: t => {
                   turnTools = t;
                 },
-                ...(noTelegram
+                ...(webOnly()
                   ? {}
                   : {
                       onQuestion: (q: TurnQuestion) => {
@@ -1353,8 +1372,8 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
           tools: turnTools,
           origin: "WebUI",
           ...(foreignInput ? { foreignInput } : {}),
-          // Denkauftrag aus dem Telefonhörer (Issue #259): ein Vorschlag erscheint nur in der WebUI
-          ...(noTelegram ? { noTelegram: { conversationId } } : {}),
+          // Denkauftrag aus dem Telefonhörer (Issue #259): ein Vorschlag erscheint nur in der WebUI, ebenso nach 401
+          ...(webOnly() ? { noTelegram: { conversationId } } : {}),
           ...(asked.question ? { question: asked.question } : {}),
           ...(threads ? { threads } : {}),
           // Telegram bekommt die Antwort ohne Steuer-Tags, der Browser über den ChatHub.
@@ -1385,10 +1404,10 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
                   output.signal.addEventListener("abort", stop, { once: true });
                   // Ohne Telegram (Issue #259): auch Freigaben des befragten Agenten nur in der WebUI;
                   // die Anmeldung des Turns ist hier schon aufgehoben
-                  const unregisterFollowUp = noTelegram
+                  const unregisterFollowUp = webOnly()
                     ? registerNoTelegramApprovals(sessionKey, conversationId, output.ask?.bind(output), output.endAsk?.bind(output))
                     : () => {};
-                  const consultTurn: InvocationTurn = { sourceAgent: agent, chatId, topicId, sessionKey, conversationId, metadata: metaBase, noTelegram };
+                  const consultTurn: InvocationTurn = { sourceAgent: agent, chatId, topicId, sessionKey, conversationId, metadata: metaBase, noTelegram: webOnly() };
                   return runCancelable(sessionKey, () => stages.consult(webConsultRunner(consultTurn, deps, output)))
                     .catch(async e => {
                       // Neustart dazwischen (Issue #190): Rückfragen entfallen, sichtbar gemeldet

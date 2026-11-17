@@ -59,10 +59,13 @@ describe("Datenmodell", () => {
   });
 
   test("viele Fragen: IDs eindeutig und höchstens 12 Zeichen", async () => {
+    // Die Datei dieses Tests: lief er über sein Zeitlimit, setzte beforeEach
+    // file schon für den nächsten Test, und onDisk läse eine fremde Datei
+    const own = file;
     const ids = await Promise.all(Array.from({ length: 50 }, () => createChoice(input()).then(c => c.id)));
     expect(new Set(ids).size).toBe(50);
     for (const id of ids) expect(id.length).toBeLessThanOrEqual(12);
-    expect(Object.keys(onDisk().choices)).toHaveLength(50);
+    expect(Object.keys(JSON.parse(readFileSync(own, "utf-8")).choices)).toHaveLength(50);
   });
 
   test("Topic-Zuordnung ohne Höchstzahl der Optionen (Issue #119), andere Arten mit", async () => {
@@ -124,11 +127,20 @@ describe("Gesprächsfilter", () => {
 
 describe("Ablauf", () => {
   test("überschrittenes expiresAt gilt beim Lesen als expired, ohne die Datei zu ändern", async () => {
-    const c = await createChoice(input({ expiresAt: Date.now() + 30 }));
-    expect((await getChoice(c.id))?.state).toBe("open");
-    await Bun.sleep(40);
-    expect((await getChoice(c.id))?.state).toBe("expired");
-    expect(onDisk().choices[c.id].state).toBe("open");
+    // Feste Uhr statt echter Pause: wie lange Anlegen und Lesen dauern, zählt nicht
+    let clock = Date.now();
+    const nowSpy = spyOn(Date, "now").mockImplementation(() => clock);
+    try {
+      const c = await createChoice(input({ expiresAt: clock + 30 }));
+      expect((await getChoice(c.id))?.state).toBe("open");
+      clock += 29;
+      expect((await getChoice(c.id))?.state).toBe("open");
+      clock += 1;
+      expect((await getChoice(c.id))?.state).toBe("expired");
+      expect(onDisk().choices[c.id].state).toBe("open");
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 
   test("expireChoice: offen wird expired, zweiter Aufruf already, unbekannt unknown", async () => {

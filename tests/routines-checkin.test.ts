@@ -32,6 +32,7 @@ import {
   parseCheckinArgs,
   readDecision,
   runCheckin,
+  CHECKIN_DISABLED_REASON,
   type CheckinFacts,
   type CheckinRunDeps,
 } from "../src/routines/checkin";
@@ -405,6 +406,15 @@ describe("Entscheidung des Aux-Modells", () => {
     ["Modellfehler", async () => ({ text: "", isError: true })],
     ["Zeitlimit", async () => ({ text: "", isError: true })],
   ];
+  test("Nebenaufgabe abgeschaltet (Issue #566, Claude fehlt): nichts gesendet, Exit 0, keine Fehlerzeile", async () => {
+    const r = rig({ answer: async () => ({ text: "", isError: true, disabled: true }) as { text: string; isError: boolean } });
+    expect(await runCheckin(r.deps)).toBe(0);
+    expect(r.box.sent).toEqual([]);
+    expect(r.prompts.length).toBe(1);
+    expect(lines).toContain(`[checkin] keine Meldung (${CHECKIN_DISABLED_REASON})`);
+    expect(lines.some(l => l.includes("failed"))).toBe(false);
+  });
+
   for (const [name, answer] of broken) {
     test(`${name}: nichts gesendet, keine Versandzeit, Exit 1, nächster Lauf nicht blockiert`, async () => {
       const r = rig({ answer });

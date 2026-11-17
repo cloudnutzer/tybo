@@ -36,8 +36,8 @@ own machine.
 - [Git](https://git-scm.com)
 - [Bun](https://bun.sh) 1.3.10 or newer
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI,
-  installed and logged in. On macOS, Linux and WSL use the native installer,
-  which needs neither Node.js nor `sudo`:
+  installed and logged in, unless Codex does the work ([docs/server.md](docs/server.md)).
+  On macOS, Linux and WSL use the native installer, which needs neither Node.js nor `sudo`:
   `curl -fsSL https://claude.ai/install.sh | bash`, then `claude` and
   `/login`. On Windows (without WSL) the npm way still works:
   `npm install -g @anthropic-ai/claude-code` (needs Node.js 22 or newer)
@@ -109,7 +109,8 @@ pm2 restart tybo-telegram-relay                               # PM2
 ```
 
 From inside a conversation with tybo, use `bun run restart:request "reason"`
-instead: it waits until the current reply has been sent.
+instead: it waits until the current reply has been sent. If `tybo pruefen`
+warns about background jobs on Linux, run `tybo setup autostart` once.
 
 **Costs.** tybo itself is free; you pay for Claude Code. `CLAUDE_AUTH` in
 `.env` decides how: `subscription` uses your Claude Pro or Max plan,

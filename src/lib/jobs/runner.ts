@@ -21,10 +21,17 @@
  * fullAccess (--full-access), also nur für Aufträge, die tybo selbst
  * formuliert hat. Sonst acceptEdits: Dateien im Projekt schreiben (auch den
  * Bericht) ja, Befehle ohne Rückfrage nein.
+ *
+ * Eigener Arbeitsordner (workDir, Issue #493): Claude startet dort statt im
+ * Projektordner, mit --restricted (keine Einstellungsdateien, Dateiwerkzeuge
+ * nur im Arbeitsordner, kein bypassPermissions) und ohne MCP-Server. Der Job
+ * kann so nur in diesem Ordner schreiben; den Bericht legt er dort als
+ * bericht.md ab, der Wächter kopiert ihn nach dem Ende in den Job-Ordner.
  */
 
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, readFile, stat, writeFile } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
 import { acquireFileLock, releaseFileLock, type LockOwner } from "../file-lock";
 import type { SendAndRecordInput, SendAndRecordResult } from "../outbox";
 import { maskSecrets } from "./mask";
@@ -59,7 +66,15 @@ export const START_CONFIRM_MS = 15_000;
 /** Ein Job ohne Wächter-Eintrag gilt erst danach als verwaist (Starter könnte noch dabei sein) */
 export const STARTING_GRACE_MS = 60_000;
 
-export function reportInstruction(root: string, id: string): string {
+/** Bericht eines Jobs mit eigenem Arbeitsordner, dort abgelegt */
+export const WORKDIR_REPORT = "bericht.md";
+/** Größer wird ein Bericht aus dem Arbeitsordner nicht übernommen */
+export const WORKDIR_REPORT_MAX_BYTES = 256 * 1024;
+/** Werkzeuge eines Jobs mit eigenem Arbeitsordner (--tools): Dateien lesen und schreiben, keine Befehle */
+export const WORKDIR_FILE_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep"] as const;
+
+export function reportInstruction(root: string, id: string, workDir?: string): string {
+  if (workDir) return `Schreibe am Ende einen kurzen Bericht nach ${WORKDIR_REPORT} in deinem Arbeitsordner (voller Pfad: ${join(workDir, WORKDIR_REPORT)}).`;
   return `Schreibe am Ende einen kurzen Bericht nach data/jobs/${id}/report.md (voller Pfad: ${jobFile(root, id, "report")}).`;
 }
 
@@ -74,8 +89,8 @@ export const JOB_RULES =
   "und starte nichts mit & oder nohup, auf dessen Ergebnis du wartest. Beende den Turn erst, wenn die Arbeit getan und der Bericht geschrieben ist.";
 
 /** Auftrag, wie Claude ihn über stdin bekommt */
-export function jobPrompt(root: string, id: string, brief: string): string {
-  return `${brief.trimEnd()}\n\n---\n${reportInstruction(root, id)}\n\n${JOB_RULES}\n`;
+export function jobPrompt(root: string, id: string, brief: string, workDir?: string): string {
+  return `${brief.trimEnd()}\n\n---\n${reportInstruction(root, id, workDir)}\n\n${JOB_RULES}\n`;
 }
 
 export interface ClaudeCommandOptions {
@@ -84,14 +99,35 @@ export interface ClaudeCommandOptions {
   effort?: string;
   fullAccess: boolean;
   platform: NodeJS.Platform;
+  /** Zusätzlich ohne Rückfrage erlaubte Werkzeuge (etwa WebSearch für eine Recherche ohne --full-access) */
+  allowedTools?: readonly string[];
+  /** Zusätzlich gesperrte Werkzeuge oder Regeln wie Edit(./config/**) */
+  deniedTools?: readonly string[];
+  /**
+   * Eigener Arbeitsordner: --restricted, --strict-mcp-config und --tools mit
+   * WORKDIR_FILE_TOOLS plus allowedTools. Nie zusammen mit fullAccess.
+   */
+  restricted?: boolean;
 }
+
+/** Werkzeugname oder Regel mit Pfad: keine Leerzeichen, keine Kommas, kein führender Bindestrich */
+export const TOOL_RULE_PATTERN = /^[A-Za-z][A-Za-z0-9_]*(\([^\s,()]{1,200}\))?$/;
 
 export function claudeCommand(o: ClaudeCommandOptions): string[] {
   const args = ["-p", "--output-format", "text", "--model", o.model];
   if (o.effort) args.push("--effort", o.effort);
-  args.push("--permission-mode", o.fullAccess ? "bypassPermissions" : "acceptEdits");
+  const restricted = o.restricted === true;
+  args.push("--permission-mode", o.fullAccess && !restricted ? "bypassPermissions" : "acceptEdits");
+  const allowed = (o.allowedTools ?? []).filter(tool => TOOL_RULE_PATTERN.test(tool));
+  if (restricted) {
+    // Werkzeugnamen ohne Regel: --tools kennt nur ganze Werkzeuge
+    const names = allowed.filter(tool => /^[A-Za-z][A-Za-z0-9_]*$/.test(tool));
+    args.push("--restricted", "--strict-mcp-config", "--tools", [...new Set([...WORKDIR_FILE_TOOLS, ...names])].join(","));
+  }
+  if (allowed.length) args.push("--allowedTools", allowed.join(","));
   // Monitor und Co. lassen claude -p nur warten (PRINT_MODE_DISALLOWED_TOOLS)
-  args.push("--disallowedTools", PRINT_MODE_DISALLOWED_TOOLS.join(","));
+  const denied = (o.deniedTools ?? []).filter(tool => TOOL_RULE_PATTERN.test(tool));
+  args.push("--disallowedTools", [...PRINT_MODE_DISALLOWED_TOOLS, ...denied].join(","));
   // Wie der Bot: auf macOS kein Ruhezustand, solange der Job läuft
   return o.platform === "darwin" ? ["/usr/bin/caffeinate", "-i", o.claudePath, ...args] : [o.claudePath, ...args];
 }
@@ -147,6 +183,15 @@ export interface StartInput {
   fullAccess: boolean;
   /** Auch starten, wenn ein Job mit gleichem Titel oder Auftrag läuft */
   allowDuplicate?: boolean;
+  /** Wie ClaudeCommandOptions.allowedTools; nur aus dem Programm, nicht über die Befehlszeile */
+  allowedTools?: string[];
+  /** Wie ClaudeCommandOptions.deniedTools */
+  deniedTools?: string[];
+  /**
+   * Eigener Arbeitsordner (absoluter Pfad, echter Ordner): Claude startet dort
+   * eingeschränkt (ClaudeCommandOptions.restricted). Nie mit fullAccess.
+   */
+  workDir?: string;
 }
 
 export type StartResult =
@@ -236,6 +281,11 @@ async function finish(id: string, outcome: JobOutcome, extra: ClaimExtra, deps: 
  * der Start als gescheitert (mit Meldung).
  */
 export async function startJob(input: StartInput, deps: JobDeps): Promise<StartResult> {
+  if (input.workDir !== undefined) {
+    if (input.fullAccess) return { ok: false, error: "Ein Job mit eigenem Arbeitsordner läuft nie mit --full-access." };
+    const entry = isAbsolute(input.workDir) ? await lstat(input.workDir).catch(() => null) : null;
+    if (!entry?.isDirectory()) return { ok: false, error: "Der Arbeitsordner des Jobs fehlt oder ist kein echter Ordner." };
+  }
   const id = deps.newId();
   const dir = jobDir(deps.root, id);
   const status: JobStatus = {
@@ -248,6 +298,9 @@ export async function startJob(input: StartInput, deps: JobDeps): Promise<StartR
     model: input.model,
     ...(input.effort ? { effort: input.effort } : {}),
     fullAccess: input.fullAccess,
+    ...(input.allowedTools?.length ? { allowedTools: input.allowedTools } : {}),
+    ...(input.deniedTools?.length ? { deniedTools: input.deniedTools } : {}),
+    ...(input.workDir !== undefined ? { workDir: input.workDir } : {}),
     target: input.target,
   };
   // Prüfen und Anlegen unter einer Sperre: zwei gleichzeitige Starts sehen einander
@@ -314,6 +367,29 @@ export async function startJob(input: StartInput, deps: JobDeps): Promise<StartR
   }
 }
 
+/**
+ * Bericht aus dem Arbeitsordner in den Job-Ordner: nur eine normale Datei
+ * (kein Link) bis WORKDIR_REPORT_MAX_BYTES. Was fehlt oder nicht passt, gilt
+ * als kein Bericht.
+ */
+async function copyWorkReport(workDir: string, root: string, id: string): Promise<void> {
+  let handle;
+  try {
+    handle = await open(join(workDir, WORKDIR_REPORT), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch {
+    return;
+  }
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.size > WORKDIR_REPORT_MAX_BYTES) return;
+    await writeFile(jobFile(root, id, "report"), await handle.readFile("utf8"), { mode: 0o600 });
+  } catch {
+    // kein Bericht
+  } finally {
+    await handle.close();
+  }
+}
+
 async function reportPresent(root: string, id: string): Promise<boolean> {
   try {
     const info = await stat(jobFile(root, id, "report"));
@@ -358,15 +434,24 @@ export async function runWatcher(id: string, deps: JobDeps): Promise<number> {
     return 0;
   }
 
-  const cmd = claudeCommand({ claudePath: deps.claudePath, model: status.model, effort: status.effort, fullAccess: status.fullAccess, platform: deps.platform });
+  const cmd = claudeCommand({
+    claudePath: deps.claudePath,
+    model: status.model,
+    effort: status.effort,
+    fullAccess: status.fullAccess,
+    platform: deps.platform,
+    ...(status.allowedTools ? { allowedTools: status.allowedTools } : {}),
+    ...(status.deniedTools ? { deniedTools: status.deniedTools } : {}),
+    ...(status.workDir !== undefined ? { restricted: true } : {}),
+  });
   let child: SpawnedClaude;
   try {
     child = deps.spawnClaude({
       id,
       cmd,
-      cwd: deps.root,
+      cwd: status.workDir ?? deps.root,
       env: deps.claudeEnv(status),
-      prompt: jobPrompt(deps.root, id, brief),
+      prompt: jobPrompt(deps.root, id, brief, status.workDir),
       logPath: jobFile(deps.root, id, "log"),
     });
   } catch (e) {
@@ -425,6 +510,7 @@ export async function runWatcher(id: string, deps: JobDeps): Promise<number> {
   // Rest der Ausgabe ins Log, damit der Log-Auszug vollständig ist
   if (child.drained) await Promise.race([child.drained, deps.sleep(DRAIN_WAIT_MS)]);
 
+  if (status.workDir !== undefined) await copyWorkReport(status.workDir, deps.root, id);
   const outcome: JobOutcome =
     exit.code === 0 ? ((await reportPresent(deps.root, id)) ? "success" : "no_report") : "failed";
   // MCP-Server und Shells brauchen nach Claudes Ende einen Moment; nur wer danach noch lebt, zählt

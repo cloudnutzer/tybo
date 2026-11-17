@@ -329,7 +329,31 @@ der Bot startet normal.
 **Symptom:** Eine Nachricht in Telegram oder im Browser bleibt ohne Antwort,
 auch ohne „tippt…“.
 
-**Nachsehen, der Reihe nach:**
+**Zuerst:** im Terminal, im Ordner von tybo,
+
+```bash
+tybo pruefen
+```
+
+Der Bericht sagt in einem Durchgang, ob der Dienst läuft (Abschnitt
+„Dienste“), ob der Standard-Motor installiert und angemeldet ist, und zwar mit
+dem `PATH`, mit dem der Dienst startet (Abschnitt „Motor“), und ob Telegram
+und die Datenbank antworten. Jede Zeile mit ✗ nennt die Abhilfe; der
+Exit-Code ist dann 1. Der Bericht ruft kein Modell auf und schickt nichts.
+
+Der Nachtcheck (täglich 03:30, unter Linux als systemd-Timer oder unter
+PM2) meldet einen stehenden Bot von selbst: Im Bericht stehen dann
+`❌ Bot-Prozess` (Dienst steht oder fehlt) und `❌ Bot antwortet` (der
+Health-Port antwortet nicht). Siehe
+[Nachtcheck meldet: Bot steht](#nachtcheck-meldet-bot-steht).
+
+Lässt sich die WebUI im Browser noch öffnen, zeigt der Reiter „Status“
+dasselbe für den laufenden Bot: die Motoren mit ihrem echten Stand (auch, ob
+Claude Code angemeldet ist) und den Telegram-Eingang. Die WebUI läuft im
+Bot-Prozess; ist sie nicht erreichbar, läuft meist der Bot nicht, dann hilft
+nur `tybo pruefen`.
+
+Bleibt danach etwas unklar, **der Reihe nach von Hand:**
 
 1. **Läuft der Dienst?**
 
@@ -340,8 +364,11 @@ auch ohne „tippt…“.
    ```
 
    Unter macOS steht eine Zeile wie `1234  0  ai.tybo.telegram-relay`. Ein `-`
-   statt der Zahl vorn heißt: eingerichtet, läuft aber nicht. Fehlt die Zeile
-   ganz, ist der Dienst nicht eingerichtet; dann `tybo setup autostart`.
+   statt der Zahl vorn heißt: eingerichtet, läuft aber nicht, auch wenn die
+   Zahl in der Mitte 0 ist (`tybo pruefen` meldet das als Fehler, siehe
+   [Bot-Dienst startet nicht (macOS)](#bot-dienst-startet-nicht-macos)).
+   Fehlt die Zeile ganz, ist der Dienst nicht eingerichtet; dann
+   `tybo setup autostart`.
 
 2. **Was steht im Log?**
 
@@ -361,18 +388,81 @@ auch ohne „tippt…“.
    Antwort; eine falsche ID sieht deshalb aus wie ein toter Bot.
 
 4. **Hält ein anderer Prozess die Sperre?** Die Datei `bot.lock` im
-   Projektordner enthält die Prozessnummer des Bots, der gerade läuft. Ein
-   zweiter Start beendet sich sofort und still, solange dieser Prozess lebt.
-   Ist der Besitzer tot, ersetzt der nächste Start die Sperre selbst.
+   Projektordner nennt den Bot, der gerade läuft: Prozessnummer und
+   Startzeit, etwa `{"pid":1234,"started":"Thu Nov 12 20:17:33 2026"}` (die
+   Zeit in UTC). Lehnt ein Start ab, weil die Sperre belegt ist, steht vor
+   dem Ende eine Zeile im Fehler-Log (`logs/telegram-relay.error.log`, unter
+   PM2 `logs/telegram-relay.log`):
 
-   ```bash
-   cat bot.lock && ps -p "$(cat bot.lock)" -o pid,command
+   ```text
+   Start abgelehnt: bot.lock gehört Prozess 1234 (bun /pfad/src/bot.ts …), gestartet 2026-11-12 20:17:33 UTC.
    ```
 
-   Zeigt `ps` einen Prozess, läuft schon ein Bot: siehe
-   [Zwei Bots laufen gleichzeitig](#zwei-bots-laufen-gleichzeitig). Die
-   Sperre nicht von Hand löschen. Das hilft nur, wenn in der Datei keine
-   Prozessnummer steht (leer oder kaputt) und nachweislich kein Bot läuft.
+   Nachweislich verwaist ist eine Sperre, wenn ihr Prozess nicht mehr lebt
+   oder unter der Nummer ein Prozess mit anderer Startzeit läuft, etwa nach
+   einem Stromausfall, wenn das System die Nummern neu vergeben hat. Solche
+   Sperren ersetzt der nächste Start selbst. Eine Sperre aus einer älteren
+   Version enthält nur die Prozessnummer; sie gilt als verwaist, wenn der
+   Prozess nachweislich kein `src/bot.ts` aus diesem Ordner ausführt.
+
+   Im Zweifel startet kein zweiter Bot. Das steht dann so in der Zeile:
+
+   - „Ob er ein Bot aus diesem Ordner ist, ließ sich nicht prüfen“: Befehl
+     oder Arbeitsordner des Prozesses ließen sich nicht abfragen, etwa weil er
+     einem anderen Benutzer gehört. Oder die Befehlszeile lässt offen, welche
+     Datei gemeint ist: `ps` zeigt die Argumente ohne Anführungszeichen, und
+     bei `bun run src/bot.ts` aus einem anderen Ordner könnte auch
+     `run src/bot.ts` der Pfad gewesen sein.
+   - „bot.lock ist unlesbar oder beschädigt“: Die Datei lässt sich nicht
+     lesen (etwa fehlende Rechte), oder ihr Inhalt passt zu keinem Format.
+   - „wird gerade von einem anderen Start übernommen“: Zwei Starts kamen
+     gleichzeitig, der andere hat gewonnen.
+
+   Nachsehen mit derselben Sprache und Zeitzone, mit der die Sperre ihre
+   Startzeit schreibt (`LC_ALL=C`, `TZ=UTC`); ohne sie zeigt `ps` die Zeit in
+   Ortszeit oder anderer Sprache, und ein Vergleich mit der Sperre täuscht:
+
+   ```bash
+   cat bot.lock
+   LC_ALL=C TZ=UTC ps -ww -p <prozessnummer> -o pid,lstart,command   # Prozessnummer aus der Sperre
+   ```
+
+   Zeigt `ps` einen Bot (`src/bot.ts`) mit derselben Startzeit, läuft schon
+   einer: siehe [Zwei Bots laufen gleichzeitig](#zwei-bots-laufen-gleichzeitig).
+   Die Sperre nicht von Hand löschen, solange dieser Prozess lebt.
+
+   Löschen hilft nur bei den Zweifelsfällen oben, und nur mit Nachweis, dass
+   kein Bot aus diesem Ordner läuft. Dafür jeden Prozess mit `src/bot.ts`
+   einzeln prüfen:
+
+   ```bash
+   pwd -P                                                     # dieser Ordner ohne Symlinks
+   LC_ALL=C TZ=UTC ps -ww -axo pid,lstart,command | grep '[s]rc/bot.ts'
+   lsof -a -p <prozessnummer> -d cwd -Fn                     # Arbeitsordner (macOS)
+   readlink /proc/<prozessnummer>/cwd                        # Arbeitsordner (Linux)
+   ```
+
+   Ein Prozess stammt nur dann nachweislich aus einem anderen Ordner, wenn
+   sein Pfad zu `src/bot.ts` dorthin zeigt: bei einem absoluten Pfad (etwa
+   `bun /anderer/ordner/src/bot.ts`) der Pfad selbst, bei einem relativen
+   (etwa `bun run src/bot.ts`) der Arbeitsordner des Prozesses, jeweils mit
+   aufgelösten Symlinks (`realpath <pfad>`) verglichen mit `pwd -P`. Die
+   `grep`-Liste allein beweist nichts. Scheitert eine Abfrage (keine Ausgabe,
+   „Permission denied“, Prozess eines anderen Benutzers) oder ist die
+   Befehlszeile leer, ist das ebenfalls kein Nachweis: dann nicht löschen,
+   sondern erst klären, was der Prozess ist.
+
+   **Unter PM2** braucht der Bot die Frist `--kill-timeout 10000`, sonst
+   beendet PM2 ihn nach 1,6 Sekunden hart, bevor er die Sperre freigibt.
+   Neue Einträge von `tybo dienste` und `tybo setup autostart` haben sie,
+   `deploy.sh` setzt sie beim nächsten Deploy. Ein schon gespeicherter
+   Eintrag ändert sich nicht von selbst, auch nicht durch `tybo setup
+   autostart`. Ihn einmal in einem Terminal neu anlegen (der Bot startet
+   dabei neu):
+
+   ```bash
+   tybo dienste telegram-relay                      # entfernt den Eintrag, legt ihn mit Frist neu an, pm2 save
+   ```
 
 **Danach:** Eine Testnachricht bekommt eine Antwort, und im Log steht der
 Eingang der Nachricht.
@@ -380,8 +470,38 @@ Eingang der Nachricht.
 ### Zwei Bots laufen gleichzeitig
 
 **Symptom:** Antworten kommen doppelt, abwechselnd von verschiedenen Ständen,
-oder Telegram-Nachrichten verschwinden scheinbar. Im Fehler-Log kann ein
-`409` mit `Conflict` von Telegram stehen.
+oder Telegram-Nachrichten verschwinden scheinbar. Im Log steht:
+
+```text
+Telegram: Ein anderer Bot nutzt denselben Token (409). Telegram-Eingang pausiert, nächster Versuch in <n> Sekunden.
+```
+
+Dieselbe Meldung steht einmal je Fehlerserie im Direktchat der WebUI, im
+Reiter „Status“ unter „Telegram-Eingang“ und in `tybo pruefen` als Fehler
+(Exit-Code 1).
+
+**Was tybo dann tut:** Nur der Telegram-Eingang pausiert. Der Prozess läuft
+weiter, also auch WebUI, Erinnerungen, Hintergrund-Jobs und Ziele. tybo
+versucht es nach 15 Sekunden erneut, dann mit doppelter Pause bis höchstens
+10 Minuten. Beim Polling ruft tybo nie `deleteWebhook`, auch nicht beim
+ersten Start, und verdrängt den anderen Bot nie, auch keinen Server im
+Webhook-Betrieb (Profil `server`). Ein noch eingetragener Webhook ergibt
+deshalb ebenfalls 409; wer bewusst vom Webhook zurück zum Polling wechselt,
+löscht ihn von Hand ([Zurück zum Polling](telegram-webhook.md#zurück-zum-polling)).
+Senden geht weiter, Antworten aus dem Browser kommen in Telegram an. Sobald Telegram wieder Nachrichten liefert, steht im Log
+„Telegram-Eingang läuft wieder.“, die Pause beginnt von vorn und der Status
+zeigt „läuft“.
+
+Lehnt Telegram den Token ab, steht im Log
+„Telegram lehnt den Token ab (401). Telegram-Eingang aus, bis der Token
+stimmt.“ Dann gibt es keinen neuen Versuch. Der laufende Bot übernimmt eine
+geänderte `.env` nicht von selbst: Token in der `.env` korrigieren, danach
+tybo bewusst neu starten (Knopf im Reiter „Status“ oder
+`bun run restart:request "Token geändert"`). Bis dahin bleibt der Browser
+nutzbar: Nachrichten im Direktchat und in den Topics verarbeitet tybo wie
+sonst, nur ohne Telegram. Antwort und Freigaben stehen dann nur
+in der WebUI, und der offene Browser zeigt den Hinweis „Telegram lehnt den
+Token ab (401). Nachricht und Antwort stehen nur hier in der WebUI.“
 
 **Ursache:** Zwei Prozesse holen mit demselben Bot-Token Nachrichten ab: ein
 zweiter Rechner, ein zweiter Ordner, ein von Hand gestarteter Bot neben dem
@@ -747,6 +867,42 @@ tybo pruefen
 **Danach:** Der Verbindungstest in `tybo setup datenbank` meldet Lesen und
 Schreiben, und eine neue Nachricht steht im Verlauf.
 
+### Nach einem Update: „Der Datenbank fehlen … Migrationen“
+
+**Symptom:** Nach einem Update meldet tybo beim Start in Telegram oder der
+WebUI „Der Datenbank fehlen … Migrationen: …“, oder `tybo pruefen` zeigt
+`✗ Schema: Nachholen mit tybo setup datenbank. Es fehlt …`. Erinnerungen,
+Abschnitte langer Nachrichten oder die Suche gehen dann nicht.
+
+**Ursache:** Das Update hat neuen Code geholt, aber die neuen Dateien aus
+`db/migrations/` sind noch nicht in der Datenbank. Die Schemaprobe vergleicht
+je Datei ein Merkmal über die REST-Schnittstelle
+([einrichtung.md](einrichtung.md#schemaprobe)).
+
+**Abhilfe:**
+
+- Supabase in der Cloud: `tybo setup datenbank` mit einem frischen
+  Zugangstoken (`sbp_…`). Der Ablauf spielt nur ein, was noch fehlt.
+- Supabase auf diesem Rechner: `tybo datenbank start`. Läuft Supabase schon,
+  spielt der Befehl die fehlenden Dateien ein und ändert sonst nichts.
+  Scheitert eine Datei, endet er mit Exit 1 und nennt sie; die Meldung von
+  Postgres zeigt der SQL-Editor in Studio (`tybo datenbank start --studio`).
+- Eigene Zugangsdaten: die genannten Dateien der Reihe nach im SQL-Editor
+  ausführen. `db/schema.sql` dafür nicht neu einspielen, das setzt Policies
+  und Suchfunktionen zurück.
+
+Danach den Bot neu starten (`bun run restart:request "Schema"` bzw. in der
+WebUI „Neustart anfordern“).
+
+**„Schema: nicht prüfbar“:** Die Probe bekam keine verwertbare Antwort
+(Netzfehler, Zeitüberschreitung, abgelehnter Schlüssel, fehlende Rechte). Das
+heißt nicht, dass etwas fehlt. Erst die Zeile „Verbindung“ und den Schlüssel
+prüfen (oben); mit dem öffentlichen statt dem Server-Schlüssel bleibt die
+Probe immer „nicht prüfbar“.
+
+**Danach:** `tybo pruefen` zeigt `✓ Schema: alle Migrationen eingespielt`,
+und beim nächsten Start kommt keine Meldung mehr.
+
 ### Supabase meldet „permission denied“
 
 **Symptom:** Der Verbindungstest von `tybo setup datenbank` meldet
@@ -997,7 +1153,7 @@ loginctl show-user "$USER" -p Linger        # Linger=yes: startet auch ohne Anme
 |---|---|
 | „Failed to connect to bus“ | `tybo setup` lief über `sudo`, `su` oder ohne Anmeldesitzung. Als normaler Benutzer per SSH oder am Gerät anmelden und erneut ausführen. |
 | Bot läuft erst, wenn du dich anmeldest | Linger ist aus. Einmal `sudo loginctl enable-linger "$USER"`, dann `tybo setup autostart`; der Schritt prüft es. |
-| Antworten nur über Ersatzmodelle oder gar keine | Der Dienst findet Bun oder die Claude CLI nicht. Die Unit-Datei setzt ihren `PATH` beim Anlegen. Wurde die CLI danach installiert oder verschoben, den Dienst neu anlegen (Befehle unten). |
+| Antworten nur über Ersatzmodelle, dazu einmal je Gespräch „Claude Code ist auf diesem Rechner nicht installiert oder nicht im Suchpfad des Dienstes“ | Der Dienst findet die Claude CLI nicht ([mehr](#claude-code-ist-nicht-installiert-oder-nicht-im-suchpfad)). Die Unit-Datei setzt ihren `PATH` beim Anlegen. Wurde die CLI danach installiert oder verschoben, den Dienst neu anlegen (Befehle unten). Fehlt Bun, startet der Dienst gar nicht. |
 | `status` zeigt ständige Neustarts | `Restart=always` startet den Bot nach jedem Ende neu, auch nach einem Fehler in der `.env`. Der Grund steht im Fehler-Log. Anhalten bis zur Korrektur: `systemctl --user stop tybo-telegram-relay`. |
 | `tybo-telegram-relay` steht zusätzlich in `pm2 list` oder in `~/.pm2/dump.pm2` | Zwei Bots holen dieselben Nachrichten. Einen entfernen, siehe [Zwei Bots laufen gleichzeitig](#zwei-bots-laufen-gleichzeitig). `tybo setup autostart` legt nie einen zweiten an. |
 
@@ -1141,6 +1297,51 @@ Fehlerserie keine zweite Meldung. Mehr: [routinen.md](routinen.md).
 
 ---
 
+### Nachtcheck meldet: Bot steht
+
+**Symptom:** Im Bericht des Nachtchecks steht `❌ Bot-Prozess` und/oder
+`❌ Bot antwortet`.
+
+**Was die Zeilen heißen:**
+
+- `❌ Bot-Prozess: kein Dienst für den Bot …`: weder systemd noch PM2 (unter
+  macOS launchd) kennt den Bot. Abhilfe: `tybo setup autostart`.
+- `❌ Bot-Prozess: systemd-Dienst tybo-telegram-relay.service läuft nicht
+  (failed/failed, letzter Exit 1)` bzw. `PM2-Prozess tybo-telegram-relay läuft
+  nicht (Status errored)`: der Dienst ist eingerichtet, steht aber. Nachsehen
+  mit `systemctl --user status tybo-telegram-relay` bzw.
+  `pm2 logs tybo-telegram-relay --lines 50` und
+  `tail -n 50 logs/telegram-relay.error.log`.
+- `⚠️ Bot-Prozess: nicht prüfbar …`: `systemctl --user` antwortete nicht
+  oder PM2 lieferte keine lesbare Liste. Das heißt nicht, dass der Bot
+  steht; die Zeile „Bot antwortet“ sagt es.
+- `❌ Bot antwortet: Port 3000: keine Verbindung, der Bot läuft nicht`: auf
+  `127.0.0.1:<HEALTH_PORT>` lauscht nichts. Läuft laut „Bot-Prozess“ ein
+  Prozess, hängt er beim Start; das Fehler-Log nennt meist den Grund.
+- `❌ Bot antwortet: … keine Antwort nach 5 s`: der Bot hängt.
+- `❌ Bot antwortet: … nicht der Health-Server von tybo`: auf dem Port
+  antwortet ein anderes Programm. `HEALTH_PORT` in der `.env` auf einen
+  freien Port setzen.
+
+**Abhilfe:** Den Dienst im Terminal neu starten (nicht aus einem Gespräch
+mit tybo heraus, siehe „Regeln im Betrieb“ in `CLAUDE.md`), unter systemd mit
+`systemctl --user restart tybo-telegram-relay`, unter PM2 mit
+`pm2 restart tybo-telegram-relay`, unter macOS siehe
+[Bot-Dienst startet nicht (macOS)](#bot-dienst-startet-nicht-macos).
+Startet er sofort wieder nicht, steht der Grund im Fehler-Log.
+
+**Ohne Telegram:** Der Bericht liegt dann nur in der WebUI, und die läuft im
+Bot-Prozess. Du siehst ihn erst, wenn der Bot wieder läuft.
+
+**Kommt gar kein Bericht:** `/routinen health-check` bzw.
+`systemctl --user list-timers 'tybo-health-check*'` zeigt, ob der Timer
+aktiv ist; einrichten mit `tybo dienste health-check`. Die Uhrzeit gilt in
+der Zeitzone aus `USER_TIMEZONE`.
+
+**Danach:** `bun run health -- --no-send` zeigt beide Zeilen mit ✅.
+
+---
+
 ### Routine fehlt in der Übersicht
 
 **Symptom:** `/routinen`, `tybo routinen` oder der Reiter „Routinen“ in der
@@ -1155,8 +1356,15 @@ WebUI zeigt einen Dienst nicht, der auf dem Rechner zeitgesteuert läuft.
    (Vorlage `config/routines.example.json`). Ist die Datei kein gültiges
    JSON, gilt sie als leer, und die Übersicht zeigt dazu eine Hinweiszeile.
 3. **Ort der Plist.** Gezählt werden nur Plists in `~/Library/LaunchAgents`.
-   Dienste unter `/Library/LaunchDaemons` oder `/Library/LaunchAgents`,
-   systemd-Timer und cron erfasst die Übersicht nicht.
+   Dienste unter `/Library/LaunchDaemons` oder `/Library/LaunchAgents` und
+   cron-Zeilen erfasst die Übersicht nicht.
+4. **Linux.** Gezählt werden die Einheiten `tybo-*.timer` und
+   `tybo-*.service` in `~/.config/systemd/user` und die PM2-Prozesse
+   `tybo-*`. Fremde Namen (etwa noch `go-*`) erscheinen nicht;
+   `tybo dienste` richtet die Timer unter dem richtigen Namen neu ein.
+   Steht „Status unbekannt“ mit dem Hinweis „systemctl --user antwortet
+   nicht“, läuft die Übersicht ohne Anmeldesitzung (etwa über `sudo`); der
+   Bot selbst sieht die Timer, wenn er als Benutzerdienst läuft.
 
 Steht die Routine da, aber mit „kein Verlauf (nicht eingebunden)“, fehlt ihr
 nur der Wrapper. `tybo routinen einbinden <label>` schaltet den Verlauf ein.
@@ -1447,7 +1655,9 @@ oder Codex antwortet ohne Werkzeuge, Skills oder Projektwissen.
 **Nachsehen:** `codex --version` und `codex login status` (Exit 0 heißt
 angemeldet). Dasselbe prüft tybo mit `checkEngine("codex")`
 (`src/lib/engines/check.ts`, je 5 Sekunden Zeitlimit, Ergebnis eine Minute
-gemerkt). Die Rechte-Stufe steht beim ersten Aufruf im Log:
+gemerkt). `tybo pruefen` prüft dasselbe im Abschnitt „Motor“ mit dem `PATH`
+aus der Dienstdatei des Bots; liegt Codex nur im `PATH` deiner Shell, ist die
+Zeile dort ein Fehler. Die Rechte-Stufe steht beim ersten Aufruf im Log:
 `[Codex] Rechte-Stufe: …`.
 
 **Abhilfe:**
@@ -1637,7 +1847,8 @@ einer Antwort von tybo heraus, mit `bun run restart:request "Grund"`.
 # Gesamtzustand
 tybo pruefen                                   # Bericht mit Exit-Code
 curl -s http://127.0.0.1:3000/health           # Bot lebt? (HEALTH_PORT, nur lokal)
-cat bot.lock && ps -p "$(cat bot.lock)" -o pid,command
+cat bot.lock                                   # Besitzer: Prozessnummer und Startzeit (UTC)
+LC_ALL=C TZ=UTC ps -ww -p <prozessnummer> -o pid,lstart,command   # lebt er noch, mit derselben Startzeit? Sprache und Zeitzone wie die Sperre
 
 # Dienste
 launchctl list | grep ai.tybo                  # macOS
@@ -1665,8 +1876,12 @@ claude --version
 claude -p "Sag hallo" --output-format text     # CLI direkt, ohne tybo
 ```
 
-`bot.lock` nicht von Hand löschen: Ein Start ersetzt die Sperre selbst, wenn
-ihr Prozess nicht mehr lebt (siehe [Bot antwortet nicht](#bot-antwortet-nicht)).
+`bot.lock` nicht von Hand löschen, solange ihr Prozess lebt: Ein Start
+ersetzt die Sperre selbst, wenn sie nachweislich verwaist ist (Prozess
+beendet oder Nummer neu vergeben). Zweifelsfälle und was dann zu tun ist:
+[Bot antwortet nicht](#bot-antwortet-nicht), Schritt 4. Eine `grep`-Suche
+allein oder eine gescheiterte Abfrage beweist nicht, dass kein Bot aus diesem
+Ordner läuft.
 
 ---
 
@@ -1682,8 +1897,9 @@ Ausgabe und `<name>.error.log` für Fehler.
 | `telegram-relay.error.log` | Fehler des Bots und der Claude CLI, Zeitlimits |
 | `smart-checkin.log`, `smart-checkin.error.log` | Check-in: Entscheidung, Versand |
 | `morning-briefing.log`, `morning-briefing.error.log` | Morgenbriefing: Quellen, Versand |
-| `health-check.log`, `health-check.error.log` | Nachtcheck um 03:30 |
+| `health-check.log`, `health-check.error.log` | Nachtcheck um 03:30 (unter Linux in der Zeitzone aus `USER_TIMEZONE`) |
 | `software-update.log`, `software-update.error.log` | Software-Updates um 03:00, nur wenn eingerichtet |
+| `wartung.log`, `wartung.error.log` | Wartung sonntags um 03:15, nur wenn eingerichtet (`tybo dienste wartung`) |
 | `supabase.log` | Autostart von Supabase auf diesem Rechner, Ausgabe und Fehler in einer Datei |
 | `embedding-reindex.log` | Neuberechnung der Embeddings im Hintergrund |
 
@@ -1691,6 +1907,22 @@ Unter PM2 schreibt der Bot zusätzlich in PM2s eigene Logs
 (`pm2 logs tybo-telegram-relay --lines 50`). Die Logs nennen Kennungen,
 Anbieter und Dauer, aber keine Schlüssel. Nachrichteninhalte können in
 Fehlerzeilen vorkommen; vor dem Weitergeben durchsehen.
+
+Bot-Tokens stehen nie im Log: Der Bot ersetzt sie in jeder Ausgabe, auch in
+Fehlerobjekten mit der Telegram-Adresse. Aus
+`https://api.telegram.org/bot<token>/sendMessage` wird
+`https://api.telegram.org/bot<verborgen>/sendMessage`
+(`src/lib/telegram-token-mask.ts`). Der Nachtcheck durchsucht trotzdem jede
+Nacht alle Dateien in `logs/` samt Unterordnern, auch die `.gz`-Archive, und
+warnt in der Zeile „Telegram-Token im Log“ mit Datei und Anzahl der
+Fundstellen. Was er nicht vollständig prüfen konnte, nennt er als „nicht
+geprüft“ mit Grund (unlesbar, während der Logrotation verschwunden,
+symbolischer Link, Archiv entpackt über 512 MiB, Zeitlimit) und warnt
+ebenfalls. Bei Fundstellen die Stellen in den genannten Dateien ersetzen
+oder die Dateien löschen; ist ein Log schon weitergegeben worden, das Token
+bei @BotFather erneuern.
+Eine Warnung ist keine Entwarnung für den aktuellen Betrieb: Sie kann alte
+Fundstellen, ein neues Leck oder nicht vollständig geprüfte Dateien betreffen.
 
 ---
 
@@ -1791,6 +2023,48 @@ Profil `local`), löscht er den Webhook beim Start. Dann
 
 **Danach:** `getWebhookInfo` zeigt keine `last_error_message`, und
 `pending_update_count` steht auf 0.
+
+### Claude Code ist nicht installiert oder nicht im Suchpfad
+
+**Symptom:** Antworten kommen vom Ersatzmodell. Einmal je Gespräch steht davor
+die Zeile „Claude Code ist auf diesem Rechner nicht installiert oder nicht im
+Suchpfad des Dienstes. Prüfen mit: tybo pruefen“. Ohne eingerichtetes
+Ersatzmodell bleibt es bei dieser Zeile und der Meldung, dass gerade keine
+Antwort möglich ist.
+
+**Ursache:** Der Bot konnte das Programm `claude` nicht starten. Unter Linux
+scheitert schon der Start (im Fehler-Log `[Claude] Start fehlgeschlagen: claude
+nicht im PATH des Dienstes, code=ENOENT`), unter macOS endet `caffeinate` mit
+Exit-Code 127 (`… exit=127`). Ist `CLAUDE_PATH` gesetzt, heißt es „Programm aus
+CLAUDE_PATH nicht gefunden“. Das passiert auch, wenn ein anderer Motor (Codex,
+OpenCode) nicht bereit ist und tybo auf Claude Code ausweicht. Eine bestehende
+Session bleibt erhalten; sobald die CLI wieder da ist, setzt die nächste
+Nachricht sie fort, und ein späterer Ausfall wird wieder gemeldet.
+
+**Nachsehen:**
+
+```bash
+tybo pruefen
+which claude                                  # im Terminal
+grep -n "Start fehlgeschlagen" logs/telegram-relay.error.log | tail -n 5
+```
+
+Findet das Terminal `claude`, der Dienst aber nicht, fehlt der Ordner (meist
+`~/.local/bin`) im `PATH` des Dienstes.
+
+**Abhilfe:** Claude Code installieren oder den Pfad in der `.env` als
+`CLAUDE_PATH` eintragen. Danach den Dienst neu anlegen: `tybo setup
+autostart` (unter Linux mit systemd die Befehle unter
+[systemd-Dienst startet nicht](#systemd-dienst-startet-nicht-linux-raspberry-pi)).
+
+Andere Startfehler zählen nicht als „nicht installiert“: fehlt das
+Arbeitsverzeichnis oder ist es eine Datei, steht „Arbeitsverzeichnis des
+Laufs fehlt oder ist kein Verzeichnis“ im Log, fehlt
+das Ausführungsrecht, „Claude CLI ist nicht ausführbar“ (`code=EACCES`). Auch
+dann antwortet das Ersatzmodell, aber ohne die Zeile im Gespräch.
+
+**Danach:** `tybo pruefen` meldet Claude Code ohne Fehler, und die nächste
+Antwort nennt kein Ersatzmodell.
 
 ### Claude Code antwortet auf dem Server nicht
 
@@ -2022,3 +2296,149 @@ Werte aus der `.env` gehören nie in ein Issue.
 ---
 
 **Zurück zum Anfang:** [Einrichtung](einrichtung.md)
+
+## Ziele fehlen oder `/goals` bleibt leer
+
+Bis zur Korrektur (Issue #518) scheiterte mit Supabase jedes Ziel still, weil
+der Code eine Spalte `completed` erwartete, die es in `memory` nicht gibt. Jetzt
+ist offen, was `type = 'goal'` trägt, erledigt, was `type = 'completed_goal'`
+samt `completed_at` trägt. Scheitert das Speichern, steht es im Log und im
+Gespräch.
+
+Ziele aus alten Antworten holt einmalig `tybo gedaechtnis ziele-nachholen`
+zurück: Jedes `[GOAL:]` kommt als Vorschlag mit Knöpfen in den Direktchat,
+gespeichert wird erst beim Übernehmen, solange der Bot läuft und höchstens 7
+Tage lang. Eine relative Frist gilt ab der alten Antwort. Ein zweiter Aufruf
+fragt nichts doppelt; was schon vorgeschlagen wurde, steht als Prüfsumme in
+`data/goal-backfill.json`. Wer nach Ablauf noch einmal gefragt werden will,
+löscht diese Datei. Schon gespeicherte Ziele kommen auch dann nicht wieder.
+
+## Fakten aufräumen
+
+Fakten lassen sich archivieren statt löschen. Archivierte Fakten kommen in
+keinen Prompt und keine Suche, `/forget` und `[FORGET:]` finden sie nicht, und
+sie lassen sich zurückholen. `/forget` und `[FORGET:]` selbst löschen weiterhin
+endgültig. Das Archiv braucht die Migration `20261031_memory_archive.sql`.
+
+Eine einmalige Bereinigung startet `tybo gedaechtnis bereinigen --datei <Pfad>`.
+Die Datei bleibt lokal und gehört nicht ins Repo. Sie ist ein JSON-Feld:
+
+```json
+[
+  { "kennung": 12, "einstufung": "doppelt", "begruendung": "steht schon in Fakt 30", "originaltext": "Alex trinkt Tee" },
+  { "kennung": 13, "einstufung": "ueberholt", "begruendung": "Umzug im Mai", "originalhash": "<SHA-256 des Texts, hex>" },
+  { "kennung": 14, "einstufung": "umschreiben", "begruendung": "nur der Ort ist alt", "originaltext": "Mia wohnt in Kiel und spielt Cello", "neuer_text": "Mia spielt Cello" }
+]
+```
+
+`doppelt` und `ueberholt` archivieren, `umschreiben` ersetzt den Text und
+verlangt `neuer_text`. `originaltext` oder `originalhash` ist Pflicht. Eine
+fehlerhafte Liste wird ganz abgelehnt.
+
+Die Fragen kommen nacheinander in den Direktchat, in Telegram und in der WebUI,
+und werden beantwortet, solange der Bot läuft, je Frage höchstens 7 Tage lang:
+zuerst ein Paket mit allen klaren Fällen („Liste zeigen“ klappt die vollständige
+Liste auf, „Ausnahme wählen“ nimmt einzelne heraus), danach die umzuschreibenden
+in Gruppen von höchstens 10. Ohne Bestätigung ändert sich nichts. Stimmt der Text
+zu einer Kennung nicht mehr, bleibt der Fakt unverändert und das Ergebnis nennt
+ihn als übersprungen. Scheitert das Berechnen des Suchvektors, gilt der neue Text
+trotzdem, der alte Vektor ist weg, und der Fakt wird bis zur nächsten Berechnung
+nur über Wörter gefunden; das Ergebnis sagt es.
+
+Ein zweiter Aufruf fragt nichts doppelt. Abgelaufene Fragen und gescheiterte
+Einträge legt er erneut vor, Verworfenes nicht. Der Stand steht in
+`data/gedaechtnis-bereinigung.json`, samt den alten Texten. Solange der Bot eine
+Entscheidung noch ausführt, legt er diese Gruppe nicht erneut vor, auch wenn das
+lange dauert. Hängt die Ausführung, hilft ein Neustart des Bots; der nächste
+Aufruf legt dann vor, was noch offen ist.
+
+Zurückholen geht auch ohne laufenden Bot:
+
+```bash
+tybo gedaechtnis archiv                    # archivierte Fakten mit Kennung
+tybo gedaechtnis zurueckholen 12 13        # nimmt je Fakt die letzte Änderung zurück
+tybo gedaechtnis zurueckholen --alle       # das ganze Archiv
+```
+
+Jeder Aufruf nimmt genau eine Änderung zurück, die letzte zuerst. Wurde ein Fakt
+umgeschrieben und danach archiviert, holt der erste Aufruf ihn mit dem neuen Text
+aus dem Archiv, der zweite stellt den alten Text wieder her. Nach zwei
+Umschreibungen von A nach B nach C führt der erste Aufruf zu B, der zweite zu A.
+Hat sich der Text inzwischen anders geändert, bleibt er unverändert.
+
+Der Sprachkontext der Voice-Bridge lädt die Fakten bei jeder Anfrage frisch, jede
+dieser Änderungen gilt also schon für die nächste Anfrage.
+
+Was danach noch auftauchen kann: Eine laufende Session behält bereits geladene
+Fakten bis `/new`. Umgeschriebene und zurückgeholte Fakten bekommt sie mit der
+nächsten Nachricht nachgereicht, archivierte lassen sich dort nicht zurücknehmen.
+Ein laufendes Gespräch am Telefonhörer behält seinen Prompt bis zum Auflegen.
+Alte Nachrichten im Verlauf bleiben, wie sie sind, und können den Fakt weiter
+erwähnen.
+
+### Geheimnisse in Fakten
+
+Ein Wert, der nach API-Schlüssel, Token, privatem Schlüssel oder Passwort aussieht,
+wird nicht gespeichert, weder über `/remember` noch über `[REMEMBER:]`, einen
+bestätigten Vorschlag oder eine Umschreibung. Er geht auch nicht an den
+Embedding-Anbieter. tybo antwortet mit einem Hinweis: Solche Werte gehören in die
+`.env` im Projektordner.
+
+Ältere Fakten mit Geheimnis bleiben gespeichert, in jedem Prompt und jeder Ausgabe
+steht der Wert aber als `[maskiert]`: beim Start einer Session, in Nachträgen, beim
+Nachladen und Nachschlagen, am Telefon, bei `/memory`, im Archiv und in den Fragen
+der Bereinigung. Auch beim Neuberechnen der Vektoren bekommt der Anbieter nur die
+maskierte Fassung.
+
+Einzeln entscheiden, was mit ihnen geschieht:
+
+```bash
+tybo gedaechtnis geheimnisse          # Kennung und maskierter Text, je Fakt eine Frage im Direktchat
+tybo gedaechtnis geheimnisse --alle   # auch schon behaltene noch einmal vorlegen
+```
+
+Die Fragen stehen im Direktchat, in Telegram und in der WebUI, nie in einem anderen
+Gespräch; entschieden wird, solange der Bot läuft, je Frage höchstens 7 Tage lang,
+höchstens 20 Fragen stehen gleichzeitig offen.
+
+- **Behalten:** Der Fakt bleibt gespeichert, der Wert steht weiter maskiert. Das
+  Modell sieht das Passwort also nie, auch ein behaltenes nicht. Die Entscheidung
+  gilt für diese Kennung und diesen Text (`data/gedaechtnis-geheimnisse.json`);
+  ändert sich der Text, fragt der nächste Aufruf neu.
+- **Archivieren:** Der Fakt kommt in keinen Prompt und keine Suche mehr, zurück mit
+  `tybo gedaechtnis zurueckholen <Kennung>`.
+
+Was das nicht leisten kann: Eine laufende Session behält, was sie schon geladen hat,
+bis `/new`. Früher an den Anbieter gesendete Prompts und Vektoren lassen sich nicht
+zurückholen. Die Prüfung gilt für Fakten und den Kern: `/kern setzen` lehnt ein
+Geheimnis ab, eine Datei `config/kern.md` von Hand steht in Prompt und `/kern`
+maskiert. Ziele werden nur beim Zeigen maskiert; alte Nachrichten im Verlauf und die
+Wissensbasis bleiben, wie sie sind.
+Sie erkennt Muster, kein Passwort ohne jeden Hinweis: „Waldmeister“ allein ist für
+sie ein Wort. Jede Bezeichnung (`Passwort`, `PIN`, `Token`, `API-Key`, `GROQ_KEY`,
+`Authorization`) gilt in jeder Schreibweise: mit Hervorhebung (`**Passwort:**`,
+`_Authorization: Basic …_`), mit Strich oder Pfeil (`Passwort - Wert`, `Passwort -> Wert`),
+hinter `ist` und `lautet` und in Tabellen (`| Passwort | Wert |`, als Spalte unter der
+Kopfzeile, ohne äußere Striche, auf eine Zeile zusammengezogen). Mehrere Wörter gelten
+hinter einem deutlichen Trenner und in einer Zelle als Passphrase, Zifferngruppen hinter
+einer PIN als ein Wert (`| PIN | 47 11 |`), außer der Text beschreibt erkennbar etwas
+(`noch nicht gesetzt`, `mindestens 12 Zeichen`). Auch Paare wie `Login: alex / Wert` zählen.
+Der Wert fällt ganz weg, gleich wie viele Wörter er hat und ob er in Anführungszeichen steht,
+auch hinter einer Kopfzeile (`Authorization: Bearer "…"`). Steht die Bezeichnung in einem Dateipfad
+(`/Users/alex/Passwort Backup2026/notizen.txt`), nennt sie keinen Wert.
+Steht hinter der Bezeichnung nichts, nur ein Trenner oder ein Blockeinstieg (`password: |`,
+auch mit Kommentar wie `password: >- # gefaltet`, `Passwort: <pre>`, `Passwort: (`), gehört, was
+darunter folgt, zum Wert: eingerückte Zeilen und Zitatzeilen bis zum Ende der Einrückung, sonst bis
+zur Leerzeile, bei Tag oder Klammer bis zum passenden Gegenstück. Verschachtelte Tags und Klammern
+gleicher Art zählen mit, etwa `<div><div>…</div>…</div>` oder eine Klammer über Zeilen mit einer
+inneren Klammer; fehlt das passende Ende,
+reicht der Wert bis zur Leerzeile. Tag und Klammer werden zusätzlich bis zum ersten schließenden
+Zeichen gelesen; ergibt eine der beiden Lesarten einen Wert, wird maskiert. So gibt ein
+beschreibender Schluss wie in `PIN: (…\n(…)\noptional)` den Wert davor nicht frei. Ohne Trenner gilt das nur, wenn die Bezeichnung allein auf ihrer Zeile steht.
+Maskiert wird der ganze Block.
+Als Verweis statt Wert gelten nur Masken, Variablen, Pfade, eine `.env` als Datei und
+Klammern, die den Wert bloß beschreiben (`<dein passwort>`, `(siehe Tresor)`); `"(Waldmeister42)"` ist
+ein Wert. Bekannte Grenze: Verschachtelte Tags mit einem harmlosen Text darin, etwa
+`Passwort: <div><div>siehe Tresor</div></div>`, gelten als Wert und werden maskiert. Das ist
+bewusst hingenommen, weil dabei höchstens harmloser Text verschwindet. Falsch erkannt? Text
+umformulieren, etwa ohne `Passwort:` davor.

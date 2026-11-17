@@ -116,9 +116,9 @@ describe("Prozessliste vom PM2-Daemon", () => {
 
   test("Daemon läuft nicht oder antwortet nicht: Hinweis, leere Liste", async () => {
     const notRunning = await listRoutines(fakeRoutinesDeps({ platform: "linux", pm2Path: "/usr/bin/pm2", pm2: { status: "not-running" } }));
-    expect(notRunning).toEqual({ available: true, source: "pm2", routines: [], notes: [PM2_TEXT.notRunning] });
+    expect(notRunning).toEqual({ available: true, source: "pm2", sources: ["pm2"], routines: [], notes: [PM2_TEXT.notRunning] });
     const failed = await listRoutines(fakeRoutinesDeps({ platform: "linux", pm2Path: "/usr/bin/pm2", pm2: { status: "failed" } }));
-    expect(failed).toEqual({ available: true, source: "pm2", routines: [], notes: [PM2_TEXT.listFailed] });
+    expect(failed).toEqual({ available: true, source: "pm2", sources: ["pm2"], routines: [], notes: [PM2_TEXT.listFailed] });
   });
 
   test("unbrauchbare Einträge in der Liste werden übersprungen", async () => {

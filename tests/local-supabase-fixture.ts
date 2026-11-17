@@ -6,6 +6,7 @@
  */
 
 import type { CommandResult, CommandRunner, RunOptions } from "../src/setup/context";
+import { EMPTY_DATABASE_SQL, MIGRATION_LOCK_SQL } from "../src/setup/local-migrations";
 import { LOCAL_API_PORT, LOCAL_DB_PORT, SUPABASE_CLI_VERSION, type LocalSupabaseDeps, type SqlRunner } from "../src/setup/local-supabase";
 
 /** Testwerte in der Form der lokalen Schlüssel, keine echten */
@@ -68,9 +69,11 @@ export interface FakeLocal {
   sql: SqlRunner;
   /** Sitzungen: Adresse, Aufrufe (file:<pfad> bzw. query:<text>), geschlossen? */
   sessions: Array<{ dbUrl: string; ops: string[]; closed: boolean; signal: AbortSignal }>;
-  /** Antwort auf eine Abfrage; Standard: Bilder-Ordner fehlt vorab, danach privat */
+  /** Antwort auf eine Abfrage; Standard: Bilder-Ordner fehlt vorab, danach privat, Datenbank leer, keine Historie */
   onQuery: (text: string) => Array<Record<string, unknown>> | Promise<Array<Record<string, unknown>>>;
   onFile: (path: string) => void | Promise<void>;
+  /** Datei mit Verbuchung in einer Transaktion; Standard: onFile, dann onQuery je Anweisung */
+  onTransaction: (path: string, after: string[]) => void | Promise<void>;
   lan: number[];
   mem: number;
   /** Laufende Container (Zeilen von docker ps: Name, Tab, Ports) */
@@ -101,8 +104,21 @@ export function fakeLocal(answers: Record<string, Answer> = {}): FakeLocal {
     trail: () => calls.map(c => shortName(c.cmd)),
     sql: undefined as any,
     sessions: [],
-    onQuery: text => (text.startsWith("select public from storage.buckets") ? [] : text.includes("insert into storage.buckets") ? [{ public: false }] : []),
+    onQuery: text =>
+      text.startsWith("select public from storage.buckets")
+        ? []
+        : text.includes("insert into storage.buckets")
+          ? [{ public: false }]
+          : text === EMPTY_DATABASE_SQL
+            ? [{ empty: true }]
+            : text === MIGRATION_LOCK_SQL
+              ? [{ locked: true }]
+              : [],
     onFile: () => {},
+    onTransaction: async (path, after) => {
+      await f.onFile(path);
+      for (const text of after) await f.onQuery(text);
+    },
     lan: [],
     mem: 16 * 1024 ** 3,
     containers: [],
@@ -131,6 +147,10 @@ export function fakeLocal(answers: Record<string, Answer> = {}): FakeLocal {
       async file(path) {
         s.ops.push(`file:${path}`);
         await f.onFile(path);
+      },
+      async fileInTransaction(path, after) {
+        s.ops.push(`file:${path}`, ...after.map(text => `query:${text}`));
+        await f.onTransaction(path, after);
       },
       async query(text) {
         s.ops.push(`query:${text}`);

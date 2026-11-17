@@ -5,6 +5,11 @@ Zeitlimit einer Antwort (Entscheidung `docs/webui/decisions/0016-hintergrund-job
 Issue #103). Ein Wächter-Prozess startet Claude, wartet auf das Ende und
 meldet sich immer, auch wenn Claude abstürzt oder keinen Bericht schreibt.
 
+Jobs brauchen deshalb Claude Code. Fehlt es (etwa auf einem Server nur mit
+Codex), stellt der Bot das beim Start fest; dann gibt es keine Jobs, und der
+Block `LONG TASKS` bittet statt um einen Job darum, die Arbeit auf mehrere
+Antworten zu verteilen ([Server und Codex](server.md)).
+
 ## Wann ein Job statt einer Chat-Antwort
 
 Ein Chat-Turn endet nach einer Zeit ohne Aktivität und spätestens an einer
@@ -103,6 +108,22 @@ Ein Job läuft ohne Rückfragen. Deshalb gilt:
   Das ist nur für Aufträge gedacht, die tybo selbst formuliert hat. Inhalte aus
   Mails, Webseiten oder fremden Dateien gehören nie ungeprüft in einen solchen
   Auftrag.
+- Aus dem Programm heraus (nicht über die Befehlszeile) kann ein Job zusätzlich
+  erlaubte Werkzeuge (`allowedTools`, etwa `WebSearch` und `WebFetch` für eine
+  Recherche) und gesperrte Werkzeuge (`deniedTools`) bekommen. Sie stehen in
+  `status.json` und gehen als `--allowedTools` bzw. zusätzlich zu den festen
+  Sperren als `--disallowedTools` an Claude; `acceptEdits` bleibt.
+- Ebenfalls nur aus dem Programm: ein eigener Arbeitsordner (`workDir`, absoluter
+  Pfad, echter Ordner, nie mit `--full-access`). Claude startet dann dort statt
+  im Projektordner, mit `--restricted` (Einstellungsdateien bleiben aus,
+  Dateiwerkzeuge reichen nicht über den Arbeitsordner hinaus,
+  `bypassPermissions` geht nicht), `--strict-mcp-config` (keine MCP-Server) und
+  `--tools` mit Read, Write, Edit, Glob, Grep und den erlaubten Werkzeugen. Den
+  Bericht schreibt der Job als `bericht.md` in den Arbeitsordner; der Wächter
+  kopiert ihn nach dem Ende nach `data/jobs/<id>/report.md`, nur als normale
+  Datei bis 256 KB. So recherchiert der Entwurf eines Sprachagenten ohne
+  `--full-access` und kann nur in seinem Arbeitsordner schreiben (Issue #493,
+  `docs/sprechen.md`).
 
 ## Ablauf
 
@@ -145,7 +166,33 @@ Ein Job läuft ohne Rückfragen. Deshalb gilt:
    „Job gestoppt". Der Wächter schweigt danach.
 
 Der Wächter hängt nicht am Bot. Ein Neustart des Bots beendet laufende Jobs
-nicht.
+nicht. Unter launchd und PM2 reicht dafür die eigene Prozess-Session. Unter
+systemd nicht: systemd beendet beim Stoppen eines Dienstes von sich aus alle
+Prozesse seiner Kontrollgruppe (cgroup), und eine eigene Session verlässt
+die Kontrollgruppe nicht. Deshalb steht in der Dienstdatei, die
+`tybo setup autostart` anlegt, `KillMode=process`: systemd beendet dann nur
+den Bot selbst. Seine Motor-Aufrufe (Claude, Codex, OpenCode) und die
+Prüfbefehle der Motoren (Versionsprüfung von OpenCode, `opencode models`
+für die Modell-Liste, die Prüfungen wie `codex --version` und
+`codex login status` sowie `claude --help` des Telefonhörers) beendet der Bot
+unter systemd beim Herunterfahren samt Kindern selbst; danach startet keine
+Prüfung mehr einen Prozess. Er wartet bis zu 5 Sekunden auf ihr Ende; wer dann
+noch läuft, bekommt SIGKILL (`waitForEngineExit` in
+`src/lib/engines/calls.ts`). Die gemeinsame Prozessverwaltung verfolgt jede
+Motor-Gruppe, bis sie nachweislich leer ist. Das Ende des Hauptprozesses,
+eine Abmeldung und das SIGKILL des Abbruch-Nachlaufs geben die Gruppe noch
+nicht frei. So werden beim Herunterfahren auch Kinder bereits erfolgreicher,
+abgebrochener oder zeitlich begrenzter Aufrufe und Prüfungen beendet, ohne
+den abgeschlossenen Auftrag erneut abzubrechen. Unter launchd und PM2
+wartet er nicht und lässt Prüfprozesse samt Kindern unberührt, dort
+bleibt das Beenden wie vorher. Die Kehrseite: Stürzt der Bot ab, bleiben auch
+seine übrigen Kindprozesse stehen, bis sie von selbst enden; systemd räumt
+sie nicht mehr ab.
+
+Eine Dienstdatei von vor dieser Änderung hat die Zeile nicht. `tybo pruefen`
+meldet das als Warnung „telegram-relay (Hintergrund-Jobs)“,
+`tybo setup autostart` trägt die Zeile nach (siehe
+[Einrichtung](einrichtung.md#autostart-mit-systemd)).
 
 ## Genau eine Meldung
 
@@ -176,7 +223,8 @@ Zustellung:
 Beim Start prüft der Bot alle Jobs (`recoverJobs` in `src/lib/jobs/control.ts`):
 
 - Steht ein Job auf „läuft", aber sein Wächter lebt nicht mehr (Absturz,
-  Neustart des Rechners), wird ein noch laufender Claude beendet und der Job
+  Neustart des Rechners, unter systemd mit einer alten Dienstdatei auch der
+  Neustart des Bots), wird ein noch laufender Claude beendet und der Job
   als „abgebrochen" gemeldet, mit Log-Auszug.
 - Wer mit Stopp, Zeitlimit oder Abbruch gewinnt, trägt zuerst „Beendigung
   ausstehend" in `status.json` ein und beendet dann Claudes Prozessgruppe.

@@ -16,6 +16,7 @@ const { getSupabase } = await import("../src/lib/supabase");
 const { embedForDatabase } = await import("../src/lib/embedding");
 const { EMBEDDING_TEXT_LIMIT } = await import("../src/lib/store/supabase/memory");
 const { sessionKeyFor } = await import("../src/lib/store/message-rules");
+const { maskSecrets } = await import("../src/lib/memory/secrets");
 
 const sb = getSupabase();
 if (!sb) {
@@ -34,12 +35,13 @@ if (error) {
 }
 let embedded = 0;
 for (const row of rows ?? []) {
-  const embedding = await embedForDatabase(row.content.slice(0, EMBEDDING_TEXT_LIMIT));
+  const embedding = await embedForDatabase(maskSecrets(row.content).slice(0, EMBEDDING_TEXT_LIMIT));
   if (!embedding) continue;
   const { error: upErr } = await sb
     .from("memory")
     .update({ embedding })
-    .eq("id", row.id);
+    .eq("id", row.id)
+    .eq("content", row.content);
   if (!upErr) embedded++;
 }
 console.log(`memory: ${embedded}/${rows?.length ?? 0} rows embedded`);

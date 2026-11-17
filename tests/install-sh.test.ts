@@ -76,6 +76,8 @@ case "$1 $2" in
   "merge-base --is-ancestor") [ -n "\${FAKE_DIVERGED:-}" ] && exit 1; exit 0 ;;
   "pull --ff-only") exit 0 ;;
   "rev-parse --short") echo abc1234 ;;
+  "rev-parse HEAD") [ -n "\${FAKE_NO_HEAD:-}" ] && exit 128; echo "\${FAKE_OLD_HEAD:-0123456789abcdef}" ;;
+  "diff --quiet") [ -n "\${FAKE_DIFF_ERROR:-}" ] && exit 128; [ -n "\${FAKE_DB_CHANGED:-}" ] && exit 1; exit 0 ;;
 esac
 exit 0`,
 };
@@ -438,6 +440,42 @@ for (const shell of SHELLS) {
       expect(r.calls.some(c => c[2] === "--no-env-file")).toBe(false);
       expect(has(r, "bun", "install", "--frozen-lockfile")).toBe(true);
       expect(r.stdout).toContain(`Aktualisiert auf abc1234. Läuft tybo schon, einmal neu starten: cd ${dir} && bun run restart:request "Update"`);
+    });
+
+    test("Issue #560: Update ohne Änderung in db/: kein Hinweis auf Migrationen, Vergleich mit dem Stand vor dem Pull", async () => {
+      const r = await run({ shell, tty: "", env: { FAKE_ORIGIN: "git@github.com:cloudnutzer/tybo.git", FAKE_OLD_HEAD: "feed1234" }, prepare: existingClone() });
+      expect(r.exit).toBe(0);
+      const dir = join(r.home, "tybo");
+      const gits = named(r, "git");
+      const before = gits.findIndex(c => c[3] === "rev-parse" && c[4] === "HEAD");
+      const pull = gits.findIndex(c => c[3] === "pull");
+      expect(before).toBeGreaterThanOrEqual(0);
+      expect(before).toBeLessThan(pull);
+      expect(has(r, "git", "-C", dir, "diff", "--quiet", "feed1234", "HEAD", "--", "db")).toBe(true);
+      expect(r.stdout).not.toContain("tybo setup datenbank");
+    });
+
+    test("Issue #560: Update mit Änderung in db/ nennt tybo setup datenbank nach dem Neustart-Hinweis", async () => {
+      const r = await run({ shell, tty: "", env: { FAKE_ORIGIN: "git@github.com:cloudnutzer/tybo.git", FAKE_DB_CHANGED: "1" }, prepare: existingClone() });
+      expect(r.exit).toBe(0);
+      const dir = join(r.home, "tybo");
+      expect(r.stdout).toContain(`Die Datenbank bekommt neue Migrationen. Vor dem Neustart einspielen: cd ${dir} && tybo setup datenbank`);
+      expect(r.stdout.indexOf("Aktualisiert auf")).toBeLessThan(r.stdout.indexOf("neue Migrationen"));
+    });
+
+    test("Issue #560: Vergleich nicht möglich (kein alter Stand, Fehler von git): lieber den Hinweis zeigen", async () => {
+      for (const env of [{ FAKE_NO_HEAD: "1" }, { FAKE_DIFF_ERROR: "1" }]) {
+        const r = await run({ shell, tty: "", env: { FAKE_ORIGIN: "git@github.com:cloudnutzer/tybo.git", ...env }, prepare: existingClone() });
+        expect(r.exit).toBe(0);
+        expect(r.stdout).toContain("tybo setup datenbank");
+      }
+    });
+
+    test("Issue #560: frische Installation vergleicht nichts", async () => {
+      const r = await run({ shell, args: ["--no-setup"], tty: "" });
+      expect(r.exit).toBe(0);
+      expect(named(r, "git").some(c => c[3] === "diff")).toBe(false);
+      expect(r.stdout).not.toContain("neue Migrationen");
     });
 
     test("zweiter Lauf: HTTPS-origin ohne .git und ssh:// gelten als dasselbe Repo", async () => {

@@ -42,13 +42,26 @@ Nachrichten erst nach dem Aufwachen an; eine verpasste Erinnerung kommt dann
 als verspätet markiert. Wer tybo rund um die Uhr will, hat drei Wege:
 
 - einen Rechner, der durchläuft, etwa einen Raspberry Pi (nächste Frage);
-- einen Server im Profil `server`, bei dem Telegram jede Nachricht per Webhook
-  zustellt;
+- einen Server, der durchläuft: wie zu Hause per Polling, ohne öffentliche
+  Adresse, oder im Profil `server`, bei dem Telegram jede Nachricht per
+  Webhook zustellt (braucht eine öffentliche `https`-Adresse);
 - den Hybrid-Betrieb: Der Server nimmt alles an und reicht es an deinen
   Rechner weiter, solange der wach ist, sonst antwortet er selbst.
 
-Server und Hybrid: [telegram-webhook.md](telegram-webhook.md) und
+Server, auch ohne Claude-Konto: [server.md](server.md). Webhook und Hybrid:
+[telegram-webhook.md](telegram-webhook.md) und
 [erweiterungen.md](erweiterungen.md#server-und-hybrid).
+
+---
+
+## Geht tybo ohne Claude-Konto?
+
+Ja, mit Codex als Motor (ChatGPT-Anmeldung über `codex login`). Chat,
+Sessions, Merk-Tags und Ersatzmodelle gehen wie mit Claude Code;
+Hintergrund-Jobs gibt es dann nicht, und die Nebenaufgaben (Richter von
+`/goal`, offene Fäden, Check-in und weitere) laufen nur mit einem eigenen
+Nebenmodell über OpenRouter oder Ollama. Einrichten und die ganze Tabelle:
+[server.md](server.md).
 
 ---
 
@@ -101,9 +114,15 @@ Was bei Codex und OpenCode einzurichten ist, steht in
 Mit demselben Befehl wie bei der Installation:
 `curl -fsSL https://tybo.ai/install | sh`. Er holt den neuen Stand in den
 vorhandenen Ordner, lässt `.env`, `config/` und `data/` in Ruhe und ändert
-nichts, wenn du Dateien im Ordner selbst geändert hast. Danach den Bot neu
-starten, in der WebUI mit „Neustart anfordern“. Was sich geändert hat, steht
-in [CHANGELOG.md](../CHANGELOG.md).
+nichts, wenn du Dateien im Ordner selbst geändert hast. Bringt das Update
+neue Tabellen mit (der Installer sagt es am Ende), vorher `tybo setup
+datenbank` ausführen; in der Cloud braucht das ein frisches Zugangstoken,
+Supabase auf diesem Rechner holt es beim nächsten `tybo datenbank start`
+selbst nach. Danach den Bot neu starten, in der WebUI mit „Neustart
+anfordern“. Vergessen ist nicht schlimm: Der Bot prüft beim Start, ob
+Migrationen fehlen, und meldet sich dann einmal; `tybo pruefen` zeigt es in
+der Zeile „Schema“. Was sich geändert hat, steht in
+[CHANGELOG.md](../CHANGELOG.md).
 
 ---
 

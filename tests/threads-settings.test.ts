@@ -8,7 +8,7 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setChoicesFileForTests, type ChoiceConversation } from "../src/lib/choices";
@@ -46,10 +46,17 @@ afterAll(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
-/** Einstellungsdatei schreiben; mtime je Schreibvorgang verschieden, damit getSettings neu liest */
+/**
+ * Einstellungsdatei schreiben. getSettings liest neu, wenn sich mtime, Größe
+ * oder Inode ändern; Linux setzt mtime nur im Takt der Kernel-Uhr, zwei
+ * schnelle Schreibvorgänge gleicher Größe sähen gleich aus. Darum bekommt
+ * jeder Schreibvorgang eine eigene, streng steigende mtime.
+ */
 let bump = 0;
 async function settings(value: unknown) {
-  await writeFile(file, JSON.stringify(value) + " ".repeat(++bump % 7));
+  await writeFile(file, JSON.stringify(value));
+  const t = 1_700_000_000 + ++bump;
+  await utimes(file, t, t);
 }
 
 const at = (iso: string) => Date.parse(iso);

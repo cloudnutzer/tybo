@@ -20,7 +20,8 @@
  * LIKE-Mustern etwas bedeutet); ein Bild passt, wenn die Beschreibung eines
  * der Wörter enthält oder ein Schlagwort ihm gleicht. Neueste zuerst.
  *
- * Fehler werfen nicht, sie ergeben null, leere Listen bzw. eine Logzeile.
+ * Fehler werfen nicht, sie ergeben null, leere Listen bzw. eine Logzeile; nur die
+ * Suche mit strict wirft, damit das Nachschlagen sie von „nichts gefunden“ trennen kann.
  */
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { embeddingColumns, MISSING_COLUMN_CODES } from "../../../../supabase/functions/_shared/embedding";
@@ -93,21 +94,24 @@ export function supabaseAssets(clientSource: ClientSource, deps: AssetDeps = {})
   const withLinks = (client: SupabaseClient, rows: unknown): Promise<Asset[]> =>
     Array.isArray(rows) ? Promise.all((rows as Asset[]).map(row => withLink(client, row))) : Promise.resolve([]);
 
-  /** Liste aus einer Abfrage, jede Zeile mit frischem Link; Fehler: leer */
-  const list = async (label: string, run: (client: SupabaseClient) => PromiseLike<{ data: unknown; error: { message?: string } | null }>) => {
+  /** Liste aus einer Abfrage, jede Zeile mit frischem Link; Fehler: leer, mit strict wirft es */
+  const list = async (label: string, run: (client: SupabaseClient) => PromiseLike<{ data: unknown; error: { message?: string } | null }>, strict = false) => {
     const client = clientSource();
-    if (!client) return [];
-    try {
-      const answer = await run(client);
-      if (answer.error) {
-        console.error(`[Bilder] ${label} gescheitert:`, answer.error.message ?? "Fehler");
-        return [];
-      }
-      return await withLinks(client, answer.data);
-    } catch (err) {
-      console.error(`[Bilder] ${label} gescheitert:`, err instanceof Error ? err.message : "Fehler");
+    if (!client) {
+      if (strict) throw new Error(`${label} gescheitert`);
       return [];
     }
+    let detail: string;
+    try {
+      const answer = await run(client);
+      if (!answer.error) return await withLinks(client, answer.data);
+      detail = answer.error.message ?? "Fehler";
+    } catch (err) {
+      detail = err instanceof Error ? err.message : "Fehler";
+    }
+    console.error(`[Bilder] ${label} gescheitert:`, detail);
+    if (strict) throw new Error(`${label} gescheitert`);
+    return [];
   };
 
   return {
@@ -192,11 +196,13 @@ export function supabaseAssets(clientSource: ClientSource, deps: AssetDeps = {})
         return (fileType ? query.eq("file_type", fileType) : query).order("created_at", { ascending: false }).limit(limit);
       }),
 
-    async search(query, limit) {
+    async search(query, limit, options = {}) {
       const terms = knowledgeTerms(query, SEARCH_TERMS);
       if (terms.length === 0) return [];
-      return list("Bildsuche", client =>
-        client.from(TABLE).select(COLUMNS).or(assetSearchFilter(terms)).order("created_at", { ascending: false }).limit(limit),
+      return list(
+        "Bildsuche",
+        client => client.from(TABLE).select(COLUMNS).or(assetSearchFilter(terms)).order("created_at", { ascending: false }).limit(limit),
+        options.strict,
       );
     },
   };

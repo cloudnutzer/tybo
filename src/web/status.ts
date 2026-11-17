@@ -135,6 +135,20 @@ export interface SessionCounts {
   resumable: number;
 }
 
+/**
+ * Zustand des Telegram-Eingangs (Issue #562, data/telegram-intake.json des
+ * laufenden Prozesses): ok, conflict (409), unauthorized (401), other
+ */
+export type TelegramIntakeState = "ok" | "conflict" | "unauthorized" | "other";
+export interface TelegramIntakeStatus {
+  state: TelegramIntakeState;
+  /** Meldung wie im Log, ohne Token */
+  message: string;
+  /** ISO-Zeitpunkt der Meldung */
+  since: string;
+}
+const INTAKE_STATES: readonly TelegramIntakeState[] = ["ok", "conflict", "unauthorized", "other"];
+
 /** Echte Quellen; in bot.ts botStatus aus ./bot-status */
 export interface StatusPort {
   /** Version aus package.json */
@@ -167,6 +181,11 @@ export interface StatusPort {
    * wenn es nicht ermittelbar ist; fehlt die Methode, meldet die API null.
    */
   engines?(): Promise<EngineAvailability[]>;
+  /**
+   * Telegram-Eingang (Issue #562); null ohne Telegram, im Webhook-Betrieb
+   * oder vor dem ersten Ergebnis. Fehlt die Methode, meldet die API null.
+   */
+  telegramIntake?(): Promise<TelegramIntakeStatus | null>;
   now?(): number;
 }
 
@@ -202,6 +221,12 @@ function statusEngine(a: EngineAvailability): EngineAvailability {
   };
 }
 
+/** Nur die bekannten Felder und Zustände; Meldung gekürzt */
+function statusIntake(value: TelegramIntakeStatus | null): TelegramIntakeStatus | null {
+  if (!value || !INTAKE_STATES.includes(value.state) || typeof value.message !== "string" || typeof value.since !== "string") return null;
+  return { state: value.state, message: value.message.slice(0, 300), since: value.since };
+}
+
 export function createStatusApi(port: StatusPort, log: (message: string) => void): StatusApi {
   const now = () => (port.now ? port.now() : Date.now());
 
@@ -217,13 +242,14 @@ export function createStatusApi(port: StatusPort, log: (message: string) => void
 
   return {
     async get() {
-      const [commit, supervisor, sessions, restartRequested, semanticSearch, engines] = await Promise.all([
+      const [commit, supervisor, sessions, restartRequested, semanticSearch, engines, telegramIntake] = await Promise.all([
         safe("Git-Hash", () => port.commit()),
         safe("Supervisor", () => port.supervisor()),
         safe("Sessions", () => port.sessions()),
         safe("Neustart-Marker", () => port.restartRequested()),
         safe("Semantische Suche", async () => (port.semanticSearch ? await port.semanticSearch() : null)),
         safe("Motoren", async () => (port.engines ? await port.engines() : null)),
+        safe("Telegram-Eingang", async () => (port.telegramIntake ? await port.telegramIntake() : null)),
       ]);
       const startedAt = port.startedAt();
       const current = now();
@@ -244,6 +270,7 @@ export function createStatusApi(port: StatusPort, log: (message: string) => void
           restartRequested,
           // Nur die bekannten Felder, nie rohe Ausgaben der Prüfbefehle
           engines: Array.isArray(engines) ? engines.map(statusEngine) : null,
+          telegramIntake: statusIntake(telegramIntake),
           keys: port.keys().map(k => ({ name: k.name, group: k.group, set: k.set === true })),
         },
       };

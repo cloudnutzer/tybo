@@ -27,8 +27,10 @@ const publicDir = join(root, "src", "web", "public");
 
 test("keine HTML-Datei in src/web/public hat Inline-Skripte, on...-Attribute oder Inline-Styles", async () => {
   const files = (await readdir(publicDir)).filter(f => f.endsWith(".html"));
-  // offline.html (Issue #224): Seite „nicht erreichbar" aus dem Service Worker
-  expect(files.sort()).toEqual(["index.html", "login.html", "offline.html"]);
+  // offline.html (Issue #224): Seite „nicht erreichbar" aus dem Service Worker;
+  // sprachagent.html (Issue #494): Gesprächsseite /sa/<kennung>;
+  // sprachagenten.html (Issue #495): Liste und Detail unter /sprachagenten
+  expect(files.sort()).toEqual(["index.html", "login.html", "offline.html", "sprachagent.html", "sprachagenten.html"]);
   for (const f of files) {
     const html = await readFile(join(publicDir, f), "utf8");
     expect(html).not.toMatch(/<script(?![^>]*\bsrc=)[^>]*>/i);

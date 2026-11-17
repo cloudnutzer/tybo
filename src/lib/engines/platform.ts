@@ -129,11 +129,18 @@ export function signalTree(proc: TreeProc, signal: TreeSignal, platform: Process
  * Erst plan.first, nach plan.killAfterMs SIGKILL, beides über signalTree
  * (also je mit Prüfung der Gruppe im selben Schritt). Das SIGKILL kommt auch
  * dann, wenn der Prozess selbst inzwischen beendet ist; der Nachlauf hält den
- * Bot-Prozess nicht am Leben.
+ * Bot-Prozess nicht am Leben. afterKill läuft nach dem SIGKILL (Ende des
+ * Nachlaufs).
  */
-export function stopTree(proc: TreeProc, plan: StopPlan, platform: ProcessPlatform = hostPlatform): void {
+export function stopTree(proc: TreeProc, plan: StopPlan, platform: ProcessPlatform = hostPlatform, afterKill?: () => void): void {
   if (!(proc.pid > 1)) return;
   signalTree(proc, plan.first, platform);
-  const later = platform.setTimeout(() => signalTree(proc, "SIGKILL", platform), plan.killAfterMs);
+  const later = platform.setTimeout(() => {
+    try {
+      signalTree(proc, "SIGKILL", platform);
+    } finally {
+      afterKill?.();
+    }
+  }, plan.killAfterMs);
   (later as { unref?: () => void } | undefined)?.unref?.();
 }

@@ -1,5 +1,12 @@
 /**
- * Schritt „modelle“: Standardmodell, Standard-Effort und Fallback-Kette.
+ * Schritt „modelle“: Motor, Standardmodell, Standard-Effort und Fallback-Kette.
+ *
+ * Motor (Issue #566): engine.default in config/settings.json, wie die
+ * Einstellungsseite; die Datei hat Vorrang vor TYBO_ENGINE in .env. Ist
+ * ein anderer Motor als Claude Code gewählt, prüft der Test ihn
+ * (installiert und angemeldet, src/setup/engine.ts). Wer kein Claude-Konto
+ * hat, wählt hier etwa Codex; der Schritt „voraussetzungen“ verlangt die
+ * Claude CLI danach nicht mehr.
  *
  * Geschrieben wird config/settings.json (Schema aus src/lib/settings.ts),
  * weil die Laufzeit dort zuerst nachsieht: für Agenten-Modelle gibt es keine
@@ -25,11 +32,20 @@ import {
   type StatusItem,
 } from "../model";
 import { envValues, invalid, writeEnv, writeProblem } from "./common";
+import { engineItem, isSetupEngine, SETUP_ENGINE_LABELS } from "../engine";
+import { SELECTABLE_ENGINES, type SelectableEngine } from "../../lib/settings";
 
 const MODEL_NAME = /^[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,127}$/;
 const modelRule = (label: string) => (v: string) => (MODEL_NAME.test(v) ? null : `${label}: ungültiger Modellname`);
 
 export const MODEL_FIELDS: SetupField[] = [
+  {
+    name: "TYBO_ENGINE",
+    label: "Motor (optional)",
+    kind: "choice",
+    help: "Wer die Antworten schreibt. Ohne Claude-Konto etwa Codex (vorher installieren und „codex login“). Leer lassen: Claude Code.",
+    choices: SELECTABLE_ENGINES.map(e => ({ value: e, label: SETUP_ENGINE_LABELS[e] })),
+  },
   {
     name: "DEFAULT_MODEL",
     label: "Standardmodell (optional)",
@@ -95,13 +111,16 @@ async function readSettings(path: string): Promise<ReadSettings> {
 }
 
 async function existingValues(ctx: SetupContext): Promise<{ values: SetupValues; settings: ReadSettings }> {
-  const env = await envValues(ctx, ["OPENROUTER_API_KEY", "OPENROUTER_MODEL", "OLLAMA_MODEL", "FALLBACK_OFFLINE_ONLY"]);
+  const env = await envValues(ctx, ["OPENROUTER_API_KEY", "OPENROUTER_MODEL", "OLLAMA_MODEL", "FALLBACK_OFFLINE_ONLY", "TYBO_ENGINE"]);
   const settings = await readSettings(ctx.settingsPath);
   const s = settings.ok ? settings.settings : {};
   const values: SetupValues = {};
   const put = (name: string, v: string | boolean | undefined) => {
     if (v !== undefined && v !== "") values[name] = String(v);
   };
+  // Wie engine-choice.ts: Einstellungsdatei vor .env, ein unbekannter Wert zählt nicht
+  const envEngine = env.TYBO_ENGINE?.toLowerCase();
+  put("TYBO_ENGINE", s.engine?.default ?? (isSetupEngine(envEngine) ? envEngine : undefined));
   put("DEFAULT_MODEL", s.defaults?.model);
   put("DEFAULT_EFFORT", s.defaults?.effort);
   put("OPENROUTER_API_KEY", env.OPENROUTER_API_KEY);
@@ -116,6 +135,7 @@ async function existingValues(ctx: SetupContext): Promise<{ values: SetupValues;
 /** Überträgt die Eingaben in die Einstellungen; alles andere bleibt */
 export function mergeSettings(settings: Settings, entered: SetupValues): Settings {
   const next: Settings = structuredClone(settings);
+  if (entered.TYBO_ENGINE) next.engine = { ...next.engine, default: entered.TYBO_ENGINE as SelectableEngine };
   if (entered.DEFAULT_MODEL || entered.DEFAULT_EFFORT) {
     next.defaults = { ...next.defaults };
     if (entered.DEFAULT_MODEL) next.defaults.model = entered.DEFAULT_MODEL;
@@ -133,7 +153,7 @@ export function mergeSettings(settings: Settings, entered: SetupValues): Setting
 export const modelsStep: SetupStep = {
   id: "modelle",
   title: "Modelle und Fallback",
-  description: "Welches Claude-Modell antwortet und was einspringt, wenn Claude nicht erreichbar ist.",
+  description: "Welcher Motor und welches Claude-Modell antworten und was einspringt, wenn der Motor nicht erreichbar ist.",
   optional: true,
   fields: MODEL_FIELDS,
 
@@ -156,6 +176,8 @@ export const modelsStep: SetupStep = {
     const merged = mergeValues(existing, values);
     const offline = merged.FALLBACK_OFFLINE_ONLY === "true";
     const items: StatusItem[] = [];
+    const engine = merged.TYBO_ENGINE;
+    if (isSetupEngine(engine) && engine !== "claude") items.push({ ...(await engineItem(ctx, engine)), label: `Motor ${SETUP_ENGINE_LABELS[engine]}` });
     if (merged.OPENROUTER_API_KEY && !offline) {
       const r = await ctx.providers.openrouterKey(merged.OPENROUTER_API_KEY);
       items.push({ label: "OpenRouter", ok: r.ok, detail: r.message });

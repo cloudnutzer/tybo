@@ -1,0 +1,12 @@
+{
+  "pakete": {
+    "@elevenlabs/client": "1.35.0",
+    "livekit-client": "2.21.0"
+  },
+  "sha256": {
+    "lib.iife.js": "17e0bd09dcc812e6fd21acac25589589061467c7c5115e1295c9ff6a6ca8b43d",
+    "rawAudioProcessor.js": "3bea39a5ee6359b252e76b6a87115aa178d63359dcb4b769d7e3e50a19c01f59",
+    "LICENSE-elevenlabs-client.txt": "0bfed2a2aa8d106bdb144f55416e193450fbc1e1b3257e3852bc64418069de5a",
+    "LICENSE-livekit-client.txt": "09e8a9bcec8067104652c168685ab0931e7868f9c8284b66f5ae6edae5f1130b"
+  }
+}

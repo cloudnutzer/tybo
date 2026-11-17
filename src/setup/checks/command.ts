@@ -20,7 +20,7 @@ export interface CheckCommandOptions {
 
 export function checkUsage(): string {
   return [
-    `${BRAND.cli} pruefen   Prüfbericht: alle Einrichtungsschritte, Kanäle, Telegram, Datenbank, Dienste, Sprache`,
+    `${BRAND.cli} pruefen   Prüfbericht: alle Einrichtungsschritte, Kanäle, Motor, Telegram, Datenbank, Dienste, Sprache`,
     "",
     "Schickt keine Testnachricht, schreibt nichts in die Datenbank und ruft kein Modell auf.",
     "Exit-Code 1, wenn etwas fehlgeschlagen ist, sonst 0 (auch mit Warnungen).",

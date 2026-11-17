@@ -40,6 +40,7 @@ const NOT_LOGGED_IN: EngineStatus = {
 let dir: string;
 let file: string;
 let status: EngineStatus;
+let claudeStatus: EngineStatus;
 let env: Record<string, string | undefined>;
 let errorSpy: ReturnType<typeof spyOn>;
 
@@ -49,6 +50,7 @@ beforeEach(() => {
   setSettingsPath(file);
   resetEngineChoiceForTests();
   status = READY;
+  claudeStatus = { engine: "claude", checked: true, installed: true, loggedIn: true };
   env = {};
   errorSpy = spyOn(console, "error").mockImplementation(() => {});
 });
@@ -62,7 +64,7 @@ afterEach(() => {
 function services(): CommandServices {
   return {
     engines: createEngineCommandServices({
-      checkEngine: async (id) => (id === "claude" ? { engine: "claude", checked: false, installed: true, loggedIn: true } : { ...status, engine: id }),
+      checkEngine: async (id) => (id === "claude" ? claudeStatus : { ...status, engine: id }),
       env: () => env,
     }),
   } as unknown as CommandServices;
@@ -273,6 +275,48 @@ describe("Telegram", () => {
       boardMeeting: async () => {},
     });
     expect(replies).toEqual([MOTOR_TEXT.unavailable]);
+  });
+});
+
+describe("Claude Code mit echtem Stand (Issue #567)", () => {
+  const CLAUDE_LOGGED_OUT: EngineStatus = {
+    engine: "claude",
+    checked: true,
+    installed: true,
+    loggedIn: false,
+    message: "Claude Code ist nicht angemeldet: im Terminal `claude` starten und /login ausführen",
+  };
+
+  test("/motor zeigt Claude Code als nicht bereit, mit Grund, ohne „bis dahin antwortet Claude Code“", async () => {
+    claudeStatus = CLAUDE_LOGGED_OUT;
+    const r = await runIn("web", "/motor", "web:1");
+    const text = r.replies.join("\n");
+    expect(text).toContain("Claude Code (Claude Code ist nicht angemeldet: im Terminal `claude` starten und /login ausführen)");
+    expect(text).toContain(`Claude Code ist gerade nicht bereit (${CLAUDE_LOGGED_OUT.message}). ${MOTOR_TEXT.claudeNotReady}`);
+    expect(text).not.toContain("bis dahin antwortet Claude Code");
+  });
+
+  test("/motor claude bei abgemeldetem Claude: gespeichert, Hinweis ohne Rückfall auf sich selbst", async () => {
+    claudeStatus = CLAUDE_LOGGED_OUT;
+    const r = await runTelegram("/motor claude", 5);
+    expect(r.replies[0]).toContain("Dieses Gespräch läuft schon mit Claude Code.");
+    expect(r.replies[0]).toContain(MOTOR_TEXT.claudeNotReady);
+  });
+
+  test("Claude bereit: Häkchen, kein Hinweis", async () => {
+    const r = await runIn("web", "/motor", "web:2");
+    expect(r.replies.join("\n")).toContain("Claude Code ✓");
+    expect(r.replies.join("\n")).not.toContain("nicht bereit");
+  });
+
+  test("Motor-Wahl fragt Claude Code nie ab: bleibt Rückfallmotor, auch wenn abgemeldet", async () => {
+    let asked = 0;
+    const d = { env: () => env, checkEngine: async (id: EngineId) => (asked++, id === "claude" ? CLAUDE_LOGGED_OUT : { ...NOT_LOGGED_IN, engine: id }), log: () => {} };
+    expect((await resolveEngine("web:3", d)).engine).toBe("claude");
+    expect(asked).toBe(0);
+    env.TYBO_ENGINE = "codex";
+    expect((await resolveEngine("web:3", d)).engine).toBe("claude");
+    expect(asked).toBe(1);
   });
 });
 

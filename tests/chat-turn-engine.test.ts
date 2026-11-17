@@ -35,7 +35,8 @@ import {
   takeExpiredSession,
   type BotSession,
 } from "../src/lib/session-manager";
-import { setSpawnForTests } from "../src/lib/claude";
+import { setRuntimeForTests, setSpawnForTests } from "../src/lib/claude";
+import { CLAUDE_NOT_INSTALLED_NOTICE } from "../src/lib/claude/start-failure";
 import { setMcpReaderForTests } from "../src/lib/subprocess-env";
 import { getEngine, type Engine, type EngineId, type EngineRequest, type EngineResult, type EngineStatus } from "../src/lib/engines";
 import { sessionKeyFor } from "../src/lib/store/message-rules";
@@ -105,6 +106,7 @@ function setup(opts: { sessionMode?: boolean } = {}) {
   const infos: TurnInfo[] = [];
   const metas: TurnSessionMeta[] = [];
   const fallbackCalls: string[] = [];
+  const fallbackContexts: string[] = [];
   const distilled: BotSession[] = [];
   const logs: unknown[][] = [];
   const sink: TurnSink = {
@@ -132,8 +134,9 @@ function setup(opts: { sessionMode?: boolean } = {}) {
     forgetEngineCheck: () => {
       forgets++;
     },
-    runFallbackChain: async ({ question }) => {
+    runFallbackChain: async ({ question, context }) => {
       fallbackCalls.push(question);
+      fallbackContexts.push(context ?? "");
       return { text: "ersatz-antwort", source: "openrouter", model: "ersatz-modell" };
     },
     buildPromptContext: async () => ({ fullPrompt: "voller-prompt", fallbackContext: "kontext" }),
@@ -174,7 +177,7 @@ function setup(opts: { sessionMode?: boolean } = {}) {
       deps,
       ...extra,
     });
-  return { deps, turn, notices, infos, metas, fallbackCalls, distilled, logs, engines };
+  return { deps, turn, notices, infos, metas, fallbackCalls, fallbackContexts, distilled, logs, engines };
 }
 
 beforeEach(async () => {
@@ -569,6 +572,144 @@ describe("Ausfall des Motors", () => {
     expect(reply).not.toContain("Claude");
     expect(calls).toHaveLength(1);
     expect(s.fallbackCalls).toEqual([]);
+  });
+});
+
+describe("Claude Code fehlt (Issue #565)", () => {
+  const MISSING = {
+    isError: true,
+    text: "Claude Code konnte nicht gestartet werden (claude nicht im PATH des Dienstes, code=ENOENT).",
+    errorKind: "not_installed" as const,
+    sessionId: undefined,
+  };
+
+  test("Fallback-Kette antwortet, der Hinweis kommt einmal über mehrere Turns", async () => {
+    replies.claude = [MISSING, MISSING, MISSING];
+    const s = setup();
+    for (let i = 0; i < 3; i++) expect(await s.turn(DM)).toContain("ersatz-antwort");
+    // Kein neuer Versuch: je Turn genau ein Claude-Lauf, danach die Kette
+    expect(calls.map((c) => c.engine)).toEqual(["claude", "claude", "claude"]);
+    expect(s.fallbackCalls).toEqual(["Frage?", "Frage?", "Frage?"]);
+    expect(s.notices).toEqual([CLAUDE_NOT_INSTALLED_NOTICE]);
+    expect(s.infos.map((i) => i.model)).toEqual(["ersatz-modell", "ersatz-modell", "ersatz-modell"]);
+    // Die Diagnose steht im Log, nur aus kontrollierten Feldern
+    expect(s.logs[0][3]).toMatchObject({ engine: "claude", errorKind: "not_installed", error: MISSING.text });
+  });
+
+  test("getrennte Gespräche bekommen den Hinweis je einmal", async () => {
+    replies.claude = [MISSING, MISSING, MISSING, MISSING];
+    const s = setup();
+    await s.turn(CHAT, TOPIC_A);
+    await s.turn(CHAT, TOPIC_B);
+    await s.turn(WEB);
+    await s.turn(CHAT, TOPIC_A);
+    expect(s.notices).toEqual([CLAUDE_NOT_INSTALLED_NOTICE, CLAUDE_NOT_INSTALLED_NOTICE, CLAUDE_NOT_INSTALLED_NOTICE]);
+    expect(s.fallbackCalls).toHaveLength(4);
+  });
+
+  test("beim Fortsetzen: kein frischer Neuversuch, Session bleibt, das Ersatzmodell bekommt den vollen Kontext", async () => {
+    const s = setup();
+    expect(await s.turn(DM)).toBe("antwort-claude");
+    replies.claude = [MISSING];
+    expect(await s.turn(DM)).toContain("ersatz-antwort");
+    expect(calls.map((c) => [c.engine, c.prompt, c.resumeSessionId])).toEqual([
+      ["claude", "voller-prompt", undefined],
+      ["claude", "resume-prompt", "claude-s1"],
+    ]);
+    expect(s.fallbackContexts).toEqual(["kontext"]);
+    const [stored] = await getSessionsForKey(sessionKeyFor(DM));
+    expect(stored).toMatchObject({ engine: "claude", engineSessionId: "claude-s1" });
+    expect(s.notices).toEqual([CLAUDE_NOT_INSTALLED_NOTICE]);
+  });
+
+  test("Codex nicht bereit, Claude fehlt: Ersatzkette, beide Hinweise je einmal", async () => {
+    await putSettings({ engine: { default: "codex" } });
+    status = { engine: "codex", checked: true, installed: false, loggedIn: false, message: "Codex ist nicht installiert" };
+    replies.claude = [MISSING, MISSING];
+    const s = setup();
+    expect(await s.turn(DM)).toContain("ersatz-antwort");
+    expect(await s.turn(DM)).toContain("ersatz-antwort");
+    expect(calls.map((c) => c.engine)).toEqual(["claude", "claude"]);
+    expect(s.notices).toEqual(["Codex ist nicht verfügbar, ich antworte mit Claude Code. Codex ist nicht installiert", CLAUDE_NOT_INSTALLED_NOTICE]);
+    expect(s.fallbackContexts).toEqual(["kontext", "kontext"]);
+  });
+
+  test("Codex scheitert beim Lauf, Claude fehlt: Ersatzkette statt Wurf", async () => {
+    await putSettings({ engine: { default: "codex" } });
+    replies.codex = [{ isError: true, text: "codex fehlt", errorKind: "not_installed", sessionId: undefined }];
+    replies.claude = [MISSING];
+    const s = setup();
+    expect(await s.turn(DM)).toContain("ersatz-antwort");
+    expect(calls.map((c) => [c.engine, c.prompt])).toEqual([
+      ["codex", "voller-prompt"],
+      ["claude", "voller-prompt"],
+    ]);
+    expect(s.notices).toEqual(["Codex ist nicht verfügbar, ich antworte mit Claude Code. Codex ist nicht installiert.", CLAUDE_NOT_INSTALLED_NOTICE]);
+    expect(s.fallbackCalls).toHaveLength(1);
+  });
+
+  test("nach einem gelungenen Claude-Lauf wird ein neuer Ausfall wieder gemeldet", async () => {
+    replies.claude = [MISSING, { text: "wieder da" }, MISSING];
+    const s = setup();
+    await s.turn(DM);
+    expect(await s.turn(DM)).toBe("wieder da");
+    await s.turn(DM);
+    expect(s.notices).toEqual([CLAUDE_NOT_INSTALLED_NOTICE, CLAUDE_NOT_INSTALLED_NOTICE]);
+  });
+
+  test("ein anderer Claude-Fehler bleibt still wie bisher", async () => {
+    replies.claude = [{ isError: true, text: "kaputt", sessionId: undefined }];
+    const s = setup({ sessionMode: false });
+    expect(await s.turn(DM)).toContain("ersatz-antwort");
+    expect(s.notices).toEqual([]);
+  });
+
+  test("Abbruch bleibt ohne Ersatzkette und ohne Hinweis", async () => {
+    replies.claude = [{ ...MISSING, aborted: true }];
+    const s = setup();
+    expect(await s.turn(DM)).toBe(ABORT_REPLY);
+    expect(s.fallbackCalls).toEqual([]);
+    expect(s.notices).toEqual([]);
+  });
+
+  describe.each(["linux", "darwin"] as const)("echter Claude-Motor auf %s, Start ohne Programm", (os) => {
+    beforeAll(() => {
+      setMcpReaderForTests(() => new Set());
+      setRuntimeForTests({ os, terminate: () => {} });
+      // Linux wirft beim Start, macOS startet caffeinate, das mit 127 endet
+      setSpawnForTests(((o: { cmd: string[] }) => {
+        if (o.cmd[0] !== "/usr/bin/caffeinate") throw Object.assign(new Error('Executable not found in $PATH: "claude"'), { code: "ENOENT" });
+        const empty = new ReadableStream<Uint8Array>({ start: (c) => c.close() });
+        return { pid: 0, stdin: { write() {}, end() {} }, stdout: empty, stderr: new ReadableStream({ start: (c) => c.close() }), exited: Promise.resolve(127), kill() {} };
+      }) as any);
+    });
+    afterAll(() => {
+      setSpawnForTests(null);
+      setRuntimeForTests(null);
+      setMcpReaderForTests(null);
+    });
+
+    for (const [name, run] of [
+      ["streaming", runStreamingTurn],
+      ["json", runJsonTurn],
+    ] as const) {
+      test(`${name}: kein Wurf bis zum Kanal, Ersatzkette und Hinweis`, async () => {
+        const s = setup({ sessionMode: false });
+        const notices: string[] = [];
+        const reply = await run({ userMessage: "x", chatId: DM, agentName: "general", sink: { progress() {}, notice: (t) => void notices.push(t) }, deps: { ...s.deps, getEngine } });
+        expect(reply).toContain("ersatz-antwort");
+        expect(notices).toEqual([CLAUDE_NOT_INSTALLED_NOTICE]);
+        expect(s.fallbackCalls).toEqual(["x"]);
+      });
+    }
+  });
+
+  test("JSON-Turn verhält sich gleich", async () => {
+    replies.claude = [MISSING];
+    const s = setup();
+    const reply = await runJsonTurn({ userMessage: "Frage?", chatId: DM, agentName: "general", sink: { progress: () => {}, notice: (t) => void s.notices.push(t) }, deps: s.deps });
+    expect(reply).toContain("ersatz-antwort");
+    expect(s.notices).toEqual([CLAUDE_NOT_INSTALLED_NOTICE]);
   });
 });
 

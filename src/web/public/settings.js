@@ -294,7 +294,7 @@ function routineRequestId() {
 /** Reiter „Routinen" (Issue #284), Texte wie /routinen in src/lib/routines/format.ts */
 const ROUTINES_TEXT = {
   intro: "Zeitgesteuerte Dienste dieses Rechners mit Zeitplan, Status, letztem und nächstem Lauf. Ein Tipp auf eine Routine zeigt ihre letzten Läufe und die Knöpfe zum Testen, Pausieren und Fortsetzen.",
-  unavailable: "Routinen: auf diesem System nicht verfügbar (weder launchd noch PM2).",
+  unavailable: "Routinen: auf diesem System nicht verfügbar (weder launchd noch systemd noch PM2).",
   none: "Keine Routinen gefunden.",
   failed: "Routinen konnten nicht geladen werden.",
   daemons: "Dauerdienste",
@@ -4921,6 +4921,14 @@ function createSettingsView(deps) {
     return two(date.getDate()) + "." + two(date.getMonth() + 1) + "., " + two(date.getHours()) + ":" + two(date.getMinutes()) + " Uhr";
   }
 
+  function intakeFact(v) {
+    if (!v || typeof v !== "object" || typeof v.state !== "string") return [];
+    if (v.state === "ok") return [fact("Telegram-Eingang", "läuft")];
+    const known = v.state === "conflict" || v.state === "unauthorized" || v.state === "other";
+    const text = known && typeof v.message === "string" && v.message ? v.message : "unbekannt";
+    return [fact("Telegram-Eingang", text)];
+  }
+
   function statusFacts(d) {
     const version = d.version && typeof d.version === "object" ? d.version : {};
     const supervisor = d.supervisor === "launchd" ? "launchd" : d.supervisor === "pm2" ? "PM2" : d.supervisor === "systemd" ? "systemd" : d.supervisor === null ? "keiner" : "unbekannt";
@@ -4941,6 +4949,8 @@ function createSettingsView(deps) {
       fact("Ausführungen (laufend und wartend)", count(running.executions)),
       fact("Claude-Aufrufe", count(running.claudeCalls)),
       fact("Neustart angefordert", d.restartRequested === true ? "ja" : d.restartRequested === false ? "nein" : "unbekannt"),
+      // Telegram-Eingang (Issue #562): nur mit Zustand; bei 401, 409 und Störung die Meldung aus dem Log
+      ...intakeFact(d.telegramIntake),
     ];
     for (const [dt, dd] of rows) {
       list.appendChild(dt);

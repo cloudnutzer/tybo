@@ -10,6 +10,8 @@ config/.google-tokens.json
 
 # --- Eigene Einstellungen (Vorlagen liegen daneben als *.example.*) ---
 config/profile.md
+# Kern samt Sicherung, Sperre und Zwischendateien (Entwürfe liegen unter data/)
+config/kern.md*
 config/schedule.json
 config/agent-overrides.json
 config/settings.json
@@ -17,12 +19,17 @@ config/settings.json.lock
 config/topics.json
 config/agents.json
 config/routines.json
+config/wartung.json
 config/whatsapp-groups.json
 config/reminders.json
 config/*-state.json
+config/voice-agents/
+config/voice-agent-preise.json
 
 # --- Zustand des Bots, in welchem Ordner er auch liegt ---
 **/bot.lock
+# Zwischen- und Aufbruchdateien der Sperre (Issue #564)
+**/bot.lock.*
 **/session-state.json
 **/memory.json
 **/credit-tally.json

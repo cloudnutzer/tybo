@@ -99,7 +99,9 @@ describe("HTML-Dateien", () => {
     // tybo-push-device, tybo-push-off-pending: Gerät und ausstehendes Ausschalten für Web Push (Issue #225)
     // tybo-speech-device: Einstellungen des Sprechmodus auf diesem Gerät (Issue #250)
     // tybo-call-device: Einstellungen des Telefonhörers auf diesem Gerät (Issue #258)
-    expect(keys.sort()).toEqual(["tybo-call-device", "tybo-last-conversation", "tybo-push-device", "tybo-push-off-pending", "tybo-reload-drafts", "tybo-speech-device", "tybo-theme", "tybo-unread"]);
+    // tybo-sprachagent-gespraech: kein Speicher, Name der Web-Lock-Sperre für ein Gespräch je Browser (Issue #495)
+    // tybo-sprachagent-wizard-neu: Eingaben eines neuen Wizard-Entwurfs, bevor es eine Kennung gibt (Issue #515)
+    expect(keys.sort()).toEqual(["tybo-call-device", "tybo-last-conversation", "tybo-push-device", "tybo-push-off-pending", "tybo-reload-drafts", "tybo-speech-device", "tybo-sprachagent-gespraech", "tybo-sprachagent-wizard-neu", "tybo-theme", "tybo-unread"]);
   });
 });
 

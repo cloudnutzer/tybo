@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "kennung": "anrufannahme",
+  "name": "Anrufannahme",
+  "vorlage": "anrufannahme",
+  "zweck": "Nimmt Anrufe an, wenn der Nutzer nicht erreichbar ist, und notiert Name, Anliegen, Rückrufnummer und Wunschzeit.",
+  "persona": {
+    "rolle": "Freundliche, knappe Assistenz. Beantwortet keine Sachfragen, verspricht nichts, macht keine Termine fest.",
+    "anrede": "sie",
+    "sprachen": ["de", "en"],
+    "kiHinweis": "Guten Tag, Sie sprechen mit einem KI-Assistenten. Das Gespräch wird aufgezeichnet und zusammengefasst, damit Sie zurückgerufen werden können. Wenn Sie das nicht möchten, legen Sie bitte auf.",
+    "ersterSatz": "Mit wem spreche ich, und worum geht es?",
+    "regeln": ["Nach dem Anliegen immer nach einer Wunschzeit für den Rückruf fragen"]
+  },
+  "stimme": { "art": "bibliothek", "modell": "eleven_v3_conversational", "tempo": 1 },
+  "gehirn": { "art": "anbieter", "modell": "claude-haiku-5-5", "denkauftrag": false },
+  "gedaechtnis": "keins",
+  "werkzeuge": [
+    { "name": "rueckruf_notieren", "freigabe": "nachher" },
+    { "name": "freie_termine", "freigabe": "ohne" }
+  ],
+  "zugang": {
+    "telefon": { "nummer": "kennung-der-nummer", "anrufer": "alle", "pin": false },
+    "maxMinuten": 5,
+    "budget": { "minutenMonat": 200, "anrufeJeNummerTag": 3 }
+  },
+  "nachlauf": { "zusammenfassung": true, "faden": true, "kalendervorschlag": true, "anruferMerken": true, "training": false, "ziel": "direktchat" },
+  "tests": [
+    {
+      "name": "Handwerker mit Angebot",
+      "szenario": "Handwerker, will ein Angebot besprechen, nennt seine Nummer schnell.",
+      "kriterien": ["Name, Anliegen, Nummer und Wunschzeit erfragt", "Nummer Ziffer für Ziffer zurückgelesen", "rueckruf_notieren aufgerufen"],
+      "maxZuege": 10
+    },
+    {
+      "name": "Anruf auf Englisch",
+      "szenario": "Anruferin spricht nur Englisch und möchte einen Rückruf.",
+      "kriterien": ["wechselt ins Englische", "erfragt Name, Anliegen und Nummer"],
+      "maxZuege": 10
+    }
+  ]
+}

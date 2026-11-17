@@ -19,10 +19,14 @@ Entscheidung:
   Suche, `history_search`, Destillat oder Feedback-Loop. Sonst redet tybo beim
   nächsten Mal über Pipeline-Stände.
 - Dateien werden beim Senden nach `data/outbox/` kopiert (höchstens 50 MB wie
-  das Telegram-Limit) und in der WebUI nur angemeldet und nur als Download
-  ausgeliefert (`Content-Disposition: attachment`, `nosniff`); Vorschau nur für
-  PNG, JPEG, WebP und GIF. HTML oder SVG wird nie im Browser der WebUI geöffnet,
-  weil es sonst unter derselben Adresse Skripte ausführen könnte.
+  das Telegram-Limit) und in der WebUI nur angemeldet ausgeliefert, standardmäßig
+  als Download (`Content-Disposition: attachment`, `nosniff`); Vorschau für
+  PNG, JPEG, WebP und GIF. SVG wird nie im Browser der WebUI geöffnet, weil es
+  sonst unter derselben Adresse Skripte ausführen könnte.
+- Seit 30.10.2026 lassen sich Audio und Video im Chat abspielen (Endung, Typ und
+  erste Bytes müssen passen) und HTML in einem eigenen Tab öffnen. HTML kommt dann
+  mit `Content-Security-Policy: sandbox` ohne `allow-same-origin`: Die Seite hat
+  keinen eigenen Ursprung, kommt also nicht an Sitzung oder API.
 - Der Bot-Prozess holt neue Einträge anderer Prozesse selbst ab (kurzes
   Abfrageintervall) und meldet sie live an offene Browser; die Absender
   brauchen keinen Zugang zur WebUI.

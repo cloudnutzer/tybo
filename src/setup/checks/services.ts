@@ -14,7 +14,8 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { lingerCheckCommand, lingerCommand, parseShow } from "../../../setup/configure-systemd";
+import { KILL_MODE, KILL_MODE_LINE, lingerCheckCommand, lingerCommand, parseShow } from "../../../setup/configure-systemd";
+import { BRAND } from "../../brand";
 import { BOT_SERVICE, findLaunchctlLine, pm2Name, SUPABASE_SERVICE, SUPABASE_START_STATE, systemdUnit, systemdUnitFile } from "../../lib/service-names";
 import type { SetupContext } from "../context";
 import { DB_CONTAINER, isLocalSupabaseUrl, PROJECT_LABEL } from "../local-supabase";
@@ -58,7 +59,15 @@ function launchdColumns(listing: string, service: string): { pid: string; exit: 
   return { pid, exit };
 }
 
-/** ai.tybo.<dienst> für jeden Dienst; ein einziges launchctl list */
+/** Dauerdienste (KeepAlive): ohne Prozess antwortet niemand, egal mit welchem Exit-Code (Issue #567) */
+const LAUNCHD_DAEMONS: ReadonlySet<string> = new Set([BOT_SERVICE]);
+
+/**
+ * ai.tybo.<dienst> für jeden Dienst; ein einziges launchctl list. Ein
+ * geladener Dauerdienst ohne PID ist ein Fehler, wie unter systemd (Issue
+ * #567), auch mit letztem Exit 0; zeitgesteuerte Dienste stehen zwischen zwei
+ * Läufen ohne PID in der Liste und bleiben wie bisher.
+ */
 export async function launchdFindings(ctx: ServiceCheckContext, services: readonly string[]): Promise<Finding[]> {
   const listing = await exec(ctx, ["launchctl", "list"]);
   if (!listing.ok) return [fail("launchctl", "launchctl list ließ sich nicht abfragen")];
@@ -66,6 +75,13 @@ export async function launchdFindings(ctx: ServiceCheckContext, services: readon
     const cols = launchdColumns(listing.text, service);
     if (!cols) return skip(service, "Nicht eingerichtet");
     if (cols.pid !== "-") return pass(service, `Läuft (PID: ${cols.pid})`);
+    if (LAUNCHD_DAEMONS.has(service)) {
+      const exit = cols.exit && cols.exit !== "-" ? `letzter Exit-Code ${cols.exit}` : "letzter Exit-Code unbekannt";
+      return fail(
+        service,
+        `Geladen, läuft aber nicht (${exit}), ${BRAND.name} antwortet so nicht. Ursache in logs/${service}.error.log, Abhilfe in docs/troubleshooting.md unter „Bot-Dienst startet nicht (macOS)“`
+      );
+    }
     // Zeitgesteuerte Dienste stehen zwischen zwei Läufen mit Exit 0 in der Liste
     if (cols.exit === "0") return pass(service, "Geladen, letzter Exit 0 (wartet auf den Zeitplan)");
     return warn(service, `Geladen, letzter Exit-Code ${cols.exit}`);
@@ -126,7 +142,7 @@ export async function systemdFindings(ctx: ServiceCheckContext, exists: (path: s
   const unitFile = systemdUnitFile(BOT_SERVICE);
   if (!exists(join(ctx.systemdUserDir, unitFile))) return null;
   const unit = systemdUnit(BOT_SERVICE);
-  const show = await exec(ctx, ["systemctl", "--user", "show", unitFile, "--property=ActiveState,SubState,UnitFileState,MainPID"]);
+  const show = await exec(ctx, ["systemctl", "--user", "show", unitFile, "--property=ActiveState,SubState,UnitFileState,MainPID,KillMode"]);
   if (!show.ok) {
     return [fail(BOT_SERVICE, "systemd-Benutzerdienst antwortet nicht (systemctl --user); als normaler Benutzer prüfen, nicht über sudo")];
   }
@@ -144,6 +160,15 @@ export async function systemdFindings(ctx: ServiceCheckContext, exists: (path: s
   }
   if (props.UnitFileState !== "enabled") {
     found.push(warn(`${BOT_SERVICE} (Autostart)`, `Nicht aktiviert, startet nicht mit dem Rechner: systemctl --user enable ${unit}`));
+  }
+  // Issue #561: alte Dienstdatei ohne KillMode=process (wirksamer Wert samt Drop-ins); fehlt der Wert, keine Zeile
+  if (props.KillMode && props.KillMode !== KILL_MODE) {
+    found.push(
+      warn(
+        `${BOT_SERVICE} (Hintergrund-Jobs)`,
+        `Ein Neustart des Bots beendet auch laufende Hintergrund-Jobs (KillMode=${props.KillMode}, nötig ist ${KILL_MODE_LINE}). Nachziehen ohne Neustart: ${BRAND.cli} setup autostart`
+      )
+    );
   }
   found.push(await lingerFinding(ctx));
   return found;

@@ -99,6 +99,14 @@ export const CHOICE_SOURCES: Record<ChoiceKind, string> = {
   ask: "rueckfrage",
   // Auftrag aus einem Telefonanruf (Issue #366)
   call: "anruf",
+  // Bereinigung der Fakten (Issue #520)
+  cleanup: "gedaechtnis",
+  // Entwurf für den Kern (Issue #522)
+  core: "gedaechtnis",
+  // Geheimnisse in Fakten (Issue #524)
+  secret: "gedaechtnis",
+  // Sprachagenten (Issue #492), wie VOICE_AGENT_SOURCE in voice-agents/manage.ts
+  sprachagent: "sprachagent",
 };
 
 const VIA_TEXT: Record<ChoiceChannel, string> = {

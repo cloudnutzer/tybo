@@ -12,10 +12,17 @@
  *
  * Zeiten:
  * - Termine kommen aus dem Katalog (def.calendar). Ein fehlendes Feld steht
- *   dort, wie unter launchd, für jeden Wert und wird hier `*`. Die Einrichtung
+ *   dort, wie unter launchd, für jeden Wert und wird hier `*`. Ein Wochentag
+ *   (weekday, 0 = Sonntag) wird zu `Sun …` in OnCalendar bzw. zum fünften
+ *   cron-Feld. Die Einrichtung
  *   liest schedule.json in der Lesart „zero“ wie die bisherige cron-Einrichtung.
- * - OnCalendar und cron rechnen in der Zeitzone des Systems, nicht in
- *   USER_TIMEZONE; genauso wie launchd unter macOS.
+ * - Zeitzone (Issue #568): OnCalendar trägt die Zeitzone aus USER_TIMEZONE
+ *   (`OnCalendar=*-*-* 03:30:00 Europe/Berlin`), denn Check-in, Briefing
+ *   und Nachtcheck meinen die Uhrzeit des Nutzers, nicht die des Servers
+ *   (oft UTC). Fehlt USER_TIMEZONE oder ist der Wert keine gültige
+ *   Zeitzone, gilt die des Systems; der Timer sagt das in einem Kommentar,
+ *   die Einrichtung warnt bei einem ungültigen Wert (timerTimeZone). cron
+ *   und PM2 rechnen immer in der Zeitzone des Systems.
  * - Persistent=true: ein Termin, den der Rechner verpasst hat (aus oder im
  *   Ruhezustand), läuft einmal nach dem nächsten Start nach, wie launchd
  *   StartCalendarInterval nach dem Aufwachen. cron holt nichts nach.
@@ -89,9 +96,37 @@ export function timerSlots(def: ServiceDefinition, schedule: SetupSchedule): Set
 
 const two = (n: number | undefined) => (n === undefined ? "*" : String(n).padStart(2, "0"));
 
-/** Termin als OnCalendar-Ausdruck, täglich; fehlendes Feld heißt jeder Wert */
-export function onCalendar(slot: SetupInterval): string {
-  return `*-*-* ${two(slot.hour)}:${two(slot.minute)}:00`;
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/** Termin als OnCalendar-Ausdruck, täglich oder an einem Wochentag; fehlendes Feld heißt jeder Wert; mit Zeitzone dahinter */
+export function onCalendar(slot: SetupInterval, timeZone: string | null = null): string {
+  const day = slot.weekday === undefined ? "" : `${WEEKDAYS[slot.weekday]} `;
+  return `${day}*-*-* ${two(slot.hour)}:${two(slot.minute)}:00${timeZone ? ` ${timeZone}` : ""}`;
+}
+
+/** Name einer Zeitzone, wie systemd ihn als Datei unter zoneinfo sucht: keine Leerzeichen, kein Doppelpunkt, kein .. */
+const ZONE_NAME = /^[A-Za-z][A-Za-z0-9_+-]*(?:\/[A-Za-z0-9_+-]+)*$/;
+
+/**
+ * Zeitzone für OnCalendar aus USER_TIMEZONE. zone null heißt Zeitzone des
+ * Systems; warning steht nur bei einem gesetzten, aber ungültigen Wert.
+ * Gültig ist, was Intl kennt und als Name unter zoneinfo stehen kann
+ * (keine festen Abstände wie „+01:00“). Weicht nur die Schreibweise ab
+ * („europe/berlin“), gilt die von Intl, denn systemd sucht die Datei mit
+ * genau diesem Namen.
+ */
+export function timerTimeZone(raw: string | undefined): { zone: string | null; warning: string | null } {
+  const value = raw?.trim() ?? "";
+  if (!value) return { zone: null, warning: null };
+  const invalid = { zone: null, warning: `USER_TIMEZONE „${value.slice(0, 40)}“ ist keine gültige Zeitzone; die Timer laufen in der Zeitzone des Systems. Beispiel: USER_TIMEZONE=Europe/Berlin` };
+  if (!ZONE_NAME.test(value)) return invalid;
+  let resolved: string;
+  try {
+    resolved = new Intl.DateTimeFormat("en-US", { timeZone: value }).resolvedOptions().timeZone;
+  } catch {
+    return invalid;
+  }
+  return { zone: resolved.toLowerCase() === value.toLowerCase() ? resolved : value, warning: null };
 }
 
 function requireRoutine(def: ServiceDefinition): void {
@@ -126,19 +161,24 @@ export function serviceUnit(def: ServiceDefinition, m: LinuxMachine): string {
   ].join("\n");
 }
 
-/** Inhalt von tybo-<dienst>.timer; wirft ohne Termine (systemd lehnt einen Timer ohne OnCalendar ab) */
-export function timerUnit(def: ServiceDefinition, schedule: SetupSchedule): string {
+/**
+ * Inhalt von tybo-<dienst>.timer; wirft ohne Termine (systemd lehnt einen
+ * Timer ohne OnCalendar ab). timeZone: geprüfter Wert aus timerTimeZone,
+ * null für die Zeitzone des Systems.
+ */
+export function timerUnit(def: ServiceDefinition, schedule: SetupSchedule, timeZone: string | null = null): string {
   requireRoutine(def);
   const slots = timerSlots(def, schedule);
   if (slots.length === 0) throw new UnitError(`${def.name} hat keine Termine`);
+  if (timeZone !== null && !ZONE_NAME.test(timeZone)) throw new UnitError("Zeitzone mit Zeichen, die systemd als Syntax liest");
   return [
     HEADER,
     "[Unit]",
     `Description=${BRAND.name}: Zeitplan für ${def.summary}`,
     "",
     "[Timer]",
-    "# Zeitzone des Systems; verpasste Termine einmal nachholen",
-    ...slots.map(slot => `OnCalendar=${onCalendar(slot)}`),
+    timeZone ? `# Zeitzone aus USER_TIMEZONE; verpasste Termine einmal nachholen` : "# Zeitzone des Systems (USER_TIMEZONE fehlt oder ist ungültig); verpasste Termine einmal nachholen",
+    ...slots.map(slot => `OnCalendar=${onCalendar(slot, timeZone)}`),
     "Persistent=true",
     `Unit=${systemdUnit(def.name)}.service`,
     "",
@@ -156,7 +196,28 @@ export function cronLines(def: ServiceDefinition, m: LinuxMachine, schedule: Set
   const out = checkWord(`${root}/${def.logs.out}`);
   const err = checkWord(`${root}/${def.logs.err}`);
   const command = `cd ${checkWord(root)} && ${env.join(" ")} ${commandWords(def, m).join(" ")} >> ${out} 2>> ${err} ${cronMarker(def.name)}`;
-  return cronTimes(timerSlots(def, schedule)).map(time => `${time} * * * ${command}`);
+  // Je Wochentag eine eigene Gruppe von Zeilen (cron-Feld 5, 0 = Sonntag); ohne Wochentag jeden Tag
+  const groups = new Map<string, SetupInterval[]>();
+  for (const slot of timerSlots(def, schedule)) {
+    const day = slot.weekday === undefined ? "*" : String(slot.weekday);
+    groups.set(day, [...(groups.get(day) ?? []), slot]);
+  }
+  return [...groups].flatMap(([day, slots]) => cronTimes(slots).map(time => `${time} * * ${day} ${command}`));
+}
+
+/**
+ * Zeitplan für PM2 (cron_restart, Issue #568): genau ein cron-Ausdruck mit
+ * fünf Feldern. PM2 kennt je Prozess nur einen; ergäben die Termine mehrere
+ * Zeilen (verschiedene Uhrzeiten oder Wochentage), wirft die Funktion.
+ * PM2 rechnet in der Zeitzone des Systems.
+ */
+export function pm2CronExpression(def: ServiceDefinition, schedule: SetupSchedule): string {
+  requireRoutine(def);
+  const slots = timerSlots(def, schedule);
+  const days = [...new Set(slots.map(slot => (slot.weekday === undefined ? "*" : String(slot.weekday))))];
+  const times = cronTimes(slots);
+  if (times.length !== 1 || days.length !== 1) throw new UnitError(`${def.name} braucht unter PM2 genau einen Zeitplan`);
+  return `${times[0]} * * ${days[0]}`;
 }
 
 const range = (n: number) => Array.from({ length: n }, (_, i) => i);

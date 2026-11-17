@@ -184,7 +184,16 @@ export async function runProactive(
   let message: ProactiveMessage | null = null;
   let outcome: ProactiveOutcome | undefined;
   const renewMs = deps.renewMs ?? CLAIM_RENEW_MS;
-  const renewer = renewMs > 0 ? setInterval(() => void renewClaim(statePath, kind, token, now()).catch(() => {}), renewMs) : undefined;
+  // Die nächste Erneuerung erst renewMs nach dem Ende der vorigen: wartet eine
+  // länger auf die Sperre, stauten sich sonst Erneuerungen davor und
+  // verdrängten andere Läufe, die dort nur begrenzt warten
+  let renewing = renewMs > 0;
+  let renewer: ReturnType<typeof setTimeout> | undefined;
+  const scheduleRenew = () => {
+    if (!renewing) return;
+    renewer = setTimeout(() => void renewClaim(statePath, kind, token, now()).catch(() => {}).finally(scheduleRenew), renewMs);
+  };
+  scheduleRenew();
   try {
     message = await compose({ kind, now: now(), zone, config });
     if (!message || message.text.trim() === "") outcome = { status: "skipped", reason: "nothing" };
@@ -192,7 +201,8 @@ export async function runProactive(
     console.error(`[proactive] ${kind}: Text nicht gebaut (${errorName(error)})`);
     outcome = { status: "failed", reason: "compose" };
   } finally {
-    clearInterval(renewer);
+    renewing = false;
+    clearTimeout(renewer);
   }
 
   if (!outcome) {

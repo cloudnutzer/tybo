@@ -21,6 +21,8 @@ import {
   type ChoiceConversation,
   type CreateChoiceInput,
 } from "../src/lib/choices";
+import { CALL_SUMMARY_DISABLED_TEXT, extractTaskFromTranscript, summarizeTranscriptStrict } from "../src/lib/call-summary";
+import { resetClaudeAvailabilityForTests, setClaudeAvailability } from "../src/lib/claude-availability";
 import { callIdsFrom, callNote } from "../src/lib/phone/bridge-note";
 import { callVariables } from "../src/lib/phone/context";
 import { historyRecorder } from "../src/lib/phone";
@@ -113,6 +115,11 @@ function harness(
     deliver?: (text: string) => DeliveryOutcome;
     /** Ergebnis der Ablage im Verlauf je Versuch (der letzte bleibt stehen); Standard true */
     store?: (boolean | Error)[];
+    /** Eigene Zusammenfassung und Auftragssuche statt der festen Attrappen */
+    summarize?: (transcript: string) => Promise<string>;
+    findTask?: (transcript: string, summary: string) => Promise<string | null>;
+    /** Logzeilen des Dienstes */
+    logs?: string[];
   } = {},
 ): Harness {
   const net = fakeFetch(routes);
@@ -126,9 +133,10 @@ function harness(
     ledger,
     summarize: async transcript => {
       h.summaries.push(transcript);
-      return "Folien für Freitag besprochen.";
+      return opts.summarize ? opts.summarize(transcript) : "Folien für Freitag besprochen.";
     },
-    findTask: async () => (opts.task === undefined ? "Folien für Freitag vorbereiten" : opts.task),
+    findTask: async (transcript, summary) =>
+      opts.findTask ? opts.findTask(transcript, summary) : opts.task === undefined ? "Folien für Freitag vorbereiten" : opts.task,
     notify: async (conversation, text, format) => {
       h.notes.push({ conversation, text, format });
       return opts.deliver ? opts.deliver(text) : "delivered";
@@ -163,7 +171,7 @@ function harness(
     pollMs: 10_000,
     waitMs: 60_000,
     newRef: () => `ref${++refs}${Math.random().toString(36).slice(2, 6)}`,
-    log: () => {},
+    log: line => void opts.logs?.push(line),
   });
   return h;
 }
@@ -394,6 +402,63 @@ describe("Anrufen und Abholen", () => {
     expect(h.notes).toHaveLength(1);
     expect(h.asked).toEqual([]);
     expect(h.ledger.get(result.ref!)?.stage).toBe("closed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ohne Claude (Issue #566)
+// ---------------------------------------------------------------------------
+
+describe("Zusammenfassung abgeschaltet (Claude fehlt, Issue #566)", () => {
+  const savedPath = process.env.CLAUDE_PATH;
+  const savedAux = process.env.AUX_MODEL_CALL_SUMMARY;
+  beforeEach(() => {
+    // Ein Aufruf der Claude CLI landete hier und scheiterte ohne disabled
+    process.env.CLAUDE_PATH = join(dir, "gibt-es-nicht", "claude");
+    delete process.env.AUX_MODEL_CALL_SUMMARY;
+    setClaudeAvailability({ state: "missing", reason: "Claude CLI nicht installiert" });
+  });
+  afterEach(() => {
+    resetClaudeAvailabilityForTests();
+    if (savedPath === undefined) delete process.env.CLAUDE_PATH;
+    else process.env.CLAUDE_PATH = savedPath;
+    if (savedAux === undefined) delete process.env.AUX_MODEL_CALL_SUMMARY;
+    else process.env.AUX_MODEL_CALL_SUMMARY = savedAux;
+  });
+
+  test("echte call-summary: ein Versuch, Anfang des Protokolls mit Grund, auch mit vorgespulter Uhr und Neustart keine Wiederholung und kein Fehlerlog", async () => {
+    const clock = { t: 1_000_000 };
+    const logs: string[] = [];
+    const errors: unknown[][] = [];
+    const realError = console.error;
+    console.error = (...args: unknown[]) => void errors.push(args);
+    try {
+      const h = harness({ dial: [DIALED], poll: [DONE] }, { clock, logs, summarize: summarizeTranscriptStrict, findTask: extractTaskFromTranscript });
+      const result = await h.service.startCall({ reason: "Folien", conversation: TOPIC, userName: "Alex" });
+      await h.service.idle();
+      const call = h.ledger.get(result.ref!);
+      expect(call).toMatchObject({ stage: "closed", note: "Zusammenfassung abgeschaltet" });
+      expect(h.summaries).toHaveLength(1);
+      expect(h.notes).toHaveLength(1);
+      expect(h.notes[0].conversation).toEqual(TOPIC);
+      expect(h.notes[0].text).toContain("Alex: Bitte bereite die Folien für Freitag vor.");
+      expect(h.notes[0].text).toContain(CALL_SUMMARY_DISABLED_TEXT);
+      expect(h.asked).toEqual([]);
+
+      // Weit über Frist und Wiederholungsabstand vorspulen, dann ein Neustart: nichts mehr
+      clock.t += 24 * 60 * 60 * 1000;
+      const again = harness({ poll: [DONE] }, { clock, logs, summarize: summarizeTranscriptStrict, findTask: extractTaskFromTranscript });
+      again.service.resume();
+      await again.service.idle();
+      expect(again.summaries).toEqual([]);
+      expect(again.notes).toEqual([]);
+
+      expect(logs.filter(l => /gescheitert|neuer Versuch|unterbrochen/.test(l))).toEqual([]);
+      expect(logs.filter(l => l.includes("Zusammenfassung abgeschaltet (Claude fehlt)"))).toHaveLength(1);
+      expect(errors).toEqual([]);
+    } finally {
+      console.error = realError;
+    }
   });
 });
 

@@ -239,6 +239,7 @@ describe("Tags", () => {
       "[CANCEL: partial match]",
       "[REMEMBER: fact]",
       "[FORGET: partial match]",
+      "[KNOWLEDGE: category | title | content | project]",
       "[REMIND: when | text]",
     ]) {
       expect(MEMORY_TAGS_SECTION).toContain(syntax);
@@ -249,9 +250,10 @@ describe("Tags", () => {
       "[CANCEL: Marathon laufen]",
       "[REMEMBER: Alex mag kurze Antworten]",
       "[FORGET: alte Adresse]",
+      "[KNOWLEDGE: reference | Teekannen | Gusseisen hält die Wärme am längsten]",
       "[REMIND: morgen 9 Uhr | Zahnarzt anrufen]",
     ].join("\n");
-    expect(parseMemoryIntents(reply).map(i => i.type).sort()).toEqual(["cancel", "done", "fact", "forget", "goal", "remind"]);
+    expect(parseMemoryIntents(reply).map(i => i.type).sort()).toEqual(["cancel", "done", "fact", "forget", "goal", "knowledge", "remind"]);
   });
 
   test("Bildbeschreibung: Syntax und Beispiel passen zum Parser", () => {

@@ -1,0 +1,3 @@
+; Kein Rückruf bei besetzt (Issue #511)
+[general]
+cc_max_requests = 0

@@ -2302,6 +2302,19 @@ describe("Reiter „Status\"", () => {
     expect(await shown({ storage: "none", semanticSearch: null })).toBeUndefined();
   });
 
+  test("Telegram-Eingang (Issue #562): läuft, Meldung bei 409 und 401, ohne Zustand keine Zeile", async () => {
+    const shown = async (telegramIntake: unknown) => facts(await openStatus({ status: statusBody({ telegramIntake }) }))["Telegram-Eingang"];
+    const since = "2026-11-12T09:00:00.000Z";
+    expect(await shown({ state: "ok", message: "Telegram-Eingang läuft.", since })).toBe("läuft");
+    const conflict = "Telegram: Ein anderer Bot nutzt denselben Token (409). Telegram-Eingang pausiert, nächster Versuch in 15 Sekunden.";
+    expect(await shown({ state: "conflict", message: conflict, since })).toBe(conflict);
+    const unauthorized = "Telegram lehnt den Token ab (401). Telegram-Eingang aus, bis der Token stimmt.";
+    expect(await shown({ state: "unauthorized", message: unauthorized, since })).toBe(unauthorized);
+    expect(await shown({ state: "komisch", message: "x", since })).toBe("unbekannt");
+    expect(await shown(null)).toBeUndefined();
+    expect(await shown(undefined)).toBeUndefined();
+  });
+
   test("Schlüssel nur als Name und gesetzt/fehlt, nie Werte oder Teile davon", async () => {
     const app = await openStatus();
     const rows = app.byClass("settings-keys").flatMap(ul => ul.children).map((li: Node) => li.children.map((c: Node) => c.textContent).join(" = "));
@@ -3766,7 +3779,7 @@ describe("Reiter „Routinen\"", () => {
     expect(empty.texts("settings-empty")).toContain("Keine Routinen gefunden.");
     expect(empty.byKey("routines-daemons")).toBeUndefined();
     const off = await openRoutines({ routines: { available: false, source: null, routines: [], notes: [] } });
-    expect(off.texts("settings-empty")).toContain("Routinen: auf diesem System nicht verfügbar (weder launchd noch PM2).");
+    expect(off.texts("settings-empty")).toContain("Routinen: auf diesem System nicht verfügbar (weder launchd noch systemd noch PM2).");
     expect(off.texts("actions-error")).toEqual([]);
   });
 

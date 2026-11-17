@@ -135,7 +135,7 @@ describe("Text der Übersicht", () => {
 
   test("nicht verfügbar: Linux ohne pm2", async () => {
     const text = formatRoutineList(await listRoutines(fakeRoutinesDeps({ platform: "linux", pm2Path: null })));
-    expect(text).toBe("Routinen: auf diesem System nicht verfügbar (weder launchd noch PM2).");
+    expect(text).toBe("Routinen: auf diesem System nicht verfügbar (weder launchd noch systemd noch PM2).");
     expect(text).toContain("auf diesem System nicht verfügbar");
   });
 

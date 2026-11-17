@@ -1,0 +1,8 @@
+# Auf dem Server entstehend, nie ins Repo
+.env
+erzeugt/
+erzeugt.neu/
+erzeugt.alt/
+zertifikat/
+logs/
+zustand/

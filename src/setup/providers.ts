@@ -9,6 +9,8 @@
  */
 
 import { claudeAuthProblem } from "../lib/engines/claude-auth";
+import { openCodeProviderKeysIn, parseOpenCodeAuthList } from "../lib/engines/check";
+import { parseOpenCodeVersion } from "../lib/engines/opencode";
 import { filterSubprocessEnv, SUBPROCESS_MARKER } from "../lib/subprocess-env";
 import { supabaseHeaders } from "../lib/supabase-keys";
 import type { CommandRunner, HttpFetch } from "./context";
@@ -38,6 +40,20 @@ export interface ClaudeRunContext {
   env?: Record<string, string>;
 }
 
+/**
+ * Motor außer Claude Code (Issue #566): Pfad, Ordner und Umgebung der
+ * Prüfung, aus der .env des Projekts (CODEX_PATH, OPENCODE_PATH), nicht aus
+ * der Shell der Einrichtung
+ */
+export interface EngineRunContext {
+  path?: string;
+  cwd?: string;
+  env?: Record<string, string>;
+}
+
+/** Motoren, die die Einrichtung selbst prüft; Claude Code prüft der Schritt „voraussetzungen“ */
+export type CheckedEngine = "codex" | "opencode" | "api";
+
 export interface OllamaResult extends ProbeResult {
   models?: string[];
 }
@@ -58,6 +74,16 @@ export interface Providers {
   claudeVersion(claudePath: string, context?: ClaudeRunContext): Promise<ClaudeVersionResult>;
   /** Echter Probeaufruf; context wie bei claudeVersion */
   claudeProbe(claudePath: string, context?: ClaudeRunContext): Promise<ProbeResult>;
+  /**
+   * Ist der Motor installiert und angemeldet (Issue #566)? Wie checkEngine
+   * aus src/lib/engines/check.ts, aber mit dem Befehlsläufer der
+   * Einrichtung und dem Kontext oben: Codex mit `codex --version` und
+   * `codex login status`, OpenCode mit `opencode --version` und
+   * `opencode auth list`, die Anthropic API über den Schlüssel in der
+   * Umgebung. Kein Modellaufruf; von den Ausgaben gehen nur
+   * Versionsnummer und Anbieternamen weiter.
+   */
+  engineCheck(engine: CheckedEngine, context?: EngineRunContext): Promise<ProbeResult>;
   openrouterKey(key: string): Promise<ProbeResult>;
   ollamaTags(): Promise<OllamaResult>;
 }
@@ -73,6 +99,13 @@ export const TELEGRAM_API = "https://api.telegram.org";
 export const OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key";
 export const OLLAMA_TAGS_URL = "http://localhost:11434/api/tags";
 const CLAUDE_PROBE_TIMEOUT_MS = 90_000;
+const ENGINE_CHECK_TIMEOUT_MS = 10_000;
+
+export const CODEX_MISSING = "Codex nicht gefunden (anderer Pfad über CODEX_PATH in .env). Installieren: npm install -g @openai/codex";
+export const CODEX_LOGGED_OUT = "Codex ist nicht angemeldet. Im Terminal „codex login“ ausführen.";
+export const OPENCODE_MISSING = "OpenCode nicht gefunden (anderer Pfad über OPENCODE_PATH in .env).";
+export const OPENCODE_LOGGED_OUT = "OpenCode ist nicht angemeldet. Im Terminal „opencode auth login“ ausführen.";
+export const API_KEY_ABSENT = "Für den Motor Anthropic API fehlt ANTHROPIC_API_KEY in der .env.";
 
 /**
  * Nur die Versionsnummer aus einer Befehlsausgabe (etwa „2.1.300“), sonst
@@ -313,6 +346,34 @@ export function createProviders(deps: ProviderDeps): Providers {
       }
       if (text.includes("limit")) return { ok: false, message: "Claude CLI ist angemeldet, aber das Nutzungslimit ist erreicht." };
       return { ok: false, message: "Der Probeaufruf der Claude CLI ist fehlgeschlagen. Im Terminal „claude“ starten und prüfen." };
+    },
+
+    async engineCheck(engine, context = {}) {
+      const env = context.env ?? probeEnv();
+      if (engine === "api") {
+        return env.ANTHROPIC_API_KEY?.trim() ? { ok: true, message: "Anthropic API: Schlüssel ist gesetzt." } : { ok: false, message: API_KEY_ABSENT };
+      }
+      const name = engine === "codex" ? "Codex" : "OpenCode";
+      const path = context.path || engine;
+      const options = { timeoutMs: ENGINE_CHECK_TIMEOUT_MS, env, ...(context.cwd ? { cwd: context.cwd } : {}) };
+      const version = await run([path, "--version"], options);
+      if (version.code === -1 && version.spawnError === "ENOENT") return { ok: false, message: engine === "codex" ? CODEX_MISSING : OPENCODE_MISSING };
+      if (version.timedOut) return { ok: false, message: `${name} antwortet nicht („${engine} --version“ brauchte zu lange).` };
+      if (version.code !== 0) return { ok: false, message: `${name} ist da, startet aber nicht richtig („${engine} --version“ scheitert).` };
+      if (engine === "codex") {
+        const v = versionOnly(version.stdout);
+        const login = await run([path, "login", "status"], options);
+        if (login.code === 0) return { ok: true, message: `Codex${v ? ` ${v}` : ""} ist angemeldet.` };
+        if (login.timedOut) return { ok: false, message: "Codex-Anmeldung nicht prüfbar („codex login status“ brauchte zu lange)." };
+        return { ok: false, message: CODEX_LOGGED_OUT };
+      }
+      const parsed = parseOpenCodeVersion(version.stdout.slice(0, 200));
+      if (!parsed) return { ok: false, message: "OpenCode meldet keine erkennbare Version." };
+      if (parsed.major !== 1) return { ok: false, message: `OpenCode ${parsed.version} wird nicht unterstützt, nötig ist Version 1.` };
+      const login = await run([path, "auth", "list"], options);
+      const list = login.code === 0 ? parseOpenCodeAuthList(login.stdout) : null;
+      if ((list && list.count > 0) || openCodeProviderKeysIn(env).length > 0) return { ok: true, message: `OpenCode ${parsed.version} ist angemeldet.` };
+      return { ok: false, message: list ? OPENCODE_LOGGED_OUT : "OpenCode-Anmeldung nicht prüfbar („opencode auth list“ scheitert)." };
     },
 
     async openrouterKey(key) {

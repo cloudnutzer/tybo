@@ -20,7 +20,9 @@
  * oder Treffer eines Worts die anderen nicht verdrängen.
  *
  * Tabellen-, Spalten- und Funktionsnamen sind Schnittstelle zur Datenbank.
- * Fehler und Ausnahmen ergeben leere Listen bzw. einen Schreibfehler.
+ * Fehler und Ausnahmen ergeben leere Listen bzw. einen Schreibfehler; nur der
+ * Kontext mit strict wirft, damit das Nachschlagen „nicht lesbar“ von „kein Eintrag“
+ * trennen kann.
  */
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { containsPattern } from "../../../../supabase/functions/_shared/like-pattern";
@@ -40,6 +42,8 @@ export const PRIORITY_CATEGORIES: KnowledgeCategory[] = ["project", "decision", 
 export const SIMILARITY_THRESHOLD = 0.7;
 /** Längster Text, der an den Embedding-Anbieter geht */
 const EMBEDDING_TEXT_LIMIT = 8000;
+
+const CONTEXT_UNREADABLE = "Supabase: Wissensbasis nicht lesbar";
 
 /** Sätze für den Nutzer, im Wortlaut wie vor #317 (/learn zeigt sie an) */
 export const KNOWLEDGE_TEXT = {
@@ -149,6 +153,7 @@ export function supabaseKnowledge(clientSource: ClientSource, deps: KnowledgeDep
       ),
       Promise.all(q.terms.map(term => textSearch(client, [term], q.perTerm))),
     ]);
+    if (q.strict && [...priority, ...textual].includes(null)) throw new Error(CONTEXT_UNREADABLE);
     const picked: KnowledgeHit[] = [
       ...priority.flatMap(found => (found ?? []).map(row => asHit(row, "priority"))),
       ...textual.flatMap(found => (found ?? []).map(row => asHit(row, "text"))),
@@ -215,8 +220,9 @@ export function supabaseKnowledge(clientSource: ClientSource, deps: KnowledgeDep
         return ((await textSearch(client, terms, limit, category)) ?? []).map(row => asHit(row, "text"));
       }),
 
-    context: q =>
-      withClient<KnowledgeHit[]>([], async client => {
+    context: q => {
+      if (q.strict && !clientSource()) return Promise.reject(new Error(CONTEXT_UNREADABLE));
+      return withClient<KnowledgeHit[]>([], async client => {
         const answer = await rows(() =>
           client.rpc("knowledge_context", {
             p_terms: q.terms,
@@ -237,6 +243,7 @@ export function supabaseKnowledge(clientSource: ClientSource, deps: KnowledgeDep
             return asHit(rest, match);
           }),
         );
-      }),
+      });
+    },
   };
 }

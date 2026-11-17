@@ -56,6 +56,7 @@ function fakeSources(over: Partial<PromptSources> = {}): { sources: PromptSource
     overrides: () => "",
     consultation: name => `${CONSULTATION_HEADING}\nfür ${name}`,
     profile: async () => "Name: Alex",
+    core: async () => "",
     memory: async () => "FACTS:\n- mag Tee",
     knowledge: async () => "- [howto] Drucker",
     recent: async (chatId, limit, topicId) => {
@@ -70,6 +71,8 @@ function fakeSources(over: Partial<PromptSources> = {}): { sources: PromptSource
       seen.memorySince.push(since.getTime());
       return "- [fact] wohnt in Leipzig";
     },
+    // Wie der echte Suchweg: Treffer und Fakten aus einer Suche; Tests geben Treffer über similar vor
+    followUp: async (chatId, query, limit) => ({ messages: await sources.similar(chatId, query, limit), facts: [] }),
     now: () => NOW,
     timeZone: () => ZONE,
     ...over,
@@ -79,6 +82,43 @@ function fakeSources(over: Partial<PromptSources> = {}): { sources: PromptSource
 
 const sections = (prompt: string) => prompt.split("\n\n---\n\n");
 const heads = (prompt: string) => sections(prompt).map(s => s.split("\n")[0]);
+
+describe("fester Kern (Issue #522)", () => {
+  const HEADING = "## USER CORE (confirmed by the user)";
+
+  test("steht nach dem Profil im frischen Prompt und im Fallback-Kontext, das Budget der Suche bleibt getrennt", async () => {
+    const { sources } = fakeSources({ core: async () => "Alex, Imkerin" });
+    const { fullPrompt, fallbackContext } = await buildPromptContext({ userMessage: "q", chatId: "1", agentName: "general" }, sources);
+    const order = heads(fullPrompt);
+    expect(order.slice(order.indexOf("## USER PROFILE"), order.indexOf("## USER PROFILE") + 3)).toEqual(["## USER PROFILE", HEADING, "## CURRENT TIME"]);
+    expect(sections(fullPrompt)).toContain(`${HEADING}\nAlex, Imkerin`);
+    expect(sections(fullPrompt)).toContain("## MEMORY\nFACTS:\n- mag Tee");
+    expect(fallbackContext.split("\n\n")).toContain(`${HEADING}\nAlex, Imkerin`);
+    expect(fallbackContext).toContain("## MEMORY (facts & goals)\nFACTS:\n- mag Tee");
+  });
+
+  test("ohne Kern fehlt der Abschnitt, der Prompt ist derselbe wie ohne diese Quelle", async () => {
+    const { sources } = fakeSources();
+    const { fullPrompt, fallbackContext } = await buildPromptContext({ userMessage: "q", chatId: "1", agentName: "general" }, sources);
+    expect(fullPrompt).not.toContain("USER CORE");
+    expect(fallbackContext).not.toContain("USER CORE");
+  });
+
+  test("ein Fehler der Quelle kostet nur den Abschnitt", async () => {
+    const { sources } = fakeSources({ core: async () => { throw new Error("kaputt"); } });
+    const { fullPrompt } = await buildPromptContext({ userMessage: "q", chatId: "1", agentName: "general" }, sources);
+    expect(fullPrompt).not.toContain("USER CORE");
+    expect(fullPrompt).toContain("## USER MESSAGE\nq");
+  });
+
+  test("die Folgenachricht einer Session trägt ihn nicht", async () => {
+    let asked = 0;
+    const { sources } = fakeSources({ core: async () => (asked++, "Alex, Imkerin") });
+    const prompt = await buildResumePrompt({ userMessage: "q", chatId: "1", sinceMs: 1 }, sources);
+    expect(prompt).not.toContain("Imkerin");
+    expect(asked).toBe(0);
+  });
+});
 
 describe("frischer Prompt", () => {
   test("Reihenfolge der Abschnitte, Kanal Telegram ohne Angabe", async () => {
@@ -94,6 +134,7 @@ describe("frischer Prompt", () => {
       "## RECENT CONVERSATION",
       "## SEMANTIC SEARCH RESULTS",
       CONSULTATION_HEADING,
+      "## LOOKING UP EARLIER INFORMATION",
       "## MEMORY TAGS",
       "## QUESTIONS WITH BUTTONS",
       "## IMAGES",
@@ -142,6 +183,7 @@ describe("frischer Prompt", () => {
       CHANNEL_HEADING,
       "## CURRENT TIME",
       CONSULTATION_HEADING,
+      "## LOOKING UP EARLIER INFORMATION",
       "## MEMORY TAGS",
       "## QUESTIONS WITH BUTTONS",
       "## IMAGES",
@@ -406,8 +448,8 @@ describe("Kanal im Chat-Kern", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  function deps(): Partial<ChatTurnDeps> {
-    const { sources } = fakeSources();
+  function deps(over: Partial<PromptSources> = {}): Partial<ChatTurnDeps> {
+    const { sources } = fakeSources(over);
     let n = 0;
     const engine: Engine = {
       id: "claude",
@@ -478,6 +520,25 @@ describe("Kanal im Chat-Kern", () => {
     ]);
     // Der Kanal stammt nie aus der Chat-ID: dieselbe Gruppe, verschiedene Kanäle
     expect(new Set(requests.map(r => r.resumeSessionId ?? "frisch"))).toEqual(new Set(["frisch", "s-1"]));
+  });
+
+  test("Kern (Issue #522): Session-Start und erste Nachricht nach /new tragen ihn, Folgenachrichten nicht; eine Änderung wirkt ohne Neustart", async () => {
+    let core = "Kern A";
+    const d = deps({ core: async () => core });
+    await turn(d);
+    core = "Kern B";
+    await turn(d);
+    expect(requests[0]!.resumeSessionId).toBeUndefined();
+    expect(requests[0]!.prompt).toContain("Kern A");
+    expect(requests[1]!.resumeSessionId).toBe("s-1");
+    expect(requests[1]!.prompt).not.toContain("Kern");
+
+    await resetSession("topic:-100555:5");
+    requests.length = 0;
+    await turn(d);
+    expect(requests[0]!.resumeSessionId).toBeUndefined();
+    expect(requests[0]!.prompt).toContain("Kern B");
+    expect(requests[0]!.prompt).not.toContain("Kern A");
   });
 
   test("frische Session im Browser", async () => {

@@ -273,3 +273,52 @@ exports[`Snapshot je Dienst supabase 1`] = `
 </plist>
 "
 `;
+
+exports[`Snapshot je Dienst wartung 1`] = `
+"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Erzeugt von tybo aus src/lib/services/catalog.ts; die nächste Einrichtung überschreibt Änderungen -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.tybo.wartung</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/bun/bin/bun</string>
+		<string>--no-env-file</string>
+		<string>src/routine-run.ts</string>
+		<string>--id</string>
+		<string>ai.tybo.wartung</string>
+		<string>--</string>
+		<string>/opt/bun/bin/bun</string>
+		<string>run</string>
+		<string>src/maintenance.ts</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/home/test/tybo</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/bun/bin:/home/test/.local/bin:/home/test/.local/bin:/home/test/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin</string>
+		<key>HOME</key>
+		<string>/home/test</string>
+		<key>GO_PROJECT_ROOT</key>
+		<string>/home/test/tybo</string>
+	</dict>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>3</integer>
+		<key>Minute</key>
+		<integer>15</integer>
+		<key>Weekday</key>
+		<integer>0</integer>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/home/test/tybo/logs/wartung.log</string>
+	<key>StandardErrorPath</key>
+	<string>/home/test/tybo/logs/wartung.error.log</string>
+</dict>
+</plist>
+"
+`;

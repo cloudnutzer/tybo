@@ -2,7 +2,8 @@
  * Tor fuer Merk-Tags aus einem Turn (Issue #53, Entscheidung 0008 Punkt 2).
  *
  * Hat der Turn fremde Inhalte gelesen (Web, Mail, lesende MCP-Werkzeuge,
- * Dateien ausserhalb des Projekts, siehe turn-tools.ts), werden seine
+ * curl und Co., gh gegen fremde oder unklare Repos, siehe turn-tools.ts;
+ * Dateien auf diesem Rechner zaehlen seit Issue #525 nicht mehr), werden seine
  * [REMEMBER:]/[GOAL:]/[FORGET:]/[DONE:]/[CANCEL:]/[KNOWLEDGE:] (#317)/[REMIND:] (#322) nicht angewendet, sondern
  * als Vorschlag mit Knoepfen gestellt (derselbe Weg wie der Session-Review,
  * data/pending-reviews.json). Das gilt immer, auch ohne Zustellweg und bei
@@ -24,7 +25,7 @@
  * Regeln wie ein Vorschlag (Topic, Web-Gespraech, Direktchat, ohne Telegram).
  */
 
-import { processIntents as applyIntents, type IntentConversation, type ProcessedIntents } from "./memory";
+import { memoryFailureText, processIntents as applyIntents, reportMemoryFailures, type IntentConversation, type ProcessedIntents } from "./memory";
 import { fixReminderTimes } from "./schedule/remind";
 import { reviewConversation } from "./review-choices";
 import { stageMemoryReview, takePendingReview, type PendingReview } from "./session-distill";
@@ -196,8 +197,12 @@ export async function gateTurnIntents(
   if (verdict.status === "unknown") {
     d.log(`[Intents] ${target.origin}: Werkzeuge des Turns unbekannt, Merk-Tags wie bisher direkt angewendet`);
   }
-  const processed = await d.processIntents(text, turnConversation(target, d.dmChatId));
-  return { outcome: "applied", ...(isProcessedIntents(processed) ? { processed } : {}) };
+  const where = turnConversation(target, d.dmChatId);
+  const processed = await d.processIntents(text, where);
+  if (!isProcessedIntents(processed)) return { outcome: "applied" };
+  // Issue #518: ein nicht gespeichertes Ziel erfährt der Nutzer im Gespräch des Turns
+  await reportMemoryFailures(processed, where);
+  return { outcome: "applied", processed };
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +232,10 @@ export function describeApplied(p: ProcessedIntents): string {
     ...(p.remindersAdded?.length ? [`${p.remindersAdded.length} Erinnerung(en)`] : []),
     ...(p.asked?.length ? [`${p.asked.length} Rückfrage(n) zur Auswahl`] : []),
   ];
-  return `✅ Übernommen: ${parts.join(", ")}.`;
+  const failed = memoryFailureText(p);
+  if (!failed) return `✅ Übernommen: ${parts.join(", ")}.`;
+  const anything = [p.factsAdded, p.goalsAdded, p.factsRemoved, p.goalsCompleted, p.goalsCancelled, p.knowledgeAdded, p.remindersAdded, p.asked].some(list => list?.length);
+  return anything ? `Teilweise übernommen: ${parts.join(", ")}.\n${failed}` : failed;
 }
 
 /**

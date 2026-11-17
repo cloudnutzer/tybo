@@ -8,18 +8,32 @@
  * Rückfall-Modell; das ist etwas anderes als eine bekannte leere Liste.
  *
  * classifyTurnTools entscheidet, ob ein Turn fremde Inhalte gelesen hat. Die
- * Liste der fremden Werkzeuge steht nur hier.
+ * Liste der fremden Werkzeuge steht nur hier, die Prüfung von Bash-Befehlen
+ * in bash-network.ts.
+ *
+ * Seit Issue #525 zählen nur noch Inhalte aus dem Netz: Dateien auf diesem
+ * Rechner sind nie fremd, auch außerhalb des Projekts, und gh gegen ein Repo
+ * eines eigenen Kontos (TYBO_TRUSTED_GITHUB_OWNERS) ebenfalls nicht.
+ * Hochgeladene Dateien und Fotos stehen nicht in der Werkzeugliste, sie
+ * meldet der Kanal als foreignInput an das Tor (intent-gate.ts).
  */
 
-import { existsSync, realpathSync } from "fs";
-import { dirname, isAbsolute, relative, resolve, sep } from "path";
+import { bashNetworkReason, trustedGithubOwners } from "./bash-network";
 
 export interface ToolUse {
   name: string;
   /** Dateipfad bzw. Suchpfad lesender Datei-Werkzeuge (Read, Grep, Glob, ...) */
   path?: string;
-  /** Befehl eines Bash-Aufrufs, gekürzt */
+  /** Befehl eines Bash-Aufrufs, gekürzt auf MAX_COMMAND_CHARS */
   command?: string;
+  /**
+   * Nur bei Befehlen ab MAX_COMMAND_CHARS Zeichen: Einstufung des
+   * vollständigen Befehls bei der Erfassung (null: kein Netzabruf). So
+   * verschwindet ein fremder Teil hinter der Kürzung nicht. Ein Befehl an der
+   * Kürzungsgrenze ohne diese Angabe (ältere Einträge) oder mit beschädigter
+   * Angabe gilt als fremd.
+   */
+  commandCut?: { reason: string | null };
   /** Werkzeug, das außerhalb von tybo ausgeführt wurde (Sprach-Brücke: ElevenLabs) */
   external?: boolean;
 }
@@ -30,16 +44,33 @@ export interface TurnTools {
   cwd?: string;
 }
 
-const MAX_COMMAND_CHARS = 2000;
+export const MAX_COMMAND_CHARS = 2000;
+
+/** Grund für einen gekürzten Befehl ohne bekannte Einstufung */
+const CUT_REASON = "Bash mit gekürztem Befehl";
+
+/**
+ * ToolUse eines Bash-Aufrufs für alle Motoren. Ab MAX_COMMAND_CHARS Zeichen
+ * wird der Befehl vorher vollständig eingestuft und dann gekürzt; auch genau
+ * MAX_COMMAND_CHARS Zeichen bekommen die Einstufung, damit ein Eintrag an der
+ * Grenze ohne sie immer als womöglich gekürzt gilt.
+ */
+export function bashToolUse(command: string | undefined, githubOwners: readonly string[] = trustedGithubOwners()): ToolUse {
+  if (!command) return { name: "Bash" };
+  if (command.length < MAX_COMMAND_CHARS) return { name: "Bash", command };
+  return { name: "Bash", command: command.slice(0, MAX_COMMAND_CHARS), commandCut: { reason: bashNetworkReason(command, githubOwners) } };
+}
 
 /** ToolUse aus einem tool_use-Block der CLI oder der Anthropic API; null ohne Namen. */
 export function toolUseFromBlock(block: any): ToolUse | null {
   if (!block || block.type !== "tool_use" || typeof block.name !== "string" || !block.name) return null;
   const input = block.input && typeof block.input === "object" ? block.input : {};
+  const command = typeof input.command === "string" ? bashToolUse(input.command) : undefined;
   const use: ToolUse = { name: block.name };
   const path = [input.file_path, input.notebook_path, input.path].find(v => typeof v === "string" && v);
   if (path) use.path = path;
-  if (typeof input.command === "string") use.command = input.command.slice(0, MAX_COMMAND_CHARS);
+  if (command?.command !== undefined) use.command = command.command;
+  if (command?.commandCut) use.commandCut = command.commandCut;
   return use;
 }
 
@@ -67,9 +98,6 @@ const MCP_RESOURCE_TOOLS = new Set(["ListMcpResourcesTool", "ReadMcpResourceTool
 /** Unter-Agenten: ihre eigenen Werkzeuge sind im Ergebnis nicht sicher sichtbar */
 const SUBAGENT_TOOLS = new Set(["Task", "Agent"]);
 
-/** Lesen Dateien; fremd, wenn der Pfad außerhalb des tybo-Projekts liegt */
-const FILE_READ_TOOLS = new Set(["Read", "Grep", "Glob", "NotebookRead", "LS"]);
-
 /**
  * Lesende MCP-Server, nach Namensbestandteil (mcp__<server>__<werkzeug>):
  * Mail, Kalender, Ablagen, Web-Scraper, Browser, Wissensdienste. Nur
@@ -84,12 +112,6 @@ const READING_MCP_PATTERNS: [RegExp, string][] = [
   [/browser|playwright|puppeteer|chrome|computer/i, "Browser"],
   [/notion|slack|linear|github|jira|confluence|discord|telegram|whatsapp/i, "Dienst"],
 ];
-
-/**
- * Bash-Befehle, die Inhalte aus dem Netz holen. Bash selbst gilt nicht als
- * fremd (tybo arbeitet ständig damit), ein Netzabruf schon.
- */
-const NETWORK_COMMAND = /\b(curl|wget|lynx|w3m|yt-dlp)\b|\bgh\s+(api|issue|pr|release)\b|https?:\/\//i;
 
 /** ElevenLabs-Systemwerkzeuge der Sprach-Brücke: steuern das Gespräch, liefern keine Inhalte */
 const HARMLESS_EXTERNAL_TOOLS = new Set([
@@ -107,35 +129,8 @@ export type TurnToolsVerdict =
   | { status: "own" }
   | { status: "foreign"; reasons: string[] };
 
-/** Echter Pfad; für noch nicht vorhandene Pfade der des nächsten vorhandenen Elternordners. */
-function realPath(path: string): string {
-  let current = path;
-  const rest: string[] = [];
-  while (!existsSync(current)) {
-    const parent = dirname(current);
-    if (parent === current) return path;
-    rest.unshift(current.slice(parent.length).replace(/^[\\/]+/, ""));
-    current = parent;
-  }
-  try {
-    return resolve(realpathSync(current), ...rest);
-  } catch {
-    return path;
-  }
-}
-
-/** Liegt path (relativ zu cwd) nach Auflösung von Symlinks im Projekt? */
-export function isInsideProject(path: string, cwd: string, projectRoot: string): boolean {
-  const expanded = path.startsWith("~/") && process.env.HOME ? resolve(process.env.HOME, path.slice(2)) : path;
-  const absolute = isAbsolute(expanded) ? resolve(expanded) : resolve(cwd, expanded);
-  const target = realPath(absolute);
-  const root = realPath(resolve(projectRoot));
-  const rel = relative(root, target);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel) && !rel.startsWith(`..${sep}`));
-}
-
 /** Warum dieses Werkzeug fremde Inhalte gelesen hat; null, wenn nicht. */
-export function foreignReason(use: ToolUse, cwd: string, projectRoot: string): string | null {
+export function foreignReason(use: ToolUse, githubOwners: readonly string[] = trustedGithubOwners()): string | null {
   const name = use.name;
   if (use.external) return HARMLESS_EXTERNAL_TOOLS.has(name) ? null : `${name} (externes Werkzeug)`;
   if (WEB_TOOLS.has(name)) return name;
@@ -145,25 +140,38 @@ export function foreignReason(use: ToolUse, cwd: string, projectRoot: string): s
     const label = READING_MCP_PATTERNS.find(([pattern]) => pattern.test(name))?.[1] ?? "MCP";
     return `${name} (${label})`;
   }
-  if (FILE_READ_TOOLS.has(name)) {
-    // Ohne Pfad suchen Grep/Glob im Arbeitsverzeichnis
-    const path = use.path ?? cwd;
-    return isInsideProject(path, cwd, projectRoot) ? null : `${name} außerhalb des Projekts`;
+  if (name === "Bash" && use.commandCut !== undefined) {
+    // Gekürzter Befehl: es zählt die Einstufung des vollständigen Befehls bei der Erfassung
+    const cut = use.commandCut;
+    if (cut && typeof cut === "object" && (cut.reason === null || typeof cut.reason === "string")) return cut.reason;
+    return CUT_REASON;
   }
-  if (name === "Bash" && use.command && NETWORK_COMMAND.test(use.command)) return "Bash mit Netzabruf";
+  if (name === "Bash" && use.command) {
+    const reason = bashNetworkReason(use.command, githubOwners);
+    // An der Kürzungsgrenze ohne Einstufung (ältere Einträge): der Rest des Befehls ist unbekannt
+    if (!reason && use.command.length >= MAX_COMMAND_CHARS) return CUT_REASON;
+    return reason;
+  }
   return null;
 }
 
 /**
  * Einstufung eines Turns: unknown ohne Werkzeugliste, foreign sobald ein
- * Werkzeug fremde Inhalte gelesen hat, sonst own.
+ * Werkzeug fremde Inhalte gelesen hat, sonst own. Bash zählt nur mit
+ * Netzabruf (bash-network.ts), lesende Datei-Werkzeuge nie. projectRoot
+ * bleibt für die Aufrufer im Tor; die Einstufung hängt seit #525 nicht mehr
+ * vom Ort einer Datei ab.
  */
-export function classifyTurnTools(tools: TurnTools | undefined, projectRoot: string): TurnToolsVerdict {
+export function classifyTurnTools(
+  tools: TurnTools | undefined,
+  _projectRoot: string,
+  options: { githubOwners?: readonly string[] } = {}
+): TurnToolsVerdict {
   if (!tools) return { status: "unknown" };
-  const cwd = tools.cwd ?? projectRoot;
+  const owners = options.githubOwners ?? trustedGithubOwners();
   const reasons: string[] = [];
   for (const use of tools.uses) {
-    const reason = foreignReason(use, cwd, projectRoot);
+    const reason = foreignReason(use, owners);
     if (reason && !reasons.includes(reason)) reasons.push(reason);
   }
   return reasons.length > 0 ? { status: "foreign", reasons } : { status: "own" };

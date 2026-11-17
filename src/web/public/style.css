@@ -221,6 +221,10 @@ body.login {
 
 .error { margin: 0.2rem 0 0; color: var(--error); font-size: 0.9375rem; }
 
+/* Gesprächsseite eines Sprachagenten (Issue #494): Aufbau wie das Login, ein Knopf zur Zeit */
+.voice-agent-actions { display: grid; margin-bottom: 1.6rem; }
+.voice-agent-actions .primary-button { width: 100%; }
+
 /* Offline-Seite (Issue #224): Aufbau wie das Login, Gründe als leise Liste */
 .offline .login-lead { margin-bottom: 0.75rem; }
 
@@ -935,6 +939,9 @@ body.app {
   object-fit: contain;
 }
 
+.file-media { display: block; width: 100%; max-height: 20rem; border-radius: 0.6rem; }
+.file:has(.file-media) { width: 100%; }
+
 .file-card {
   display: flex;
   align-items: center;
@@ -950,7 +957,10 @@ body.app {
 .file-info { display: flex; flex-direction: column; flex: 1; min-width: 0; }
 .file-name { color: var(--ink); font-size: 0.9375rem; overflow-wrap: anywhere; }
 .file-size { color: var(--muted); font-size: 0.75rem; font-variant-numeric: tabular-nums; }
-.file-download { flex: none; width: auto; text-decoration: none; }
+.file-download, .file-open { flex: none; width: auto; text-decoration: none; }
+/* Name, Öffnen und Herunterladen passen auf dem Handy nicht in eine Zeile */
+.file-card:has(.file-open) { flex-wrap: wrap; }
+.file-card:has(.file-open) .file-info { flex-basis: 8rem; }
 
 /*
  * Rückfrage-Knöpfe (M10, Entscheidung 0017): eine Reihe leiser Knöpfe unter der
@@ -2033,7 +2043,7 @@ body.setup { min-height: 100vh; min-height: 100dvh; display: flex; }
   /* Rückfrage-Knöpfe (M10): Daumen-Ziele */
   .choice-button { min-height: 2.75rem; }
   /* Meldungen (Issue #47): Herunterladen als Daumen-Ziel */
-  .file-download { min-height: 2.75rem; }
+  .file-download, .file-open { min-height: 2.75rem; }
   /* Anhänge (Issue #73): Entfernen als Daumen-Ziel */
   .attachment-remove { width: 2.75rem; height: 2.75rem; }
   /* Geteilt (Issue #229): Anderes Gespräch als Daumen-Ziel */
@@ -2123,4 +2133,207 @@ body.setup { min-height: 100vh; min-height: 100dvh; display: flex; }
 @media (max-width: 56rem) {
   .thread-actions .quiet-button { min-height: 2.75rem; }
   .threads-toggle { min-height: 2.75rem; }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Sprachagenten (Issue #495): eigene Seite in der Lesespalte, Bausteine der   */
+/* Einstellungen; das Gespräch selbst bleibt auf /sa/<kennung>                 */
+/* ------------------------------------------------------------------------- */
+
+a.quiet-button { text-decoration: none; }
+
+body.voice-agents-page {
+  min-height: 100vh;
+  min-height: 100dvh;
+  padding: 1.25rem 1.5rem 2.5rem;
+  padding-top: max(1.25rem, env(safe-area-inset-top));
+  padding-right: max(1.5rem, env(safe-area-inset-right));
+  padding-bottom: max(2.5rem, env(safe-area-inset-bottom));
+  padding-left: max(1.5rem, env(safe-area-inset-left));
+}
+.voice-agents { width: 100%; max-width: var(--column); margin: 0 auto; display: grid; gap: 0.75rem; }
+.voice-agents-head { display: grid; gap: 0.5rem; justify-items: start; }
+.voice-agents-back { width: auto; margin-left: -0.6rem; }
+.voice-agents-title { margin: 0; font-size: 1.5rem; font-weight: 600; overflow-wrap: anywhere; }
+.voice-agents-title:focus { outline: none; }
+.voice-agents .settings-intro,
+.voice-agents .settings-empty { margin: 0; }
+.voice-agents-list li { padding: 0; }
+.voice-agents-item {
+  display: grid;
+  gap: 0.1rem;
+  width: 100%;
+  padding: 0.6rem 0.6rem;
+  border-radius: 0.55rem;
+  color: var(--ink);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+.voice-agents-item:hover { background: var(--hover); }
+.voice-agents-name { font-weight: 600; }
+.voice-agents-list .actions-error { padding: 0 0.6rem 0.4rem; }
+.voice-agent-detail { display: grid; gap: 0.75rem; }
+.voice-agent-detail .settings-actions .quiet-button { width: auto; }
+.voice-agent-talk { margin-top: 0; text-decoration: none; display: inline-block; }
+.voice-agent-detail .actions-hint,
+.voice-agent-detail .actions-error,
+.voice-agent-confirm .actions-question { margin: 0; overflow-wrap: anywhere; }
+.voice-agent-confirm { display: grid; gap: 0.35rem; }
+.voice-agent-confirm .actions-question { font-weight: 600; }
+.voice-agent-line { margin: 0; font-size: 0.9375rem; overflow-wrap: anywhere; }
+.voice-agent-lines { margin: 0; padding-left: 1.1rem; font-size: 0.9375rem; color: var(--muted); }
+.voice-agent-version[aria-pressed="true"] { background: var(--active); color: var(--ink); }
+.voice-agent-recipe-title { margin: 0.5rem 0 0; font-size: 0.9375rem; font-weight: 600; }
+.voice-agent-recipe { display: grid; grid-template-columns: minmax(8rem, 12rem) 1fr; gap: 0.3rem 1rem; margin: 0; font-size: 0.9375rem; }
+.voice-agent-recipe dt { color: var(--muted); }
+.voice-agent-recipe dd { margin: 0; overflow-wrap: anywhere; }
+@media (max-width: 40rem) {
+  .voice-agent-recipe { grid-template-columns: 1fr; gap: 0.1rem; }
+  .voice-agent-recipe dd { margin-bottom: 0.4rem; }
+  .voice-agents .quiet-button,
+  .voice-agent-talk { min-height: 2.75rem; }
+}
+/* Wizard für Sprachagenten (Issue #515): fünf Schritte in der Lesespalte der Seite.
+   Nur vorhandene Farben und Bausteine (Felder der Einstellungen, Schrittmarke der
+   Einrichtung), keine Bewegung. */
+.voice-agents-new { justify-self: start; display: inline-flex; align-items: center; min-height: 2.75rem; margin-top: 0; padding: 0.6rem 1.4rem; text-decoration: none; }
+.voice-agents-drafts .group-label { margin: 0.25rem 0 0; }
+.va-wizard { display: grid; gap: 1rem; min-width: 0; }
+.va-wizard-step-list { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.25rem; }
+.va-wizard-step {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.75rem;
+  padding: 0.4rem 0.7rem 0.4rem 0.5rem;
+  border-radius: 0.6rem;
+  color: var(--muted);
+  font-size: 0.875rem;
+  text-align: left;
+}
+.va-wizard-step:hover { background: var(--hover); color: var(--ink); }
+.va-wizard-step[aria-current="step"] { background: var(--active); color: var(--ink); font-weight: 600; }
+.va-wizard-step-mark {
+  display: inline-grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 1.5rem;
+  height: 1.5rem;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.va-wizard-step[aria-current="step"] .va-wizard-step-mark { border-color: var(--accent); background: var(--accent); color: var(--accent-ink); }
+.va-wizard-heading { margin: 0; font-size: 1.125rem; font-weight: 600; overflow-wrap: anywhere; }
+.va-wizard-heading:focus { outline: none; }
+.va-wizard-body { display: grid; gap: 1.25rem; min-width: 0; margin: 0; padding: 0; border: 0; }
+.va-wizard-body:disabled .settings-input,
+.va-wizard-body:disabled .va-wizard-choice { opacity: 0.75; }
+.va-wizard .actions-hint,
+.va-wizard .actions-error,
+.va-wizard .actions-question { margin: 0; overflow-wrap: anywhere; }
+.va-wizard .actions-hint:empty,
+.va-wizard .actions-error:empty { display: none; }
+.va-wizard .settings-actions .quiet-button,
+.va-wizard-add,
+.va-wizard-remove,
+.va-wizard-probe,
+.va-wizard-discard .quiet-button { width: auto; }
+.va-wizard-propose,
+.va-wizard-add,
+.va-wizard-probe { border: 1px solid var(--line); color: var(--ink); }
+.va-wizard-add { justify-self: start; }
+/* Auswahl: je Möglichkeit eine ganze Zeile zum Antippen, gewählt in active */
+.va-wizard-choices { display: grid; gap: 0.35rem; min-width: 0; margin: 0; padding: 0; border: 0; }
+.va-wizard-choices legend { padding: 0; margin-bottom: 0.35rem; }
+.va-wizard-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.7rem;
+  min-height: 2.75rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  background: var(--raised);
+  cursor: pointer;
+}
+.va-wizard-choice:has(input:checked) { border-color: var(--accent); background: var(--active); }
+.va-wizard-choice:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.va-wizard-choice input { flex-shrink: 0; width: 1.1rem; height: 1.1rem; margin: 0.15rem 0 0; accent-color: var(--accent); }
+.va-wizard-choice input:focus-visible { outline: none; }
+.va-wizard-choice-text { display: grid; gap: 0.1rem; min-width: 0; overflow-wrap: anywhere; }
+.va-wizard-choice-label { font-size: 0.9375rem; font-weight: 600; }
+.va-wizard-choice-hint { color: var(--muted); font-size: 0.8125rem; }
+.va-wizard-choice-row { display: flex; align-items: stretch; gap: 0.5rem; }
+.va-wizard-choice-row .va-wizard-choice { flex: 1; min-width: 0; }
+.va-wizard-choice-row .va-wizard-probe { flex-shrink: 0; min-height: 2.75rem; padding: 0.55rem 0.9rem; border-radius: 0.75rem; }
+.va-wizard-check { display: grid; gap: 0.2rem; }
+.va-wizard-check-label { margin: 0; min-height: 2.75rem; cursor: pointer; }
+.va-wizard-check-label input { flex-shrink: 0; }
+.va-wizard-check .setup-help { margin-left: 1.7rem; }
+.va-wizard-sub { display: grid; gap: 1.25rem; padding-left: 1rem; border-left: 1px solid var(--line); }
+.va-wizard-list-rows { display: grid; gap: 0.5rem; }
+.va-wizard-list-rows:empty { display: none; }
+.va-wizard-list-row { display: flex; align-items: center; gap: 0.5rem; }
+.va-wizard-list-row .settings-input { flex: 1; min-width: 0; }
+.va-wizard-remove { flex-shrink: 0; }
+.va-wizard-criteria { gap: 0.5rem; }
+.va-wizard-criteria .setup-help { margin: -0.25rem 0 0.1rem; }
+.va-wizard-file-input { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); opacity: 0; }
+.va-wizard-files { position: relative; }
+.va-wizard-section { gap: 1.25rem; }
+.va-wizard-section > .group-label,
+.va-wizard-fixed > .group-label,
+.va-wizard-summary > .group-label,
+.va-wizard-progress > .group-label { margin: 0; }
+/* Feste Regeln: sichtbar, ohne Schalter */
+.va-wizard-fixed { display: grid; gap: 0.5rem; padding: 0.85rem 1rem; border: 1px solid var(--line); border-radius: 0.75rem; }
+.va-wizard-fixed-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.6rem; font-size: 0.9375rem; }
+.va-wizard-fixed-list li { display: grid; gap: 0.1rem; overflow-wrap: anywhere; }
+.va-wizard-fixed-reason { color: var(--muted); font-size: 0.8125rem; }
+.va-wizard-nav { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 0.5rem 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--line); }
+.va-wizard-back { width: auto; margin-right: auto; }
+.va-wizard-next { margin-top: 0; min-width: 7rem; min-height: 2.75rem; }
+.va-wizard-discard { display: grid; gap: 0.35rem; justify-items: start; }
+.va-wizard-discard .quiet-button { margin-left: -0.6rem; }
+.va-wizard-discard .settings-actions .quiet-button { margin-left: 0; }
+.va-wizard-summary,
+.va-wizard-progress { display: grid; gap: 0.5rem; }
+.va-wizard-phase { margin: 0; font-size: 1rem; font-weight: 600; overflow-wrap: anywhere; }
+.va-wizard-question { display: grid; gap: 0.6rem; justify-items: start; padding: 0.85rem 1rem; border: 1px solid var(--line); border-radius: 0.75rem; background: var(--raised); }
+.va-wizard-question-text { margin: 0; font-size: 0.9375rem; overflow-wrap: anywhere; }
+.va-wizard-chat { display: inline-flex; align-items: center; min-height: 2.75rem; margin-top: 0; text-decoration: none; }
+.va-wizard-tests,
+.va-wizard-aborted,
+.va-wizard-missing,
+.va-wizard-build-error { display: grid; gap: 0.35rem; }
+.va-wizard-test-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 1px; font-size: 0.9375rem; }
+.va-wizard-test-list li { display: grid; gap: 0.1rem; padding: 0.4rem 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.va-wizard-test-reason { color: var(--muted); font-size: 0.8125rem; }
+.va-wizard-result .voice-agent-talk { display: inline-flex; align-items: center; min-height: 2.75rem; }
+@media (max-width: 40rem) {
+  /* Schritte als fünf gleich breite Marken; den Titel nennt die Überschrift darunter */
+  .va-wizard-step-list { display: grid; grid-template-columns: repeat(5, 1fr); }
+  .va-wizard-step { justify-content: center; padding: 0.4rem; }
+  .va-wizard-step-title { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .va-wizard .quiet-button,
+  .va-wizard .primary-button { min-height: 2.75rem; }
+  .va-wizard .settings-input { min-height: 2.75rem; }
+  .va-wizard-list-row { align-items: stretch; }
+  .va-wizard-nav .va-wizard-next { flex: 1; }
+}
+/* Gesprächsseite: Stumm und Unterbrechen leise unter dem Hauptknopf, Wechsel als Auswahl */
+.voice-agent-controls { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.5rem; }
+.voice-agent-controls .quiet-button { width: auto; border: 1px solid var(--line); border-radius: 999px; padding: 0.45rem 0.9rem; }
+.voice-agent-controls .quiet-button[aria-pressed="true"] { background: var(--hover); color: var(--ink); }
+.voice-agent-switch { display: grid; gap: 0.35rem; margin-bottom: 1.2rem; font-size: 0.875rem; }
+.voice-agent-switch label { font-weight: 600; }
+.voice-agent-switch select { padding: 0.6rem 0.8rem; border: 1px solid var(--line); border-radius: 0.75rem; background: var(--raised); color: var(--ink); font-size: 1rem; }
+/* Handy: Stumm, Unterbrechen und die Auswahl mit derselben Trefferfläche wie die übrigen Knöpfe */
+@media (max-width: 40rem) {
+  .voice-agent-controls .quiet-button,
+  .voice-agent-switch select { min-height: 2.75rem; }
 }

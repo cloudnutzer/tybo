@@ -29,6 +29,7 @@ const PASSWORD = "test-passwort-lang";
 const GROUP = "-1001234567890";
 const ENV = { USER_TIMEZONE: "UTC" };
 const T10 = Date.parse("2026-10-15T10:00:00Z");
+const PUSH_WAIT_MS = 10_000;
 const keys = await generateVapidKeys();
 const root = await mkdtemp(join(tmpdir(), "tybo-thread-push-"));
 const servers: WebServer[] = [];
@@ -141,10 +142,17 @@ async function start(o: { telegramReply?: TelegramReply } = {}) {
     });
     return r.thread.id;
   };
-  /** Push-Verteilung abwarten, auch den 15-Sekunden-Abgleich des Ports */
-  const settle = async () => {
+  /**
+   * Push-Verteilung abwarten, auch den 15-Sekunden-Abgleich des Ports. Der
+   * Server verschickt ohne Warten (Titel lesen, verschlüsseln), unter Last also
+   * beliebig spät: Erwartete Pushes bekommen eine Frist, die letzte Pause lässt
+   * einem überzähligen Push noch Zeit, aufzufallen.
+   */
+  const settle = async (expectedPushes = 0) => {
     await Bun.sleep(30);
     await choices.tick();
+    const deadline = Date.now() + PUSH_WAIT_MS;
+    while (pushes.length < expectedPushes && Date.now() < deadline) await Bun.sleep(5);
     await Bun.sleep(30);
   };
   const setNotices = (on: boolean) => call("PATCH", `/api/push/subscriptions/${device.id}`, { settings: { notices: on } });
@@ -167,7 +175,7 @@ describe("Push bei Erinnerungen an offene Fäden", () => {
     expect(ctx.pushes).toHaveLength(0);
     // Gegenprobe: eine andere Art pusht beim Anlegen weiterhin
     await ctx.choices.create({ conversation });
-    await ctx.settle();
+    await ctx.settle(1);
     expect(ctx.pushes).toHaveLength(1);
     expect(await ctx.pushes[0]).toMatchObject({ category: "choice" });
   });
@@ -177,7 +185,7 @@ describe("Push bei Erinnerungen an offene Fäden", () => {
     const id = await ctx.webConversation();
     const thread = await ctx.dueThread({ type: "web", conversationId: id });
     const r = await ctx.reminders().tick();
-    await ctx.settle();
+    await ctx.settle(1);
     expect(r.sent).toBe(1);
     expect(ctx.outboxSends).toEqual([`web:${id}`]);
     expect(ctx.pushes).toHaveLength(1);
@@ -226,7 +234,7 @@ describe("Push bei Erinnerungen an offene Fäden", () => {
     expect((await orphan.tick()).sent).toBe(0);
     // Zwei Zeitgeber gleichzeitig
     const results = await Promise.all([ctx.reminders().tick(), ctx.reminders().tick()]);
-    await ctx.settle();
+    await ctx.settle(1);
     expect(results.reduce((s, r) => s + r.sent, 0)).toBe(1);
     expect(ctx.outboxSends).toHaveLength(1);
     expect(ctx.pushes).toHaveLength(1);

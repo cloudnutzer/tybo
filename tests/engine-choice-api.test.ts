@@ -3,6 +3,7 @@
  * aus der Attrappe (setApiRuntimeForTests), kein Netz, kein Prozess.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { DEFAULT_CLAUDE_MODEL } from "../src/lib/default-model";
 import { createEngineCommandServices, engineLabel, engineModelAndEffort, isSelectableEngine, modelFitsEngine } from "../src/lib/engine-choice";
 import { checkEngine, inspectEngine } from "../src/lib/engines";
 import { API_KEY_MISSING, setApiRuntimeForTests } from "../src/lib/engines/api";
@@ -55,8 +56,8 @@ describe("Auswahl", () => {
       getAgentConfig: () => agent as any,
     });
     expect(engineModelAndEffort("api", "general", deps({ defaults: { model: "claude-sonnet-5-5", effort: "low" } }))).toEqual({ model: "claude-sonnet-5-5", effort: "low" });
-    expect(engineModelAndEffort("api", "general", deps({}, { model: "sonnet", effort: "xhigh" }))).toEqual({ model: "claude-opus-5-5", effort: "xhigh" });
-    expect(engineModelAndEffort("api", "general", deps({}, { model: "claude-opus-5-5[1m]", effort: "turbo" }))).toEqual({ model: "claude-opus-5-5" });
+    expect(engineModelAndEffort("api", "general", deps({}, { model: "sonnet", effort: "xhigh" }))).toEqual({ model: DEFAULT_CLAUDE_MODEL, effort: "xhigh" });
+    expect(engineModelAndEffort("api", "general", deps({}, { model: "claude-opus-5-5[1m]", effort: "turbo" }))).toEqual({ model: DEFAULT_CLAUDE_MODEL });
   });
 
   test("modelFitsEngine: nur volle claude-Namen passen zur API", () => {

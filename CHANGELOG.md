@@ -1,5 +1,127 @@
 # Changelog
 
+## 2.17.0: voice agents from recipes, a tidier memory
+
+- **Voice agents from recipes:** a voice agent is no longer assembled by hand
+  at ElevenLabs but described in a recipe, a file
+  `config/voice-agents/<id>.json` (examples in `config/voice-agents.example/`:
+  a call answering service, a personal assistant and a trainer). tybo creates
+  the agent at ElevenLabs from it, with its tests. Each recipe names a
+  template (`anrufannahme`, `jarvis`, `experte`) whose fixed rules cannot be
+  removed: say that an AI is speaking, read numbers back digit by digit, in
+  an emergency point to 112 and end the call, make no promises on your
+  behalf. Needs `ELEVENLABS_API_KEY`. `/anruf` and an agent you set up by
+  hand keep working as before. tybo does not assign phone numbers.
+- **`/sprachagent`** in Telegram, the WebUI and the terminal: `liste`,
+  `testen <id>`, `loeschen <id>`, `link <id>`, and `neu <description>` or
+  `aendern <id> <wish>`. For `neu`, a background job writes the recipe (for
+  an expert also a knowledge file with sources), you pick a voice and approve
+  with buttons; the approval shows the estimated cost per minute. Nothing is
+  created without a button, and an agent is only unlocked once its tests
+  pass or you unlock it yourself.
+- **Voice agents in the browser:** a new area "Sprachagenten" in the WebUI
+  with a list, details and a wizard in five steps (purpose, voice with a
+  sample, knowledge and behaviour, access, check and start). Experts and the
+  personal assistant can be talked to on a page of their own, only after
+  login: one conversation at a time, with the limit per call and the monthly
+  minute budget from the recipe.
+- **Practice with an expert:** after a practice conversation tybo rates it
+  against the three criteria of the recipe, with quotes of what you said, and
+  shows the last five sessions. This needs the ElevenLabs post-call webhook,
+  which only the `server` profile receives.
+- **Own phone line (optional):** `ELEVENLABS_PHONE_PROVIDER=sip_trunk` lets
+  `/anruf` dial through a SIP trunk. `deploy/sip-vermittlung/` holds a small
+  exchange for a private easybell line, so agents can answer calls to a
+  landline number.
+
+- **Memory, goals:** with Supabase every goal failed silently; goals work
+  now, and a failed save is reported in the conversation.
+  `tybo gedaechtnis ziele-nachholen` offers goals from old answers again, as
+  suggestions with buttons.
+- **Memory, the core:** `/kern` keeps a short overview (who you are, how you
+  work, what you are working on; at most 2,000 characters) that is in every
+  fresh session, whatever the topic. `/kern entwurf` drafts it from your
+  facts, `/kern setzen <text>` takes your own text; the file is
+  `config/kern.md`.
+- **Memory, facts:** every fact carries its date in the prompt, with a note
+  that older ones may be outdated. Follow-up messages bring up to five
+  matching facts the session has not seen yet, and tybo can look facts up
+  during a conversation. tybo remembers more strictly: research goes into the
+  knowledge base, not into facts.
+- **Memory, tidying up:** facts can be archived instead of deleted and
+  brought back (`tybo gedaechtnis archiv`, `zurueckholen`).
+  `tybo gedaechtnis bereinigen --datei <path>` works through a list of
+  duplicates and outdated facts, confirmed with buttons.
+- **Memory, secrets:** a value that looks like a password, token or API key
+  is not stored as a fact. Older facts with such a value stay, but the value
+  is masked in every prompt and output; `tybo gedaechtnis geheimnisse` lets
+  you keep or archive them one by one.
+- **Memory, suggestions:** tybo now only asks before remembering when the
+  turn read content from the net or an uploaded file. Files on your own
+  machine no longer count as foreign, nor does `gh` against repositories of
+  the accounts in `TYBO_TRUSTED_GITHUB_OWNERS`.
+- **Telegram token:** the bot token never appears in a log; the nightly
+  check searches the logs for it and warns.
+
+- **Maintenance:** `tybo wartung` clears things that can be recreated safely
+  (Xcode test simulators, download and build caches, oversized own logs) and
+  reports the space gained; `--dry-run` only shows. As a weekly routine:
+  `tybo dienste wartung` (Sundays 03:15), settings in `config/wartung.json`.
+- **Services after updates:** services listed in `config/wartung.json` are
+  restarted when they still run an older version than the installed one, for
+  example the Cloudflare tunnel. The bot itself is never restarted that way.
+- **Nightly check:** it now runs on Linux too (systemd timer in your time
+  zone from `USER_TIMEZONE`, otherwise PM2 or cron) and checks whether the
+  bot process runs and answers and whether the chosen engine is installed and
+  logged in. It warns earlier about low disk space and shows maintenance,
+  service versions and new facts of the last seven days. Set it up with
+  `tybo dienste health-check`. On Linux `/routinen` lists the systemd timers.
+- **`tybo pruefen`:** checks the chosen engine and its login with the `PATH`
+  of the service, whether the bot really runs (on macOS a loaded but stopped
+  service is an error) and, in the line "Schema", whether the database is
+  missing a migration.
+- **Without a Claude account:** a machine with only Codex can be set up;
+  `tybo setup` asks for the engine in the step `modelle` and says clearly
+  what is missing (background jobs and the side tasks need Claude or a side
+  model of their own). `docs/server.md` has the table of what works with
+  which engine.
+- **Updates and the database:** an update brings new code but no new tables.
+  The installer now says when `db/` changed, the bot checks for missing
+  migrations at every start and reports them once, and Supabase on this
+  machine applies them itself at `tybo datenbank start`.
+- **Telegram conflicts:** a second bot with the same token (409) or a
+  rejected token (401) only pauses the Telegram intake. WebUI, reminders,
+  background jobs and goals keep running, and the WebUI status page and
+  `tybo pruefen` show it. tybo never deletes a Telegram webhook itself any
+  more: when moving back from the `server` profile to polling, delete it by
+  hand (`docs/telegram-webhook.md`).
+- **Background jobs under systemd:** they survive a restart of the bot
+  (`KillMode=process` in the unit file).
+- **More robust:** a stale `bot.lock` no longer blocks the start, and a
+  refused start says which process holds the lock. `/stop` during an active
+  goal never ends the bot. When the Claude CLI is missing, the fallback
+  models also step in on Linux, and the reply names the reason once per
+  conversation.
+- **WebUI:** audio and video from messages play in the chat, HTML files open
+  in a tab of their own, sandboxed. The Telegram list and the message
+  fetcher read far less from Supabase.
+- **Models:** `claude-fable-5-2` is in the model list, and effort `max` can
+  be chosen for Claude too.
+
+**Updating from 2.16.0**
+
+- Run the installer again, `curl -fsSL https://tybo.ai/install | sh`, then
+  `tybo setup datenbank` before restarting: two new migrations (fact archive,
+  fact search). In the cloud this needs a fresh access token (`sbp_…`).
+- With semantic search in the cloud, run `tybo setup suche` once more so the
+  updated Edge Function `search-memory` is deployed. Until then follow-up
+  messages find facts by shared words only.
+- Linux with systemd: run `tybo setup autostart` once to add
+  `KillMode=process` to the existing unit file (`tybo pruefen` warns until
+  then), and `tybo dienste health-check` for the nightly check.
+- PM2: recreate the bot entry once with `tybo dienste telegram-relay`, so it
+  gets the longer stop timeout and can release its lock (the bot restarts).
+
 ## 2.16.0: a new public history
 
 - **New history:** the public repository starts over with a single commit

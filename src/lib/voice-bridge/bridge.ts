@@ -9,13 +9,17 @@
  * Der Kern ist laufzeitneutral und ohne Abhaengigkeiten; alles tybo-Spezifische
  * kommt ueber BridgeHooks aus src/voice-bridge.ts (damit die Tests ohne
  * Supabase und ohne laufenden Bot auskommen).
+ *
+ * Mit Kopf x-tybo-rezept bestimmt das Rezept, was ein Gespräch bekommt
+ * (hooks.resolveRecipe, src/lib/voice-bridge/recipes.ts); ohne Kopf gilt der
+ * Betrieb von vor den Rezepten unverändert.
  */
 
 import { BRAND } from "../../brand";
 import { voiceAgentName } from "../voice-agent-name";
 import type { ToolUse, TurnTools } from "../turn-tools";
 import { classifyTurn, EFFORTS, type Effort } from "../voice-brain/plan";
-import { voiceStyle } from "../voice-brain/style";
+import { isolatedVoiceStyle, voiceStyle } from "../voice-brain/style";
 import { TagFilter } from "../voice-brain/tags";
 import { callIdsFrom, type CallIds } from "../phone/bridge-note";
 import { streamAnthropic, type AContent, type AnthropicToolDef, type AnthropicTurn, type Sinks } from "../voice-brain/backends/anthropic";
@@ -41,7 +45,35 @@ export interface BridgeEnv {
   VOICE_DEFAULT_COUNTRY_CODE?: string;
 }
 
+/** Was die Bridge über den Anrufer weiß; daraus folgt die Stufe eines Rezepts */
+export interface RecipeCaller {
+  /** ElevenLabs hat eine Rufnummer gemeldet: ein Telefonat, kein Web-Gespräch */
+  hasNumber: boolean;
+  /** Eine der gemeldeten Nummern ist freigeschaltet; VOICE_ALLOW_UNIDENTIFIED zählt hier nie */
+  numberAllowed: boolean;
+  conversationId?: string;
+}
+
+/** Was ein Rezept diesem Gespräch erlaubt. Die Bridge bekommt nichts darüber hinaus. */
+export interface RecipeScope {
+  kennung: string;
+  name: string;
+  level: "keins" | "thema" | "voll";
+  model: string;
+  /** Steht im System-Prompt zuletzt, damit die festen Regeln des Rezepts das Letzte bleiben */
+  prompt: string;
+  /** Namen der Werkzeuge aus der Anfrage, die das Modell sehen darf */
+  tools: readonly string[];
+  deepThink: boolean;
+  /** Eigener Verlauf des Rezepts (Stufe thema); landet nicht im Verlauf des Nutzers */
+  saveTurn?: (userText: string, assistantText: string, conversationId?: string) => Promise<void>;
+  /** Zusatz für die Zeile im Log, ohne Inhalte */
+  logNote?: string;
+}
+
 export interface BridgeHooks {
+  /** Rezept zur Kennung aus x-tybo-rezept. null: unbekannt, das Gespräch bekommt die Absage. */
+  resolveRecipe?: (kennung: string, caller: RecipeCaller) => Promise<RecipeScope | null>;
   reserveRequest?: () => (actualUsd?: number) => void;
   /** tybo-Kontext (Agent-Prompt, Profil, Memory, letzte Nachrichten). Caching macht der Hook. */
   loadContext?: () => Promise<string>;
@@ -208,6 +240,8 @@ export function normalizePhone(raw: string | null | undefined, defaultCc = "49")
 
 export interface CallerVerdict {
   ok: boolean;
+  /** Eine gemeldete Nummer steht auf der Freigabeliste (anders als ok nie durch VOICE_ALLOW_UNIDENTIFIED) */
+  numberAllowed: boolean;
   /** Fuers Log: welche Nummern ElevenLabs gemeldet hat */
   caller: string;
   called: string;
@@ -231,18 +265,30 @@ export function checkCaller(headers: Headers, env: BridgeEnv): CallerVerdict {
       .filter(Boolean)
   );
   const numbers = [caller, called].filter(Boolean);
-  const ok = numbers.length ? numbers.some((n) => allowed.has(n)) : env.VOICE_ALLOW_UNIDENTIFIED === "true";
-  return { ok, caller, called, channel };
+  const numberAllowed = numbers.some((n) => allowed.has(n));
+  const ok = numbers.length ? numberAllowed : env.VOICE_ALLOW_UNIDENTIFIED === "true";
+  return { ok, numberAllowed, caller, called, channel };
+}
+
+/** Kopf, den tybo beim Anlegen eines Agenten aus einem Rezept setzt (src/lib/voice-agents/elevenlabs.ts) */
+export const RECIPE_HEADER = "x-tybo-rezept";
+
+/** Fehler fürs Log: Art und HTTP-Status, nie der Text. Antworten und Meldungen können Gesprächsinhalte enthalten. */
+export function errorLabel(err: unknown): string {
+  if (!(err instanceof Error)) return "Fehler";
+  const reason = (err as { reason?: unknown }).reason;
+  const status = /^Anthropic (\d{3})\b/.exec(err.message)?.[1];
+  return [err.name, typeof reason === "string" ? reason : "", status].filter(Boolean).join(" ");
 }
 
 const REJECT_TEXT = "Dieser Anschluss ist privat. Auf Wiederhören.";
 
 /** Abweisung ohne Kontext, Tools, Historie und ohne Anthropic-Aufruf; legt per end_call auf, wenn ElevenLabs es anbietet. */
-function rejectResponse(body: OARequest, model: string): Response {
+function rejectResponse(body: OARequest, model: string, reason = "Rufnummer nicht freigeschaltet"): Response {
   const id = `chatcmpl-${crypto.randomUUID()}`;
   const endCall = (body.tools ?? []).find((t) => t.type === "function" && t.function?.name === "end_call");
   const props = (endCall?.function.parameters as { properties?: Record<string, unknown> } | undefined)?.properties ?? {};
-  const args = JSON.stringify("reason" in props ? { reason: "Rufnummer nicht freigeschaltet" } : {});
+  const args = JSON.stringify("reason" in props ? { reason } : {});
   const parts = [oaChunk(id, model, { role: "assistant", content: REJECT_TEXT })];
   if (endCall) {
     parts.push(oaChunk(id, model, { tool_calls: [{ index: 0, id: `call_${crypto.randomUUID()}`, type: "function", function: { name: "end_call", arguments: args } }] }));
@@ -263,6 +309,9 @@ const SSE_HEADERS = {
 
 const DEEP_ACK = "Alles klar, das denke ich in Ruhe durch und schicke dir das Ergebnis per Telegram.";
 const DEEP_ACK_TOOL = " Ich denke das in Ruhe durch und melde mich per Telegram.";
+const THINK_NOW_HINT =
+  "Der Nutzer hat dich gerade ausdruecklich gebeten, gruendlich nachzudenken: Antworte jetzt live und vollstaendig mit deiner Einschaetzung, verweise nicht auf spaeter oder auf Telegram.";
+const THINK_NOW_HINT_ISOLATED = "Dein Gegenüber hat dich gerade ausdrücklich gebeten, gründlich nachzudenken: Antworte jetzt live und vollständig, verweise nicht auf später.";
 
 export async function handleBridge(
   req: Request,
@@ -281,16 +330,40 @@ export async function handleBridge(
   }
 
   const body = (await req.json()) as OARequest;
-  const model = env.VOICE_MODEL || "claude-opus-5";
+  const envModel = env.VOICE_MODEL || "claude-opus-5";
   const verdict = checkCaller(req.headers, env);
-  if (!verdict.ok) {
+  const callIds = callIdsFrom(req.headers);
+  const recipeHeader = req.headers.get(RECIPE_HEADER);
+  let scope: RecipeScope | null = null;
+  if (recipeHeader !== null) {
+    // Auch ein leerer oder nicht aufgelöster Kopf: nie zurück in den Betrieb ohne Rezept
+    try {
+      scope = hooks.resolveRecipe
+        ? await hooks.resolveRecipe(recipeHeader.trim(), {
+            hasNumber: Boolean(verdict.caller || verdict.called),
+            numberAllowed: verdict.numberAllowed,
+            ...(callIds.conversationId ? { conversationId: callIds.conversationId } : {}),
+          })
+        : null;
+    } catch (err) {
+      console.error(`[bridge] Rezept nicht lesbar: ${errorLabel(err)}`);
+    }
+    if (!scope) {
+      console.warn(`[bridge] Abgewiesen: rezept=${/^[a-z0-9-]{1,64}$/.test(recipeHeader) ? recipeHeader : "ungueltig"} (nicht verfuegbar)`);
+      return rejectResponse(body, envModel, "Unbekanntes Rezept");
+    }
+  } else if (!verdict.ok) {
     console.warn(
       `[bridge] Abgewiesen: kanal=${verdict.channel} anrufer=${verdict.caller || "-"} angerufen=${verdict.called || "-"}` +
         (verdict.caller || verdict.called ? "" : " (keine Rufnummer: Header fehlen oder Web-Gespraech)")
     );
-    return rejectResponse(body, model);
+    return rejectResponse(body, envModel);
   }
-  const callIds = callIdsFrom(req.headers);
+  const model = scope?.model ?? envModel;
+  // Ohne Rezept und mit Stufe voll: der ganze tybo-Kontext. Sonst weder Kontext noch Verlauf noch Merk-Tags.
+  const personal = !scope || scope.level === "voll";
+  const deepAllowed = scope ? scope.deepThink : true;
+  const logTag = scope ? ` rezept=${scope.kennung} stufe=${scope.level}${scope.logNote ? ` ${scope.logNote}` : ""}` : "";
   const fallback = (EFFORTS.includes(env.VOICE_DEFAULT_EFFORT as Effort) ? env.VOICE_DEFAULT_EFFORT : "medium") as Effort;
   const lastUser = [...body.messages].reverse().find((m) => m.role === "user");
   // Werkzeuge, deren Ergebnisse ElevenLabs seit der letzten Nutzer-Nachricht
@@ -301,20 +374,26 @@ export async function handleBridge(
     .flatMap((m) => (m.role === "assistant" ? m.tool_calls ?? [] : []))
     .map((c) => ({ name: c.function?.name || "unbekannt", external: true }));
   const lastUserText = partText(lastUser?.content ?? "").trim();
-  const plan = classifyTurn(lastUserText, fallback, body.elevenlabs_extra_body?.effort);
+  const classified = classifyTurn(lastUserText, fallback, body.elevenlabs_extra_body?.effort);
+  // Ohne Denkauftrag bleibt die gründliche Antwort, aber live
+  const plan = classified.deep && !deepAllowed ? { effort: "high" as const, deep: false } : classified;
   const { system: agentSystem, messages: history } = toAnthropic(body.messages);
   const id = `chatcmpl-${crypto.randomUUID()}`;
   const enc = new TextEncoder();
 
-  const localTools = hooks.localTools?.() ?? [];
+  const localTools = personal ? hooks.localTools?.() ?? [] : [];
   const localNames = new Set(localTools.map((t) => t.name));
   // Hat der Nutzer ausdruecklich um Nachdenken gebeten (high), will er die Antwort jetzt hoeren:
   // dann kein deep_think anbieten, sonst vertagt Opus nach 20 s Denkzeit auf Telegram.
   const thinkNow = plan.effort !== "medium" && plan.effort !== "low";
-  const tools: AnthropicToolDef[] = [...toAnthropicTools(body.tools), ...localTools, ...(thinkNow ? [] : [DEEP_THINK_TOOL])];
-  const thinkNowHint = thinkNow
-    ? "Der Nutzer hat dich gerade ausdruecklich gebeten, gruendlich nachzudenken: Antworte jetzt live und vollstaendig mit deiner Einschaetzung, verweise nicht auf spaeter oder auf Telegram."
-    : "";
+  // Die Anfrage kommt von aussen: Mit Rezept zählt nur, was das Rezept nennt
+  const requestTools = toAnthropicTools(body.tools).filter((t) => !scope || scope.tools.includes(t.name));
+  // Was das Modell an ElevenLabs weitergeben darf. Ruft es trotzdem etwas anderes auf
+  // (frei erfunden oder aus dem Verlauf), geht weder Name noch Argument hinaus.
+  // null: ohne Rezept wie vor den Rezepten.
+  const externalAllowed = scope ? new Set(requestTools.map((t) => t.name)) : null;
+  const tools: AnthropicToolDef[] = [...requestTools, ...localTools, ...(thinkNow || !deepAllowed ? [] : [DEEP_THINK_TOOL])];
+  const thinkNowHint = thinkNow ? (personal ? THINK_NOW_HINT : THINK_NOW_HINT_ISOLATED) : "";
 
   // Kappt ElevenLabs die Verbindung (Unterbrechung, eigener Timeout), brechen wir Anthropic mit ab.
   let closed = false;
@@ -338,6 +417,8 @@ export async function handleBridge(
       const filter = new TagFilter();
       const startedAt = Date.now();
       let toolRounds = 0;
+      // Gesperrte Werkzeugaufrufe des Modells, fürs Log nur die Anzahl
+      let blockedTotal = 0;
       // Keepalive waehrend langer Denkzeit: ElevenLabs wartet nur wenige Sekunden auf den naechsten
       // Chunk und springt sonst (entgegen der Doku) auf das Backup-LLM. Ein Leerzeichen ist unhoerbar.
       let keepalive: ReturnType<typeof setInterval> | null = null;
@@ -376,13 +457,14 @@ export async function handleBridge(
         send(oaChunk(id, model, {}, finish));
         send("data: [DONE]\n\n");
         console.log(
-          `[bridge] Turn fertig: effort=${plan.effort}${plan.deep ? " (deep)" : ""} tool_rounds=${toolRounds} finish=${finish} dauer=${Date.now() - startedAt} ms`
+          `[bridge] Turn fertig:${logTag} effort=${plan.effort}${plan.deep ? " (deep)" : ""} tool_rounds=${toolRounds}${blockedTotal ? ` gesperrt=${blockedTotal}` : ""} finish=${finish} dauer=${Date.now() - startedAt} ms`
         );
       };
       let rawAssistant = "";
       const persist = () => {
-        if (!hooks.persistTurn || !lastUserText) return;
-        background(hooks.persistTurn(lastUserText, rawAssistant, { uses: turnUses }));
+        if (!lastUserText) return;
+        if (scope?.saveTurn) background(scope.saveTurn(lastUserText, rawAssistant, callIds.conversationId));
+        if (personal && hooks.persistTurn) background(hooks.persistTurn(lastUserText, rawAssistant, { uses: turnUses }));
       };
 
       try {
@@ -404,32 +486,55 @@ export async function handleBridge(
         }
 
         let context = "";
-        if (hooks.loadContext) {
+        if (personal && hooks.loadContext) {
           try {
             context = await hooks.loadContext();
           } catch (err) {
-            console.error("[bridge] loadContext:", err);
+            console.error(`[bridge] loadContext: ${errorLabel(err)}`);
           }
         }
         let callNote: string | null = null;
-        if (hooks.callNote) {
+        if (personal && hooks.callNote) {
           try {
             callNote = await hooks.callNote(callIds);
           } catch (err) {
-            console.error("[bridge] callNote:", err);
+            console.error(`[bridge] callNote: ${errorLabel(err)}`);
           }
         }
-        const system = [context, callNote, agentSystem, voiceStyle({ agentName: voiceAgentName(env), channel: "phone" }), thinkNowHint].filter(Boolean).join("\n\n");
+        // Mit Rezept zählt dessen Prompt, nicht der System-Text aus der Anfrage
+        const system = (
+          scope
+            ? [context, callNote, personal ? voiceStyle({ agentName: scope.name, channel: "phone" }) : isolatedVoiceStyle(), thinkNowHint, scope.prompt]
+            : [context, callNote, agentSystem, voiceStyle({ agentName: voiceAgentName(env), channel: "phone" }), thinkNowHint]
+        )
+          .filter(Boolean)
+          .join("\n\n");
         const messages: AnthropicTurn[] = [...history];
+        // Je Runde: externe Nummer aus dem Strom -> Nummer im Ausgang (nur freigegebene, lückenlos ab 0)
+        let outgoing = new Map<number, number>();
+        // Je Runde: gesperrte Aufrufe, die in der Fortsetzung eine Absage als Ergebnis brauchen
+        let blockedIds: string[] = [];
         const sinks: Sinks = {
           onText: speak,
-          onToolStart: (i, tid, name) =>
-            send(oaChunk(id, model, { tool_calls: [{ index: i, id: tid, type: "function", function: { name, arguments: "" } }] })),
-          onToolArgs: (i, json) => send(oaChunk(id, model, { tool_calls: [{ index: i, function: { arguments: json } }] })),
+          onToolStart: (i, tid, name) => {
+            if (externalAllowed && !externalAllowed.has(name)) {
+              blockedIds.push(tid);
+              return;
+            }
+            const n = outgoing.size;
+            outgoing.set(i, n);
+            send(oaChunk(id, model, { tool_calls: [{ index: n, id: tid, type: "function", function: { name, arguments: "" } }] }));
+          },
+          onToolArgs: (i, json) => {
+            const n = outgoing.get(i);
+            if (n !== undefined) send(oaChunk(id, model, { tool_calls: [{ index: n, function: { arguments: json } }] }));
+          },
         };
 
         let finish: "stop" | "tool_calls" = "stop";
         for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+          outgoing = new Map();
+          blockedIds = [];
           const r = await streamAnthropic(
             env.VOICE_ANTHROPIC_API_KEY,
             {
@@ -439,6 +544,8 @@ export async function handleBridge(
               effort: plan.effort,
               max_tokens: plan.effort === "medium" || plan.effort === "low" ? 4000 : 12000,
               tools,
+              // Die Wissensdatei ist gross und bleibt zwischen den Zügen gleich
+              ...(scope?.level === "thema" ? { cacheSystem: true } : {}),
               signal: abort.signal,
             },
             localNames,
@@ -446,7 +553,9 @@ export async function handleBridge(
             hooks.reserveRequest
           );
           rawAssistant += r.text;
-          finish = r.finish;
+          // Nur was wirklich hinausging, macht den Turn zu tool_calls
+          finish = outgoing.size > 0 ? "tool_calls" : "stop";
+          blockedTotal += blockedIds.length;
           for (const b of r.content) {
             if (b.type !== "tool_use") continue;
             // Lokal (history_search) und deep_think laufen in tybo, alles andere bei ElevenLabs
@@ -454,13 +563,16 @@ export async function handleBridge(
             turnUses.push(external ? { name: b.name, external } : { name: b.name });
           }
 
-          for (const d of r.deepCalls) {
+          // Nur was angeboten war: Ohne Freigabe geht auch ein deep_think des Modells nirgends hin
+          const deepCalls = deepAllowed ? r.deepCalls : [];
+          const deniedDeep = deepAllowed ? [] : r.deepCalls;
+          for (const d of deepCalls) {
             speak(DEEP_ACK_TOOL);
             rawAssistant += DEEP_ACK_TOOL;
             if (hooks.deepThink) background(hooks.deepThink(d.question || lastUserText, lastUserText));
           }
 
-          const canLoop = r.localCalls.length > 0 && r.finish === "stop" && round < MAX_TOOL_ROUNDS && hooks.runLocalTool;
+          const canLoop = r.localCalls.length > 0 && finish === "stop" && round < MAX_TOOL_ROUNDS && hooks.runLocalTool;
           if (!canLoop) break;
           toolRounds++;
 
@@ -474,7 +586,10 @@ export async function handleBridge(
             })
           );
           const toolResults: AContent[] = r.localCalls.map((c, i) => ({ type: "tool_result", tool_use_id: c.id, content: results[i] }));
-          for (const d of r.deepCalls) toolResults.push({ type: "tool_result", tool_use_id: d.id, content: "Denkauftrag angenommen, Ergebnis kommt per Telegram." });
+          for (const d of deepCalls) toolResults.push({ type: "tool_result", tool_use_id: d.id, content: "Denkauftrag angenommen, Ergebnis kommt per Telegram." });
+          // Jeder tool_use-Block braucht in der Fortsetzung ein Ergebnis, auch ein gesperrter
+          for (const d of deniedDeep) toolResults.push({ type: "tool_result", tool_use_id: d.id, content: "Denkaufträge sind in diesem Gespräch nicht freigegeben.", is_error: true });
+          for (const b of blockedIds) toolResults.push({ type: "tool_result", tool_use_id: b, content: "Dieses Werkzeug ist in diesem Gespräch nicht freigegeben.", is_error: true });
           messages.push({ role: "assistant", content: r.content });
           messages.push({ role: "user", content: toolResults });
         }
@@ -482,9 +597,9 @@ export async function handleBridge(
         persist();
       } catch (err) {
         if (closed) {
-          console.log(`[bridge] Turn abgebrochen (Client weg) nach ${Date.now() - startedAt} ms, effort=${plan.effort}`);
+          console.log(`[bridge] Turn abgebrochen (Client weg) nach ${Date.now() - startedAt} ms,${logTag} effort=${plan.effort}`);
         } else {
-          console.error("[bridge]", err);
+          console.error(`[bridge] Turn fehlgeschlagen:${logTag} ${errorLabel(err)}`);
           const sorry = "Entschuldige, da ist gerade etwas schiefgelaufen. Frag mich bitte noch einmal.";
           send(oaChunk(id, model, { content: sorry }));
           end("stop");

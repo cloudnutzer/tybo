@@ -48,10 +48,22 @@ export interface TopicActivity {
   lastActivity: string;
 }
 
+/**
+ * Aktivität ab einem Zeitpunkt (Issue #684). truncated: das Zeilenlimit hat
+ * gegriffen, für ältere Zeilen des Zeitraums fehlen womöglich Sitzungen.
+ */
+export interface TopicActivityChanges {
+  activity: TopicActivity[];
+  truncated: boolean;
+}
+
 /** Meldung (metadata.display_only) mit dem Chat, zu dem sie gehört */
 export interface DisplayOnlyRow extends HistoryRow {
   chat_id: string;
 }
+
+/** Kopf einer Meldung: genug für Reihenfolge, Cursor und „schon gesehen“, ohne Text und Metadaten (Issue #684) */
+export type DisplayOnlyHead = Pick<DisplayOnlyRow, "id" | "created_at">;
 
 export interface DisplayOnlyPageOptions {
   /** Ab diesem Zeitpunkt, einschließlich */
@@ -71,7 +83,42 @@ export interface MemoryItem {
   completed?: boolean;
   completed_at?: string;
   created_at?: string;
+  /** Letztes Umschreiben oder Zurückholen eines Fakts, ISO */
+  revised_at?: string;
+  /** Nur in archivedFacts (Issue #520), ISO */
+  archived_at?: string;
 }
+
+/** Fakten, die eine Suche in den Nachrichten aus demselben Vektor mitbringen soll (Issue #523) */
+export interface FactWish {
+  limit: number;
+  /** Fakten, die die Session schon kennt */
+  excludeIds: string[];
+}
+
+/** Treffer einer Suche samt Fakten */
+export interface HitsWithFacts {
+  messages: Message[];
+  /** null: nach Bedeutung war keine Suche möglich (kein Vektor, Funktion oder Migration fehlt) */
+  facts: MemoryItem[] | null;
+}
+
+/** Wie searchFacts sucht */
+export interface FactSearchOptions {
+  /** Auch nach Bedeutung; fragt dafür den Anbieter nach einem Vektor */
+  meaning?: boolean;
+  excludeIds?: string[];
+  /** So viele Wörter des Suchtextes muss ein Treffer der Textsuche enthalten (Standard 1) */
+  minTerms?: number;
+}
+
+/**
+ * Ergebnis einer Änderung an genau einem Fakt (Issue #520): conflict heißt, die
+ * Zeile steht nicht mehr im erwarteten Stand, nichts ist geändert; failed, die
+ * Datenbank hat die Änderung nicht ausgeführt; secret, der neue Text enthält ein
+ * Geheimnis (Issue #524), nichts ist geändert und nichts ging an den Anbieter.
+ */
+export type FactChange = "changed" | "changed_without_vector" | "conflict" | "failed" | "secret";
 
 export type TaskStatus = "pending" | "running" | "needs_input" | "completed" | "failed";
 
@@ -204,6 +251,8 @@ export interface KnowledgeContextQuery {
   perTerm: number;
   /** Treffer nach Bedeutung */
   matches: number;
+  /** Wirft, wenn Einträge nicht lesbar waren, statt sie still wegzulassen (Nachschlagen, #523) */
+  strict?: boolean;
 }
 
 /** Ergebnis beim Anlegen eines Wissenseintrags, mit Satz für den Nutzer */

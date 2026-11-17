@@ -80,6 +80,42 @@ und ändert nichts. Klone von 2.15.x oder älter stellt er einmalig auf die mit
 und ein laufender Bot wird nicht von selbst neu gestartet; den Befehl dafür
 nennt der Installer am Ende.
 
+**Neue Migrationen nach einem Update:** Ein Update holt neuen Code, aber keine
+neuen Tabellen. Hat sich zwischen altem und neuem Stand etwas in `db/`
+geändert, nennt der Installer am Ende `tybo setup datenbank`. Das vor dem
+Neustart ausführen:
+
+- Supabase in der Cloud: `tybo setup datenbank` braucht wieder ein frisches
+  Zugangstoken (`sbp_…`), weil tybo es nie speichert. Der Bot spielt in der
+  Cloud nichts von selbst ein.
+- Supabase auf diesem Rechner: `tybo datenbank start` (auch der Dienst
+  dafür) spielt fehlende Migrationen nach dem Start und der Schutzprüfung
+  selbst ein und verbucht sie; beim nächsten Start ist nichts mehr zu tun.
+  Jeder Lauf hält vom Lesen der Historie bis zum Ende eine gemeinsame
+  Datenbanksperre; ein zweiter wartet und liest danach neu. Vor der ersten
+  Datei prüft er unter dieser Sperre die betroffenen Bilder-Ordner. Würde
+  eine Migration einen öffentlichen Ordner privat stellen, bricht er mit
+  Hinweis und Exit 1 ab, ohne eine Migrationsdatei einzuspielen. Das schützt
+  auch den festen Ordner `tybo-assets` aus
+  `20260909_security_knowledge.sql`, wenn in der
+  `.env` ein anderer Name steht. Auch eine nicht mögliche Prüfung
+  beendet den Lauf.
+  Jede Datei läuft in einer Transaktion, neue Dateien am Ende zusammen
+  mit ihrer Verbuchung. Ab der ersten unverbuchten Datei laufen alle
+  späteren noch einmal mit, damit neuere Fassungen von Funktionen erhalten
+  bleiben. Bei einer solchen Historienlücke werden die fehlenden Einträge
+  erst mit der letzten schon verbuchten Datei festgeschrieben. Scheitert
+  der Nachlauf vorher, bleibt die Lücke offen; der nächste Start wiederholt
+  ihn, auch wenn einzelne Dateien bereits eingespielt sind.
+  `tybo setup datenbank` geht denselben Weg.
+- Zugangsdaten selbst eingetragen: die fehlenden Dateien aus
+  `db/migrations/` der Reihe nach im SQL-Editor ausführen, nie
+  `db/schema.sql` allein.
+
+Ob etwas fehlt, zeigt `tybo pruefen` in der Zeile „Schema“ (siehe
+[Schemaprobe](#schemaprobe)). Der Bot prüft das bei jedem Start auch und
+meldet eine Lücke einmal in Telegram und der WebUI.
+
 **Windows:** Der Befehl läuft nicht unter Windows selbst (unter WSL schon).
 Dort den Weg [Von Hand einrichten](#von-hand-einrichten) nehmen.
 
@@ -129,6 +165,8 @@ Schritt „Voraussetzungen“, installiert sie aber nicht selbst.
   curl -fsSL https://claude.ai/install.sh | bash
   claude          # einmal starten, dann /login
   ```
+  Ohne Claude-Konto geht es mit Codex als Motor; dann ist die Claude CLI
+  keine Pflicht, siehe [Server und Codex](server.md).
   Findet die Shell `claude` danach nicht, ist `~/.local/bin` in dieser
   Sitzung noch nicht im `PATH`: neues Terminal bzw. neue SSH-Sitzung öffnen.
   Hilft das nicht, `export PATH="$HOME/.local/bin:$PATH"` in `~/.zshrc`
@@ -278,6 +316,16 @@ Sind alle drei da, zählt er als erledigt und kommt nur in der Gesamtprüfung
 wieder vor. Dort startet der Assistent zusätzlich einen kurzen Probeaufruf
 der Claude CLI, um die Anmeldung zu prüfen. Fehlt etwas, steht der Befehl zum
 Nachholen daneben; nach dem Installieren „Nochmal prüfen“.
+
+**Ohne Claude-Konto:** Ist als Motor nicht Claude Code eingestellt (etwa
+Codex, siehe Schritt 7), prüft dieser Schritt statt der Claude CLI den
+gewählten Motor: Codex muss installiert und mit `codex login` angemeldet
+sein. Eine fehlende Claude CLI oder Anmeldung ist dann nur ein Hinweis, etwa
+„Claude ist nicht angemeldet: Hintergrund-Jobs und Nebenaufgaben laufen
+nicht.“ Bei einem frischen Lauf gilt zunächst Claude Code; scheitert der
+Schritt daran, „überspringen“ wählen. Der Schritt Modelle kommt dann gleich
+als nächster, und die Gesamtprüfung prüft die Voraussetzungen am Ende mit
+dem gewählten Motor noch einmal. Mehr: [Server und Codex](server.md).
 
 ### Telegram, WebUI oder beides
 
@@ -484,8 +532,13 @@ ist; danach startest du die Einrichtung einfach noch einmal.
    er, dass Supabase nur auf diesem Rechner erreichbar ist.
 3. Adresse und Schlüssel bei Supabase abfragen. Sie erscheinen nirgends in
    der Ausgabe.
-4. Tabellen einspielen: `db/schema.sql` und die Dateien aus `db/migrations/`.
-   Alle sind wiederholbar.
+4. Tabellen einspielen: `db/schema.sql` (nur in eine leere Datenbank) und
+   die Dateien aus `db/migrations/`, über denselben gesperrten Ablauf
+   wie bei `tybo datenbank start` (siehe Updates oben). Vor der ersten
+   Datei prüft er die Bilder-Ordner. Bei vollständiger Historie läuft keine
+   Datei erneut; bei einer Lücke folgt der ganze nötige Nachlauf. Dessen
+   Verbuchung bleibt offen, bis alle schon verbuchten Folgedateien erneut
+   erfolgreich gelaufen sind.
 5. Den privaten Bilder-Ordner anlegen: `SUPABASE_ASSETS_BUCKET` aus der
    `.env`, sonst `tybo-assets`. Ist er schon da und öffentlich, bricht der
    Assistent ab, statt ihn umzustellen.
@@ -695,7 +748,8 @@ von tybo, das die Version ändert:
 2. `tybo datenbank stop`
 3. tybo aktualisieren (Installer erneut oder `git pull` und `bun install`)
 4. `tybo datenbank start`: die neue CLI lädt beim ersten Start die neuen
-   Images (einige Minuten)
+   Images (einige Minuten); danach spielt der Befehl fehlende Migrationen
+   ein
 5. Prüfen wie oben unter Wiederherstellen, Schritt 6
 
 **Nie** `supabase stop --no-backup` ohne frische Sicherung. Die offizielle
@@ -754,6 +808,40 @@ Meldet der Verbindungstest „Supabase verweigert dem Schlüssel das Recht, …
 
 Bleibt die Meldung danach, ist der eingetragene Schlüssel nicht der Secret
 key (`sb_secret_…`) bzw. `service_role`.
+
+
+#### Schemaprobe
+
+Die Schemaprobe (`src/lib/schema-probe.ts`) prüft, ob der Datenbank eine
+Datei aus `db/` fehlt. Sie fragt über die REST-Schnittstelle mit dem
+eingetragenen Schlüssel je Datei ein Merkmal ab und schreibt nichts:
+
+- Spalten und Tabellen mit `select=<spalten>&limit=0`, also ohne Zeilen
+- Funktionen über das Verzeichnis der Schnittstelle (`/rest/v1/`). PostgREST
+  listet dort nur, was der Schlüssel ausführen darf. Fehlt eine Funktion,
+  fragt die Probe sie darum einzeln mit GET `/rest/v1/rpc/<name>` ab (nur
+  lesend, mit Werten, die nichts Nennenswertes ausführen). Fehlend ist sie
+  nur, wenn PostgREST sie nicht kennt; ohne Ausführungsrecht heißt es
+  „nicht prüfbar“.
+- `20261021_base_grants.sql` legt nichts an und vergibt nur Rechte. Geprüft
+  wird, ob der Server-Schlüssel die Grundtabellen lesen darf. Schreib- und
+  Zählerrechte belegt das nicht; die lassen sich ohne Schreiben nicht prüfen.
+
+`tybo pruefen` zeigt das Ergebnis in der Zeile „Schema“: „fail“ mit den
+fehlenden Dateien und dem Befehl `tybo setup datenbank`, bei Netzfehlern,
+Zeitüberschreitung, abgelehntem Schlüssel oder fehlenden Rechten nur eine
+Warnung „nicht prüfbar“. Scheitert schon die Zeile „Verbindung“, steht
+„Schema“ nur da, wenn die Probe etwas sicher vermisst (die Grundtabelle aus
+`db/schema.sql` oder die Leserechte aus `20261021_base_grants.sql`).
+Der Bot führt dieselbe Probe bei jedem Start aus.
+Fehlt etwas, schickt er genau eine Meldung über den Meldeweg (Telegram und
+WebUI) und schreibt sie ins Log. Ohne Telegram hält die WebUI die Meldung in
+der Tabelle `messages` fest; fehlt gerade diese oder darf tybo dort nicht
+schreiben, steht der Hinweis nur im Log (`logs/`) und in `tybo pruefen`.
+
+Wer eine neue Migration anlegt, trägt sie in `SCHEMA_FILES`
+(`src/setup/supabase-schema.ts`) und ihr Merkmal in `SCHEMA_MARKERS`
+(`src/lib/schema-probe.ts`) ein; `tests/schema-probe.test.ts` scheitert sonst.
 
 #### Zugangsdaten selbst eintragen
 
@@ -1075,9 +1163,14 @@ entsteht `config/profile.md`. Gibt es die Datei schon, passt der Assistent nur
 
 ### 7. Modelle und Fallback (optional)
 
-Welches Claude-Modell antwortet und was einspringt, wenn Claude nicht
-erreichbar ist. Leer lassen heißt jeweils: Standard aus dem Code.
+Welcher Motor und welches Claude-Modell antworten und was einspringt, wenn
+der Motor nicht erreichbar ist. Leer lassen heißt jeweils: Standard aus dem
+Code.
 
+- **Motor (optional):** wer die Antworten schreibt: Claude Code (Standard),
+  Codex, OpenCode oder Anthropic API (Motor `api`, braucht
+  `ANTHROPIC_API_KEY`). Ohne Claude-Konto etwa Codex, vorher installieren und
+  mit `codex login` anmelden. Was dann fehlt: [Server und Codex](server.md).
 - **Standardmodell (optional):** Claude-Modell für alle Agenten ohne eigene
   Einstellung.
 - **Standard-Effort (optional):** wie gründlich Claude nachdenkt (low,
@@ -1094,9 +1187,10 @@ Datei wie die Einstellungen der WebUI), nur der OpenRouter-Schlüssel in der
 `.env`. Der Test prüft den OpenRouter-Schlüssel und ob Ollama läuft und das
 Modell geladen ist.
 
-Den Motor fragt dieser Schritt nicht ab. Standard ist Claude Code; Codex,
-OpenCode oder die Anthropic API (Motor `api`, braucht `ANTHROPIC_API_KEY`)
-wählst du später in der WebUI unter Einstellungen, Reiter Agenten, oder je
+Der Motor landet als `engine.default` in `config/settings.json` und gilt
+vor `TYBO_ENGINE` aus der `.env`. Ist ein anderer Motor als Claude Code
+gewählt, prüft der Test, ob er installiert und angemeldet ist. Ändern geht
+auch später in der WebUI unter Einstellungen, Reiter Agenten, oder je
 Gespräch mit `/motor`.
 
 ### 8. Sprache (optional)
@@ -1483,8 +1577,9 @@ startet ihn mit `systemctl --user enable --now tybo-telegram-relay`. Die
 Datei enthält den tatsächlichen Projektordner, den vollen Pfad zu Bun,
 `Restart=always` und einen eigenen `PATH` mit dem Ordner von Bun, dem Ordner
 der Claude CLI (aus `CLAUDE_PATH` oder dort, wo `claude` gefunden wurde),
+dem Ordner von Codex (aus `CODEX_PATH` oder dort, wo `codex` gefunden wurde),
 `~/.bun/bin` und `~/.local/bin`. Ein Benutzerdienst bekommt sonst nur die
-Systemordner und fände Claude nicht. Das Protokoll landet wie auf macOS in
+Systemordner und fände Claude oder Codex nicht. Das Protokoll landet wie auf macOS in
 `logs/telegram-relay.log` und `logs/telegram-relay.error.log`, nicht im
 Journal: das eigene Journal ist auf Debian ohne die Gruppe `adm` oft nicht
 lesbar.
@@ -1521,6 +1616,32 @@ Aus einer Antwort des Bots heraus nie `restart` oder `stop` aufrufen, sondern
 `bun run restart:request "Grund"`: der Bot beendet sich nach der laufenden
 Antwort, systemd startet ihn neu. Wiederholt man `tybo setup autostart` bei
 laufendem Dienst, bleibt er unberührt.
+
+**Hintergrund-Jobs überleben den Neustart.** Die Dienstdatei enthält
+`KillMode=process`. Ohne die Zeile beendet systemd beim Stoppen oder
+Neustarten alle Prozesse des Dienstes, auch laufende
+[Hintergrund-Jobs](hintergrund-jobs.md). Mit ihr beendet systemd nur den Bot,
+seine Motor-Aufrufe räumt der Bot beim Beenden selbst ab. Nach einem Absturz
+des Bots räumt systemd dafür keine übrig gebliebenen Kindprozesse mehr ab.
+
+Eine Dienstdatei von vor dieser Zeile erkennt `tybo pruefen` und warnt mit
+„telegram-relay (Hintergrund-Jobs)“. Nachziehen, ohne dass der Bot neu startet:
+
+```bash
+tybo setup autostart
+```
+
+Der Assistent trägt `KillMode=process` direkt unter `[Service]` ein, lässt
+den Rest der Datei, wie er ist, und lädt sie mit
+`systemctl --user daemon-reload` neu. systemd nimmt den Wert beim nächsten
+Beenden. Ein zweiter Lauf ändert nichts mehr. Maßgeblich ist der Wert, den
+systemd tatsächlich lädt, also samt Zusatzdateien (Drop-ins) unter
+`~/.config/systemd/user/tybo-telegram-relay.service.d/`. Setzt die
+Dienstdatei selbst einen anderen `KillMode`, bleibt er stehen; setzt ihn eine
+Zusatzdatei, nennt der Assistent `systemctl --user cat tybo-telegram-relay`,
+damit du die Zeile dort findest. Selbst nachsehen:
+`systemctl --user show tybo-telegram-relay -p KillMode` (erwartet
+`KillMode=process`).
 
 **Schon unter PM2 eingerichtet?** Dann bleibt es bei PM2; der Assistent legt
 nie einen zweiten Dienst daneben an. Wechseln: erst

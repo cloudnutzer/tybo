@@ -34,7 +34,14 @@
  *                          cron, PM2), Rückfrage zu models/speech/ (Issue #373,
  *                          src/setup/services/uninstall.ts); bun run uninstall
  *                          ruft denselben Befehl
+ *   tybo wartung [--dry-run]
+ *                          sichere Posten aufräumen (Test-Simulatoren, Caches,
+ *                          eigene Logs) und melden; --dry-run zeigt nur
+ *                          (Issue #485, src/lib/maintenance/run.ts)
  *   tybo erinnerungen importieren [datei]
+ *   tybo gedaechtnis ziele-nachholen
+ *   tybo gedaechtnis bereinigen --datei <Pfad> | archiv | zurueckholen <Kennung> ...
+ *   tybo gedaechtnis geheimnisse [--alle]
  *                          offene Einträge der alten config/reminders.json
  *                          genau einmal übernehmen (Issue #323,
  *                          src/lib/schedule/legacy-import.ts)
@@ -96,12 +103,24 @@ export interface TyboOptions {
   };
   /** Nur für Tests: tybo routinen mit Attrappen statt launchctl, plutil und Dateien */
   routines?: Partial<WrapCommandDeps>;
+  /** Nur für Tests: tybo gedaechtnis mit Attrappen statt Bot-API und Versand */
+  goalBackfill?: Pick<import("../src/lib/memory/goal-backfill-command").GoalBackfillCommandOptions, "createApi" | "send">;
+  factCleanup?: Pick<import("../src/lib/memory/fact-cleanup-command").FactCleanupCommandOptions, "createApi" | "send">;
+  secretReview?: Pick<import("../src/lib/memory/secret-review-command").SecretCommandOptions, "createApi" | "send">;
   /** Nur für Tests: tybo dienste mit Attrappen statt launchctl und Dateien */
   services?: Partial<LaunchdDeps>;
   /** Nur für Tests: tybo pruefen mit eigenen Spezialprüfungen und Zeitlimit (Kontext über setup.ctx) */
   checks?: Pick<import("../src/setup/checks/command").CheckCommandOptions, "specials" | "timeoutMs">;
   /** Nur für Tests: tybo dienste unter Linux mit Attrappen statt systemctl, crontab und PM2 */
   linuxServices?: { timers?: Partial<import("../src/setup/services/linux").LinuxDeps>; pm2?: Partial<import("../src/setup/services/pm2").Pm2Deps> };
+  /**
+   * Nur für Tests: tybo wartung mit Attrappen statt xcrun, notify und echtem
+   * Home; services ergänzt die echten Dienstzugriffe, env kommt immer aus
+   * Umgebung und Projekt-.env
+   */
+  maintenance?: Partial<Omit<import("../src/lib/maintenance/items").MaintenanceDeps, "services">> & {
+    services?: Partial<Omit<import("../src/lib/maintenance/services").ServiceDeps, "env">>;
+  };
   /** Nur für Tests: tybo deinstallieren mit Attrappen statt launchctl, systemctl, crontab, PM2 und Dateien */
   uninstall?: Partial<import("../src/setup/services/uninstall").UninstallDeps>;
 }
@@ -140,7 +159,11 @@ function usage(): string {
     `  ${BRAND.cli} dienste [Dienst]  Dienste einrichten (launchd, unter Linux PM2 und systemd-Timer), ohne Angabe alle (${BRAND.cli} dienste help)`,
     `  ${BRAND.cli} pruefen          Prüfbericht über die ganze Einrichtung, Exit-Code 1 bei Fehlern (${BRAND.cli} pruefen help)`,
     `  ${BRAND.cli} deinstallieren   Hintergrunddienste entfernen; Projektordner, .env und Daten bleiben (${BRAND.cli} deinstallieren help)`,
+    `  ${BRAND.cli} wartung          sichere Posten aufräumen, veraltete Dienste neu starten, melden; --dry-run zeigt nur (${BRAND.cli} wartung help)`,
     `  ${BRAND.cli} erinnerungen importieren [Datei]  alte config/reminders.json einmal übernehmen (${BRAND.cli} erinnerungen help)`,
+    `  ${BRAND.cli} gedaechtnis ziele-nachholen  [GOAL:]-Tags aus alten Antworten als Vorschläge vorlegen (${BRAND.cli} gedaechtnis help)`,
+    `  ${BRAND.cli} gedaechtnis bereinigen --datei <Pfad>  Fakten per Knöpfen archivieren oder umschreiben; archiv, zurueckholen (${BRAND.cli} gedaechtnis help)`,
+    `  ${BRAND.cli} gedaechtnis geheimnisse  Fakten mit Passwort oder Schlüssel maskiert zeigen, per Knopf behalten oder archivieren`,
     `  ${BRAND.cli} help             Diese Hilfe`,
     "",
     "Im Chat: Enter sendet, Alt+Enter oder \\ am Zeilenende für eine neue Zeile,",
@@ -160,17 +183,14 @@ export function startHint(root: string, platform: NodeJS.Platform, home: string)
   return `cd ${root} && bun run start`;
 }
 
-/** Läuft laut bot.lock ein Bot-Prozess? (PID lebt, auch wenn wir ihm keine Signale schicken dürften) */
+/**
+ * Läuft laut bot.lock ein Bot-Prozess? Gleiches Urteil wie beim Start des
+ * Bots (Issue #564): PID und Startzeit, alte Sperren über die Befehlszeile;
+ * im Zweifel ja.
+ */
 async function botProcessRunning(root: string): Promise<boolean> {
-  const owner = await readFile(join(root, "bot.lock"), "utf8").catch(() => "");
-  const pid = Number(owner.trim());
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e: any) {
-    return e?.code === "EPERM";
-  }
+  const { botLockHeld } = await import("../src/app/lifecycle");
+  return botLockHeld(root);
 }
 
 /** Wohin tybo sich verbindet: laufender Bot oder web:dev */
@@ -590,6 +610,31 @@ async function erinnerungen(options: TyboOptions, root: string, env: Env, args: 
   return 0;
 }
 
+/**
+ * tybo gedaechtnis ziele-nachholen (Issue #518), bereinigen, archiv und
+ * zurueckholen (Issue #520), geheimnisse (Issue #524). Store und Outbox lesen process.env, darum samt
+ * Projekt-.env; Ablagen unter dem Projektordner, auch die lokale der Fakten
+ */
+async function gedaechtnis(options: TyboOptions, root: string, env: Env, args: string[]): Promise<number> {
+  const { goalBackfillUsage, runGoalBackfillCommand } = await import("../src/lib/memory/goal-backfill-command");
+  const { FACT_CLEANUP_COMMANDS, factCleanupUsage, runFactCleanupCommand } = await import("../src/lib/memory/fact-cleanup-command");
+  const { SECRET_COMMAND, secretCommandUsage, runSecretCommand } = await import("../src/lib/memory/secret-review-command");
+  if (options.env === process.env) {
+    Object.assign(process.env, env);
+    process.env.GO_PROJECT_ROOT ||= root;
+  }
+  const out = options.out ?? console.log;
+  const err = options.err ?? console.error;
+  const [sub] = args;
+  if (sub === undefined || sub === "help" || sub === "--help" || sub === "-h") {
+    out(`${goalBackfillUsage()}\n\n${factCleanupUsage()}\n\n${secretCommandUsage()}`);
+    return 0;
+  }
+  if (sub === SECRET_COMMAND) return runSecretCommand(args, { root, env, out, err, ...options.secretReview });
+  if (FACT_CLEANUP_COMMANDS.includes(sub)) return runFactCleanupCommand(args, { root, env, out, err, ...options.factCleanup });
+  return runGoalBackfillCommand(args, { root, env, out, err, ...options.goalBackfill });
+}
+
 /** tybo dienste … (Issue #369): Projektordner und Home vom Aufrufer, nie vom Arbeitsverzeichnis */
 async function dienste(options: TyboOptions, root: string, args: string[]): Promise<number> {
   const { runServicesCommand } = await import("../src/setup/services/command");
@@ -622,6 +667,22 @@ async function deinstallieren(options: TyboOptions, root: string, args: string[]
   return runUninstallCommand(args, deps);
 }
 
+/**
+ * tybo wartung … (Issue #485): Projektordner und Home vom Aufrufer, nie vom
+ * Arbeitsverzeichnis. env samt Projekt-.env, damit der Bot-Schutz der
+ * Dienste (Issue #486) eigene Namen aus TYBO_LAUNCHD_LABEL und
+ * TYBO_SYSTEMD_UNIT kennt
+ */
+async function wartung(options: TyboOptions, root: string, env: Env, args: string[]): Promise<number> {
+  const { runMaintenanceCommand } = await import("../src/lib/maintenance/run");
+  const { realMaintenanceDeps } = await import("../src/maintenance");
+  const home = options.home ?? options.env.HOME ?? homedir();
+  const real = realMaintenanceDeps(root, home, env);
+  const { services, ...overrides } = options.maintenance ?? {};
+  const deps = { ...real, ...(options.platform && { platform: options.platform }), ...overrides, services: { ...real.services!, ...services, env } };
+  return runMaintenanceCommand(args, { deps, out: options.out ?? console.log, err: options.err ?? console.error });
+}
+
 /** Verteilt die Unterbefehle; gibt den Exit-Code zurück */
 export async function runTybo(options: TyboOptions): Promise<number> {
   const out = options.out ?? console.log;
@@ -643,7 +704,9 @@ export async function runTybo(options: TyboOptions): Promise<number> {
   if (command === "dienste") return dienste(options, root, rest);
   if (command === "pruefen") return pruefen(options, root, rest);
   if (command === "deinstallieren") return deinstallieren(options, root, rest);
+  if (command === "wartung") return wartung(options, root, env, rest);
   if (command === "erinnerungen") return erinnerungen(options, root, env, rest);
+  if (command === "gedaechtnis") return gedaechtnis(options, root, env, rest);
   if (command === undefined || command.startsWith("--")) {
     const args = parseChatArgs(options.args);
     if (args) return chat(options, root, env, args);

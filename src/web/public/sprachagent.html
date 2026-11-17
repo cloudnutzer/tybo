@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <script src="/theme.js"></script>
+  <title>Sprachagent · {{brand.name}}</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <script src="/brand.js"></script>
+  <script src="/sprachagent.js" defer></script>
+</head>
+<body class="login voice-agent">
+  <main class="login-panel">
+    <h1 id="agent-name" class="wordmark">Sprachagent</h1>
+    <p id="agent-status" class="login-lead" role="status">Wird geladen …</p>
+    <div class="voice-agent-actions">
+      <button type="button" id="agent-talk" class="primary-button" hidden></button>
+      <button type="button" id="agent-hangup" class="primary-button" hidden></button>
+      <div class="voice-agent-controls">
+        <button type="button" id="agent-mute" class="quiet-button" aria-pressed="false" hidden></button>
+        <button type="button" id="agent-interrupt" class="quiet-button" hidden></button>
+      </div>
+    </div>
+    <div id="agent-switch" class="voice-agent-switch" hidden>
+      <label for="agent-switch-select">Anderer Sprachagent</label>
+      <select id="agent-switch-select"></select>
+      <p id="agent-switch-hint" class="actions-hint" hidden></p>
+    </div>
+    <p id="agent-minutes" hidden></p>
+    <p><a href="/sprachagenten">Alle Sprachagenten</a> · <a href="/">Zurück zu {{brand.name}}</a></p>
+  </main>
+</body>
+</html>

@@ -27,21 +27,26 @@
  * Einstellungsseite (#126); die Claude-Prüfung beim Einrichten bleibt in
  * src/setup/steps/prerequisites.ts.
  *
- * inspectEngine (Issue #126) ist die Anzeige für Einstellungs- und
- * Statusseite: wie checkEngine, prüft aber auch Claude Code wirklich, mit
- * `claude --version` und `claude auth status --json`. Von der Anmeldung wird
- * nur das Feld loggedIn gelesen, Konto und E-Mail gehen nirgends hin. Ist
+ * checkEngine("claude") (Issue #126, seit Issue #567 auch in checkEngine)
+ * prüft Claude Code wirklich, mit `claude --version` und
+ * `claude auth status --json`. Von der Anmeldung wird nur das Feld loggedIn
+ * gelesen, Konto und E-Mail gehen nirgends hin; eine unlesbare Ausgabe oder
+ * ein Zeitlimit heißt „nicht prüfbar" (loginUnknown), nie „angemeldet". Ist
  * CLAUDE_AUTH=apiKey eingestellt, aber kein Schlüssel da (Issue #349), meldet
- * die Anzeige „nicht angemeldet" mit CLAUDE_API_KEY_MISSING, ohne die
+ * die Prüfung „nicht angemeldet" mit CLAUDE_API_KEY_MISSING, ohne die
  * Anmeldung der CLI zu fragen; der Zwischenspeicher unterscheidet Modus und
- * Schlüssel-Anwesenheit, nie den Wert. Die
- * Motor-Wahl nutzt weiter checkEngine: Claude Code bleibt der Motor, auf den
- * tybo zurückfällt, und wird dort nicht übersprungen.
+ * Schlüssel-Anwesenheit, nie den Wert. So zeigen /motor, Einstellungs- und
+ * Statusseite den echten Stand. Die Motor-Wahl (resolveEngine) fragt
+ * checkEngine für Claude Code nicht: es bleibt der Motor, auf den tybo
+ * zurückfällt, und wird dort nie übersprungen. inspectEngine ist derselbe
+ * Aufruf unter dem älteren Namen.
  */
 
+import { CLAUDE_NOT_INSTALLED } from "../claude-availability";
 import { OPENCODE_PROVIDER_KEYS, subprocessEnv } from "../subprocess-env";
 import { API_KEY_MISSING, apiKey } from "./api";
 import { CLAUDE_API_KEY_MISSING, claudeAuthCacheKey, claudeAuthProblem } from "./claude-auth";
+import { engineShutdownStarted, trackEngineProcess } from "./calls";
 import { codexEnv, codexPath, codexRuntime, terminateCodexProcess } from "./codex";
 import {
   forgetOpenCodeVersion,
@@ -66,7 +71,7 @@ export const ENGINE_CHECK_CACHE_MS = 60_000;
 
 export interface EngineStatus {
   engine: EngineId;
-  /** false: nicht geprüft (Claude Code, siehe checkEngine) */
+  /** Seit Issue #567 immer true: jeder Motor wird geprüft (Attrappen in Tests dürfen false setzen) */
   checked: boolean;
   installed: boolean;
   loggedIn: boolean;
@@ -74,7 +79,7 @@ export interface EngineStatus {
   version?: string;
   /** Verständliche Meldung, wenn der Motor nicht bereit ist */
   message?: string;
-  /** Installiert, aber ob angemeldet, ließ sich nicht feststellen (loggedIn ist dann false); Claude nur in inspectEngine */
+  /** Installiert, aber ob angemeldet, ließ sich nicht feststellen (loggedIn ist dann false) */
   loginUnknown?: true;
   /** Nur OpenCode: Anbieter mit gespeicherter Anmeldung laut `opencode auth list` (etwa „OpenRouter") */
   providers?: string[];
@@ -84,7 +89,24 @@ export const CODEX_NOT_INSTALLED =
   "Codex ist nicht installiert: der Befehl codex wurde nicht gefunden (anderer Pfad über CODEX_PATH in .env)";
 export const CODEX_NOT_LOGGED_IN = "Codex ist nicht angemeldet: im Terminal `codex login` ausführen";
 
-type Probe = { kind: "exit"; code: number | null; stdout: string } | { kind: "start_failed" } | { kind: "timeout" };
+/** start_failed.errorCode: Fehlercode des Startfehlers (etwa ENOENT, EAGAIN), falls der Start einen lieferte */
+type Probe = { kind: "exit"; code: number | null; stdout: string } | { kind: "start_failed"; errorCode?: string } | { kind: "timeout" };
+
+/** Fehlercode einer Startausnahme (Bun: error.code, etwa „ENOENT“); nur Großbuchstaben, Ziffern und Unterstrich */
+function startErrorCode(error: unknown): string | undefined {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" && /^[A-Z][A-Z0-9_]{0,31}$/.test(code) ? code : undefined;
+}
+
+/**
+ * Startfehler, die sicher heißen „Befehl gibt es nicht“: ENOENT (Datei fehlt,
+ * auch „Executable not found in $PATH“) und ENOTDIR (ein Teil des Pfads ist
+ * kein Ordner). Alles andere, etwa EAGAIN, EMFILE, ENOMEM, EACCES oder ein
+ * Fehler ohne Code, kann vorübergehend sein oder etwas anderes bedeuten.
+ */
+export function isCommandAbsentError(errorCode: string | undefined): boolean {
+  return errorCode === "ENOENT" || errorCode === "ENOTDIR";
+}
 
 type ProbeCommand = "codex" | "claude" | "opencode";
 
@@ -101,8 +123,18 @@ function commandEnv(command: ProbeCommand, cwd: string): Record<string, string> 
   return command === "codex" ? codexEnv(cwd) : command === "opencode" ? opencodeEnv(cwd) : claudeCheckEnv(cwd);
 }
 
-/** Ein Prüfbefehl: Exit-Code und stdout, Startfehler oder Zeitlimit (dann beendet) */
+/** Fehler eines Prüfbefehls, der nach Beginn des Beendens nicht mehr startet (die Prüfung endet mit „ließ sich nicht prüfen") */
+export const PROBE_AFTER_SHUTDOWN = "tybo wird beendet, keine Motor-Prüfung mehr";
+
+/**
+ * Ein Prüfbefehl: Exit-Code und stdout, Startfehler oder Zeitlimit (dann
+ * beendet). Issue #561: Der Prozess wird bis zu seinem Ende verfolgt
+ * (trackEngineProcess), damit das Beenden des Bots ihn samt Kindern beendet
+ * und abwartet; nach Beginn des Beendens startet keiner mehr (Fehler
+ * PROBE_AFTER_SHUTDOWN, auch zwischen zwei Phasen einer Prüfung).
+ */
 async function probe(args: string[], command: ProbeCommand = "codex"): Promise<Probe> {
+  if (engineShutdownStarted()) throw new Error(PROBE_AFTER_SHUTDOWN);
   const rt = command === "opencode" ? opencodeRuntime() : codexRuntime();
   const terminate = command === "opencode" ? terminateOpenCodeProcess : terminateCodexProcess;
   const cwd = checkCwd();
@@ -117,9 +149,11 @@ async function probe(args: string[], command: ProbeCommand = "codex"): Promise<P
       stdout: "pipe",
       stderr: "pipe",
     });
-  } catch {
-    return { kind: "start_failed" };
+  } catch (error) {
+    const errorCode = startErrorCode(error);
+    return errorCode ? { kind: "start_failed", errorCode } : { kind: "start_failed" };
   }
+  trackEngineProcess(proc, (p) => terminate(p, rt));
   // stderr lesen, damit eine volle Pipe nicht blockiert; der Inhalt wird verworfen
   void new Response(proc.stderr as ReadableStream<Uint8Array>).text().catch(() => "");
   const done = Promise.all([new Response(proc.stdout as ReadableStream<Uint8Array>).text().catch(() => ""), proc.exited.catch(() => null)]).then(
@@ -297,12 +331,11 @@ function checkApi(): EngineStatus {
 }
 
 /**
- * Ist der Motor installiert und angemeldet? Codex, OpenCode und api werden
- * geprüft (siehe oben). Claude Code wird hier nicht geprüft (checked: false)
- * und gilt als bereit: es ist der Motor, auf den tybo zurückfällt.
+ * Ist der Motor installiert und angemeldet? Alle vier Motoren werden geprüft
+ * (siehe oben), Claude Code seit Issue #567 ebenfalls.
  */
 export async function checkEngine(id: EngineId): Promise<EngineStatus> {
-  if (id === "claude") return { engine: "claude", checked: false, installed: true, loggedIn: true };
+  if (id === "claude") return checkClaudeCached();
   if (id === "api") return checkApi();
   if (id === "opencode") {
     const now = opencodeRuntime().now();
@@ -328,9 +361,13 @@ export async function checkEngine(id: EngineId): Promise<EngineStatus> {
 // Anzeige für Einstellungen und Status (Issue #126)
 // ---------------------------------------------------------------------------
 
-export const CLAUDE_NOT_INSTALLED =
-  "Claude Code ist nicht installiert: der Befehl claude wurde nicht gefunden (anderer Pfad über CLAUDE_PATH in .env)";
+/** Steht in claude-availability.ts: nur diese Meldung gilt dort als sicher nicht installiert (Issue #566) */
+export { CLAUDE_NOT_INSTALLED };
 export const CLAUDE_NOT_LOGGED_IN = "Claude Code ist nicht angemeldet: im Terminal `claude` starten und /login ausführen";
+/** Startfehler von claude --version, der nicht sicher „nicht installiert“ heißt (Issue #566) */
+export function claudeStartFailedMessage(errorCode: string | undefined): string {
+  return `Claude Code ließ sich nicht starten (${errorCode ?? "unbekannter Fehler"}): claude --version, später erneut prüfen`;
+}
 export const CLAUDE_LOGIN_UNKNOWN = "Ob Claude Code angemeldet ist, ließ sich nicht feststellen (im Terminal `claude auth status`)";
 
 const HOME_DIR = process.env.HOME || process.env.USERPROFILE || "";
@@ -362,8 +399,12 @@ export function parseClaudeLogin(stdout: string): boolean | undefined {
 async function checkClaude(): Promise<EngineStatus> {
   const base = { engine: "claude" as const, checked: true };
   const version = await probe(["--version"], "claude");
-  if (version.kind === "start_failed" || (version.kind === "exit" && version.code === 127)) {
+  if ((version.kind === "start_failed" && isCommandAbsentError(version.errorCode)) || (version.kind === "exit" && version.code === 127)) {
     return { ...base, installed: false, loggedIn: false, message: CLAUDE_NOT_INSTALLED };
+  }
+  // Issue #566: vorübergehende oder unbekannte Startfehler (EAGAIN, EMFILE, ENOMEM, ohne Code) sind kein Nachweis, dass Claude fehlt
+  if (version.kind === "start_failed") {
+    return { ...base, installed: false, loggedIn: false, message: claudeStartFailedMessage(version.errorCode) };
   }
   if (version.kind === "timeout") {
     return {
@@ -387,13 +428,8 @@ async function checkClaude(): Promise<EngineStatus> {
   return { ...installed, loggedIn: false, loginUnknown: true, message: CLAUDE_LOGIN_UNKNOWN };
 }
 
-/**
- * Verfügbarkeit für die Anzeige (Einstellungs- und Statusseite): Claude Code
- * wird wirklich geprüft (siehe oben, 5 s je Befehl, Ergebnis gilt 60 s),
- * die übrigen Motoren wie checkEngine.
- */
-export async function inspectEngine(id: EngineId): Promise<EngineStatus> {
-  if (id !== "claude") return checkEngine(id);
+/** Claude Code mit Zwischenspeicher: 5 s je Befehl, Ergebnis gilt 60 s je Pfad und Anmeldemodus */
+function checkClaudeCached(): Promise<EngineStatus> {
   const now = codexRuntime().now();
   const key = `${claudePath()}\0${claudeAuthCacheKey()}`;
   if (claudeCache && claudeCache.key === key && now - claudeCache.at < ENGINE_CHECK_CACHE_MS) return claudeCache.result;
@@ -402,4 +438,12 @@ export async function inspectEngine(id: EngineId): Promise<EngineStatus> {
   );
   claudeCache = { key, at: now, result };
   return result;
+}
+
+/**
+ * Verfügbarkeit für die Anzeige (Einstellungs- und Statusseite). Seit Issue
+ * #567 dasselbe wie checkEngine; der Name bleibt für die Aufrufer.
+ */
+export function inspectEngine(id: EngineId): Promise<EngineStatus> {
+  return checkEngine(id);
 }

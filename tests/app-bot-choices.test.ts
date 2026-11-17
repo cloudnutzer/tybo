@@ -1,22 +1,33 @@
 // Issue #344: Rückfragen des laufenden Bots als Verhalten von wireBotChoices
 // (ersetzt die Quelltext-Prüfungen der Handler und Zustellwege in bot.ts).
 // Prozessweite Anmeldungen sind Attrappen, damit im Testprozess nichts hängen bleibt.
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createChoicePostWeb, wireBotChoices, type BotChoicesDeps, type ChoiceInstallers } from "../src/app/bot-choices";
 import { createBotCommandServices } from "../src/app/command-services";
 import { createBotNotices } from "../src/lib/bot-notices";
-import { getChoice, setChoicesFileForTests, type Choice, type ChoiceConversation, type ChoiceHandler, type ChoiceKind } from "../src/lib/choices";
+import { decideChoice, getChoice, onChoiceDecided, setChoicesFileForTests, type Choice, type ChoiceConversation, type ChoiceHandler, type ChoiceKind } from "../src/lib/choices";
+import { commandRegistry } from "../src/lib/commands/builtin";
+import { CORE_COMMAND_TEXT } from "../src/lib/commands/core";
+import { runTelegramCommand } from "../src/lib/commands/telegram";
 import type { ReviewDecision } from "../src/lib/intent-gate";
+import { coreDraftFile, coreForPrompt } from "../src/lib/memory/core";
+import { CORE_ADOPT, CORE_CHOICE_TEXT, CORE_SOURCE } from "../src/lib/memory/core-choices";
 import { REVIEW_MEMORY_OPTIONS, REVIEW_ROUTINE_OPTIONS, REVIEW_SOURCE, WEB_COPY_PREFIX } from "../src/lib/review-choices";
 import type { BotSession } from "../src/lib/session-manager";
 import type { PendingReview, ReviewNotifier } from "../src/lib/session-distill";
+import { getStore, resetStore } from "../src/lib/store";
 import { createTelegramRuntime } from "../src/lib/telegram-runtime";
 import { THREAD_CHOICE_TEXT, THREAD_SOURCE } from "../src/lib/thread-choices";
+import { createBotCommands } from "../src/web/bot-commands";
+import { VOICE_AGENT_COMMAND_TEXT } from "../src/lib/commands/voice-agents";
+import { VOICE_AGENT_SOURCE } from "../src/lib/voice-agents/manage";
+import { baseRecipe } from "./voice-agents-elevenlabs-fixture";
+import { FakeJobs } from "./voice-agents-drafts-fixture";
 
-function setup(env: Record<string, string> = {}, parts: BotChoicesDeps["parts"] = {}) {
+function setup(env: Record<string, string> = {}, parts: BotChoicesDeps["parts"] = {}, root = "/srv/tybo") {
   const kinds: ChoiceKind[] = [];
   const handlers = new Map<ChoiceKind, ChoiceHandler>();
   const installed: string[] = [];
@@ -32,8 +43,11 @@ function setup(env: Record<string, string> = {}, parts: BotChoicesDeps["parts"] 
     expireOrphanedToolChoices: async () => (installed.push("expireTools"), 0),
     setReviewNotifier: (fn => (installed.push("reviewNotifier"), (reviewNotifier = fn))) as ChoiceInstallers["setReviewNotifier"],
     setMemoryAsker: note("memoryAsker") as never,
+    setMemoryFailureNotice: note("memoryFailureNotice") as never,
     installAskOffer: note("askOffer") as never,
     resumeCalls: note("resumeCalls"),
+    resumeAftercall: note("resumeAftercall"),
+    resumeVoiceDrafts: () => (installed.push("resumeVoiceDrafts"), () => {}),
   };
   const telegramSends: unknown[][] = [];
   const sentChoices: Choice[] = [];
@@ -51,7 +65,7 @@ function setup(env: Record<string, string> = {}, parts: BotChoicesDeps["parts"] 
     postLive: async (id: string, post: { text: string }) => (posted.push(`live ${id} ${post.text}`), true),
   };
   const choices = wireBotChoices({
-    root: "/srv/tybo",
+    root,
     env,
     runtime,
     web: () => web as never,
@@ -67,21 +81,23 @@ function setup(env: Record<string, string> = {}, parts: BotChoicesDeps["parts"] 
 describe("wireBotChoices", () => {
   test("jede Art des Registers außer tool bekommt genau einen Handler", () => {
     const { kinds } = setup();
-    expect([...kinds].sort()).toEqual(["ask", "call", "goal", "memory", "proactive", "reminder", "review", "routine", "thread", "topicmap"]);
+    expect([...kinds].sort()).toEqual(["ask", "call", "cleanup", "core", "goal", "memory", "proactive", "reminder", "review", "routine", "secret", "sprachagent", "thread", "topicmap"]);
   });
 
   test("Ablauf der Faden-Rückfragen, Ziel- und Topic-Änderungen, Freigaben und Anrufe angemeldet", () => {
     const { installed, services } = setup();
-    expect(installed).toEqual(["goalChange", "topicMapping", "threadExpiry", "resumeCalls", "phoneService", "toolApproval", "expireTools"]);
+    expect(installed).toEqual(["goalChange", "topicMapping", "threadExpiry", "resumeCalls", "phoneService", "resumeVoiceDrafts", "resumeAftercall", "toolApproval", "expireTools"]);
     // /anruf und phone_call: derselbe Zugang
     expect(services.phone).toBeDefined();
+    expect(services.voiceAgents).toBeDefined();
+    expect(services.voiceDrafts).toBeDefined();
   });
 
   test("Zustellwege der Vorschläge erst mit installNotifiers", () => {
     const s = setup();
     expect(s.installed).not.toContain("reviewNotifier");
     s.choices.installNotifiers();
-    expect(s.installed.slice(-3)).toEqual(["reviewNotifier", "memoryAsker", "askOffer"]);
+    expect(s.installed.slice(-4)).toEqual(["reviewNotifier", "memoryAsker", "memoryFailureNotice", "askOffer"]);
   });
 
   test("postWeb: Web-Gespräch abgelegt über die WebUI", async () => {
@@ -253,5 +269,333 @@ describe("wireBotChoices: Zustellweg der Vorschläge aus installNotifiers ausgel
     const choice = s.sentChoices[0];
     expect(choice).toMatchObject({ kind: "review", ref: "r-web", conversation: { type: "web", conversationId: WEB_CONVERSATION }, options: REVIEW_ROUTINE_OPTIONS });
     expect(s.webPosts).toEqual([{ id: WEB_CONVERSATION, post: { text: "Als Routine speichern?", kind: "notice", source: REVIEW_SOURCE, choiceId: choice.id } }]);
+  });
+});
+
+// Issue #522: /kern entwurf über den Dienst, den wireBotChoices bereitstellt.
+// Ersetzt sind nur das Modell und der Versand der Outbox; Fakten kommen aus dem
+// echten Speicher (Datei), die Entscheidung aus dem echten Register.
+describe("wireBotChoices: /kern entwurf über services.core", () => {
+  const USER = "4711";
+  const WEB_CONVERSATION = "11111111-2222-4333-8444-555555555555";
+  const DRAFT = "## Wer ich bin\n- Alex, Imkerin in Görlitz";
+  const ENV_NAMES = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "MEMORY_FILE_PATH"] as const;
+  const cwd = process.cwd();
+  let root = "";
+  let savedEnv: Record<string, string | undefined> = {};
+  let silent: ReturnType<typeof spyOn>;
+  let stopHandler = () => {};
+
+  beforeEach(async () => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "app-bot-choices-kern-")));
+    process.chdir(root);
+    setChoicesFileForTests(join(root, "data", "choices.json"));
+    savedEnv = Object.fromEntries(ENV_NAMES.map(name => [name, process.env[name]]));
+    delete process.env.SUPABASE_URL;
+    delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    process.env.MEMORY_FILE_PATH = join(root, "memory.json");
+    resetStore();
+    await getStore().memory.addFact("Alex ist Imkerin");
+    silent = spyOn(console, "log").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    stopHandler();
+    stopHandler = () => {};
+    silent.mockRestore();
+    for (const name of ENV_NAMES) {
+      if (savedEnv[name] === undefined) delete process.env[name];
+      else process.env[name] = savedEnv[name];
+    }
+    resetStore();
+    setChoicesFileForTests(null);
+    process.chdir(cwd);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** Verdrahtung wie im Bot; der angemeldete Handler kommt ins echte Register, damit ein Klick ihn auslöst */
+  function wired() {
+    const aux: { purpose: string; prompt: string }[] = [];
+    const outbox: Record<string, unknown>[] = [];
+    const s = setup({}, {
+      callAux: (async (purpose: string, prompt: string) => (aux.push({ purpose, prompt }), { text: DRAFT, isError: false })) as never,
+      sendAndRecord: async input => (outbox.push({ ...input }), { sent: true }) as never,
+    });
+    stopHandler = onChoiceDecided("core", s.handlers.get("core")!);
+    return { ...s, aux, outbox };
+  }
+
+  async function telegram(services: ReturnType<typeof wired>["services"]): Promise<string[]> {
+    const sent: string[] = [];
+    const text = "/kern entwurf";
+    await runTelegramCommand({
+      chat: { reply: async t => void sent.push(t) },
+      chatId: USER,
+      sessionKey: `dm:${USER}`,
+      agent: "general",
+      text,
+      match: commandRegistry.match(text, "telegram")!,
+      services,
+      working: () => () => {},
+      resetSession: async () => ({ status: "unavailable" }),
+      agentTurn: async () => {},
+      boardMeeting: async () => {},
+    });
+    return sent;
+  }
+
+  async function browser(services: ReturnType<typeof wired>["services"]): Promise<string[]> {
+    const unused = () => {
+      throw new Error("nicht erwartet");
+    };
+    const commands = createBotCommands({
+      registry: commandRegistry,
+      services,
+      userId: "web",
+      groupId: () => null,
+      agentForTopic: () => undefined,
+      sendPlain: unused,
+      sendAndRecord: unused,
+      saveMessage: async () => true,
+      resetConversation: unused,
+      runStreamingTurn: unused,
+      processIntents: unused,
+      sendAsAgent: unused,
+      log: () => {},
+    });
+    const notices: string[] = [];
+    await commands.run({
+      conversationId: WEB_CONVERSATION,
+      agent: "general",
+      text: "/kern entwurf",
+      source: "web",
+      messageId: "m1",
+      receivedAt: new Date().toISOString(),
+      signal: new AbortController().signal,
+      sink: {} as never,
+      notice: async t => void notices.push(t),
+      answer: async () => {},
+      ask: async () => {},
+      endAsk: () => {},
+      commit: () => {},
+    });
+    return notices;
+  }
+
+  test("Telegram: Frage über sendChoice, Fakten aus dem Speicher, Übernehmen wirkt über den angemeldeten Handler", async () => {
+    const s = wired();
+    expect(s.services.core).toBeDefined();
+    expect(await telegram(s.services)).toEqual([CORE_COMMAND_TEXT.working, CORE_COMMAND_TEXT.draft.offered]);
+
+    expect(s.aux).toHaveLength(1);
+    expect(s.aux[0].purpose).toBe("distill");
+    expect(s.aux[0].prompt).toContain("Alex ist Imkerin");
+    expect(s.sentChoices).toHaveLength(1);
+    const [choice] = s.sentChoices;
+    expect(choice).toMatchObject({ kind: "core", conversation: { type: "telegram", chatId: USER } });
+    expect(choice.text).toContain(DRAFT);
+    expect(s.webPosts).toEqual([]);
+    expect(await coreForPrompt()).toBe("");
+
+    const outcome = await decideChoice(choice.id, CORE_ADOPT, "telegram");
+    expect(outcome.status).toBe("decided");
+    expect(outcome.status === "decided" ? outcome.choice.handlerError : "kein Ergebnis").toBeUndefined();
+    expect(await coreForPrompt()).toBe(DRAFT);
+    expect(existsSync(coreDraftFile())).toBe(false);
+    expect(s.outbox).toEqual([{ chatId: USER, text: CORE_CHOICE_TEXT.adopted(DRAFT.length), source: CORE_SOURCE, format: "plain" }]);
+  });
+
+  test("Browser: Frage im Web-Gespräch mit choiceId, das Ergebnis geht ins selbe Gespräch", async () => {
+    const s = wired();
+    expect(await browser(s.services)).toEqual([CORE_COMMAND_TEXT.working, CORE_COMMAND_TEXT.draft.offered]);
+
+    expect(s.sentChoices).toHaveLength(1);
+    const [choice] = s.sentChoices;
+    expect(choice).toMatchObject({ kind: "core", conversation: { type: "web", conversationId: WEB_CONVERSATION } });
+    expect(s.webPosts).toEqual([{ id: WEB_CONVERSATION, post: { text: choice.text, kind: "notice", source: CORE_SOURCE, choiceId: choice.id } }]);
+
+    expect((await decideChoice(choice.id, CORE_ADOPT, "web")).status).toBe("decided");
+    expect(await coreForPrompt()).toBe(DRAFT);
+    expect(s.outbox).toEqual([{ chatId: `web:${WEB_CONVERSATION}`, text: CORE_CHOICE_TEXT.adopted(DRAFT.length), source: CORE_SOURCE, format: "plain" }]);
+  });
+});
+
+describe("wireBotChoices: /sprachagent über services.voiceAgents (Issue #492)", () => {
+  const WEB_CONVERSATION = "11111111-2222-4333-8444-555555555555";
+  let root = "";
+  let silent: ReturnType<typeof spyOn>;
+  let stopHandler = () => {};
+
+  beforeEach(() => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "app-bot-choices-sprachagent-")));
+    setChoicesFileForTests(join(root, "data", "choices.json"));
+    silent = spyOn(console, "log").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    stopHandler();
+    stopHandler = () => {};
+    silent.mockRestore();
+    setChoicesFileForTests(null);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function wired(env: Record<string, string> = {}) {
+    const outbox: Record<string, unknown>[] = [];
+    const s = setup(env, { sendAndRecord: async input => (outbox.push({ ...input }), { sent: true }) as never }, root);
+    stopHandler = onChoiceDecided("sprachagent", s.handlers.get("sprachagent")!);
+    return { ...s, outbox };
+  }
+
+  async function browser(services: ReturnType<typeof wired>["services"], text: string): Promise<string[]> {
+    const unused = () => {
+      throw new Error("nicht erwartet");
+    };
+    const commands = createBotCommands({
+      registry: commandRegistry,
+      services,
+      userId: "web",
+      groupId: () => null,
+      agentForTopic: () => undefined,
+      sendPlain: unused,
+      sendAndRecord: unused,
+      saveMessage: async () => true,
+      resetConversation: unused,
+      runStreamingTurn: unused,
+      processIntents: unused,
+      sendAsAgent: unused,
+      log: () => {},
+    });
+    const notices: string[] = [];
+    await commands.run({
+      conversationId: WEB_CONVERSATION,
+      agent: "general",
+      text,
+      source: "web",
+      messageId: "m1",
+      receivedAt: new Date().toISOString(),
+      signal: new AbortController().signal,
+      sink: {} as never,
+      notice: async t => void notices.push(t),
+      answer: async () => {},
+      ask: async () => {},
+      endAsk: () => {},
+      commit: () => {},
+    });
+    return notices;
+  }
+
+  function writeRecipe(kennung: string) {
+    const raw = baseRecipe();
+    raw.kennung = kennung;
+    mkdirSync(join(root, "config", "voice-agents"), { recursive: true });
+    writeFileSync(join(root, "config", "voice-agents", `${kennung}.json`), JSON.stringify(raw));
+  }
+
+  test("Browser ohne Telegram: Liste aus config/voice-agents im Projektordner, Löschen mit Rückfrage im Gespräch, Ergebnis ebendort", async () => {
+    writeRecipe("beispiel");
+    const s = wired();
+    const list = await browser(s.services, "/sprachagenten");
+    expect(list.join("\n")).toContain("Beispiel (beispiel)");
+    expect(list.join("\n")).toContain("Verbrauch unbekannt, Limit 300");
+
+    expect(await browser(s.services, "/sprachagent loeschen beispiel")).toEqual([VOICE_AGENT_COMMAND_TEXT.deleteAsked("Beispiel")]);
+    const [choice] = s.sentChoices;
+    expect(choice).toMatchObject({ kind: "sprachagent", ref: "beispiel", action: "loeschen", conversation: { type: "web", conversationId: WEB_CONVERSATION } });
+    expect(s.webPosts).toEqual([{ id: WEB_CONVERSATION, post: { text: choice.text, kind: "notice", source: VOICE_AGENT_SOURCE, choiceId: choice.id } }]);
+
+    expect((await decideChoice(choice.id, "ja", "web")).status).toBe("decided");
+    expect(existsSync(join(root, "config", "voice-agents", "beispiel.json"))).toBe(false);
+    expect(readdirSync(join(root, "data", "voice-agents", "beispiel", "geloescht"))).toHaveLength(1);
+    expect(s.outbox).toHaveLength(1);
+    expect(s.outbox[0]).toMatchObject({ chatId: `web:${WEB_CONVERSATION}`, source: VOICE_AGENT_SOURCE, format: "plain" });
+    expect(String(s.outbox[0].text)).toContain("data/voice-agents/beispiel/geloescht/");
+  });
+
+  test("ohne ELEVENLABS_API_KEY: testen meldet den fehlenden Anbieter, link die fehlende Freischaltung", async () => {
+    writeRecipe("beispiel");
+    const s = wired();
+    expect(await browser(s.services, "/sprachagent testen beispiel")).toEqual([VOICE_AGENT_COMMAND_TEXT.noProvider]);
+    expect(await browser(s.services, "/sprachagent link beispiel")).toEqual([VOICE_AGENT_COMMAND_TEXT.linkLocked("Beispiel")]);
+    expect(await browser(s.services, "/sprachagent testen gibtsnicht")).toEqual([VOICE_AGENT_COMMAND_TEXT.unknown("gibtsnicht")]);
+  });
+
+  test("/sprachagent neu im Browser ohne Telegram (Issue #493): Job mit Ziel des Gesprächs, Freigabe ebendort, Verwerfen über denselben Handler wie Löschen", async () => {
+    const jobs = new FakeJobs();
+    const outbox: Record<string, unknown>[] = [];
+    const s = setup({}, { sendAndRecord: async input => (outbox.push({ ...input }), { sent: true }) as never, createDraftJobs: () => jobs }, root);
+    stopHandler = onChoiceDecided("sprachagent", s.handlers.get("sprachagent")!);
+    expect(await browser(s.services, "/sprachagent neu Eine Kochhilfe,\ndie Rezepte langsam vorliest")).toEqual([VOICE_AGENT_COMMAND_TEXT.draftStarted("neu")]);
+    expect(jobs.starts).toHaveLength(1);
+    expect(jobs.last().target).toEqual({ chatId: `web:${WEB_CONVERSATION}` });
+    expect(jobs.last().brief).toContain("Eine Kochhilfe,\ndie Rezepte langsam vorliest");
+    const [id] = readdirSync(join(root, "data", "voice-agents", "entwuerfe", ".steuerung"));
+    // Der Job arbeitet in seinem eigenen Ordner
+    expect(jobs.last().workDir).toBe(join(root, "data", "voice-agents", "entwuerfe", ".arbeit", id));
+    const raw = baseRecipe();
+    raw.kennung = "kochhilfe";
+    delete raw.stimme.voiceId;
+    raw.gedaechtnis = "keins";
+    writeFileSync(join(root, "data", "voice-agents", "entwuerfe", ".arbeit", id, "rezept.json"), JSON.stringify(raw));
+    jobs.finish(jobs.last().id);
+    await s.choices.voiceDrafts.tick();
+    const choice = s.sentChoices.at(-1)!;
+    expect(choice).toMatchObject({ kind: "sprachagent", action: "freigabe", ref: id, conversation: { type: "web", conversationId: WEB_CONVERSATION } });
+    expect(s.webPosts.at(-1)).toEqual({ id: WEB_CONVERSATION, post: { text: choice.text, kind: "notice", source: VOICE_AGENT_SOURCE, choiceId: choice.id } });
+    expect((await decideChoice(choice.id, "verwerfen", "web")).status).toBe("decided");
+    expect((await getChoice(choice.id))?.handlerError).toBeUndefined();
+    expect(existsSync(join(root, "config", "voice-agents", "kochhilfe.json"))).toBe(false);
+    expect(outbox.at(-1)).toMatchObject({ chatId: `web:${WEB_CONVERSATION}`, source: VOICE_AGENT_SOURCE, text: "Entwurf verworfen, nichts angelegt." });
+  });
+
+  test("mit ELEVENLABS_API_KEY, Agent nicht angelegt: kein Aufruf, klare Meldung", async () => {
+    writeRecipe("beispiel");
+    const s = wired({ ELEVENLABS_API_KEY: "xi-test-schluessel-1234567890" });
+    const fetchSpy = spyOn(globalThis, "fetch");
+    try {
+      expect(await browser(s.services, "/sprachagent testen beispiel")).toEqual([VOICE_AGENT_COMMAND_TEXT.notDeployed("Beispiel")]);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+});
+
+// Issue #496: Nachlauf-Weiche im Bot. Rezept-Gespräch mit Merk-Tag im Protokoll:
+// Auswertung über voice-training, Meldung über die Outbox, nie Anrufdienst, nie Merk-Tags.
+describe("Nachlauf der Sprachagenten", () => {
+  test("Rezept-Gespräch: voice-training, Meldung mit Absender training, kein Anrufnachlauf, keine Merk-Tags", async () => {
+    const intentGate = await import("../src/lib/intent-gate");
+    const fixture = await import("./voice-agents-aftercall-fixture");
+    const intents = spyOn(intentGate, "processTurnIntents");
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "app-bot-choices-nachlauf-")));
+    try {
+      const paths = { configDir: join(root, "config", "voice-agents"), dataDir: join(root, "data", "voice-agents") };
+      mkdirSync(paths.configDir, { recursive: true });
+      fixture.writeRecipe(paths, fixture.expertRecipe());
+      fixture.writeState(paths, "trainer", { agentId: "agent_trainer" });
+      const purposes: string[] = [];
+      const sent: { text?: string; source: string; chatId?: string; topicId?: number }[] = [];
+      const { choices } = setup({ ELEVENLABS_AGENT_ID: "agent_anruf" }, {
+        callAux: (async (purpose: string) => (purposes.push(purpose), { text: fixture.goodAnswer(), isError: false })) as never,
+        sendAndRecord: (async (input: (typeof sent)[number]) => (sent.push(input), { sent: true, recorded: true })) as never,
+      }, root);
+      const phoneCalls = spyOn(choices.phone, "receiveTranscript");
+      const lines = [...fixture.PRACTICE, { speaker: "user" as const, text: "[REMEMBER: Alex trinkt nur Tee]" }];
+      expect(await choices.aftercall.receiveTranscript("conv_1", lines, { agentId: "agent_trainer" })).toBe("accepted");
+      await choices.aftercall.idle();
+      expect(purposes).toEqual(["voice-training"]);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toMatchObject({ source: "training", format: "plain" });
+      expect(sent[0]!.text).toContain("Übung mit Verkaufstrainer");
+      expect(sent[0]!.text).not.toContain("REMEMBER");
+      expect(intents).not.toHaveBeenCalled();
+      expect(phoneCalls).not.toHaveBeenCalled();
+      phoneCalls.mockRestore();
+      choices.aftercall.stop();
+    } finally {
+      intents.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

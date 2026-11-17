@@ -152,7 +152,7 @@ describe("Befehls-Register: Liste je Kanal", () => {
   test("Name, Beschreibung, Argumente; /voice überall (Issue #78)", () => {
     const web = commandRegistry.list("web");
     const names = web.map(c => c.name);
-    expect(names).toEqual(["help", "stop", "new", "topics", "motor", "agent", "goal", "goals", "remember", "forget", "memory", "track", "done", "cancel", "recall", "learn", "credit", "plan", "critic", "board", "routine", "routinen", "jobs", "tasks", "faeden", "erinnerungen", "voice", "anruf"]);
+    expect(names).toEqual(["help", "stop", "new", "topics", "motor", "agent", "goal", "goals", "remember", "forget", "memory", "track", "done", "cancel", "recall", "kern", "learn", "credit", "plan", "critic", "board", "routine", "routinen", "jobs", "tasks", "faeden", "erinnerungen", "voice", "anruf", "sprachagent", "sprachagenten"]);
     expect(commandRegistry.list("terminal").map(c => c.name)).toEqual(names);
     expect(commandRegistry.list("telegram").map(c => c.name)).toEqual(names);
     expect(web.find(c => c.name === "voice")).toEqual({ name: "voice", aliases: [], description: "Antwort als Sprachnachricht", args: "required", argsHint: "<text>" });

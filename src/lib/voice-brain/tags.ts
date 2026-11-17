@@ -113,3 +113,15 @@ export function stripTags(text: string): string {
   const f = new TagFilter();
   return (f.push(text) + f.flush()).replace(/[ \t]+\n/g, "\n").trim();
 }
+
+/**
+ * Was wirklich gesprochen wurde, für einen Verlauf: ohne Intent-Tags und ohne
+ * v3-Audio-Tags wie [excited] oder [thoughtful], die ElevenLabs dem LLM für
+ * eleven_v3 nahelegt; die gehören in den Ton, nicht in die Historie.
+ */
+export function spokenText(raw: string): string {
+  return stripTags(raw)
+    .replace(/\[[a-z][a-z ,'-]{1,30}\]/gi, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}

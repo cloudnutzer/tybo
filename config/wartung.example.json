@@ -1,0 +1,16 @@
+{
+  "_hinweis": "Vorlage für config/wartung.json (tybo wartung, docs/routinen.md). Alle Schlüssel sind freiwillig.",
+  "simulatorMuster": [],
+  "runtimesLoeschen": false,
+  "caches": ["homebrew-downloads", "go-build", "pip", "node-gyp", "npm", "bun"],
+  "logs": { "abMb": 50, "behaltenMb": 5 },
+  "_dienste": "Dienste, die nach Updates neu starten, wenn eine ältere Version läuft als installiert ist. Ohne Eintrag wird kein Dienst angefasst. Den Metrik-Port nennt cloudflared beim Start im Log (Starting metrics server on …).",
+  "dienste": [
+    {
+      "name": "Cloudflare-Tunnel",
+      "launchd": "ai.tybo.cloudflare-tunnel",
+      "versionBefehl": ["cloudflared", "--version"],
+      "metrik": { "url": "http://127.0.0.1:20241/metrics", "name": "build_info", "label": "version" }
+    }
+  ]
+}

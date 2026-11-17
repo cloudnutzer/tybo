@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <script src="/theme.js"></script>
+  <title>Sprachagenten · {{brand.name}}</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <script src="/brand.js"></script>
+  <script src="/sprachagent-wizard-state.js" defer></script>
+  <script src="/sprachagent-wizard.js" defer></script>
+  <script src="/sprachagenten.js" defer></script>
+</head>
+<body class="voice-agents-page">
+  <main class="voice-agents">
+    <header class="voice-agents-head">
+      <a id="va-back" class="quiet-button voice-agents-back" href="/">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+        <span id="va-back-label">Zurück zu {{brand.name}}</span>
+      </a>
+      <h1 id="va-title" class="voice-agents-title" tabindex="-1">Sprachagenten</h1>
+    </header>
+    <p id="va-intro" class="settings-intro">Sprachagenten sprechen mit dir im Browser oder nehmen Anrufe an. Neue legst du mit „Neu“ an oder im Chat mit /sprachagent neu.</p>
+    <a id="va-new" class="primary-button voice-agents-new" href="#/neu" hidden>Neu</a>
+    <p id="va-status" class="settings-empty" role="status">Wird geladen …</p>
+    <ul id="va-list" class="settings-devices voice-agents-list" hidden></ul>
+    <section id="va-broken" class="settings-section" hidden>
+      <h2 class="group-label">Beschädigte Rezepte</h2>
+      <ul id="va-broken-list" class="settings-devices"></ul>
+    </section>
+    <section id="va-drafts" class="settings-section voice-agents-drafts" hidden></section>
+    <article id="va-detail" class="voice-agent-detail" hidden></article>
+    <section id="va-wizard" class="va-wizard" aria-labelledby="va-title" hidden></section>
+  </main>
+</body>
+</html>

@@ -47,7 +47,33 @@ async function start(id: string, env: Record<string, string> = {}, options: Star
     tickMs: 50,
   });
   await waitFor(() => s.server.eventStreamCount() >= 1, 3000, "Live-Verbindung");
+  outputs.set(s, stdout);
   return { s, stdin, stdout, exit, signals };
+}
+
+/** Terminalausgabe je Test-Server, für die Meldung von turnIn */
+const outputs = new WeakMap<TerminalTestServer, FakeStdout>();
+const TURN_WAIT_MS = 10_000;
+
+/**
+ * Wartet auf den Turn im Gespräch, höchstens TURN_WAIT_MS. Kommt keiner an
+ * (Senden gescheitert, gesperrt oder Eingabe verloren), scheitert der Test
+ * mit der Terminalausgabe und der Zahl der Turns am Server, statt bis zum
+ * Testlimit von 30 s stumm zu warten.
+ */
+async function turnIn(s: TerminalTestServer, id: string) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const shown = outputs.get(s)?.text.slice(-800) ?? "(keine Ausgabe)";
+      reject(new Error(`Kein Turn in ${id} nach ${TURN_WAIT_MS} ms (Turns am Server: ${s.telegramChat.calls.length}). Terminal zuletzt:\n${shown}`));
+    }, TURN_WAIT_MS);
+  });
+  try {
+    return await Promise.race([s.telegramChat.turn(id), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 describe("Vollmodus (TTY mit Farbe)", () => {
@@ -68,7 +94,7 @@ describe("Vollmodus (TTY mit Farbe)", () => {
     stdin.type("erste\u001b\rzweite\\");
     stdin.type("\r");
     stdin.type("dritte\r");
-    const turn = await s.telegramChat.turn("dm");
+    const turn = await turnIn(s, "dm");
     expect(turn.opts.text).toBe("erste\nzweite\ndritte");
     expect(turn.opts.source).toBe("terminal");
     s.telegramChat.finish("dm", "ok");
@@ -79,7 +105,7 @@ describe("Vollmodus (TTY mit Farbe)", () => {
   test("Fortschritt in der Statuszeile, danach verschwindet sie", async () => {
     const { s, stdin, stdout, exit } = await start("dm");
     stdin.type("recherchiere bitte\r");
-    const turn = await s.telegramChat.turn("dm");
+    const turn = await turnIn(s, "dm");
     await turn.opts.sink.progress({ kind: "tool", text: "WebSearch" });
     await waitFor(() => stdout.text.includes("Durchsucht das Web …"), 3000, "Statuszeile");
     s.telegramChat.finish("dm", "**Ergebnis** da");
@@ -93,7 +119,7 @@ describe("Vollmodus (TTY mit Farbe)", () => {
   test("Strg+C während der Antwort ruft Stopp, zweites Strg+C beendet tybo", async () => {
     const { s, stdin, stdout, exit } = await start("dm");
     stdin.type("lange Aufgabe\r");
-    await s.telegramChat.turn("dm");
+    await turnIn(s, "dm");
     await waitFor(() => stdout.text.includes("Denkt nach …"), 3000, "Statuszeile");
     stdin.type("\u0003");
     await waitFor(() => s.telegramChat.stops.length === 1, 3000, "Stopp");
@@ -190,7 +216,7 @@ describe("NO_COLOR", () => {
     const { s, stdin, stdout, exit, signals } = await start("dm", { NO_COLOR: "1" });
     expect(stdin.rawModes).toEqual([]);
     stdin.type("Frage\n");
-    const turn = await s.telegramChat.turn("dm");
+    const turn = await turnIn(s, "dm");
     await turn.opts.sink.progress({ kind: "tool", text: "WebFetch" });
     await waitFor(() => stdout.all.includes("… Ruft eine Seite ab …"), 3000, "Status als Zeile");
     signals.get("SIGINT")!();
@@ -261,7 +287,7 @@ describe("Pipe: Ende erst nach dem Abgleich einer Wiederverbindung", () => {
     void exit.then(() => (exited = true));
     stdin.type("Frage aus der Pipe\n");
     stdin.emit("end");
-    await s.telegramChat.turn("dm");
+    await turnIn(s, "dm");
     // Die erste Live-Verbindung kann nach dem Turn noch im Aufbau sein: erst kappen, wenn sie steht
     await waitFor(() => cut !== null, 3000, "Live-Verbindung");
     cut!();
@@ -344,7 +370,7 @@ describe("Pipe: Ende erst nach dem Abgleich einer Wiederverbindung", () => {
     const { s, stdin, stdout } = started;
     stdin.type("Frage aus der Pipe\n");
     stdin.emit("end");
-    await s.telegramChat.turn("dm");
+    await turnIn(s, "dm");
     // Die erste Live-Verbindung kann nach dem Turn noch im Aufbau sein: erst kappen, wenn sie steht
     await waitFor(() => cut !== null, 3000, "Live-Verbindung");
     cut!();
@@ -458,7 +484,7 @@ describe("Pipe: verspäteter Anfangsstatus", () => {
     void exit.then(() => (exited = true));
     await waitFor(() => firstRead, 3000, "Anfangsstatus zurückgehalten");
     stdin.type("Frage aus der Pipe\n");
-    await s.telegramChat.turn("dm");
+    await turnIn(s, "dm");
     await waitFor(() => postDone, 3000, "POST 202");
     stdin.emit("end");
     holdGet = true;
@@ -482,7 +508,7 @@ describe("UTF-8 über Blockgrenzen", () => {
   test("Vollmodus: Bytes mitten in Umlauten und Emoji geteilt, POST-Text unverändert", async () => {
     const { s, stdin, exit } = await start("dm");
     stdin.typeBytewise(`${TEXT}\r`);
-    const turn = await s.telegramChat.turn("dm");
+    const turn = await turnIn(s, "dm");
     expect(turn.opts.text).toBe(TEXT);
     s.telegramChat.finish("dm", "ok");
     stdin.type("\u0004");
@@ -492,7 +518,7 @@ describe("UTF-8 über Blockgrenzen", () => {
   test("Pipe: geteilte Bytes, letzte Zeile ohne Zeilenende wird bei EOF abgeschlossen", async () => {
     const { s, stdin, exit } = await start("dm", {}, { pipe: true });
     stdin.typeBytewise(`${TEXT}\n`);
-    const first = await s.telegramChat.turn("dm");
+    const first = await turnIn(s, "dm");
     expect(first.opts.text).toBe(TEXT);
     stdin.typeBytewise(`zweite ${TEXT}`);
     stdin.emit("end");
@@ -508,7 +534,7 @@ describe("UTF-8 über Blockgrenzen", () => {
     const bytes = Buffer.from("Ende 😀", "utf8");
     for (const byte of bytes.subarray(0, bytes.length - 2)) stdin.emit("data", Buffer.from([byte]));
     stdin.emit("end");
-    const turn = await s.telegramChat.turn("dm");
+    const turn = await turnIn(s, "dm");
     expect(turn.opts.text).toBe("Ende \uFFFD");
     s.telegramChat.finish("dm", "ok");
     expect(await exit).toBe(0);
@@ -571,7 +597,7 @@ describe("Rückfragen als nummerierte Auswahl (Issue #120)", () => {
   test("Auswahl während einer laufenden Antwort geht sofort raus, eine Nachricht bliebe gesperrt", async () => {
     const { s, stdin, stdout, exit } = await start("topic-443", {}, withChoices);
     stdin.type("recherchiere\r");
-    await s.telegramChat.turn("topic-443");
+    await turnIn(s, "topic-443");
     const id = s.ask("topic-443", "Research möchte `Bash` ausführen");
     await waitFor(() => stdout.text.includes("[1] Erlauben"), 3000, "Optionen");
     stdin.type("1\r");
@@ -590,7 +616,7 @@ describe("Rückfragen als nummerierte Auswahl (Issue #120)", () => {
     stdin.type("/gespraeche\r");
     await waitFor(() => stdout.text.includes("Wechseln mit /wechsel"), 3000, "Liste");
     stdin.type("1\r");
-    const turn = await s.telegramChat.turn("topic-443");
+    const turn = await turnIn(s, "topic-443");
     expect(turn.opts.text).toBe("1");
     s.telegramChat.finish("topic-443", "ok");
     await waitFor(() => stdout.text.includes("ok"), 3000, "Antwort");
@@ -615,7 +641,7 @@ describe("Rückfragen als nummerierte Auswahl (Issue #120)", () => {
     await waitFor(() => stdout.text.includes("tybo · Direktchat"), 3000, "Wechsel");
     await waitFor(() => s.server.eventStreamCount() >= 1, 3000, "Live-Verbindung");
     stdin.type("1\r");
-    const turn = await s.telegramChat.turn("dm");
+    const turn = await turnIn(s, "dm");
     expect(turn.opts.text).toBe("1");
     expect(s.choices!.decisions).toEqual([]);
     s.telegramChat.finish("dm", "ok");
@@ -646,7 +672,7 @@ describe("Rückfragen als nummerierte Auswahl (Issue #120)", () => {
   test("Zeilenmodus im Terminal (NO_COLOR): Zahl wählt sofort, auch während einer Antwort", async () => {
     const { s, stdin, stdout, exit } = await start("topic-443", { NO_COLOR: "1" }, withChoices);
     stdin.type("Frage\n");
-    await s.telegramChat.turn("topic-443");
+    await turnIn(s, "topic-443");
     const id = s.ask("topic-443", "Freigabe?");
     await waitFor(() => stdout.all.includes("[1] Erlauben"), 3000, "Optionen");
     stdin.type("2\n");

@@ -110,6 +110,7 @@ const providers: Providers = {
   claudeProbe: async () => {
     throw new Error("Im Einrichtungsmodus darf kein Modell aufgerufen werden");
   },
+  engineCheck: ok("Codex 0.155.1 ist angemeldet."),
   openrouterKey: ok("OpenRouter nimmt den Schlüssel an."),
   ollamaTags: async () => ({ ok: true, message: "Ollama läuft (1 Modelle).", models: ["qwen3:8b"] }),
 };

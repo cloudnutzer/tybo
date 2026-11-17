@@ -52,7 +52,7 @@
 
 import { spawn } from "bun";
 import { isCliResultError } from "../../claude/result";
-import { registerEngineCall, unregisterEngineCall, type EngineCallEntry } from "../../engines/calls";
+import { engineShutdownStarted, registerEngineCall, trackEngineProcess, unregisterEngineCall, type EngineCallEntry } from "../../engines/calls";
 import { claudeAuthProblem, withClaudeAuth } from "../../engines/claude-auth";
 import { terminateProcessTree } from "../../process-tree";
 import { bookRunOutcome, claudeUsage, type RunOutcome } from "../../spend/credit";
@@ -180,23 +180,35 @@ export const defaultCliRuntime: CliRuntime = {
 
 let helpCache: { path: string; at: number; text: Promise<string | null> } | undefined;
 
-/** `claude --help` mit 5 s Zeitlimit, Ergebnis gilt 10 Minuten */
+/**
+ * `claude --help` mit 5 s Zeitlimit, Ergebnis gilt 10 Minuten. Issue #561:
+ * eigene Prozessgruppe und verfolgt (trackEngineProcess), damit das Beenden
+ * des Bots unter systemd den Prozess samt Kindern beendet und abwartet;
+ * danach startet keine Prüfung mehr (null, nicht zwischengespeichert).
+ */
 async function cliHelpText(): Promise<string | null> {
+  if (engineShutdownStarted()) return null;
   const path = claudePath();
   if (helpCache && helpCache.path === path && Date.now() - helpCache.at < 600_000) return helpCache.text;
   const text = (async () => {
     try {
-      const proc = spawn({ cmd: [path, "--help"], env: claudeCliEnv("", subprocessEnv({ home: HOME_DIR })), stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+      const proc = spawn({ cmd: [path, "--help"], env: claudeCliEnv("", subprocessEnv({ home: HOME_DIR })), detached: !IS_WINDOWS, stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+      trackEngineProcess(proc, (p) => terminateProcessTree(p as typeof proc));
       const timer = setTimeout(() => proc.kill(), 5_000);
       const out = await new Response(proc.stdout).text();
       clearTimeout(timer);
       const code = await proc.exited;
-      return code === 0 ? out : null;
+      return code === 0 && !engineShutdownStarted() ? out : null;
     } catch {
       return null;
     }
   })();
-  helpCache = { path, at: Date.now(), text };
+  const entry = { path, at: Date.now(), text };
+  helpCache = entry;
+  // Vom Beenden abgebrochen: das Ergebnis gilt nicht für spätere Prüfungen
+  void text.then(() => {
+    if (engineShutdownStarted() && helpCache === entry) helpCache = undefined;
+  });
   return text;
 }
 

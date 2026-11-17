@@ -19,12 +19,15 @@
  *
  * Zeitpläne: Check-in und Briefing kommen aus den Einstellungen
  * (setupSchedule in src/lib/proactive/setup-schedule.ts, Vorrang
- * schedule.json, dann settings.json, dann Standards), Nachtcheck und
- * Software-Updates haben feste Zeiten.
+ * schedule.json, dann settings.json, dann Standards), Nachtcheck,
+ * Software-Updates und Wartung (wöchentlich, Issue #485) haben feste Zeiten.
  *
  * Unter Linux (Issue #370) laufen Bot und Supabase unter PM2
- * (src/setup/services/pm2.ts), Check-in und Briefing als systemd-Timer
- * (src/lib/services/systemd.ts, src/setup/services/linux.ts).
+ * (src/setup/services/pm2.ts), Check-in, Briefing, Wartung und seit Issue
+ * #568 der Nachtcheck als systemd-Timer (src/lib/services/systemd.ts,
+ * src/setup/services/linux.ts). Ohne systemd läuft der Nachtcheck unter PM2
+ * als Zeitplan (pm2Schedule, src/setup/services/pm2-schedule.ts), die
+ * übrigen Routinen als cron-Zeilen.
  *
  * Eigene Routinen der Nutzer stehen nicht hier; die Routinen-Übersicht
  * erkennt sie weiter an ihren Plists (src/lib/routines/).
@@ -58,6 +61,7 @@ export const SERVICE_NAMES = [
   "health-check",
   "software-update",
   "supabase",
+  "wartung",
 ] as const;
 export type ServiceName = (typeof SERVICE_NAMES)[number];
 
@@ -94,6 +98,13 @@ export interface ServiceDefinition {
    * nur unter macOS.
    */
   linux?: "pm2" | "timer";
+  /**
+   * Nur mit linux "timer" (Issue #568): auf Rechnern ohne systemd unter PM2
+   * als Zeitplan (cron_restart) statt als cron-Zeile, sofern pm2 installiert
+   * ist. Mit systemd bleibt es beim Timer, ein PM2-Eintrag desselben Diensts
+   * wird dann entfernt.
+   */
+  pm2Schedule?: boolean;
 }
 
 const logsOf = (name: string) => ({ out: `logs/${name}.log`, err: `logs/${name}.error.log` });
@@ -168,6 +179,8 @@ export const SERVICE_CATALOG: readonly ServiceDefinition[] = [
     calendar: () => ({ form: "single", slot: { hour: 3, minute: 30 } }),
     path: "long",
     projectRootEnv: true,
+    linux: "timer",
+    pm2Schedule: true,
     logs: logsOf("health-check"),
   },
   {
@@ -195,6 +208,20 @@ export const SERVICE_CATALOG: readonly ServiceDefinition[] = [
     linux: "pm2",
     logs: { out: "logs/supabase.log", err: "logs/supabase.log" },
     exitTimeout: true,
+  },
+  {
+    name: "wartung",
+    kind: "routine",
+    summary: "Wartung sonntags 03:15: Test-Simulatoren, Caches und Logs aufräumen",
+    args: ["run", "src/maintenance.ts"],
+    wrapped: true,
+    calendar: () => ({ form: "single", slot: { weekday: 0, hour: 3, minute: 15 } }),
+    // xcrun, du und Homebrew-Pfade
+    path: "long",
+    projectRootEnv: true,
+    linux: "timer",
+    logs: logsOf("wartung"),
+    onlyExplicit: true,
   },
 ];
 

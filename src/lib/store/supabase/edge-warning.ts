@@ -7,7 +7,12 @@
  * Stunde eine Warnung. Still bleiben (nur einmal im Log): 404 (Function
  * nicht ausgeliefert, semantische Suche nicht eingerichtet) und bewusst ohne
  * Embedding (kein-zugang, gesperrt während einer Neuberechnung).
+ *
+ * Der Anfang der Log-Zeilen (EDGE_FALLBACK_PREFIX) steht in log-lines.ts;
+ * der Nachtcheck zählt sie damit (Issue #568).
  */
+
+import { EDGE_FALLBACK_PREFIX } from "../../log-lines";
 
 export const EDGE_FALLBACK_WARN_INTERVAL_MS = 60 * 60 * 1000;
 
@@ -71,14 +76,14 @@ function warnUser(reason: string, now: number): void {
 export function reportEdgeFallback(status: number | null, detail?: unknown, now: number = Date.now()): void {
   if (status === 404) {
     if (firstTime("404")) {
-      console.error("[saveMessage] Edge Function store-telegram-message fehlt (HTTP 404), speichere ohne Embedding");
+      console.error(`${EDGE_FALLBACK_PREFIX} store-telegram-message fehlt (HTTP 404), speichere ohne Embedding`);
     }
     return;
   }
   let what: string;
   if (status === null) what = `nicht erreichbar (${detail instanceof Error ? detail.name : "Fehler"})`;
   else what = typeof detail === "string" ? `HTTP ${status}, ${detail}` : `HTTP ${status}`;
-  console.error(`[saveMessage] Edge Function store-telegram-message: ${what}, Direkt-Insert ohne Embedding`);
+  console.error(`${EDGE_FALLBACK_PREFIX} store-telegram-message: ${what}, Direkt-Insert ohne Embedding`);
   warnUser(`Edge Function store-telegram-message antwortet ${what}`, now);
 }
 
@@ -92,7 +97,7 @@ export function noteEdgeResult(body: unknown, now: number = Date.now()): void {
   const { embedded, embedding_status: reason } = body as { embedded?: unknown; embedding_status?: unknown };
   if (embedded !== false || typeof reason !== "string") return;
   if (!QUIET_EMBEDDING_STATUS.has(reason)) {
-    console.error(`[saveMessage] Edge Function hat ohne Embedding gespeichert (${reason})`);
+    console.error(`${EDGE_FALLBACK_PREFIX} hat ohne Embedding gespeichert (${reason})`);
     warnUser(`die Edge Function erzeugt keinen Vektor (${reason})`, now);
     return;
   }

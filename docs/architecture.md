@@ -37,9 +37,17 @@ ihren Terminen.
    Startmodus wählen. Fehlt jeder Kanal, läuft nur der Einrichtungsmodus im
    Browser (`src/setup/web-mode.ts`) und der Prozess endet danach.
 2. **Lebenszyklus** (`src/app/lifecycle.ts`): Sperrdatei `bot.lock` gegen
-   einen zweiten Bot, Herzschlag, Signale. Beim Beenden arbeitet
+   einen zweiten Bot (Prozessnummer und Startzeit; ein abgelehnter Start
+   nennt den Besitzer auf stderr), Herzschlag, Signale. Beim Beenden arbeitet
    `src/app/bot-shutdown.ts` eine feste Reihenfolge ab: laufende Aufrufe
-   abbrechen, Planer anhalten, Telegram und WebUI schließen.
+   abbrechen, Planer anhalten, Telegram und WebUI schließen. Eine
+   unbehandelte Ausnahme oder Promise-Ablehnung kommt maskiert (ohne Token)
+   ins Log und beendet den Bot geordnet, eine Ablehnung mit Exit-Code 1;
+   launchd, systemd oder PM2 holen ihn zurück. Das ist die letzte
+   Absicherung, kein Normalfall: Abläufe, die ohne `await` gestartet werden,
+   fangen ihre Fehler selbst. So endet ein Abbruch durch `/stop` in der
+   Ziel-Schleife still, und ein anderer Fehler dort pausiert das Ziel mit
+   Meldung im Gespräch, statt alle laufenden Antworten mitzureißen.
 3. **Kanäle**: Telegram (`src/app/bot-telegram-channel.ts`), WebUI
    (`src/app/bot-web.ts`) und der Health-Port (`src/app/health-server.ts`,
    standardmäßig nur lokal, mit `/health` und `POST /process`).
@@ -115,7 +123,7 @@ für jeden Kanal gleich; nur Eingang und Zustellung unterscheiden sich.
    begrenzt `src/lib/agent-capacity.ts`. `/stop` bricht alles unter dem
    Schlüssel ab (`src/lib/engines/calls.ts`).
 4. **Prompt** (`src/lib/prompt-builder.ts`): Eine neue Session bekommt den
-   vollen Prompt mit Agent, Profil, Gedächtnis, Verlauf des eigenen Topics
+   vollen Prompt mit Agent, Profil, festem Kern, Gedächtnis, Verlauf des eigenen Topics
    und Suchtreffern. Eine fortgesetzte bekommt nur Zeit, Kanal, neue
    Merk-Einträge, Suchtreffer und die Nachricht.
 5. **Motor**: `src/lib/engine-choice.ts` wählt den Motor des Gesprächs,
@@ -180,7 +188,11 @@ Alle Teile lesen und schreiben über einen Speicher (`getStore()` in
   Zeichen mit eigenem Embedding (Tabelle `message_chunks`, Teilen in
   `supabase/functions/_shared/chunks.ts`, Nachzug im Bot in
   `src/lib/message-chunks.ts`); die Suche liefert jede Nachricht einmal und
-  lange nur als Ausschnitt um die Suchbegriffe.
+  lange nur als Ausschnitt um die Suchbegriffe. Auf Wunsch sucht derselbe
+  Vektor auch in den Fakten (`match_facts_checked`, ohne archivierte): so kommen
+  bei Folgenachrichten passende Fakten in den Prompt, ohne zweiten Aufruf beim
+  Anbieter (`src/lib/memory/follow-up.ts`). Nachschlagen kann das Modell über
+  das Werkzeug `history_search`, Claude Code über `bun run nachschlagen`.
 - **Ohne Datenbank** (`src/lib/store/file/memory.ts`): nur Fakten und Ziele,
   in `memory.json.sqlite` im Projektordner (oder `<MEMORY_FILE_PATH>.sqlite`).
   Eine vorhandene `memory.json` dient nur dem Erstimport. Verlauf, Wissen und
@@ -194,9 +206,42 @@ zurück.
 Das Modell merkt sich etwas über Tags in der Antwort, etwa `[REMEMBER:]`,
 `[GOAL:]`, `[DONE:]` oder `[REMIND:]`. Der Parser steht in
 `src/lib/memory/intents.ts`, angewendet wird in `src/lib/memory/service.ts`.
-Hat der Turn fremde Inhalte gelesen (Web, Mail, Dateien außerhalb des
-Projekts, `src/lib/turn-tools.ts`), werden die Tags nicht angewendet,
-sondern als Vorschlag mit Knöpfen gestellt.
+Werte, die nach Passwort oder Schlüssel aussehen, werden nicht gespeichert und
+aus dem Altbestand maskiert, bevor sie einen Prompt oder eine Ausgabe erreichen
+(`src/lib/memory/secrets.ts`). Gemerkt wird nur, wodurch eine spätere Session anders handelt; Recherche
+gehört mit `[KNOWLEDGE:]` in die Wissensbasis, wo `history_search` sie findet
+(Regeln: `MEMORY_RULES` in `src/agents/prompt-parts.ts`). Die Zeile „Neue
+Fakten 7 Tage“ im Nachtcheck zeigt, wie viele Fakten dazukommen; archivierte
+zählen mit, wieder gelöschte nicht. Hat der Turn Inhalte aus dem Netz
+gelesen (Web-Werkzeuge und Suche, Mail und andere lesende MCP-Werkzeuge,
+`curl`, `wget` und Co., `gh` gegen fremde oder nicht erkennbare Repos,
+`src/lib/turn-tools.ts` und `src/lib/bash-network.ts`) oder eine
+hochgeladene Datei oder ein Foto verarbeitet, werden die Tags nicht
+angewendet, sondern als Vorschlag mit Knöpfen gestellt. Dateien auf diesem
+Rechner zählen nicht als fremd, auch außerhalb des Projekts, und `gh` mit
+`-R`/`--repo` bzw. `repos/` gegen ein Repo der Konten aus
+`TYBO_TRUSTED_GITHUB_OWNERS` ebenfalls nicht. Im Zweifel bleibt es ein
+Vorschlag: Ein Befehl mit mehreren Teilen zählt als fremd, sobald ein Teil
+fremd ist, auch hinter der Kürzung langer Befehle.
+
+Die gh-Ausnahme setzt voraus, dass der ganze Befehl einer unterstützten Form
+entspricht. Optionen werden mit ihrer Wertigkeit je Unterbefehl gelesen;
+unbekannte Optionen, Dateimuster in gh-Argumenten und nicht unterstützte
+Wrapper (etwa `env -S`) verhindern die Ausnahme. Unterstützt sind `gh api`,
+`issue`/`pr`/`release` mit `list` und `view` sowie `issue create` und
+`issue comment`, jeweils mit den ausdrücklich erfassten Optionen.
+Einfache Ketten mit lokalen Leseprogrammen wie `cat`, `head` oder `ls`,
+feste `sh`/`bash`/`zsh -c`-Aufrufe und feste `eval`-Argumente werden ganz
+geprüft. Jede Subshell und Substitution endet erst an ihrer eigenen
+Schlussklammer. Auch die Befehle hinter einer inneren Subshell zählen mit,
+etwa der fremde Abruf in `"$( (true); gh api repos/fremd/x )"` als
+Such- oder Feldwert. Fehlende oder unerwartete Klammern und eine
+überschrittene Verschachtelungsgrenze verhindern die Ausnahme.
+Unbekannte Programme, Shell-Zustandsänderungen, Here-Docs und Backticks in
+derselben Kette bleiben fraglich. Ein eigenes gh-Repo allein gibt solche
+Ketten nicht frei. Netzprogramme wie `cu''rl` werden auch nach der
+Shell-Wortbildung erkannt. Das ist eine vorsichtige Herkunftseinstufung,
+keine vollständige Auswertung beliebiger Shell-Programme.
 
 ## Rückfragen
 
@@ -250,7 +295,11 @@ Im Bot-Prozess laufen Zeitgeber:
 - Routinen-Wache (`src/lib/routines/watch.ts`), alle 10 Minuten; meldet
   ausgebliebene Läufe
 - Ziele mit `/goal` (`src/lib/goal-engine.ts`): Arbeits-Turn, Prüfung,
-  Richter, nächster Turn
+  Richter, nächster Turn. `/stop` pausiert das Ziel und bricht nur die
+  Aufrufe seines Gesprächs ab, auch wenn Prüfung oder Richter noch auf einen
+  freien Platz warten; Befund und Fehlschläge des Richters bleiben dabei
+  unverändert. Ein Abbruch beim Herunterfahren lässt das Ziel aktiv, nach
+  dem Start läuft es weiter
 
 Außerhalb des Bots laufen die Routinen. Jede ruft der Wrapper
 `src/routine-run.ts` auf, der Dauer, Exit-Code und die letzten Zeilen unter
@@ -272,6 +321,7 @@ kein Kontext-Leser an ein Modell weiter.
 | `config/settings.json` | Einstellungen aus der WebUI, vor `.env` und Code (`src/lib/settings.ts`) |
 | `config/topics.json`, `config/agent-overrides.json` | Topic-Zuordnung, Zusätze zu Agenten-Prompts |
 | `config/profile.md` | Profil des Nutzers, Vorlage `config/profile.example.md` |
+| `config/kern.md` | Vom Nutzer bestätigter Kern, Vorlage `config/kern.example.md`; offener Entwurf in `data/kern-entwurf.json` (`src/lib/memory/core.ts`) |
 | `data/` | Sessions, Rückfragen, Fäden, Jobs, Routinen-Protokolle, Outbox-Dateien, Anmeldungen der WebUI |
 | `uploads/`, `logs/` | Medien aus Gesprächen, Protokolle der Dienste |
 

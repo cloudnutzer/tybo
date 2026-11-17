@@ -9,8 +9,10 @@
  * (Issue #259) landen als display_only im Nachrichtenspeicher, damit der
  * Browser sie live und nach dem Neuladen sieht.
  */
+import { join } from "node:path";
 import { getAgentByTopicId, getUserProfile } from "../agents";
 import { ASK_SOURCE, createAskChoices, createAskDeliver, createAskOffer, installAskOffer } from "../lib/ask-choices";
+import { callAux } from "../lib/aux-model";
 import type { BotNotices } from "../lib/bot-notices";
 import { onChoiceDecided } from "../lib/choices";
 import { dmChatId, isWebChatId, outboxDelivered, telegramConfigured } from "../lib/channels";
@@ -18,9 +20,12 @@ import { abortEngineCalls } from "../lib/engines";
 import { getGoal, onGoalChange } from "../lib/goal-engine";
 import { createGoalChoices } from "../lib/goal-choices";
 import { decideReview } from "../lib/intent-gate";
-import { setMemoryAsker } from "../lib/memory";
-import { createMemoryAsker, createMemoryChoices } from "../lib/memory/choices";
-import { sendAndRecord } from "../lib/outbox";
+import { setMemoryAsker, setMemoryFailureNotice } from "../lib/memory";
+import { createMemoryAsker, createMemoryChoices, MEMORY_SOURCE } from "../lib/memory/choices";
+import { CORE_SOURCE, createCoreChoices } from "../lib/memory/core-choices";
+import { createCleanupChoices, factCleanupFile } from "../lib/memory/fact-cleanup";
+import { createSecretChoices, secretDecisionsFile } from "../lib/memory/secret-review";
+import { sendAndRecord, type SendAndRecordInput, type SendAndRecordResult } from "../lib/outbox";
 import { createPhone, phoneAccess, proactiveCall, type PhoneBotDeps } from "../lib/phone";
 import { createProactiveChoices } from "../lib/proactive/choices";
 import { proactiveStatePath } from "../lib/proactive/state";
@@ -32,19 +37,27 @@ import { defaultRoutinesDeps } from "../lib/routines/catalog";
 import { getScheduleStore } from "../lib/schedule/store";
 import { createRoutineFromSession } from "../lib/session-routine";
 import { setReviewNotifier } from "../lib/session-distill";
-import { storeOr } from "../lib/store";
+import { getStore, storeOr } from "../lib/store";
 import { applyThreadButton } from "../lib/threads/store";
 import { createTaskReminders } from "../lib/task-reminders";
 import { directChatIds } from "../lib/task-place";
 import type { TelegramRuntime } from "../lib/telegram-runtime";
 import { refreshChoiceMessages } from "../lib/telegram-choices";
-import { createThreadChoices, installThreadChoiceExpiry, threadTarget, THREAD_SOURCE } from "../lib/thread-choices";
+import { classifyReminderResult, createThreadChoices, installThreadChoiceExpiry, threadTarget, THREAD_SOURCE } from "../lib/thread-choices";
 import { createChoiceToolApproval, expireOrphanedToolChoices } from "../lib/tool-approval";
+import { createAftercall, type Aftercall, type AftercallTarget, type DeliveryOutcome, TRAINING_SOURCE } from "../lib/voice-agents/aftercall";
+import { createElevenLabsLayer } from "../lib/voice-agents/elevenlabs";
+import { createVoiceAgentManager, VOICE_AGENT_SOURCE } from "../lib/voice-agents/manage";
+import { loadPriceBasis } from "../lib/voice-agents/cost";
+import { createDraftJobs } from "../lib/voice-agents/draft-jobs";
+import { createDraftService, voiceAgentChoiceHandler, type DraftService } from "../lib/voice-agents/drafts";
+import { listProviderVoices, suggestVoices } from "../lib/voice-agents/voice-catalog";
 import { setPhoneCallService } from "../lib/tools/phone-call";
 import { setToolApprovalHandler } from "../lib/tools/registry";
 import { createTopicChoices } from "../lib/topic-choices";
 import { onTopicMappingSet } from "../lib/topic-setup";
 import { botGroupId } from "../web/bot-telegram";
+import { webUiBaseUrl } from "../web/startup";
 import { createApprovalTurns, createTelegramNoticeRecorder } from "../web/bot-turn";
 import type { WebServer } from "../web/server";
 import { topicChanges } from "../web/topic-changes";
@@ -67,7 +80,7 @@ export interface BotChoicesDeps {
   services: CommandServices;
   /** Nur für Tests: prozessweite Anmeldungen ersetzen (Standard CHOICE_INSTALLERS) */
   installers?: Partial<ChoiceInstallers>;
-  /** Nur für Tests: Bausteine mit Ablage oder Versand ersetzen (Standard die echten) */
+  /** Nur für Tests: Bausteine mit Ablage, Versand oder Modell ersetzen (Standard die echten) */
   parts?: Partial<ChoiceParts>;
 }
 
@@ -77,6 +90,9 @@ interface ChoiceParts {
   sendAndRecord: typeof sendAndRecord;
   saveMessage(message: Message): Promise<boolean>;
   applyThreadButton: typeof applyThreadButton;
+  callAux: typeof callAux;
+  /** Hintergrund-Jobs der Entwürfe (Issue #493) */
+  createDraftJobs: typeof createDraftJobs;
 }
 
 /** Prozessweite Anmeldungen der Rückfragen; Tests ersetzen sie, damit nichts im Prozess hängen bleibt */
@@ -90,9 +106,19 @@ export const CHOICE_INSTALLERS = {
   expireOrphanedToolChoices,
   setReviewNotifier,
   setMemoryAsker,
+  setMemoryFailureNotice,
   installAskOffer,
   /** Offene Anrufe nach einem Neustart weiter abholen */
   resumeCalls: (phone: { resume(): void }) => phone.resume(),
+  /** Nachlauf der Sprachagenten (Issue #496): offene Auswertungen und Meldungen nach einem Neustart fortsetzen */
+  resumeAftercall: (aftercall: Pick<Aftercall, "resume">) => {
+    void aftercall.resume().catch(e => console.error(`[sprachagent] Nachlauf nach dem Start nicht geprüft (${e instanceof Error ? e.name : "Fehler"})`));
+  },
+  /** Entwürfe für Sprachagenten (Issue #493): laufende Jobs nach einem Neustart weiter verfolgen, Takt alle 15 Sekunden */
+  resumeVoiceDrafts: (drafts: Pick<DraftService, "resume" | "startPolling">): (() => void) => {
+    void drafts.resume().catch(e => console.error(`[sprachagent] Entwürfe nach dem Start nicht geprüft (${e instanceof Error ? e.name : "Fehler"})`));
+    return drafts.startPolling();
+  },
 };
 export type ChoiceInstallers = typeof CHOICE_INSTALLERS;
 
@@ -121,7 +147,21 @@ export function createChoicePostWeb(deps: ChoicePostWebDeps): PostWeb {
 
 const saveMessage = (message: Message) => storeOr(false, store => store.messages.save(message));
 
-const CHOICE_PARTS: ChoiceParts = { decideReview, createRoutine: createRoutineFromSession, sendAndRecord, saveMessage, applyThreadButton };
+/**
+ * Meldung des Nachlaufs (Issue #496) an nachlauf.ziel über die Outbox, also
+ * display_only im Verlauf und nie Kontext eines Modells. Ohne Telegram gibt es
+ * keine Topics: Dann geht auch topic:<n> in den Web-Direktchat, damit die
+ * Meldung überhaupt ankommt.
+ */
+export function aftercallNotify(send: (input: SendAndRecordInput) => Promise<SendAndRecordResult>, env: Env): (target: AftercallTarget, text: string) => Promise<DeliveryOutcome> {
+  return async (target, text) => {
+    const topic = /^topic:([1-9][0-9]*)$/.exec(target);
+    const where = topic && telegramConfigured(env) ? { topicId: Number(topic[1]) } : {};
+    return classifyReminderResult(await send({ ...where, text, source: TRAINING_SOURCE, format: "plain" }));
+  };
+}
+
+const CHOICE_PARTS: ChoiceParts = { decideReview, createRoutine: createRoutineFromSession, sendAndRecord, saveMessage, applyThreadButton, callAux, createDraftJobs };
 
 export function wireBotChoices(deps: BotChoicesDeps) {
   const { env, runtime } = deps;
@@ -135,7 +175,7 @@ export function wireBotChoices(deps: BotChoicesDeps) {
     runtime.bot ? refreshChoiceMessages(choice, runtime.bot.api, undefined, refs) : Promise.resolve([]);
 
   const install = { ...CHOICE_INSTALLERS, ...deps.installers };
-  const { decideReview, createRoutine, sendAndRecord, saveMessage, applyThreadButton } = { ...CHOICE_PARTS, ...deps.parts };
+  const { decideReview, createRoutine, sendAndRecord, saveMessage, applyThreadButton, callAux, createDraftJobs } = { ...CHOICE_PARTS, ...deps.parts };
   /** Wirft, wenn die Outbox die Meldung nicht zugestellt hat */
   const deliverOrThrow = async (input: Parameters<typeof sendAndRecord>[0]): Promise<void> => {
     const result = await sendAndRecord(input);
@@ -229,6 +269,72 @@ export function wireBotChoices(deps: BotChoicesDeps) {
   const memoryChoices = createMemoryChoices({ sendAndRecord: input => sendAndRecord(input), postWeb, dmChatId: copyChat });
   onChoiceDecided("memory", memoryChoices.handler);
 
+  // Bereinigung der Fakten (Issue #520): den Befehl führt ein eigener Prozess aus, die Klicks kommen hier an
+  const cleanupChoices = createCleanupChoices({
+    file: factCleanupFile(deps.root),
+    memory: () => getStore().memory,
+    sendChoice,
+    notify: (conversation, text) => deliverOrThrow({ ...threadTarget(conversation), text, source: MEMORY_SOURCE, format: "plain" }),
+  });
+  onChoiceDecided("cleanup", cleanupChoices.handler);
+
+  // Geheimnisse in Fakten (Issue #524): behalten oder archivieren, die Fragen stellt ein eigener Prozess
+  const secretChoices = createSecretChoices({
+    file: secretDecisionsFile(deps.root),
+    memory: () => getStore().memory,
+    notify: (conversation, text) => deliverOrThrow({ ...threadTarget(conversation), text, source: MEMORY_SOURCE, format: "plain" }),
+  });
+  onChoiceDecided("secret", secretChoices.handler);
+
+  // Entwurf für den Kern (Issue #522): strenges Lesen, ein Lesefehler ergibt keinen Entwurf
+  const coreChoices = createCoreChoices({
+    facts: () => getStore().memory.facts({ strict: true }),
+    callAux,
+    sendChoice,
+    postWeb,
+    notify: (conversation, text) => deliverOrThrow({ ...threadTarget(conversation), text, source: CORE_SOURCE, format: "plain" }),
+  });
+  onChoiceDecided("core", coreChoices.handler);
+  deps.services.core = { offerDraft: coreChoices.offerDraft };
+
+  // Sprachagenten (Issue #492): /sprachagent und das Löschen mit Rückfrage. Ohne
+  // ELEVENLABS_API_KEY gibt es keine Sprachschicht, Liste und Archiv gehen trotzdem
+  const voiceAgentPaths = { configDir: join(deps.root, "config", "voice-agents"), dataDir: join(deps.root, "data", "voice-agents") };
+  const voiceLayer = () => (env.ELEVENLABS_API_KEY?.trim() ? createElevenLabsLayer({ env, paths: voiceAgentPaths }) : null);
+  const voiceNotify = (conversation: Parameters<typeof threadTarget>[0], text: string) =>
+    deliverOrThrow({ ...threadTarget(conversation), text, source: VOICE_AGENT_SOURCE, format: "plain" });
+  // Link auf die Gesprächsseite (Issue #494): Adresse der WebUI zum Zeitpunkt des Befehls
+  const voiceAgents = createVoiceAgentManager({ layer: voiceLayer, paths: voiceAgentPaths, sendChoice, postWeb, notify: voiceNotify, webBase: () => webUiBaseUrl(env) });
+  // Entwürfe (Issue #493): neu und aendern per Hintergrund-Job, Freigabe in derselben Art.
+  // Ein Handler für beide, eine zweite Anmeldung ersetzte sonst den Löschhandler
+  const voiceDrafts = createDraftService({
+    root: deps.root,
+    paths: voiceAgentPaths,
+    jobs: createDraftJobs(deps.root, env),
+    layer: voiceLayer,
+    suggestVoices: async description => suggestVoices(description, await listProviderVoices(env)),
+    prices: () => loadPriceBasis(join(deps.root, "config")),
+    sendChoice,
+    postWeb,
+    notify: voiceNotify,
+  });
+  onChoiceDecided("sprachagent", voiceAgentChoiceHandler(voiceAgents.handler, voiceDrafts));
+  deps.services.voiceAgents = voiceAgents;
+  deps.services.voiceDrafts = voiceDrafts;
+  const stopDraftPolling = install.resumeVoiceDrafts(voiceDrafts);
+
+  // Nachlauf-Weiche (Issue #496): Protokolle vom Webhook. Rezept-Agenten werden beim
+  // Rezept abgelegt und ausgewertet, alles andere geht wie bisher an den Anrufdienst
+  const aftercall = createAftercall({
+    paths: voiceAgentPaths,
+    phone: () => phone,
+    phoneAgentId: () => env.ELEVENLABS_AGENT_ID?.trim() || undefined,
+    evaluate: prompt => callAux("voice-training", prompt, { quiet: true }),
+    notify: aftercallNotify(input => sendAndRecord(input), env),
+    ...(env.USER_TIMEZONE ? { timeZone: env.USER_TIMEZONE } : {}),
+  });
+  install.resumeAftercall(aftercall);
+
   // Rückfragen des Modells (Issue #335): Fortsetzen über Session, Motor und Modell der Frage
   const askChoices = createAskChoices({
     notify: (conversation, text) => deliverOrThrow({ ...threadTarget(conversation), text, source: ASK_SOURCE, format: "plain" }),
@@ -256,17 +362,19 @@ export function wireBotChoices(deps: BotChoicesDeps) {
 
   /**
    * Zustellwege für Vorschläge aus Turns: Merk-Vorschläge und Session-Review
-   * (Issue #117), mehrdeutige Merk-Tags (Issue #316), Rückfragen des Modells
-   * (Issue #335). Bestätigte Vorschläge wendet decideReview direkt an.
+   * (Issue #117), mehrdeutige Merk-Tags (Issue #316), nicht gespeicherte
+   * Ziele (Issue #518), Rückfragen des Modells (Issue #335). Bestätigte
+   * Vorschläge wendet decideReview direkt an.
    */
   const installNotifiers = () => {
     const ways = { sendChoice, postWeb };
     install.setReviewNotifier(createReviewNotifier(ways));
     install.setMemoryAsker(createMemoryAsker(ways));
+    install.setMemoryFailureNotice(memoryChoices.failureNotice);
     install.installAskOffer(createAskOffer(ways));
   };
 
-  return { postWeb, sendChoice, threadChoices, memoryChoices, askChoices, reminderChoices, reviewResults, goalChoices, topicChoices, routineChoices, proactiveChoices, phone, taskReminders, approvalTurns, refresh, installNotifiers };
+  return { postWeb, sendChoice, voiceAgents, voiceDrafts, stopDraftPolling, threadChoices, memoryChoices, askChoices, reminderChoices, reviewResults, goalChoices, topicChoices, routineChoices, proactiveChoices, phone, aftercall, taskReminders, approvalTurns, refresh, installNotifiers };
 }
 
 export type BotChoices = ReturnType<typeof wireBotChoices>;

@@ -13,8 +13,13 @@ import type {
   AssetUpload,
   AsyncTask,
   BoardRow,
+  DisplayOnlyHead,
   DisplayOnlyPageOptions,
   DisplayOnlyRow,
+  FactChange,
+  FactSearchOptions,
+  FactWish,
+  HitsWithFacts,
   HistoryOptions,
   HistoryRow,
   KnowledgeCategory,
@@ -29,6 +34,7 @@ import type {
   PingResult,
   TaskChanges,
   TopicActivity,
+  TopicActivityChanges,
 } from "./types";
 
 /** Nachrichten, Verlauf und Meldungen (#309, #310) */
@@ -53,22 +59,61 @@ export interface MessageStore {
   lastUserMessageAt(): Promise<string | null>;
   /** Suche nach Bedeutung, sonst nach Text */
   search(chatId: string, query: string, limit: number): Promise<Message[]>;
+  /** Wie search, dazu Fakten aus demselben Suchvektor, ohne weiteren Aufruf beim Anbieter (#523) */
+  searchWithFacts(chatId: string, query: string, limit: number, facts: FactWish): Promise<HitsWithFacts>;
   /** Verlauf für die WebUI, seitenweise */
   history(chatId: string, topicId: number | null, options: HistoryOptions): Promise<HistoryRow[]>;
   /** Letzte Aktivität je Topic der letzten Tage */
   topicActivity(chatId: string, sinceDays: number): Promise<TopicActivity[]>;
+  /**
+   * Letzte Aktivität je Topic ab einem Zeitpunkt (einschließlich), zum
+   * Fortschreiben eines Stands im Prozess (#684). Wirft bei jedem Abruffehler,
+   * damit „unbekannt" nie als „nichts Neues" gilt
+   */
+  topicActivitySince(chatId: string, since: string): Promise<TopicActivityChanges>;
   /** Eine Seite Meldungen aus den genannten Chats */
   displayOnlyPage(chatIds: string[], options: DisplayOnlyPageOptions): Promise<DisplayOnlyRow[]>;
+  /** Dieselbe Seite wie displayOnlyPage, aber nur id und created_at (#684) */
+  displayOnlyHeads(chatIds: string[], options: DisplayOnlyPageOptions): Promise<DisplayOnlyHead[]>;
+  /** Volle Meldungen zu Zeilen-IDs aus displayOnlyHeads, nur aus den genannten Chats (#684) */
+  displayOnlyRows(chatIds: string[], ids: string[]): Promise<DisplayOnlyRow[]>;
   /** Zeitpunkt der jüngsten Meldung oder null */
   latestDisplayOnlyAt(chatIds: string[]): Promise<string | null>;
   /** Meldung, die die Datei mit dieser ID trägt */
   findDisplayOnlyFile(fileId: string, chatIds: string[]): Promise<DisplayOnlyRow | null>;
 }
 
-/** Fakten und Ziele (#311, Datei-Adapter und ID-Änderungen #316) */
+/**
+ * Fakten und Ziele (#311, Datei-Adapter und ID-Änderungen #316). false und []
+ * heißen bei den Zielen „kein Treffer“; hat der Speicher die Abfrage nicht
+ * ausgeführt, werfen completeGoal, cancelGoal, matchingGoals und die
+ * ById-Methoden für Ziele (#518). addGoal: false heißt „nicht gespeichert“.
+ * activeGoals bleibt für Prompts leer statt zu werfen.
+ *
+ * Archiv (#520): Archivierte Fakten liefert außer archivedFacts keine Methode,
+ * und keine Methode außer restoreFact ändert sie. Für einen Treffer zählt, dass
+ * der Fakt in einem Schritt geprüft und geändert wird.
+ *
+ * Geheimnisse (#524): addFact und rewriteFact speichern keinen Text mit Geheimnis
+ * und fragen dafür auch keinen Anbieter. Ausgaben lesen weiter den Originaltext,
+ * denn Änderungen prüfen gegen ihn; maskiert wird beim Zeigen (memory/secrets.ts).
+ */
 export interface MemoryStore {
+  /** false: nicht gespeichert, auch bei einem Geheimnis; das unterscheidet der Aufrufer vorher mit containsSecret */
   addFact(content: string): Promise<boolean>;
-  facts(): Promise<MemoryItem[]>;
+  /** Fehler ergeben [], mit strict wirft jeder, damit „unbekannt“ nie als „keine Fakten“ gilt */
+  facts(options?: { strict?: boolean }): Promise<MemoryItem[]>;
+  /** Archivierte Fakten, zuletzt archivierte zuerst; wirft, wenn sie nicht lesbar sind */
+  archivedFacts(): Promise<MemoryItem[]>;
+  /** Archiviert genau diesen Fakt, wenn sein Text noch expected lautet */
+  archiveFact(id: string, expected: string): Promise<FactChange>;
+  /** Holt genau diesen Fakt aus dem Archiv; conflict, wenn er nicht (mehr) dort liegt */
+  restoreFact(id: string): Promise<FactChange>;
+  /**
+   * Ersetzt den Text, wenn er noch expected lautet, in einem Schritt mit dem
+   * neuen Vektor. Ohne Vektor: changed_without_vector, der alte ist dann weg
+   */
+  rewriteFact(id: string, expected: string, content: string): Promise<FactChange>;
   /** Löscht den Fakt, der den Suchtext enthält */
   deleteFact(searchText: string): Promise<boolean>;
   addGoal(content: string, deadline?: Date): Promise<boolean>;
@@ -77,7 +122,10 @@ export interface MemoryStore {
   completeGoal(searchText: string): Promise<boolean>;
   /** Streicht das Ziel, das den Suchtext enthält */
   cancelGoal(searchText: string): Promise<boolean>;
-  /** Fakten und aktive Ziele, die seit diesem Zeitpunkt angelegt wurden (created_at danach) */
+  /**
+   * Fakten, die seit diesem Zeitpunkt angelegt, umgeschrieben oder
+   * zurückgeholt wurden, und aktive Ziele, die seitdem angelegt wurden
+   */
   changedSince(since: Date): Promise<MemoryItem[]>;
   /**
    * Vektoren der Fakten (je Fakt-ID), die zu Anbieter und Modell dieses
@@ -91,6 +139,12 @@ export interface MemoryStore {
    */
   matchingFacts(searchText: string, limit: number): Promise<MemoryItem[]>;
   matchingGoals(searchText: string, limit: number): Promise<MemoryItem[]>;
+  /**
+   * Nicht archivierte Fakten zum Suchtext (#523): auf Wunsch erst nach Bedeutung,
+   * dann nach gemeinsamen Wörtern. Leer heißt „nichts gefunden“; wirft, wenn die
+   * Suche nicht ausgeführt werden konnte und nichts gefunden hat
+   */
+  searchFacts(query: string, limit: number, options?: FactSearchOptions): Promise<MemoryItem[]>;
   /** Änderungen an genau einem Eintrag; false, wenn es ihn (als offenes Ziel) nicht mehr gibt */
   deleteFactById(id: string): Promise<boolean>;
   completeGoalById(id: string): Promise<boolean>;
@@ -128,7 +182,8 @@ export interface AssetStore {
   setDescription(assetId: string, description: string, tags?: string[], relatedProject?: string | null): Promise<void>;
   byId(assetId: string): Promise<Asset | null>;
   recent(limit: number, fileType?: string): Promise<Asset[]>;
-  search(query: string, limit: number): Promise<Asset[]>;
+  /** Fehler ergeben eine leere Liste; mit strict wirft die Suche (Nachschlagen, #523) */
+  search(query: string, limit: number, options?: { strict?: boolean }): Promise<Asset[]>;
 }
 
 /** Wissensbasis (#317); archivierte, ersetzte und abgelaufene Einträge liefert keine Methode */

@@ -20,7 +20,8 @@
  *
  * Ergebnis (createMemoryChoices): der Handler läuft nur im Gewinnerprozess
  * von decideChoice (also genau einmal) und meldet im Gespräch der Frage.
- * Ins Log kommen nur IDs der Rückfrage, keine Merk-Inhalte.
+ * Ins Log kommen nur IDs der Rückfrage, keine Merk-Inhalte. Fragetext und Knöpfe
+ * zeigen Geheimnisse maskiert (Issue #524).
  */
 import {
   createChoice as realCreateChoice,
@@ -35,7 +36,8 @@ import { outboxDelivered } from "../channels";
 import type { SendAndRecordInput, SendAndRecordResult } from "../outbox";
 import type { PostWeb } from "../review-choices";
 import type { MemoryItem } from "../store/types";
-import { applyToEntry, type AmbiguousMatch, type MemoryAsker, type SearchAction } from "./service";
+import { maskSecrets } from "./secrets";
+import { applyToEntry, type AmbiguousMatch, type IntentConversation, type MemoryAsker, type MemoryFailureNotice, type SearchAction } from "./service";
 
 /** source der Fragen und Meldungen, wie CHOICE_SOURCES.memory */
 export const MEMORY_SOURCE = "gedaechtnis";
@@ -74,7 +76,7 @@ const errorName = (e: unknown) => (e instanceof Error ? e.name : "Fehler");
 
 /** Auf eine Zeile gebracht und höchstens max Zeichen (mit „…"), ohne ein Ersatzzeichenpaar zu teilen */
 function shorten(text: string, max: number): string {
-  const line = text.replace(/\s+/g, " ").trim();
+  const line = maskSecrets(text).replace(/\s+/g, " ").trim();
   if (line.length <= max) return line;
   let cut = line.slice(0, max - 1);
   if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
@@ -199,8 +201,12 @@ function idsOf(ref: string | undefined): string[] | null {
   }
 }
 
-/** Handler der Art "memory" (onChoiceDecided) samt Meldung des Ergebnisses */
-export function createMemoryChoices(deps: MemoryChoicesDeps): { handler: ChoiceHandler } {
+/**
+ * Handler der Art "memory" (onChoiceDecided) samt Meldung des Ergebnisses;
+ * failureNotice sagt auf demselben Weg, dass ein Ziel nicht gespeichert wurde
+ * (Issue #518, setMemoryFailureNotice)
+ */
+export function createMemoryChoices(deps: MemoryChoicesDeps): { handler: ChoiceHandler; failureNotice: MemoryFailureNotice } {
   const log = deps.log ?? defaultLog;
   const apply = deps.apply ?? applyToEntry;
 
@@ -222,17 +228,20 @@ export function createMemoryChoices(deps: MemoryChoicesDeps): { handler: ChoiceH
     }
   }
 
-  /** Ergebnis ins Gespräch der Frage (Web-Gespräch zusätzlich als Kopie in den Direktchat; ohne Telegram nur WebUI) */
-  async function say(choice: Choice, text: string): Promise<void> {
-    if (choice.noTelegram) return web(choice.noTelegram.conversationId, text, choice.id);
-    const c: ChoiceConversation = choice.conversation;
+  /** Meldung ins Gespräch (Web-Gespräch zusätzlich als Kopie in den Direktchat; ohne Telegram nur WebUI) */
+  async function sayIn(where: IntentConversation, text: string, label: string): Promise<void> {
+    if (where.noTelegram) return web(where.noTelegram.conversationId, text, label);
+    const c: ChoiceConversation = where.conversation;
     if (c.type === "telegram") {
-      return record({ chatId: c.chatId, ...(c.topicId !== undefined ? { topicId: c.topicId } : {}), text, source: MEMORY_SOURCE, format: "plain" }, choice.id);
+      return record({ chatId: c.chatId, ...(c.topicId !== undefined ? { topicId: c.topicId } : {}), text, source: MEMORY_SOURCE, format: "plain" }, label);
     }
-    await web(c.conversationId, text, choice.id);
+    await web(c.conversationId, text, label);
     const dm = deps.dmChatId();
-    if (dm) await record({ chatId: dm, text: `${WEB_COPY_PREFIX}${text}`, source: MEMORY_SOURCE, format: "plain" }, choice.id);
+    if (dm) await record({ chatId: dm, text: `${WEB_COPY_PREFIX}${text}`, source: MEMORY_SOURCE, format: "plain" }, label);
   }
+
+  /** Ergebnis ins Gespräch der Frage */
+  const say = (choice: Choice, text: string): Promise<void> => sayIn(choice, text, choice.id);
 
   const handler: ChoiceHandler = async choice => {
     const action = choice.action as SearchAction | undefined;
@@ -259,5 +268,5 @@ export function createMemoryChoices(deps: MemoryChoicesDeps): { handler: ChoiceH
     await say(choice, changed ? MEMORY_CHOICE_TEXT.applied[action](label) : MEMORY_CHOICE_TEXT.gone);
   };
 
-  return { handler };
+  return { handler, failureNotice: (where, text) => sayIn(where, text, "gescheitertes Ziel") };
 }

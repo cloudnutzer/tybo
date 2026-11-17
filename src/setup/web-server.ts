@@ -777,7 +777,7 @@ export async function createSetupServer(options: SetupServerOptions): Promise<Se
       return json({
         ok: result.ok,
         message: clean(result.message),
-        items: (result.items ?? []).map(i => ({ label: i.label, ok: i.ok, detail: clean(i.detail), fix: i.fix ? clean(i.fix) : undefined })),
+        items: (result.items ?? []).map(i => ({ label: i.label, ok: i.ok, ...(i.optional ? { optional: true } : {}), detail: clean(i.detail), fix: i.fix ? clean(i.fix) : undefined })),
       });
     }
     // action === "apply"

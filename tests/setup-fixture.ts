@@ -76,6 +76,7 @@ export function fakeProviders(results: FakeProviders["results"] = {}): FakeProvi
     supabaseWriteProbe: make("supabaseWriteProbe", { ok: true, message: "Schreibprobe bestanden." }),
     claudeVersion: make("claudeVersion", { ok: true, message: "Claude CLI 2.1.300" }),
     claudeProbe: make("claudeProbe", { ok: true, message: "Claude CLI ist angemeldet und antwortet." }),
+    engineCheck: make("engineCheck", { ok: true, message: "Codex 0.155.1 ist angemeldet." }),
     openrouterKey: make("openrouterKey", { ok: true, message: "OpenRouter nimmt den Schlüssel an." }),
     ollamaTags: make("ollamaTags", { ok: true, message: "Ollama läuft.", models: ["qwen3:8b"] }),
   };

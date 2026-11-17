@@ -221,7 +221,9 @@ async function defaultRecentRows(): Promise<BoardRow[]> {
 }
 
 async function defaultAux(prompt: string): Promise<AuxResult> {
-  const { callAux } = await import("../lib/aux-model");
+  const { callAux, resolveAux } = await import("../lib/aux-model");
+  // Eigener Prozess (Issue #566): ob Claude da ist, weiß nur der Bot; geprüft wird nur, wenn der Check-in über Claude liefe
+  if (resolveAux("checkin").kind === "claude") await (await import("../lib/claude-availability")).ensureClaudeChecked();
   return callAux("checkin", prompt, { timeoutMs: AUX_TIMEOUT_MS, quiet: true });
 }
 
@@ -242,6 +244,9 @@ async function readProfile(root: string): Promise<string> {
 function errorName(error: unknown): string {
   return error instanceof Error ? error.name : "Fehler";
 }
+
+/** Grund im Log, wenn der Check-in abgeschaltet ist (Issue #566) */
+export const CHECKIN_DISABLED_REASON = "abgeschaltet: Claude fehlt, AUX_MODEL_CHECKIN nicht eingestellt";
 
 type Decided = { kind: "quiet"; reason: string } | { kind: "message"; message: ProactiveMessage | null; decision: CheckinDecision };
 
@@ -289,6 +294,8 @@ async function decide(now: Date, zone: string, deps: CheckinRunDeps, env: Env): 
   };
 
   const answer = await (deps.aux ?? defaultAux)(checkinPrompt(facts));
+  // Abgeschaltet (Issue #566): kein Fehler, keine Fehlermeldung bei jedem Lauf
+  if (answer.disabled) return { kind: "quiet", reason: CHECKIN_DISABLED_REASON };
   if (answer.isError) throw new CheckinError("model", "Modell ohne Antwort (Fehler oder Zeitlimit)");
   const read = readDecision(answer.text);
   if (!read.ok) throw new CheckinError("model", `Antwort unbrauchbar (${read.problem})`);

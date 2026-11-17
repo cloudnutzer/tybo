@@ -522,6 +522,14 @@ nichts. Ohne Telegram (den Start ohne Token bringt erst Issue #228):
   Issue #255: nur der Kern im Server (Satz-Strom, Turn, Weg über die Messages
   API), noch ohne Knopf und ohne Verbindung zum Browser.
 
+### Sprachagenten (Entscheidung 0026)
+
+- Rezepte statt Einzelstücke:
+  [`decisions/0026-sprachagenten-rezepte.md`](decisions/0026-sprachagenten-rezepte.md).
+  Stand Issue #490: Format, Prüfung, Vorlagen, Ablage und Sprachschicht
+  ElevenLabs (`src/lib/voice-agents/layer.ts`, `elevenlabs.ts`), noch ohne
+  Befehl; Doku in `docs/sprechen.md`, „Sprachagenten: Rezepte“.
+
 ### Routinen und offene Fäden (Entscheidung 0025)
 
 - Routinen-Zentrale (A1) und offene Fäden (A2):

@@ -32,6 +32,9 @@ export interface FakeOptions {
   plists?: Record<string, Record<string, unknown>>;
   config?: string;
   platform?: NodeJS.Platform;
+  /** Linux: mit systemd und diesen Einheiten (wie fakeRoutinesDeps, Issue #568) */
+  systemd?: boolean;
+  units?: Record<string, string>;
   /** Label → PID (null: geladen, läuft nicht); fehlt ein Label, ist es nicht geladen */
   loaded?: Record<string, number | null>;
   disabled?: string[];
@@ -99,10 +102,12 @@ export function fake(options: FakeOptions = {}): Fake {
   const bad = { ok: false, stdout: "", stderr: "Fehler" };
   const changed = (path: string) => original !== undefined && !Bun.deepEquals(files.get(path), original);
 
-  const base = fakeRoutinesDeps({ platform: options.platform, config: options.config ?? CONFIG });
+  const base = fakeRoutinesDeps({ platform: options.platform, config: options.config ?? CONFIG, systemd: options.systemd, units: options.units });
   const deps: WrapCommandDeps = {
     ...base,
     async run(cmd) {
+      // Nur lesend (Routinen-Übersicht unter Linux): kein Ereignis
+      if (cmd[0] === "systemctl" && cmd[2] === "show") return base.run(cmd);
       events.push(cmd.slice(0, 2).join(" "));
       if (cmd[0] === "plutil" && cmd[1] === "-convert") {
         const plist = files.get(cmd[cmd.length - 1]);
@@ -148,7 +153,7 @@ export function fake(options: FakeOptions = {}): Fake {
       throw new Error(`unerwarteter Befehl: ${cmd.join(" ")}`);
     },
     listDir(path) {
-      if (path !== AGENTS) throw new Error("ENOENT");
+      if (path !== AGENTS) return base.listDir(path);
       return [...files.keys()].filter(p => dirname(p) === AGENTS).map(p => p.slice(AGENTS.length + 1));
     },
     bunPath: options.bunPath === undefined ? BUN : options.bunPath,

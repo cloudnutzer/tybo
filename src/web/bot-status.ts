@@ -19,6 +19,7 @@ import { activeExecutionCount } from "../lib/execution-context";
 import { detectSupervisor, RESTART_MARKER, requestRestart } from "../lib/restart-request";
 import { isSessionModeEnabled, listStoredSessions, SESSION_IDLE_MS } from "../lib/session-manager";
 import { searchDisplayState } from "../setup/search-record";
+import { currentIntakeView, intakeStatePath } from "../lib/telegram-intake";
 import {
   countResumableSessions,
   keyStatus,
@@ -28,6 +29,7 @@ import {
   type StoredSession,
   type SemanticSearchState,
   type Supervisor,
+  type TelegramIntakeStatus,
 } from "./status";
 
 const execFileAsync = promisify(execFile);
@@ -98,6 +100,8 @@ export interface BotStatusDeps {
   semanticSearch(): Promise<SemanticSearchState | null>;
   /** Verfügbarkeit eines Motors (Issue #126), Standard inspectEngine; Tests reichen eine Attrappe herein */
   inspectEngine(id: EngineId): Promise<EngineStatus>;
+  /** Zustand des Telegram-Eingangs dieses Prozesses (Issue #562), Standard aus data/telegram-intake.json */
+  telegramIntake(): Promise<TelegramIntakeStatus | null>;
   now(): number;
 }
 
@@ -124,6 +128,8 @@ export function createBotStatus(env: Env = process.env, overrides: Partial<BotSt
     requestRestart: note => requestRestart(note),
     semanticSearch: () => searchDisplayState(root, env),
     inspectEngine,
+    // Nur der Zustand, den dieser Prozess geschrieben hat
+    telegramIntake: () => currentIntakeView(intakeStatePath(root), pid => pid === process.pid),
     now: Date.now,
     ...overrides,
   };
@@ -175,6 +181,7 @@ export function createBotStatus(env: Env = process.env, overrides: Partial<BotSt
           }
         })
       ),
+    telegramIntake: () => d.telegramIntake(),
     now: () => d.now(),
   };
 }

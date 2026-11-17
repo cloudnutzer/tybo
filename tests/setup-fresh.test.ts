@@ -86,19 +86,28 @@ function trackedFiles(): string[] {
 
 let copies = 0;
 
+/** Gleichzeitige Kopien in freshCopy() */
+const COPY_CONCURRENCY = 32;
+
+/**
+ * Kopiert die getrackten Dateien in einen neuen Ordner. Jeder Ordner wird
+ * einmal angelegt, die Dateien laufen in Gruppen von COPY_CONCURRENCY
+ * gleichzeitig: Datei für Datei nacheinander dauerte das Kopieren unter hoher
+ * Rechnerlast über 30 Sekunden (Prüfung von #549).
+ */
 async function freshCopy(): Promise<{ dir: string; project: string; home: string }> {
   const dir = join(testRoot, `frisch-${++copies}`);
   const project = join(dir, "projekt");
   const home = join(dir, "home");
   await mkdir(project, { recursive: true });
   await mkdir(home, { recursive: true });
-  for (const file of trackedFiles()) {
-    if (isLocalOnly(file)) continue;
-    const from = join(REPO, file);
-    if (!existsSync(from)) continue;
-    const to = join(project, file);
-    await mkdir(dirname(to), { recursive: true });
-    await cp(from, to, { verbatimSymlinks: true });
+  const files = trackedFiles().filter(file => !isLocalOnly(file) && existsSync(join(REPO, file)));
+  const dirs = [...new Set(files.map(file => dirname(join(project, file))))].sort();
+  for (const d of dirs) await mkdir(d, { recursive: true });
+  for (let i = 0; i < files.length; i += COPY_CONCURRENCY) {
+    await Promise.all(
+      files.slice(i, i + COPY_CONCURRENCY).map(file => cp(join(REPO, file), join(project, file), { verbatimSymlinks: true })),
+    );
   }
   await symlink(join(REPO, "node_modules"), join(project, "node_modules"));
   return { dir, project, home };
@@ -415,6 +424,7 @@ const RUN_B = [
   "Gärtnerei",
   "",
   "j", // Modelle: Jetzt einrichten?
+  "", // Motor (Issue #566): leer, Claude Code
   "test-standardmodell",
   "2", // Effort: medium
   FAKE.openrouterKey,

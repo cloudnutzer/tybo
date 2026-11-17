@@ -38,7 +38,7 @@ export interface RoutineInput {
   lastExit: number | null;
   logPath: string | null;
   errorLogPath: string | null;
-  source: "launchd" | "pm2";
+  source: "launchd" | "pm2" | "systemd";
   own: boolean;
   wrapped: boolean;
   lastRun: RoutineRunInput | null;
@@ -63,7 +63,7 @@ export type RoutineActInput =
 
 export interface RoutineListInput {
   available: boolean;
-  source: "launchd" | "pm2" | null;
+  source: "launchd" | "pm2" | "systemd" | null;
   routines: RoutineInput[];
   notes: string[];
 }
@@ -120,7 +120,9 @@ export type RunApi = LastRunApi & {
   logPath: string | null;
 };
 
-export type RoutineApi = Omit<Pick<RoutineInput, Exclude<(typeof ROUTINE_API_FIELDS)[number], "actions">>, "lastRun"> & {
+export type RoutineApi = Omit<Pick<RoutineInput, Exclude<(typeof ROUTINE_API_FIELDS)[number], "actions">>, "lastRun" | "source"> & {
+  /** null: unbekannte Quelle, nie stillschweigend launchd (Issue #568) */
+  source: RoutineInput["source"] | null;
   lastRun: LastRunApi | null;
   actions: RoutineActionName[];
 };
@@ -132,7 +134,7 @@ export type RoutineRunsApiBody = {
 
 export type RoutinesApiBody = {
   available: boolean;
-  source: "launchd" | "pm2" | null;
+  source: "launchd" | "pm2" | "systemd" | null;
   routines: RoutineApi[];
   notes: string[];
 };
@@ -193,7 +195,8 @@ function toApi(r: RoutineInput, home: string): RoutineApi {
     lastExit: typeof r.lastExit === "number" && Number.isInteger(r.lastExit) ? r.lastExit : null,
     logPath: homeRelativePath(r.logPath, home),
     errorLogPath: homeRelativePath(r.errorLogPath, home),
-    source: r.source === "pm2" ? "pm2" : "launchd",
+    // Unbekannte Quellen nie als launchd ausgeben (Issue #568)
+    source: r.source === "launchd" || r.source === "pm2" || r.source === "systemd" ? r.source : null,
     own: r.own === true,
     wrapped: r.wrapped === true,
     lastRun: lastRunApi(r.lastRun),
@@ -228,7 +231,7 @@ export function routinesApiBody(list: RoutineListInput, home: string): RoutinesA
   return scrubHome(
     {
       available: list.available === true,
-      source: list.source === "launchd" || list.source === "pm2" ? list.source : null,
+      source: list.source === "launchd" || list.source === "pm2" || list.source === "systemd" ? list.source : null,
       routines: (Array.isArray(list.routines) ? list.routines : []).map(r => toApi(r, home)),
       notes: (Array.isArray(list.notes) ? list.notes : []).map(String),
     },

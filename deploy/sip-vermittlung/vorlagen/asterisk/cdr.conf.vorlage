@@ -1,0 +1,3 @@
+; Keine Gesprächsdatensätze auf der Vermittlung (Issue #511)
+[general]
+enable = no

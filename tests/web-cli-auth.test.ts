@@ -269,6 +269,7 @@ const lan = lanAddress();
 
 describe("Bearer von einer fremden Adresse", () => {
   test.skipIf(!lan)("gültiger Schlüssel über die Heimnetz-Adresse: 401, auch mit Forwarded auf 127.0.0.1", async () => {
+    const logStart = allLogs.length;
     const ctx = await start("0.0.0.0");
     const port = new URL(ctx.server.url).port;
     const base = `http://${lan}:${port}`;
@@ -281,7 +282,10 @@ describe("Bearer von einer fremden Adresse", () => {
     expect(spoofed.status).toBe(401);
     expect((await postMessage(ctx, bearer(ctx.token), base)).status).toBe(401);
     expect(ctx.chat.turns).toEqual([]);
-    expect(allLogs.join("\n")).toContain(`Terminal-Anmeldung abgelehnt von ${lan}`);
+    // Die Absenderadresse wählt das Netz: meist die Heimnetz-Adresse selbst, auf
+    // einem Server mit Docker-Brücke auch die öffentliche. Sie ist nie Loopback
+    const rejected = allLogs.slice(logStart).flatMap(line => line.match(/^Terminal-Anmeldung abgelehnt von (\S+)$/)?.[1] ?? []);
+    expect(rejected.filter(who => !isLoopbackAddress(who)).length).toBeGreaterThan(0);
     // Über Loopback gilt derselbe Schlüssel
     expect((await fetch(`http://127.0.0.1:${port}/api/me`, { headers: bearer(ctx.token) })).status).toBe(200);
   });

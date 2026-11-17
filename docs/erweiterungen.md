@@ -68,7 +68,8 @@ Antwort kommt vom neuen Bot.
 kurzen Check-ins, wenn es etwas zu sagen gibt.
 
 **Was du brauchst:** macOS (launchd) oder Linux (systemd-Timer, ohne systemd
-cron). Unter Windows gibt es keine Dienste dafür.
+cron). Unter Windows gibt es keine Dienste dafür. Die Timer laufen in der
+Zeitzone aus `USER_TIMEZONE`, auch wenn der Server auf UTC steht.
 
 **Einrichten:** `tybo dienste` richtet alle Dienste ein, einzeln mit
 `tybo dienste smart-checkin` bzw. `tybo dienste morning-briefing`.
@@ -80,6 +81,73 @@ Nach einer Änderung der Zeiten `tybo dienste` noch einmal ausführen.
 **Prüfen:** `bun run briefing --dry-run` bzw. `bun run checkin --dry-run`
 zeigen, was gerade käme, ohne etwas zu senden. `/routinen` zeigt die Dienste
 mit ihren letzten Läufen.
+
+## Nachtcheck
+
+**Was es bringt:** Jede Nacht um 03:30 ein kurzer Bericht mit ✅, ⚠️ und ❌:
+ob der Bot läuft und antwortet, ob der eingestellte Motor (Claude Code,
+Codex, OpenCode oder die Anthropic API) installiert und angemeldet ist,
+Telegram, Datenbank, Ersatzmodelle, Plattenplatz und ob Check-in, Briefing
+und Wartung pünktlich liefen. Gerade auf einem Server ohne Bildschirm
+erfährst du so von selbst, dass der Bot steht.
+
+**Was du brauchst:** macOS (launchd) oder Linux. Unter Linux läuft er als
+systemd-Timer in der Zeitzone aus `USER_TIMEZONE`, auf Rechnern ohne systemd
+unter PM2 (Zeitplan in der Zeitzone des Systems), ohne PM2 als cron-Zeile.
+
+**Einrichten:** `tybo dienste health-check` (in `tybo dienste` ohne Angabe
+enthalten). Unter PM2 läuft der erste Bericht sofort beim Einrichten. Wer
+den Nachtcheck vorher unter PM2 hatte und jetzt systemd nutzt: `tybo
+dienste` entfernt den PM2-Eintrag `tybo-health-check` und sichert die
+PM2-Liste mit `pm2 save --force`, auch wenn sie danach leer ist. Läuft PM2
+gerade nicht, streicht `tybo dienste` den Eintrag aus der gesicherten Liste
+(`dump.pm2`), damit er beim Hochfahren nicht zurückkommt. Lässt sich die
+PM2-Liste oder ihre Sicherung nicht lesen, der Eintrag nicht entfernen oder
+die Liste nicht sichern, bleibt es beim Zeitplan unter PM2, und `tybo
+dienste` meldet einen Fehler; nie laufen beide. Lassen sich alte
+cron-Zeilen nicht entfernen, wird der Timer wieder abgeschaltet und es gilt
+die cron-Zeile. Ohne systemd und ohne antwortende PM2-CLI entsteht keine
+cron-Zeile, solange PM2 den Nachtcheck führt oder gesichert hat oder das
+unklar ist.
+
+**Wie er den Bot prüft:** Die Zeile „Bot-Prozess“ fragt launchd, systemd
+(`tybo-telegram-relay.service`) oder PM2 (`tybo-telegram-relay`), ohne PM2
+zu starten. Die Zeile „Bot antwortet“ fragt den Health-Port des Bots
+(`http://127.0.0.1:<HEALTH_PORT>/health`, Standard 3000). Steht der Bot,
+stehen beide als ❌ im Bericht. Der Bericht kommt wie jede Nacht genau
+einmal, über Telegram, falls eingerichtet, und in der WebUI. Ohne Telegram
+liegt er nur in der WebUI, und die steht mit dem Bot: Du siehst ihn erst,
+wenn der Bot wieder läuft.
+
+**Prüfen:** `bun run health -- --no-send` zeigt den Bericht, ohne ihn zu
+senden; `--no-model` lässt den kurzen Probeaufruf an Claude Haiku weg.
+`/routinen health-check` zeigt die letzten Läufe.
+
+## Wartung
+
+**Was es bringt:** tybo räumt einmal die Woche Posten weg, die sich
+gefahrlos neu erzeugen lassen: Test-Simulatoren von Xcode, Download- und
+Build-Caches, zu große eigene Logs. Danach kommt eine Meldung, wie viel
+Platz frei wurde.
+
+**Was du brauchst:** macOS (launchd) oder Linux (systemd-Timer, ohne systemd
+cron). Unter Linux fallen die Xcode-Posten weg.
+
+**Einrichten:** `tybo dienste wartung` (sonntags 03:15; `tybo dienste` ohne
+Angabe lässt sie weg). Welche Simulatoren als Test-Geräte gelten, legst du
+in `config/wartung.json` fest (Vorlage `config/wartung.example.json`); ohne
+Muster bleiben alle Geräte bis auf die nicht verfügbaren.
+
+**Dienste nach Updates:** Nennt `config/wartung.json` unter `dienste` einen
+Dauerdienst (die Vorlage: den Cloudflare-Tunnel), startet die Wartung ihn
+neu, wenn er älter läuft als installiert, ebenso `bun run updates --apply`.
+Ohne Eintrag wird kein Dienst angefasst
+([mehr](routinen.md#dienste-nach-updates-neu-starten)).
+
+**Prüfen:** `tybo wartung --dry-run` zeigt, was gelöscht bzw. neu gestartet
+würde, mit Größen, ohne etwas zu löschen, zu starten oder zu senden. Was
+genau angefasst wird und was nie:
+[Routinen, Abschnitt Wartung](routinen.md#wartung).
 
 ## Datenquellen
 
@@ -143,7 +211,10 @@ kommt eine Zusammenfassung in den Chat.
 
 **Einrichten:** Die vier Werte in die `.env`. Damit der Agent den Anlass
 kennt, braucht er unter „Custom LLM“ zwei Request-Header; beschrieben in
-[sprechen.md](sprechen.md#anruf-von-tybo-elevenlabs-und-twilio).
+[sprechen.md](sprechen.md#anruf-von-tybo-elevenlabs-und-twilio). Liegt die
+Nummer an einem SIP-Trunk (etwa an der eigenen Vermittlung für einen
+easybell-Anschluss), dazu `ELEVENLABS_PHONE_PROVIDER=sip_trunk`; siehe
+[sprechen.md](sprechen.md#anrufannahme-über-eigene-vermittlung).
 
 **Prüfen:** `/anruf Test` schicken. Fehlt eine Variable, nennt tybo sie und
 ruft nicht an.
@@ -179,10 +250,13 @@ und meldet, welche Werkzeuge ein Ersatzmodell bekommt. Den laufenden Bot
 Hybrid-Betrieb nimmt der Server alle Nachrichten an und reicht sie an deinen
 eigenen Rechner weiter, solange der wach ist; sonst antwortet der Server.
 
-**Was du brauchst:** einen Server mit Bun und Claude CLI, für Claude Code dort
-`CLAUDE_AUTH=apiKey` mit `ANTHROPIC_API_KEY`, eine öffentliche
-`https`-Adresse (Reverse-Proxy oder Tunnel) und für Hybrid dasselbe
-Supabase-Projekt auf beiden Rechnern.
+**Was du brauchst:** einen Server mit Bun und einem Motor: Claude CLI (für
+Claude Code dort `CLAUDE_AUTH=apiKey` mit `ANTHROPIC_API_KEY`) oder Codex
+ohne Claude-Konto ([server.md](server.md), mit der Tabelle, was dann geht).
+Nur für den Webhook (Profil `server`) und damit für Hybrid eine öffentliche
+`https`-Adresse (Reverse-Proxy oder Tunnel); ein Server, der wie zu Hause
+per Polling abholt, braucht keine. Für Hybrid dasselbe Supabase-Projekt auf
+beiden Rechnern.
 
 **Einrichten:** Auf dem Server `TYBO_PROFILE=server` mit
 `TELEGRAM_WEBHOOK_SECRET` und `TELEGRAM_WEBHOOK_URL`; der Bot trägt den
@@ -219,7 +293,11 @@ PM2 `pm2 list` nach einem Neustart. Mehr:
 ## Prüfbericht
 
 **Was es bringt:** Ein Bericht über alles auf einmal: jeden Schritt der
-Einrichtung, die Kanäle, Telegram, Datenbank, Dienste und Sprache.
+Einrichtung, die Kanäle, den Motor, Telegram, Datenbank, Dienste und Sprache.
+Der Abschnitt „Motor“ prüft den Standard-Motor (Einstellungen, sonst
+`TYBO_ENGINE`, sonst Claude Code): installiert und angemeldet, mit dem `PATH`
+aus der Dienstdatei des Bots. Unter macOS ist ein Bot, der geladen ist, aber
+nicht läuft, ein Fehler wie unter Linux.
 
 **Was du brauchst:** nichts; der Befehl schickt keine Testnachricht, schreibt
 nichts in die Datenbank und ruft kein Modell auf.

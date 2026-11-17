@@ -19,6 +19,7 @@ import {
   MIN_BUN_VERSION,
   prerequisitesStep,
   versionAtLeast,
+  OTHER_ENGINE_HINT,
 } from "../src/setup/steps/prerequisites";
 import { backupsOf, cleanup, FAKE, FULL_ENV, fakeRun, leakedSecrets, makeCtx, root } from "./setup-fixture";
 
@@ -67,7 +68,8 @@ describe("Schritt voraussetzungen", () => {
     ctx.providers.results.claudeVersion = { ok: false, message: "Claude CLI nicht gefunden." };
     const s = await prerequisitesStep.status(ctx);
     expect(s.state).toBe("fehlt");
-    expect(s.detail).toBe("Fehlt oder zu alt: Bun, Claude CLI, Git.");
+    // Issue #566: mit Claude Code als Motor dazu der Weg ohne Claude-Konto
+    expect(s.detail).toBe(`Fehlt oder zu alt: Bun, Claude CLI, Git. ${OTHER_ENGINE_HINT}`);
     expect(s.items?.map(i => i.fix)).toEqual(["bun upgrade", CLAUDE_INSTALL, "sudo apt install git"]);
     // Nur Prüfbefehle, keine Installation
     expect(ctx.run.calls).toEqual([["git", "--version"]]);

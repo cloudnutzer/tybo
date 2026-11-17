@@ -122,6 +122,15 @@ export interface RecoverSummary {
  * eine noch ausstehende Beendigung der Prozessgruppe, dann die Meldung.
  * Jobs ohne Wächter-Eintrag innerhalb der Schonfrist stehen in deferred.
  */
+/**
+ * Grund in der Meldung nach einem verlorenen Wächter (Issue #561): auch der
+ * Neustart des Bots, denn unter einem Dienstverwalter, der beim Stoppen alle
+ * Prozesse des Dienstes beendet (systemd ohne KillMode=process), endet der
+ * Wächter mit.
+ */
+export const LOST_WATCHER_DETAIL =
+  "Der Wächter lief nicht mehr (Absturz, Neustart des Rechners oder Neustart des Bots), der Job wurde abgebrochen.";
+
 export async function recoverJobs(deps: ControlDeps): Promise<RecoverSummary> {
   const summary: RecoverSummary = { aborted: [], resent: [], deferred: [] };
   const me = ownProcessRef(deps.proc);
@@ -137,7 +146,7 @@ export async function recoverJobs(deps: ControlDeps): Promise<RecoverSummary> {
         const detail =
           status.phase === "starting"
             ? "Der Job kam nicht in Gang, sein Wächter lief nicht mehr."
-            : "Der Wächter lief nicht mehr (Absturz oder Neustart des Rechners), der Job wurde abgebrochen.";
+            : LOST_WATCHER_DETAIL;
         const claim = await claimOutcome(deps.root, status.id, "aborted", me, { detail, terminate: true }, deps.now);
         if (!claim.claimed) continue;
         await settleAndDeliver(status.id, claim.token!, deps);

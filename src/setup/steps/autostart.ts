@@ -47,17 +47,22 @@ import { join } from "node:path";
 import { configurePM2Service, ONCE_WRAPPER, pm2FailureMessage, type Pm2Deps } from "../services/pm2";
 import {
   enableSystemdService,
+  ensureKillMode,
   ensureLinger,
   installSystemdService,
+  KILL_MODE_LINE,
+  killModeOutdated,
   lingerCheckCommand,
   lingerCommand,
   lingerState,
+  replaceFileAtomic,
   startSystemdService,
   SYSTEMD_UNIT,
   systemdBooted,
   systemdUnitPath,
   systemdUnitState,
   type ConfigureResult,
+  type KillModeOutcome,
   type LingerOutcome,
   type SystemdDeps,
 } from "../../../setup/configure-systemd";
@@ -118,7 +123,9 @@ export function systemdDeps(ctx: SetupContext): SystemdDeps {
     user: ctx.user,
     run: runOk(ctx),
     exists: existsSync,
+    readFile: path => readFileSync(path, "utf-8"),
     writeFile: (path, content) => writeFileSync(path, content, { encoding: "utf-8", mode: 0o644 }),
+    replaceFile: (path, content) => replaceFileAtomic(path, content),
     mkdir: path => mkdirSync(path, { recursive: true }),
   };
 }
@@ -449,10 +456,11 @@ async function applySystemd(ctx: SetupContext): Promise<ApplyResult> {
     intro = `${BRAND.name} lief schon als ${SYSTEMD_UNIT} und startet jetzt auch mit dem Rechner, ohne Neustart.`;
   } else {
     const fresh = !unit.fileExists && !unit.loaded;
-    const env = await envValues(ctx, ["CLAUDE_PATH"]);
+    const env = await envValues(ctx, ["CLAUDE_PATH", "CODEX_PATH"]);
     let result: ConfigureResult;
     try {
-      result = fresh ? await installSystemdService(deps, env.CLAUDE_PATH) : await startSystemdService(deps, unit.loaded);
+      // Ordner von Claude und Codex in den PATH der Unit (Issue #566: Server nur mit Codex)
+      result = fresh ? await installSystemdService(deps, env.CLAUDE_PATH, env.CODEX_PATH) : await startSystemdService(deps, unit.loaded);
     } catch {
       result = { ok: false, reason: "write" };
     }
@@ -461,15 +469,52 @@ async function applySystemd(ctx: SetupContext): Promise<ApplyResult> {
     changed = fresh ? touched : [`systemd:${SYSTEMD_UNIT}`];
     intro = `Autostart eingerichtet: ${SYSTEMD_RUNNING}`;
   }
+  // Alte Dienstdatei ohne KillMode=process nachziehen (Issue #561), ohne Neustart
+  const jobs = jobsText(await ensureKillMode(deps));
+  if (jobs.changed && !changed.includes(path)) changed = [...changed, path];
   const linger: LingerOutcome = await ensureLinger(deps);
-  if (linger === "already" && !intro) return ALREADY;
+  if (linger === "already" && !intro && !jobs.text) return ALREADY;
+  const head = intro || `${BRAND.name} läuft schon als ${SYSTEMD_UNIT}.`;
+  const say = (...parts: Array<string | undefined>) => parts.filter(Boolean).join(" ");
   if (linger === "already" || linger === "enabled") {
     const text = linger === "enabled" ? "Linger ist jetzt an: er startet auch nach einem Neustart des Rechners ohne Anmeldung." : "Er startet auch nach einem Neustart des Rechners ohne Anmeldung.";
     if (linger === "enabled") changed = [...changed, `linger:${ctx.user}`];
-    return { ok: true, message: `${intro || `${BRAND.name} läuft schon als ${SYSTEMD_UNIT}.`} ${text}`, changed };
+    if (jobs.open) return { ok: false, message: say(head, text, jobs.text), changed, running: true };
+    return { ok: true, message: say(head, jobs.text, text), changed };
   }
   const open = linger === "needs-sudo" ? lingerHint(ctx.user) : linger === "failed" ? lingerFailed(ctx.user) : lingerUnverified(ctx.user);
-  return { ok: false, message: `${intro || `${BRAND.name} läuft als ${SYSTEMD_UNIT}.`} ${open}`, changed, running: true };
+  return { ok: false, message: say(intro || `${BRAND.name} läuft als ${SYSTEMD_UNIT}.`, jobs.open ? undefined : jobs.text, open, jobs.open ? jobs.text : undefined), changed, running: true };
+}
+
+/** Befehl, der eine alte Dienstdatei nachzieht (Issue #561); wiederholbar, startet nichts neu */
+export const KILL_MODE_FIX = `${BRAND.cli} setup autostart`;
+
+/** Satz zum Ergebnis von ensureKillMode; open: es bleibt etwas zu tun */
+export function jobsText(r: KillModeOutcome): { text?: string; open?: boolean; changed?: boolean } {
+  const still = "Bis dahin beendet ein Neustart des Bots auch laufende Hintergrund-Jobs.";
+  switch (r.kind) {
+    case "already":
+      return {};
+    case "fixed":
+      return {
+        text: `Die Dienstdatei hat jetzt ${KILL_MODE_LINE}: ein Neustart des Bots beendet laufende Hintergrund-Jobs nicht mehr. ${BRAND.name} lief dabei weiter, systemd nimmt die Einstellung beim nächsten Beenden.`,
+        changed: true,
+      };
+    case "own-setting":
+      return { open: true, text: `Noch offen: Die Dienstdatei ${UNIT_PATH_TEXT} setzt selbst KillMode=${r.value}, die Zeile bleibt, wie sie ist. ${still} Ändern auf ${KILL_MODE_LINE}, dann erneut: ${KILL_MODE_FIX}` };
+    case "overridden":
+      return { open: true, text: `Noch offen: Die Dienstdatei hat ${KILL_MODE_LINE}, eine Zusatzdatei (Drop-in) setzt aber KillMode=${r.value}. ${still} Anzeigen mit: systemctl --user cat ${SYSTEMD_UNIT}; dort die Zeile entfernen, dann erneut: ${KILL_MODE_FIX}` };
+    case "no-file":
+      return { open: true, text: `Noch offen: systemd lädt ${SYSTEMD_UNIT} nicht aus ${UNIT_PATH_TEXT}. ${still} Anzeigen mit: systemctl --user cat ${SYSTEMD_UNIT}; im Abschnitt [Service] ${KILL_MODE_LINE} eintragen, dann systemctl --user daemon-reload.` };
+    case "no-section":
+      return { open: true, text: `Noch offen: In ${UNIT_PATH_TEXT} fehlt der Abschnitt [Service], ${KILL_MODE_LINE} ließ sich nicht eintragen. ${still}` };
+    case "write":
+      return { open: true, text: `Noch offen: Die Dienstdatei ließ sich nicht ändern${r.code ? ` (${r.code})` : ""}. ${still} Erneut: ${KILL_MODE_FIX}` };
+    case "reload":
+      return { open: true, changed: true, text: `Noch offen: ${KILL_MODE_LINE} steht in der Dienstdatei, aber systemctl --user daemon-reload schlug fehl. ${still} Erneut: ${KILL_MODE_FIX}` };
+    case "unreachable":
+      return { open: true, text: `Noch offen: Ob die Dienstdatei ${KILL_MODE_LINE} hat, ließ sich nicht prüfen. ${SYSTEMD_UNREACHABLE}` };
+  }
 }
 
 /** Status unter systemd, wenn die Dienstdatei da ist oder der Dienst geladen */
@@ -478,7 +523,20 @@ async function systemdStatus(ctx: SetupContext, unit: Awaited<ReturnType<typeof 
   if (!unit.active) return { state: "teilweise", detail: `Die Dienstdatei ${SYSTEMD_UNIT}.service liegt da, der Dienst läuft aber nicht. Einrichten startet ihn.`, fields: [] };
   if (!unit.enabled) return { state: "teilweise", detail: `${SYSTEMD_UNIT} läuft, startet aber nicht mit dem Rechner (nicht aktiviert). Einrichten aktiviert ihn, ohne ihn neu zu starten.`, fields: [] };
   const linger = await lingerState(systemdDeps(ctx));
-  if (linger === "yes") return { state: "erledigt", detail: `systemd-Benutzerdienst ${SYSTEMD_UNIT} läuft und startet mit dem Rechner, auch ohne Anmeldung.`, fields: [] };
+  // Issue #561: alte Dienstdatei ohne KillMode=process; nur ein Hinweis, im Prüfbericht eine Warnung
+  const jobs: StatusItem[] = killModeOutdated(unit)
+    ? [{ label: "Hintergrund-Jobs", ok: false, detail: JOBS_OUTDATED(unit.killMode), fix: KILL_MODE_FIX }]
+    : [];
+  if (linger === "yes") {
+    if (!jobs.length) return { state: "erledigt", detail: `systemd-Benutzerdienst ${SYSTEMD_UNIT} läuft und startet mit dem Rechner, auch ohne Anmeldung.`, fields: [] };
+    return {
+      state: "teilweise",
+      advisory: true,
+      detail: `systemd-Benutzerdienst ${SYSTEMD_UNIT} läuft und startet mit dem Rechner, auch ohne Anmeldung. ${JOBS_OUTDATED(unit.killMode)} Nachziehen mit: ${KILL_MODE_FIX}`,
+      fields: [],
+      items: jobs,
+    };
+  }
   return {
     state: "teilweise",
     detail:
@@ -487,9 +545,13 @@ async function systemdStatus(ctx: SetupContext, unit: Awaited<ReturnType<typeof 
         : `systemd-Benutzerdienst ${SYSTEMD_UNIT} läuft; ob er nach einem Neustart ohne Anmeldung startet (Linger), ließ sich nicht prüfen.`,
     fields: [],
     // Nur „Linger ist aus“ braucht sudo; ließ es sich nicht lesen, erst prüfen
-    items: [{ label: "Linger", ok: false, detail: "Start ohne Anmeldung ist nicht bestätigt.", fix: linger === "no" ? lingerCommand(ctx.user) : lingerCheckCommand(ctx.user) }],
+    items: [{ label: "Linger", ok: false, detail: "Start ohne Anmeldung ist nicht bestätigt.", fix: linger === "no" ? lingerCommand(ctx.user) : lingerCheckCommand(ctx.user) }, ...jobs],
   };
 }
+
+/** Satz zur alten Dienstdatei; killMode: was systemd meldet */
+export const JOBS_OUTDATED = (killMode?: string) =>
+  `Ein Neustart des Bots beendet auch laufende Hintergrund-Jobs (systemd meldet KillMode=${killMode ?? "?"}, nötig ist ${KILL_MODE_LINE}).`;
 
 // ---------------------------------------------------------------------------
 // Supabase auf diesem Rechner (Issue #165)

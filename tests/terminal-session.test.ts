@@ -798,7 +798,9 @@ describe("Rückfragen als nummerierte Auswahl (Issue #120)", () => {
     await session.loadHistory();
     session.startLive();
     await connected(server);
-    await waitFor(() => !session.isSyncing, 3000, "erster Abgleich");
+    // Der Server zählt den Stream, bevor die Sitzung onConnected sieht: erst den GET des Abgleichs abwarten (der erste ist loadHistory)
+    const historyGets = () => requests.filter(r => r.method === "GET" && r.path.startsWith(`/api/conversations/${id}/messages`)).length;
+    await waitFor(() => historyGets() >= 2 && !session.isSyncing, 3000, "erster Abgleich");
     const choicePosts = () => requests.filter(r => r.method === "POST" && r.path.includes("/choices/"));
     return { server, session, requests, choicePosts, choices, reconnect, drop: () => dropStream(), ...rec };
   }

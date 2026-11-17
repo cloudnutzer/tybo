@@ -39,7 +39,7 @@ export type ChoiceVia = "telegram" | "web" | "terminal";
 /** Wie Choice in src/lib/choices.ts, nur die Felder, die die WebUI braucht */
 export interface RegisterChoice {
   id: string;
-  /** Art wie ChoiceKind in src/lib/choices.ts (tool, review, goal, topicmap, routine, thread, memory, reminder, proactive, ask, call) */
+  /** Art wie ChoiceKind in src/lib/choices.ts (tool, review, goal, topicmap, routine, thread, memory, reminder, proactive, ask, call, cleanup, core, secret, sprachagent) */
   kind?: string;
   conversation: { type: "telegram"; chatId: string; topicId?: number } | { type: "web"; conversationId: string };
   options: { key: string; label: string }[];
@@ -91,8 +91,8 @@ export interface ChoiceChange {
 }
 
 /** Arten aus src/lib/choices.ts; andere Werte fallen weg */
-export type ChoiceKindName = "tool" | "review" | "goal" | "topicmap" | "routine" | "thread" | "memory" | "reminder" | "proactive" | "ask" | "call";
-const CHOICE_KIND_NAMES: readonly ChoiceKindName[] = ["tool", "review", "goal", "topicmap", "routine", "thread", "memory", "reminder", "proactive", "ask", "call"];
+export type ChoiceKindName = "tool" | "review" | "goal" | "topicmap" | "routine" | "thread" | "memory" | "reminder" | "proactive" | "ask" | "call" | "cleanup" | "core" | "secret" | "sprachagent";
+const CHOICE_KIND_NAMES: readonly ChoiceKindName[] = ["tool", "review", "goal", "topicmap", "routine", "thread", "memory", "reminder", "proactive", "ask", "call", "cleanup", "core", "secret", "sprachagent"];
 /** Höchstens so viele gemerkte neue Fragen (gegen doppelte Meldung aus Zuhörer und Abgleich) */
 const ANNOUNCED_LIMIT = 500;
 

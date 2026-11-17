@@ -11,6 +11,7 @@
  * Update-Schleife nicht.
  */
 import { Composer, type Context } from "grammy";
+import { logErrorMasked } from "../../lib/telegram-token-mask";
 import { installCallbackChain, type CallbackChain } from "./callbacks";
 import { handleTelegramMedia, type MediaInboxDeps } from "./media-inbox";
 import { createTelegramTextInbox, type TextInboxDeps } from "./text-inbox";
@@ -37,7 +38,8 @@ export interface TelegramChannel {
 }
 
 export function createTelegramChannel(deps: TelegramChannelDeps): TelegramChannel {
-  const logError = deps.logError ?? ((message: string, error: unknown) => console.error(message, error));
+  // Ohne Token im Log (Issue #526): Fehlerobjekte tragen die API-Adresse samt Token
+  const logError = deps.logError ?? logErrorMasked;
   const handlers = new Composer<Context>();
 
   handlers.use(async (ctx, next) => {

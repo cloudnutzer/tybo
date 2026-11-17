@@ -378,7 +378,8 @@ describe("Abbrechen mit Strg+C", () => {
   });
 
   /** Modelle: settings.json gelingt, die .env scheitert beim Ersetzen */
-  const MODELS_RUN = ["claude-test-modell", "", FAKE.openrouterKey, "", "", "", ""];
+  // Erstes Feld: Motor (Issue #566), leer
+  const MODELS_RUN = ["", "claude-test-modell", "", FAKE.openrouterKey, "", "", "", ""];
   function failingRename(onRename = () => {}) {
     return {
       envIo: {

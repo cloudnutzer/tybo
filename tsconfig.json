@@ -17,10 +17,11 @@
     "rootDir": ".",
     "outDir": "dist"
   },
-  // Bot, Skripte und setup/; tests/ läuft nur unter bun test
+  // Bot, Skripte, setup/ und deploy/; tests/ läuft nur unter bun test
   "include": [
     "src/**/*.ts",
     "scripts/**/*.ts",
+    "deploy/**/*.ts",
     "setup/**/*.ts"
   ],
   "exclude": [

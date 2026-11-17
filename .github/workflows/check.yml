@@ -8,22 +8,24 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Eigener Runner, wenn die Repo-Variable CHECK_RUNNER gesetzt ist; ohne sie
+    # GitHub-gehostet. Zurück: gh variable delete CHECK_RUNNER
+    runs-on: ${{ vars.CHECK_RUNNER || 'ubuntu-latest' }}
     # Echtes PostgreSQL mit pgvector für tests/embedding-reindex-pg.test.ts (Issue #168)
     services:
       postgres:
         image: pgvector/pgvector:pg17
         env:
           POSTGRES_PASSWORD: postgres
+        # Nur auf 127.0.0.1 und mit freiem Host-Port: Auf einem eigenen Runner soll der
+        # Port nicht von außen erreichbar sein, und mehrere Jobs dürfen ihn sich nicht teilen müssen
         ports:
-          - 5432:5432
+          - 127.0.0.1::5432
         options: >-
           --health-cmd "pg_isready -U postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-    env:
-      TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -31,6 +33,9 @@ jobs:
           bun-version: 1.3.10
       - run: bun install --frozen-lockfile
       - run: bun run check
+        # Kontext job steht erst auf Schritt-Ebene bereit (zugewiesener Host-Port)
+        env:
+          TEST_PG_URL: postgres://postgres:postgres@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/postgres
       - run: bash -n deploy.sh
       - run: shellcheck -s sh install.sh
       - uses: denoland/setup-deno@v2

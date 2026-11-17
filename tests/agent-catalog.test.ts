@@ -178,6 +178,15 @@ describe("Katalog schreiben", () => {
     expect(readCatalog()).toEqual({});
   });
 
+  test("gespeicherter Prompt bleibt wortgleich: neue Merk-Regeln überschreiben ihn nicht (Issue #521)", async () => {
+    const saved = "Mein eigener General-Prompt: A fact is worth keeping: [REMEMBER: fact]";
+    await setPrompt("general", saved);
+    expect(getAgent("general")).toMatchObject({ promptSource: "custom", systemPrompt: saved });
+    expect(readCatalog()).toEqual({ prompts: { general: saved } });
+    await resetPrompt("general");
+    expect(getAgent("general")!.systemPrompt).toContain("Having nothing to remember is a good outcome");
+  });
+
   test("setPrompt bei eigenem Agenten ändert dessen Prompt; resetPrompt dort abgelehnt", async () => {
     await createAgent(custom);
     await setPrompt("projekt-planer", "Neu");

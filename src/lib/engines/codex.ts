@@ -33,9 +33,9 @@ import {
   type ProcessPlatform,
 } from "./platform";
 import { createLineReader } from "./lines";
-import type { ToolUse, TurnTools } from "../turn-tools";
+import { bashToolUse, type ToolUse, type TurnTools } from "../turn-tools";
 import { MASK, maskSecrets, projectSecrets } from "../jobs/mask";
-import { registerEngineCall, unregisterEngineCall, type EngineProc } from "./calls";
+import { registerEngineCall, trackEngineTermination, unregisterEngineCall, type EngineProc } from "./calls";
 import { superviseRun, type RunControl } from "./lifecycle";
 import type { Engine, EngineErrorKind, EngineRequest, EngineResult, EngineUsage } from "./types";
 import { DEFAULT_CODEX_SANDBOX, getSettings, type CodexSandbox } from "../settings";
@@ -90,8 +90,6 @@ export type CodexEvent =
 /** Item-Arten, die ein Werkzeug sind (beenden eine Zwischenmeldung) */
 const TOOL_ITEM_KINDS = new Set(["command_execution", "file_change", "mcp_tool_call", "web_search", "collab_tool_call"]);
 
-const MAX_COMMAND_CHARS = 2000;
-
 const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
 const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
 
@@ -109,7 +107,7 @@ function toolsOf(kind: string, raw: any): { tools: ToolUse[]; step?: RunStep } {
     case "command_execution": {
       const command = str(raw.command);
       return {
-        tools: [command ? { name: "Bash", command: command.slice(0, MAX_COMMAND_CHARS) } : { name: "Bash" }],
+        tools: [bashToolUse(command)],
         step: command ? { name: "Bash", input: command } : { name: "Bash" },
       };
     }
@@ -599,8 +597,16 @@ const terminating = new WeakSet<object>();
 export function terminateCodexProcess(proc: EngineProc, rt: CodexRuntime = runtime): void {
   if (terminating.has(proc)) return;
   terminating.add(proc);
+  // Bis zum SIGKILL verfolgt, auch nach der Abmeldung im Register (Issue #561)
+  const done = trackEngineTermination(proc);
   rt.signal(proc, "SIGINT");
-  const timer = rt.setTimeout(() => rt.signal(proc, "SIGKILL"), CODEX_KILL_GRACE_MS);
+  const timer = rt.setTimeout(() => {
+    try {
+      rt.signal(proc, "SIGKILL");
+    } finally {
+      done();
+    }
+  }, CODEX_KILL_GRACE_MS);
   (timer as { unref?: () => void } | undefined)?.unref?.();
 }
 

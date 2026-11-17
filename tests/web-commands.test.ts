@@ -1577,7 +1577,7 @@ describe("GET /api/commands", () => {
     const res = await api(ctx, "/api/commands");
     expect(res.status).toBe(200);
     const { commands } = await res.json();
-    expect(commands.map((c: any) => c.name)).toEqual(["help", "stop", "new", "topics", "motor", "agent", "goal", "goals", "remember", "forget", "memory", "track", "done", "cancel", "recall", "learn", "credit", "plan", "critic", "board", "routine", "routinen", "jobs", "tasks", "faeden", "erinnerungen", "voice", "anruf"]);
+    expect(commands.map((c: any) => c.name)).toEqual(["help", "stop", "new", "topics", "motor", "agent", "goal", "goals", "remember", "forget", "memory", "track", "done", "cancel", "recall", "kern", "learn", "credit", "plan", "critic", "board", "routine", "routinen", "jobs", "tasks", "faeden", "erinnerungen", "voice", "anruf", "sprachagent", "sprachagenten"]);
     expect(commands.find((c: any) => c.name === "critic")).toEqual({
       name: "critic",
       aliases: [],

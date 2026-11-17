@@ -80,7 +80,7 @@ describe("GET /api/settings", () => {
     expect(body.settings).toEqual({});
     expect(body.fileInvalid).toBe(false);
     expect(body.agents).toEqual([...AGENT_NAMES]);
-    expect(body.effortLevels).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(body.effortLevels).toEqual(["low", "medium", "high", "xhigh", "max"]);
     for (const name of AGENT_NAMES) {
       expect(body.effective.agents[name].model).toEqual({ value: getAgentConfig(name)!.model, source: "code" });
       expect(body.effective.agents[name].effort.source).toBe("code");
@@ -214,9 +214,9 @@ describe("PATCH /api/settings", () => {
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error).toContain("agents.research.effort");
-    expect(body.error).toContain("low, medium, high, xhigh");
+    expect(body.error).toContain("low, medium, high, xhigh, max");
     expect(JSON.stringify(body)).not.toContain("ultra");
-    expect(body.issues).toEqual([{ path: "agents.research.effort", message: "erlaubt: low, medium, high, xhigh" }]);
+    expect(body.issues).toEqual([{ path: "agents.research.effort", message: "erlaubt: low, medium, high, xhigh, max" }]);
     expect(await readFileJson()).toEqual(before);
   });
 

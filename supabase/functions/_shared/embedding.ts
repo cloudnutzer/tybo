@@ -447,6 +447,13 @@ function parseStored(data: unknown, fn: RegistryFunction): StoredProvider | null
 export const MISSING_FUNCTION_CODES = ["PGRST202", "42883"];
 
 /**
+ * Mindestähnlichkeit für Fakten (Issue #523). Niedriger als bei Nachrichten:
+ * Fakten sind kurze Sätze, die Nachricht ist oft eine ganze Frage. Ein Fakt zu
+ * viel kostet wenig, ein verpasster ist der Anlass des Issues.
+ */
+export const FACT_MATCH_THRESHOLD = 0.4;
+
+/**
  * Fehlercodes für eine unbekannte Spalte (PostgREST bzw. Postgres): der
  * Datenbank fehlt embedding_model (Migration 20260928 nicht eingespielt).
  * Schreiber wiederholen dann ohne die Angabe, wie vor Issue #168.

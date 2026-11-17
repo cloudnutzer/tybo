@@ -3,7 +3,8 @@
  * Dauerdienste, je Zeile Name, Zeitplan, Status, letzter und nächster Lauf
  * (Issue #285). /routinen <name> zeigt die letzten 20 Läufe einer Routine.
  *
- * Zeiten in der Zeitzone des Systems (wie launchd), relativ zu heute
+ * Zeiten in der Zeitzone des Systems (wie launchd), relativ zu heute; unter
+ * Linux stehen Timer und PM2-Prozesse in einer Liste (Issue #568)
  * („heute 06:30", „gestern 06:30", „morgen 06:30").
  */
 
@@ -13,7 +14,7 @@ import type { Routine, RoutineHistory, RoutineList, RoutineRun, RoutineState } f
 
 export const ROUTINES_TEXT = {
   none: "Keine Routinen gefunden.",
-  unavailable: "Routinen: auf diesem System nicht verfügbar (weder launchd noch PM2).",
+  unavailable: "Routinen: auf diesem System nicht verfügbar (weder launchd noch systemd noch PM2).",
   scheduled: "Zeitgesteuert:",
   daemons: "Dauerdienste:",
   notWrapped: "kein Verlauf (nicht eingebunden)",
@@ -42,7 +43,13 @@ export function exitText(code: number | null): string {
   return code === 0 ? "ok" : `Fehler (Exit ${code})`;
 }
 
-const SOURCE_TEXT = { launchd: "launchd", pm2: "PM2" } as const;
+const SOURCE_TEXT = { launchd: "launchd", pm2: "PM2", systemd: "systemd" } as const;
+
+/** Quellen der Liste für die Kopfzeile: „systemd und PM2“ unter Linux */
+function sourcesText(list: RoutineList): string {
+  const sources = list.sources?.length ? list.sources : list.source ? [list.source] : [];
+  return sources.length ? sources.map(s => SOURCE_TEXT[s]).join(" und ") : "?";
+}
 
 export interface FormatOptions {
   /** Jetzt in ms; Standard Date.now() */
@@ -126,7 +133,7 @@ export function nextRunText(r: Routine, o: FormatOptions = {}): string | null {
     if (Number.isFinite(t)) return t <= c.now ? `fällig seit ${whenText(t, c)}` : whenText(t, c);
   }
   const s = r.schedule;
-  const timed = s?.type === "launchd" && (s.StartCalendarInterval !== undefined || s.StartInterval !== undefined);
+  const timed = (s?.type === "launchd" && (s.StartCalendarInterval !== undefined || s.StartInterval !== undefined)) || (s?.type === "systemd" && s.onCalendar.length > 0);
   return timed || r.state === "unknown" ? "unbekannt" : null;
 }
 
@@ -152,7 +159,7 @@ export function formatRoutineList(list: RoutineList, options: FormatOptions = {}
   const scheduled = sorted.filter(r => r.kind === "scheduled");
   const daemons = sorted.filter(r => r.kind === "daemon");
   if (!sorted.length) blocks.push(ROUTINES_TEXT.none);
-  else blocks.push(`Routinen (${list.source ? SOURCE_TEXT[list.source] : "?"}, ${sorted.length}):`);
+  else blocks.push(`Routinen (${sourcesText(list)}, ${sorted.length}):`);
   if (scheduled.length) blocks.push([ROUTINES_TEXT.scheduled, ...scheduled.map(r => line(r, o))].join("\n"));
   if (daemons.length) blocks.push([ROUTINES_TEXT.daemons, ...daemons.map(r => line(r, o))].join("\n"));
   if (list.notes.length) blocks.push(list.notes.map(n => `Hinweis: ${n}`).join("\n"));

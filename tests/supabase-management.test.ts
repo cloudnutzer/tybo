@@ -58,6 +58,8 @@ describe("SCHEMA_FILES", () => {
       "tybo_20261017_scheduled_tasks",
       "tybo_20261018_scheduled_tasks_lease",
       "tybo_20261021_base_grants",
+      "tybo_20261031_memory_archive",
+      "tybo_20261031_memory_facts_search",
     ]);
   });
 

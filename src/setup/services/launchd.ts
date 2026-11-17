@@ -108,7 +108,7 @@ export function failureMessage(failure: LaunchdFailure, label: string): string {
 
 /**
  * Welche Dienste ein Aufruf meint: ein Name aus dem Katalog nur sich selbst,
- * „all“ alle außer den nur einzeln einrichtbaren (software-update); supabase
+ * „all“ alle außer den nur einzeln einrichtbaren (software-update, wartung); supabase
  * bei „all“ nur, wenn SUPABASE_URL in der .env unter envPath auf das
  * Supabase dieses Rechners zeigt (fehlt die Datei: nie). Sonst null.
  * Dienste der Art external stehen mit drin und werden beim Einrichten

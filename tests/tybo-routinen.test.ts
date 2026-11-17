@@ -81,10 +81,28 @@ describe("tybo routinen", () => {
     });
   }
 
-  test("unter Linux: Liste sagt nicht verfügbar, einbinden lehnt ab", async () => {
-    const list = await tybo(["routinen"], fake({ platform: "linux" }));
+  // systemd kommt ausdrücklich aus der Attrappe, nie vom Rechner, auf dem der Test läuft
+  test("unter Linux ohne systemd und ohne PM2: Liste sagt nicht verfügbar, einbinden lehnt ab", async () => {
+    const list = await tybo(["routinen"], fake({ platform: "linux", systemd: false }));
     expect(list.out[0]).toContain("nicht verfügbar");
-    const wrap = await tybo(["routinen", "einbinden", LABEL, "--ja"], fake({ platform: "linux" }));
+    const wrap = await tybo(["routinen", "einbinden", LABEL, "--ja"], fake({ platform: "linux", systemd: false }));
+    expect(wrap.code).toBe(1);
+    expect(wrap.err).toEqual([EINBINDEN_TEXT.macOnly]);
+    expect(wrap.fk.events).toEqual([]);
+  });
+
+  test("unter Linux mit systemd (Issue #568): Liste zeigt die Timer aus dem Einheitenordner, einbinden lehnt weiter ab", async () => {
+    const units = {
+      "tybo-health-check.timer": "[Timer]\nOnCalendar=*-*-* 03:30:00 Europe/Berlin\n",
+      "tybo-health-check.service": `[Service]\nExecStart=/opt/bin/bun --no-env-file src/routine-run.ts --id ai.tybo.health-check -- /opt/bin/bun run src/health-check.ts\n`,
+    };
+    const list = await tybo(["routinen"], fake({ platform: "linux", systemd: true, units }));
+    expect(list.code).toBe(0);
+    expect(list.out[0]).toContain("Routinen (systemd, 1):");
+    expect(list.out[0]).toContain("- health-check: täglich 03:30 (Europe/Berlin) · aktiv");
+    expect(list.out[0]).not.toContain("nicht verfügbar");
+    expect(list.fk.events).toEqual([]);
+    const wrap = await tybo(["routinen", "einbinden", LABEL, "--ja"], fake({ platform: "linux", systemd: true, units }));
     expect(wrap.code).toBe(1);
     expect(wrap.err).toEqual([EINBINDEN_TEXT.macOnly]);
     expect(wrap.fk.events).toEqual([]);

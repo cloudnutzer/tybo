@@ -96,8 +96,8 @@ Vorher prüfen und kurz berichten, ohne Werte aus der `.env` zu zeigen:
    erkennt sie und zeigt sie nur als „gesetzt“.
 3. **Laufende Dienste:** `launchctl list | grep ai.tybo` (macOS),
    `pm2 list` (Namen `tybo-*`), `systemctl --user list-units 'tybo-*'`
-   (Linux). Zwei Bots mit demselben Telegram-Token stören sich; anhalten nur
-   nach Rückfrage.
+   (Linux). Zwei Bots mit demselben Telegram-Token: der zweite pausiert nur den Eingang (409,
+   `tybo pruefen` meldet Fehler, [mehr](docs/troubleshooting.md#zwei-bots-laufen-gleichzeitig)); anhalten nur nach Rückfrage.
 4. **`CONVEX_URL`:** Convex wird nicht mehr unterstützt, der Bot übergeht den
    Wert. Umstieg: [`docs/einrichtung.md`](docs/einrichtung.md), „Umzug von
    Convex“.
@@ -154,10 +154,10 @@ Projektordner. Für ihn gilt:
   `TYBO_TOPIC_ID` und `TYBO_CHAT_ID`, ohne sie der Direktchat. Über die
   Outbox (`src/lib/outbox.ts`) erscheint alles auch in der WebUI, ohne
   Telegram nur dort.
-- **Lange Aufträge** laufen als Hintergrund-Job (`bun run job start`), nicht
-  über `setsid` oder ein `claude -p` im Hintergrund. Ein Job meldet sich
-  immer zurück, auch nach einem Absturz. `--full-access` nur bei Aufträgen,
-  die tybo selbst formuliert hat ([mehr](docs/hintergrund-jobs.md)).
+- **Lange Aufträge** laufen als Hintergrund-Job (`bun run job start`), nie per
+  `setsid` oder `claude -p` im Hintergrund; ohne Claude Code gibt es keine
+  ([Server](docs/server.md)). Ein Job meldet sich immer, auch nach Absturz.
+  `--full-access` nur für selbst formulierte Aufträge ([mehr](docs/hintergrund-jobs.md)).
 - **Hooks:** Subprozesse tragen `TYBO_SUBPROCESS=1`. Liefert ein `Stop`-Hook
   `additionalContext`, antwortet Claude ein zweites Mal und nur das Letzte
   kommt an. Solche Hooks in `.claude/settings.local.json` mit
@@ -192,13 +192,14 @@ Aufforderung zum Testen.
 |---|---|
 | `tybo` | Chat im Terminal; `tybo help` zeigt alle Unterbefehle |
 | `tybo routinen` | Routinen wie `/routinen`; `einbinden`, `ausbinden` je Label (macOS) |
-| `tybo dienste` | Dienste einrichten; `software-update` nur, wenn genannt |
+| `tybo dienste` | Dienste einrichten; `software-update` und `wartung` nur, wenn genannt |
 | `tybo pruefen` | Prüfbericht über die Einrichtung, mit Exit-Code |
 | `tybo deinstallieren` | Dienste entfernen; Ordner, `.env` und Daten bleiben |
 | `bun run start` | Bot im Profil `local` (Polling); `bun run vps` im Profil `server` |
 | `bun run web:dev` | nur der Web-Server, ohne Telegram und ohne Bot |
 | `bun run check` | Typprüfung und alle Tests |
 | `bun run notify` | `--source <name>` mit `--text` oder `--file`, dazu `--caption`, `--topic` |
+| `bun run nachschlagen` | `"<suchtext>"` sucht in Fakten, Nachrichten, Wissensbasis und Bildern, Ausgabe als JSON; nur lesend |
 | `bun run job` | `start --title <titel> --brief <datei>`, `list`, `stop <id>`, `log <id>` |
 | `bun run restart:request` | Neustart, sobald die laufende Antwort fertig ist |
 | `bun run checkin`, `bun run briefing` | Check-in bzw. Morgenbriefing einmal von Hand |
@@ -219,7 +220,7 @@ CLI (Anmeldung, Abo-Limit, `PATH`); mehr in [Störungen](docs/troubleshooting.md
   `src/lib/session-manager.ts`, [Konzept](docs/topic-sessions.md)
 - Gedächtnis und Tags wie `[REMEMBER:]`: `src/lib/memory/`; Tags nach
   fremden Inhalten nur als Vorschlag: `src/lib/intent-gate.ts`
-- Vorschläge beim Session-Ende: `src/lib/session-distill.ts`
+- Vorschläge beim Session-Ende: `src/lib/session-distill.ts`; `/kern`: `src/lib/memory/core.ts`; Geheimnisse: `src/lib/memory/secrets.ts`
 - `/goal`: `src/lib/goal-engine.ts`; `/stop`: `src/lib/engines/calls.ts`
 - `/agent`: `src/lib/agent-overrides.ts`; Erwähnung eines Agenten-Bots:
   `src/channels/telegram/identities.ts`
@@ -228,8 +229,7 @@ CLI (Anmeldung, Abo-Limit, `PATH`); mehr in [Störungen](docs/troubleshooting.md
 - Werkzeuge und ihre Freigabe: `src/lib/tools/registry.ts`
 - `/routine` (Session wird Routine): `src/lib/session-routine.ts`;
   Übersicht und Verlauf: `src/lib/routines/`, [Doku](docs/routinen.md)
-- Offene Fäden (`/faeden`): `src/lib/threads/`; Erinnerungen: `src/lib/schedule/`
-- Proaktive Meldungen: `src/lib/proactive/`; Speicher: `src/lib/store/`
+- Offene Fäden (`/faeden`): `src/lib/threads/`; Erinnerungen: `src/lib/schedule/`; Proaktives: `src/lib/proactive/`; Speicher: `src/lib/store/`
 - Hintergrund-Jobs: `src/lib/jobs/`; Neustart: `src/lib/restart-request.ts`
 
 ## Projektstruktur

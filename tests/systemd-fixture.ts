@@ -3,6 +3,7 @@
  * loginctl, which und PM2 merken sich ihren Zustand; nichts startet echt.
  */
 
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { CommandResult, SetupContext } from "../src/setup/context";
@@ -22,14 +23,40 @@ export interface World {
    * scheitert, „timeout“: hängt
    */
   pm2: "none" | "noexec" | "nointerp" | "broken" | "timeout" | "absent" | "bot" | "unknown";
+  /**
+   * Geladener KillMode (Issue #561); fehlt: beim ersten Abfragen aus den
+   * Dateien gelesen, als hätte systemd sie schon geladen. daemon-reload liest
+   * ihn neu.
+   */
+  killMode?: string;
+  /** daemon-reload scheitert */
+  reloadFails?: boolean;
+}
+
+/**
+ * Wirksamer KillMode wie bei systemd: Dienstdatei, dann die Drop-ins unter
+ * <dienst>.service.d/*.conf in alphabetischer Reihenfolge, die letzte Zeile
+ * gewinnt; ohne Zeile control-group.
+ */
+export function killModeOnDisk(unitDir: string): string {
+  const unit = join(unitDir, "tybo-telegram-relay.service");
+  const dropDir = `${unit}.d`;
+  const files = [unit, ...(existsSync(dropDir) ? readdirSync(dropDir).filter(f => f.endsWith(".conf")).sort().map(f => join(dropDir, f)) : [])];
+  let mode = "control-group";
+  for (const file of files) {
+    if (!existsSync(file)) continue;
+    for (const m of readFileSync(file, "utf8").matchAll(/^[ \t]*KillMode[ \t]*=[ \t]*(\S*)[ \t]*$/gm)) mode = m[1];
+  }
+  return mode;
 }
 
 /** Rechner mit systemd als Attrappe; merkt sich, was gestartet und aktiviert wurde */
-export function systemdRun(ctx: { pm2DumpPath: string }, start: Partial<World> = {}) {
+export function systemdRun(ctx: { pm2DumpPath: string; systemdUserDir?: string }, start: Partial<World> = {}) {
   const w: World = { reachable: true, loaded: false, active: false, enabled: false, linger: "yes", lingerEnable: "ok", pm2: "none", ...start };
   const calls: string[] = [];
   const ok = (stdout = ""): CommandResult => ({ code: 0, stdout, stderr: "" });
   const fail = (stderr = "Fehler"): CommandResult => ({ code: 1, stdout: "", stderr });
+  const onDisk = () => (ctx.systemdUserDir ? killModeOnDisk(ctx.systemdUserDir) : "control-group");
   const run = async (cmd: string[]): Promise<CommandResult> => {
     const line = cmd.join(" ");
     calls.push(line);
@@ -38,10 +65,14 @@ export function systemdRun(ctx: { pm2DumpPath: string }, start: Partial<World> =
     if (line === "which claude") return ok("/home/alex/.local/bin/claude");
     if (line.startsWith("systemctl --user show tybo-telegram-relay.service")) {
       if (!w.reachable) return fail("Failed to connect to bus: No medium found");
-      return ok(`LoadState=${w.loaded ? "loaded" : "not-found"}\nActiveState=${w.active ? "active" : "inactive"}\nUnitFileState=${w.enabled ? "enabled" : w.loaded ? "disabled" : ""}`);
+      if (w.loaded && w.killMode === undefined) w.killMode = onDisk();
+      const killMode = w.loaded ? `\nKillMode=${w.killMode}` : "";
+      return ok(`LoadState=${w.loaded ? "loaded" : "not-found"}\nActiveState=${w.active ? "active" : "inactive"}\nUnitFileState=${w.enabled ? "enabled" : w.loaded ? "disabled" : ""}${killMode}`);
     }
     if (line === "systemctl --user daemon-reload") {
+      if (w.reloadFails) return fail();
       w.loaded = true;
+      w.killMode = onDisk();
       return ok();
     }
     if (line === "systemctl --user enable --now tybo-telegram-relay") {
@@ -87,13 +118,18 @@ export function systemdRun(ctx: { pm2DumpPath: string }, start: Partial<World> =
 
 export type Run = ReturnType<typeof systemdRun>;
 
-/** Linux mit systemd; unit: Dienstdatei liegt schon da */
-export async function linuxCtx(start: Partial<World> = {}, options: { env?: string; profile?: string; unit?: boolean } = {}) {
+/** Dienstdatei einer neuen Einrichtung (gekürzt) */
+export const CURRENT_UNIT = "[Service]\nKillMode=process\n";
+/** Dienstdatei von vor Issue #561: ohne KillMode, mit einer eigenen Anpassung */
+export const OLD_UNIT = "# Angelegt von tybo setup autostart\n[Unit]\nDescription=tybo\n\n[Service]\nType=simple\nRestart=always\nEnvironment=EIGENE=1\n\n[Install]\nWantedBy=default.target\n";
+
+/** Linux mit systemd; unit: Dienstdatei liegt schon da (true: aktuelle, Text: genau dieser Inhalt) */
+export async function linuxCtx(start: Partial<World> = {}, options: { env?: string; profile?: string; unit?: boolean | string } = {}) {
   const ctx = await makeCtx({ env: options.env, profile: options.profile, overrides: { platform: "linux" } });
   await mkdir(ctx.systemdRunDir, { recursive: true });
   if (options.unit) {
     await mkdir(ctx.systemdUserDir, { recursive: true });
-    await writeFile(join(ctx.systemdUserDir, "tybo-telegram-relay.service"), "[Service]\n");
+    await writeFile(join(ctx.systemdUserDir, "tybo-telegram-relay.service"), typeof options.unit === "string" ? options.unit : CURRENT_UNIT);
   }
   const run = systemdRun(ctx, start);
   ctx.run = run as any;

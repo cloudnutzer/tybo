@@ -153,7 +153,7 @@ describe("sendChoice", () => {
   });
 
   test("source je Art", () => {
-    expect(CHOICE_SOURCES).toEqual({ tool: "freigabe", review: "review", goal: "ziel", topicmap: "topic", routine: "routine", thread: "faeden", memory: "gedaechtnis", reminder: "erinnerung", proactive: "checkin", ask: "rueckfrage", call: "anruf" });
+    expect(CHOICE_SOURCES).toEqual({ tool: "freigabe", review: "review", goal: "ziel", topicmap: "topic", routine: "routine", thread: "faeden", memory: "gedaechtnis", reminder: "erinnerung", proactive: "checkin", ask: "rueckfrage", call: "anruf", cleanup: "gedaechtnis", core: "gedaechtnis", secret: "gedaechtnis", sprachagent: "sprachagent" });
   });
 
   test("viele Optionen: höchstens drei Knöpfe je Zeile", async () => {

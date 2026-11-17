@@ -17,6 +17,11 @@
  *   Fehlerzeile; der übrige Bericht entsteht trotzdem.
  * - Alle Texte laufen durch redact() mit den Werten geheimer Variablen der
  *   .env, bevor sie im Bericht landen.
+ * - Motoren (Claude CLI, Codex, OpenCode) prüft der ganze Bericht mit dem
+ *   PATH, mit dem der Bot als Dienst läuft (Issue #567, servicePath in
+ *   ./engine.ts), der Schritt „voraussetzungen“ also genauso wie der
+ *   Abschnitt „Motor“. Ohne lesbaren PATH aus der Dienstdatei gilt der PATH
+ *   dieser Shell.
  *
  * Exit-Code: 1, sobald eine Zeile „fail“ ist (Pflichtschritt fehlt, kein
  * Kanal, Prüfung gescheitert); Warnungen und übersprungene optionale
@@ -76,7 +81,7 @@ const SETUP_SECTION = "Einrichtung";
 const AGGREGATE_STEP: StepId = "pruefung";
 
 /** Lesende Anbieter: dieselben Argumente, dieselbe Antwort, nur eine Anfrage */
-const CACHED: ReadonlyArray<keyof Providers> = ["telegramGetMe", "telegramCheckGroup", "supabaseQuery", "claudeVersion", "openrouterKey", "ollamaTags"];
+const CACHED: ReadonlyArray<keyof Providers> = ["telegramGetMe", "telegramCheckGroup", "supabaseQuery", "claudeVersion", "engineCheck", "openrouterKey", "ollamaTags"];
 /** Anbieter mit Wirkung nach außen: im Bericht nie */
 const BLOCKED: ReadonlyArray<keyof Providers> = ["telegramSendTest", "supabaseWriteProbe", "claudeProbe"];
 
@@ -105,13 +110,14 @@ export function projectClaudeAuth(env: Env): Record<string, string | undefined> 
  * relativer CLAUDE_PATH gilt von dort), mit der gefilterten Umgebung und der
  * Anmeldung allein aus der .env des Projekts (projectClaudeAuth). CLAUDE_AUTH
  * steht dort als gültiger Modus, damit claudeAuthProblem(env) dieselbe
- * Antwort gibt.
+ * Antwort gibt. Im Bericht mit ctx.enginePath als PATH (Issue #567).
  */
 export function claudeRunContext(ctx: SetupContext, env: Env): Required<ClaudeRunContext> {
   const auth = projectClaudeAuth(env);
   const filtered: Record<string, string> = { ...filterSubprocessEnv({ cwd: ctx.root, home: ctx.home }).env, ...SUBPROCESS_MARKER };
   const runEnv = withClaudeAuth(filtered, auth);
   runEnv.CLAUDE_AUTH = resolveClaudeAuth(auth).mode;
+  if (ctx.enginePath !== undefined) runEnv.PATH = ctx.enginePath;
   return { cwd: ctx.root, env: runEnv };
 }
 
@@ -147,9 +153,14 @@ export function reportProviders(inner: Providers, claude?: ClaudeRunContext): Pr
   return wrapped as unknown as Providers;
 }
 
-/** Kontext für den Bericht: nie ein Modellaufruf, Anbieter wie reportProviders, Claude Code mit der .env env */
-export function reportContext(ctx: SetupContext, env: Env): SetupContext {
-  return { ...ctx, noModelCalls: true, providers: reportProviders(ctx.providers, claudeRunContext(ctx, env)) };
+/**
+ * Kontext für den Bericht: nie ein Modellaufruf, Anbieter wie
+ * reportProviders, Claude Code mit der .env env. enginePath: PATH des
+ * Bot-Diensts für alle Motor-Prüfungen, undefined heißt PATH dieser Shell.
+ */
+export function reportContext(ctx: SetupContext, env: Env, enginePath?: string): SetupContext {
+  const report: SetupContext = { ...ctx, noModelCalls: true, enginePath };
+  return { ...report, providers: reportProviders(ctx.providers, claudeRunContext(report, env)) };
 }
 
 /** Werte geheimer Variablen (…_TOKEN, …_KEY, Passwörter) aus der .env */
@@ -189,6 +200,7 @@ function failureText(e: unknown, ms: number): string {
 export function stepLine(step: Pick<SetupStep, "title" | "optional">, status: StepStatus): CheckLine {
   const base = { section: SETUP_SECTION, label: step.title };
   if (status.state === "erledigt") return { ...base, status: "pass", detail: status.detail };
+  if (status.advisory && status.state === "teilweise") return { ...base, status: "warn", detail: status.detail };
   if (step.optional) {
     return status.state === "fehlt"
       ? { ...base, status: "skip", detail: `Übersprungen: ${status.detail}` }
@@ -201,7 +213,9 @@ export function stepLine(step: Pick<SetupStep, "title" | "optional">, status: St
 export async function collectReport(options: CollectOptions): Promise<Report> {
   const ms = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const env = await readSetupEnv(options.ctx).catch(() => ({}) as Env);
-  const ctx = reportContext(options.ctx, env);
+  // Erst zur Laufzeit geladen: ./engine.ts braucht selbst claudeRunContext von hier
+  const { engineCheckPath } = await import("./engine");
+  const ctx = reportContext(options.ctx, env, await engineCheckPath(options.ctx));
   const lines: CheckLine[] = [];
   const statuses = new Map<StepId, StepStatus>();
 

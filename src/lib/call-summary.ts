@@ -10,10 +10,13 @@
  * Misslingt der Aufruf, bekommt der Anrufer statt der Zusammenfassung den
  * Anfang des Protokolls mit Hinweis und statt eines Auftrags null.
  * summarizeTranscriptStrict wirft stattdessen, damit der Anrufdienst es
- * später erneut versuchen kann.
+ * später erneut versuchen kann. Ist die Aufgabe abgeschaltet (Claude fehlt,
+ * Issue #566), wirft sie ClaudeUnavailableError: dann gibt es keinen neuen
+ * Versuch, und der Nutzer bekommt den Anfang des Protokolls mit Grund.
  */
 
 import { callAux } from "./aux-model";
+import { ClaudeUnavailableError } from "./claude-availability";
 
 /** So viel vom Anfang des Protokolls geht in die Zusammenfassung */
 const SUMMARY_INPUT_CHARS = 6000;
@@ -51,10 +54,18 @@ function taskPrompt(summary: string, transcriptEnd: string): string {
   ].join("\n");
 }
 
-/** Antworttext des Modells, null bei Fehler oder leerer Antwort */
-async function askCallModel(prompt: string, what: string): Promise<string | null> {
+/**
+ * Ohne Claude und ohne eigenes Nebenmodell (Issue #566): steht unter der
+ * Zusammenfassung statt eines Modelltexts und erklärt, warum
+ */
+export const CALL_SUMMARY_DISABLED_TEXT =
+  "Keine Zusammenfassung: Sie liefe über Claude, und Claude ist hier nicht installiert oder nicht angemeldet. Abhilfe: Claude anmelden oder ein anderes Nebenmodell einstellen (AUX_MODEL_CALL_SUMMARY oder WebUI, Modelle).";
+
+/** Antworttext des Modells, null bei Fehler oder leerer Antwort, "disabled" wenn abgeschaltet */
+async function askCallModel(prompt: string, what: string): Promise<string | null | "disabled"> {
   try {
     const answer = await callAux("call-summary", prompt);
+    if (answer.disabled) return "disabled";
     if (answer.isError || !answer.text.trim()) return null;
     return answer.text;
   } catch (err) {
@@ -84,6 +95,8 @@ export function summaryFallback(transcript: string): string {
  */
 export async function summarizeTranscriptStrict(transcript: string): Promise<string> {
   const summary = await askCallModel(summaryPrompt(transcript.slice(0, SUMMARY_INPUT_CHARS)), "Zusammenfassung");
+  // Abgeschaltet: eigener Fehler, den der Anrufdienst ohne Wiederholung behandelt
+  if (summary === "disabled") throw new ClaudeUnavailableError(CALL_SUMMARY_DISABLED_TEXT);
   if (summary === null) throw new Error("Zusammenfassung nicht möglich");
   return summary;
 }
@@ -101,7 +114,8 @@ export async function summarizeTranscript(transcript: string): Promise<string> {
  * enthält oder das Modell nicht antwortet.
  */
 export async function extractTaskFromTranscript(transcript: string, summary: string): Promise<string | null> {
-  const answer = (await askCallModel(taskPrompt(summary, transcript.slice(-TASK_INPUT_TAIL_CHARS)), "Auftragssuche"))?.trim();
+  const raw = await askCallModel(taskPrompt(summary, transcript.slice(-TASK_INPUT_TAIL_CHARS)), "Auftragssuche");
+  const answer = raw === "disabled" ? null : raw?.trim();
   if (!answer || answer.length < MIN_TASK_CHARS) return null;
   if (answer === NO_TASK_ANSWER || answer.toLowerCase().includes("no actionable task")) return null;
   return tidyTask(answer);

@@ -1,7 +1,9 @@
 /**
  * Start des Bots (Issue #344): Startbanner und die Hintergrunddienste, die
- * nach WebUI, Goal-Engine und MCP anlaufen. Reihenfolge in startBackground:
- * Embedding-Prüfung und Nachziehen (vorgemerkte Einträge, danach Abschnitte
+ * nach WebUI, Goal-Engine und MCP anlaufen. Die Prüfung auf Claude Code
+ * (Issue #566, checkClaudeBeforeWork) läuft vorher, src/bot.ts wartet auf sie.
+ * Reihenfolge in startBackground:
+ * Schemaprobe (Issue #560), Embedding-Prüfung und Nachziehen (vorgemerkte Einträge, danach Abschnitte
  * langer Nachrichten), Log-Rotation, verwaiste Jobs,
  * Routinen-Wache, Fäden-Erinnerungen, Erinnerungs-Planer und zuletzt die
  * erste Ablauf-Prüfung der Rückfragen. Auf diese wartet der Start des
@@ -26,7 +28,11 @@ import type { TelegramChoices } from "../lib/telegram-choices";
 import type { Choice } from "../lib/choices";
 import { conversationGoneCheck, startThreadReminders, type ThreadReminderTimer } from "../lib/threads/remind";
 import { isConversationListed } from "../web/store";
+import { probeSchema, schemaGapNotice, type SchemaProbeResult } from "../lib/schema-probe";
 import { botTopicState } from "../web/bot-telegram";
+import { checkClaudeAtStart, claudeAvailability, type ClaudeAvailability } from "../lib/claude-availability";
+import { inspectEngine } from "../lib/engines/check";
+import { getSettings } from "../lib/settings";
 
 type Env = Record<string, string | undefined>;
 
@@ -87,6 +93,15 @@ export interface BackgroundDeps {
 
 /** Bausteine der Hintergrunddienste; Tests ersetzen sie, damit keine echten Zeitgeber laufen */
 export const BACKGROUND_SERVICES = {
+  /** Schemaprobe gegen Supabase (Issue #560); null ohne SUPABASE_URL und Server-Schlüssel */
+  probeSchema: async (env: Env): Promise<SchemaProbeResult | null> => {
+    const url = env.SUPABASE_URL?.trim();
+    const key = env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+    return url && key ? probeSchema({ url, key }) : null;
+  },
+  /** Ist Claude Code installiert und angemeldet (Issue #566)? Echte Prüfung mit claude --version und auth status */
+  inspectClaude: () => inspectEngine("claude"),
+  getSettings,
   checkEmbedding: checkEmbeddingAtStartup,
   drainEmbeddings: drainEmbeddingQueue,
   syncChunks: () => syncMessageChunks(),
@@ -106,6 +121,20 @@ export const BACKGROUND_SERVICES = {
 };
 export type BackgroundServices = typeof BACKGROUND_SERVICES;
 
+/**
+ * Server ohne Claude-Konto (Issue #566): einmal prüfen, ob Claude Code
+ * installiert und angemeldet ist. src/bot.ts wartet darauf, bevor Anrufe,
+ * Übungsgespräche, WebUI, Ziele und Polling anlaufen: Schon die erste Arbeit
+ * kennt so den Zustand (keine Nebenaufgabe über Claude, keine Job-Regel im
+ * Prompt, wenn Claude fehlt). Fehlt Claude, steht genau eine Logzeile da.
+ * Wirft nie; die Prüfung selbst endet nach höchstens zwei Zeitlimits von
+ * inspectEngine.
+ */
+export async function checkClaudeBeforeWork(env: Env, services: Partial<Pick<BackgroundServices, "inspectClaude" | "getSettings" | "warn">> = {}): Promise<ClaudeAvailability> {
+  const svc = { ...BACKGROUND_SERVICES, ...services };
+  return checkClaudeAtStart({ inspect: svc.inspectClaude, getSettings: svc.getSettings, env: () => env, log: svc.warn }).catch(() => claudeAvailability());
+}
+
 export interface Background {
   routineWatch: RoutineWatch;
   threadReminders: ThreadReminderTimer;
@@ -119,6 +148,22 @@ const errorName = (e: unknown) => (e instanceof Error ? e.name : "Fehler");
 export function startBackground(deps: BackgroundDeps): Background {
   const { env } = deps;
   const svc = { ...BACKGROUND_SERVICES, ...deps.services };
+
+  // Fehlende Migrationen nach einem Update (Issue #560): genau eine Meldung je Start über den
+  // Meldeweg (Telegram und WebUI), dazu immer ins Log. Ohne Telegram hält die Outbox die Meldung
+  // in messages fest; scheitert das (etwa weil gerade diese Tabelle fehlt), bleibt nur das Log
+  void svc
+    .probeSchema(env)
+    .then(async result => {
+      if (!result) return;
+      if (result.state === "ok") return svc.log("[schema] alle Migrationen eingespielt");
+      if (result.state === "unknown") return svc.warn(`[schema] nicht prüfbar: ${result.reason}`);
+      const text = schemaGapNotice(result);
+      if (!text) return;
+      svc.warn(`[schema] ACHTUNG: ${text}`);
+      if (!(await deps.notices.notifyUser(text))) svc.warn("[schema] Meldung an den Nutzer nicht zugestellt, der Hinweis steht nur hier im Log");
+    })
+    .catch(e => svc.error(`[schema] Schemaprobe gescheitert (${errorName(e)})`));
 
   // Embedding-Anbieter gegen die Kennung der Datenbank (Issue #167): Abweichung laut melden
   void svc.checkEmbedding().then(check => {

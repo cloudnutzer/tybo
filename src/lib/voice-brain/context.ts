@@ -1,11 +1,17 @@
 /**
  * Schlanker Kontext fuer Sprachgespraeche: Agent-Prompt, Profil, Memory und
- * die letzten Nachrichten, einmal pro Gespraech geladen (Cache mit TTL),
- * nicht pro Turn. Aus src/voice-bridge.ts herausgelöst (Issue #255).
+ * die letzten Nachrichten. Profil und Nachrichten einmal pro Gespraech geladen
+ * (Cache mit TTL), nicht pro Turn. Aus src/voice-bridge.ts herausgelöst (Issue #255).
  *
  * Der Cache gilt je Chat-ID und Topic: die Brücke ruft mit TELEGRAM_USER_ID
  * ohne Topic, der Telefonhörer später mit Chat und Topic des Gesprächs.
  * Alle Daten kommen über deps, damit Tests ohne Datenbank auskommen.
+ *
+ * Das Memory kommt bei jedem load frisch aus dem Speicher (Issue #520), nie aus
+ * dem Cache. Archiviert wird in anderen Prozessen; so hängt es an keinem Signal,
+ * dass Archiviertes schon in der nächsten Anfrage fehlt. Dafür kostet jede Anfrage
+ * eine Abfrage. Scheitert sie, fehlt der Abschnitt für diese Anfrage, ein alter
+ * Stand kommt auch dann nicht in den Prompt.
  */
 
 export interface VoiceContextMessage {
@@ -52,12 +58,13 @@ const cacheKey = (chatId: string, topicId?: number | null) => `${chatId}\u0000${
 
 export function createVoiceContext({ agent, ttlMs = VOICE_CONTEXT_TTL_MS, deps }: VoiceContextOptions): VoiceContext {
   const now = deps.now ?? Date.now;
-  const cache = new Map<string, { text: string; at: number }>();
+  const cache = new Map<string, { compose: (memory: string) => string; at: number }>();
+  const freshMemory = () => deps.getMemoryContext().catch(() => "");
 
-  async function build(chatId: string, topicId?: number | null): Promise<string> {
-    const [profile, memory, recent] = await Promise.all([
+  /** Alles außer dem Memory; das Ergebnis setzt den Kontext mit dem jeweils frischen Memory zusammen */
+  async function buildFrame(chatId: string, topicId?: number | null): Promise<(memory: string) => string> {
+    const [profile, recent] = await Promise.all([
       deps.getUserProfile().catch(() => ""),
-      deps.getMemoryContext().catch(() => ""),
       chatId
         ? (topicId == null ? deps.getRecentMessages(chatId, RECENT_LIMIT) : deps.getRecentMessages(chatId, RECENT_LIMIT, topicId)).catch(() => [])
         : Promise.resolve([]),
@@ -67,25 +74,27 @@ export function createVoiceContext({ agent, ttlMs = VOICE_CONTEXT_TTL_MS, deps }
       .map((m) => `[${relTime(m.created_at, at)}] ${m.role === "user" ? "User" : "Bot"}: ${m.content.replace(/\s+/g, " ").slice(0, 300)}`)
       .join("\n");
     const time = new Date(at).toLocaleString("de-DE", { timeZone: deps.timeZone || "Europe/Berlin", dateStyle: "full", timeStyle: "short" });
-    return [
-      agent.systemPrompt,
-      profile ? `## USER PROFILE\n${profile}` : "",
-      `## CURRENT TIME\n${time}`,
-      memory ? `## MEMORY\n${memory}` : "",
-      recentText ? `## RECENT TELEGRAM CONVERSATION\n${recentText}` : "",
-    ]
-      .filter(Boolean)
-      .join("\n\n---\n\n");
+    return memory =>
+      [
+        agent.systemPrompt,
+        profile ? `## USER PROFILE\n${profile}` : "",
+        `## CURRENT TIME\n${time}`,
+        memory ? `## MEMORY\n${memory}` : "",
+        recentText ? `## RECENT TELEGRAM CONVERSATION\n${recentText}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n---\n\n");
   }
 
   return {
     async load(chatId, topicId) {
       const key = cacheKey(chatId, topicId);
       const hit = cache.get(key);
-      if (hit && now() - hit.at < ttlMs) return hit.text;
+      if (hit && now() - hit.at < ttlMs) return hit.compose(await freshMemory());
       const started = now();
-      const text = await build(chatId, topicId);
-      cache.set(key, { text, at: now() });
+      const [compose, memory] = await Promise.all([buildFrame(chatId, topicId), freshMemory()]);
+      const text = compose(memory);
+      cache.set(key, { compose, at: now() });
       deps.log?.(`Kontext geladen: ${text.length} Zeichen in ${now() - started} ms`);
       return text;
     },

@@ -1,0 +1,58 @@
+# SIP-Vermittlung (Issue #511): easybell <-> ElevenLabs.
+# Einrichtung und Rückbau: README.md in diesem Ordner.
+name: sip-vermittlung
+
+services:
+  # Erzeugt die Asterisk-Konfiguration aus vorlagen/ und .env nach erzeugt/.
+  # Ohne Netz; scheitert die Prüfung, startet Asterisk nicht.
+  vorlagen:
+    image: oven/bun:1.4.4-alpine
+    network_mode: none
+    working_dir: /vermittlung
+    volumes:
+      - .:/vermittlung
+    # pjsip.conf (Zugangsdaten) gehört dem Asterisk-Nutzer im Container, 0640
+    command: ["bun", "render.ts", "--env", ".env", "--aus", "erzeugt", "--besitzer", "1000:1000"]
+
+  asterisk:
+    # Standard-Image andrius/asterisk:22.11.0_debian-trixie-1b724ca mit
+    # gepatchtem pjproject, damit Folgeverbindungen zu ElevenLabs das
+    # Zertifikat *.hosts.rtc.elevenlabs.io annehmen (image/Dockerfile,
+    # README.md „Folgeverbindungen“). docker compose build baut es.
+    # Das weicht vom Issue-Kriterium „Standard-Image“ ab; der Maintainer hat
+    # es freigegeben, nur mit diesem Patch und neuer Probe bei jedem Update
+    # (README.md „Folgeverbindungen“, Entscheidung 0026, Nachtrag E1).
+    build: ./image
+    image: sip-vermittlung-asterisk:22.11.0-folge1
+    pull_policy: build
+    container_name: sip-vermittlung
+    # Host-Netz: SIP und RTP ohne Docker-NAT, Ports begrenzt erzeugt/firewall.nft
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      vorlagen:
+        condition: service_completed_successfully
+    # container/start.sh: startet erst, wenn die Firewall seit dem Systemstart
+    # geladen ist, und leitet die Meldungen durch den Filter, der Rufnummern
+    # kürzt. Asterisk läuft ohne -v und -d: die ausführlichen Meldungen
+    # enthielten jede Nummer.
+    command: ["/bin/sh", "/vermittlung/start.sh"]
+    environment:
+      # Asterisk-Nutzer im Container, passend zu --besitzer im Dienst vorlagen
+      PUID: "1000"
+      PGID: "1000"
+      # Zeitstempel im Log in UTC, passend zu logtimezone im fail2ban-Jail
+      TZ: UTC
+    volumes:
+      - ./erzeugt/asterisk:/etc/asterisk:ro
+      - ./zertifikat:/zertifikat:ro
+      - ./container:/vermittlung:ro
+      - ./logs:/var/log/asterisk
+      # Marke von firewall.sh; /run ist nach jedem Neustart des Servers leer
+      - /run/sip-vermittlung:/firewall:ro
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

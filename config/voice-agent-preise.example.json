@@ -1,0 +1,33 @@
+{
+  "stand": "2026-11-07",
+  "tarif": "ElevenLabs Agents, jede Minute zum Preis der Zusatzminute (im Plan enthaltene Minuten nicht abgezogen)",
+  "waehrung": "USD",
+  "anbieter": { "jeMinute": 0.08, "quelle": "https://elevenlabs.io/pricing/agents" },
+  "gehirn": {
+    "quelle": "https://elevenlabs.io/scale-tier#llm-prices",
+    "jeMillionToken": {
+      "claude-sonnet-5-5": { "eingabe": 2.2, "ausgabe": 11 },
+      "claude-sonnet-5": { "eingabe": 2.2, "ausgabe": 11 },
+      "claude-haiku-5-5": { "eingabe": 0.11, "ausgabe": 0.55 },
+      "gemini-3.8-flash": { "eingabe": 0.83, "ausgabe": 4.13 },
+      "gemini-2.5-flash": { "eingabe": 0.3, "ausgabe": 2.5 },
+      "gemini-2.0-flash": { "eingabe": 0.1, "ausgabe": 0.4 }
+    }
+  },
+  "annahmen": {
+    "zuegeJeMinute": 3,
+    "eingabeTokenJeZug": 6700,
+    "ausgabeTokenJeZug": 150,
+    "herkunft": "tybos eigene Messung der Brücke, ohne Prompt-Cache"
+  },
+  "telefon": {
+    "jeMinute": null,
+    "quelle": "https://elevenlabs.io/pricing/agents",
+    "hinweis": "ElevenLabs berechnet Telefonie nicht zusätzlich, der Anbieter der Nummer rechnet selbst ab"
+  },
+  "credits": {
+    "jeEinheit": 5500,
+    "tarif": "Gegenwert zum Satz des Creator-Plans (monatlich 121.000 Credits für 22 USD, also 5.500 Credits je USD; Stand 2026-11-09); andere Pläne rechnen anders um",
+    "quelle": "https://elevenlabs.io/pricing"
+  }
+}

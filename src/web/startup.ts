@@ -18,6 +18,7 @@ import type { SpeechPort } from "./speech";
 import type { CallMemoryPort } from "./call-history";
 import type { CallPort } from "./call-protocol";
 import type { VoiceClonePort } from "./voice-clone";
+import type { VoiceAgentSessionPort } from "./voice-agent-page";
 import type { InstructionsPort } from "./instructions";
 import type { ModelCatalog, OpenCodeModelsPort } from "./models";
 import type { StatusPort } from "./status";
@@ -68,6 +69,11 @@ export interface StartWebUiOptions {
   callMemory?: CallMemoryPort;
   /** Eigene Stimme (Issue #253) */
   voiceClone?: VoiceClonePort;
+  /** Web-Gespräch je Rezept (Issue #494); in bot.ts createVoiceAgentSessions */
+  voiceAgentSessions?: VoiceAgentSessionPort;
+  /** Bereich „Sprachagenten“ (Issue #495); in bot.ts createVoiceAgentAdmin */
+  voiceAgentAdmin?: WebServerDeps["voiceAgentAdmin"];
+  voiceAgentWizard?: WebServerDeps["voiceAgentWizard"];
   /** Agenten-Anweisungen wie /agent (Issue #36); in bot.ts botInstructions */
   instructions?: InstructionsPort;
   /** Modell-Listen (Issue #36); ohne Angabe die Standard-Abfrage im Server */
@@ -129,6 +135,19 @@ export function reachableUrls(host: string, port: number, lan: string[]): string
   return [`http://${host.includes(":") ? `[${host}]` : host}:${port}`];
 }
 
+/**
+ * Adresse der WebUI für Links, die tybo verschickt (/sprachagent link, Issue
+ * #494): WEB_PUBLIC_ORIGIN, sonst bei 0.0.0.0 die erste LAN-Adresse, sonst der
+ * eingestellte Host. null, wenn die WebUI aus oder falsch eingestellt ist.
+ */
+export function webUiBaseUrl(env: Record<string, string | undefined>, lan: () => string[] = lanIPv4Addresses): string | null {
+  const result = loadWebConfig(env);
+  if (result.status !== "ok") return null;
+  if (result.config.publicOrigin) return result.config.publicOrigin;
+  const urls = reachableUrls(result.config.host, result.config.port, lan());
+  return urls[1] ?? urls[0];
+}
+
 /** Entfernt das Passwort aus Fehlermeldungen, falls es darin vorkommt. */
 function scrub(message: string, password: string): string {
   return password ? message.split(password).join("***") : message;
@@ -165,6 +184,9 @@ export async function startWebUi(options: StartWebUiOptions): Promise<WebServer 
       call: options.call,
       callMemory: options.callMemory,
       voiceClone: options.voiceClone,
+      voiceAgentSessions: options.voiceAgentSessions,
+      voiceAgentAdmin: options.voiceAgentAdmin,
+      voiceAgentWizard: options.voiceAgentWizard,
       instructions: options.instructions,
       models: options.models,
       opencodeModels: options.opencodeModels,

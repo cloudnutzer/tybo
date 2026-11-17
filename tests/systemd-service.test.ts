@@ -5,20 +5,23 @@
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  ensureKillMode,
   ensureLinger,
   installSystemdService,
   lingerCommand,
   lingerState,
   parseShow,
   renderSystemdUnit,
+  replaceFileAtomic,
   systemdBooted,
   systemdUnitPath,
   systemdUnitState,
   unitPathOk,
+  type ReplaceFs,
   type SystemdDeps,
 } from "../setup/configure-systemd";
 import { LINGER_KEPT, realUninstallDeps, runUninstallCommand, type UninstallDeps } from "../src/setup/services/uninstall";
@@ -46,7 +49,16 @@ function fakeSystemd(answers: Record<string, Answer> = {}, files = new Map<strin
       return { ok: true, stdout: "", stderr: "", ...answers[key] };
     },
     exists: path => files.has(path) || dirs.includes(path),
+    readFile: path => {
+      const text = files.get(path);
+      if (text === undefined) throw Object.assign(new Error("fehlt"), { code: "ENOENT" });
+      return text;
+    },
     writeFile: (path, content) => void files.set(path, content),
+    replaceFile: (path, content) => {
+      if (!files.has(path)) throw Object.assign(new Error("fehlt"), { code: "ENOENT" });
+      files.set(path, content);
+    },
     mkdir: path => void dirs.push(path),
   };
   return { deps, calls, files, dirs };
@@ -68,6 +80,10 @@ describe("Dienstdatei", () => {
     expect(unit).toContain("\nStandardError=append:/home/alex/tybo/logs/telegram-relay.error.log\n");
     expect(unit).toContain("\nWantedBy=default.target\n");
     expect(unit).toContain("\nStartLimitIntervalSec=0\n");
+    // Issue #561: Hintergrund-Jobs überleben den Neustart des Bots, genau eine Zeile im Abschnitt [Service]
+    expect(unit.match(/^KillMode=.*$/gm)).toEqual(["KillMode=process"]);
+    const service = unit.slice(unit.indexOf("[Service]"), unit.indexOf("[Install]"));
+    expect(service).toContain("\nKillMode=process\n");
     // Kein fest eingebautes %h/tybo aus dem VM-Beispiel
     expect(unit).not.toContain("%h");
   });
@@ -127,7 +143,8 @@ describe("Einrichten", () => {
     const unit = files.get(systemdUnitPath(deps.unitDir))!;
     expect(unit).toContain("Restart=always");
     expect(unit).toContain("/home/alex/.local/bin");
-    expect(calls).toEqual(["which bun", "which claude", "systemctl --user daemon-reload", "systemctl --user enable --now tybo-telegram-relay"]);
+    // which codex (Issue #566): ohne Codex bleibt es bei den Standardorten
+    expect(calls).toEqual(["which bun", "which claude", "which codex", "systemctl --user daemon-reload", "systemctl --user enable --now tybo-telegram-relay"]);
   });
 
   test("CLAUDE_PATH mit festem Pfad: dessen Ordner im PATH, kein which claude", async () => {
@@ -135,6 +152,38 @@ describe("Einrichten", () => {
     await installSystemdService(deps, "/opt/claude/bin/claude");
     expect(files.get(systemdUnitPath(deps.unitDir))).toContain(":/opt/claude/bin:");
     expect(calls).not.toContain("which claude");
+  });
+
+  test("Codex gefunden (Issue #566): dessen Ordner steht im PATH der Unit", async () => {
+    const { deps, files } = fakeSystemd({ ...WHICH, "which codex": { stdout: "/home/alex/.npm-global/bin/codex" }, "systemctl --user": {} });
+    expect(await installSystemdService(deps)).toEqual({ ok: true });
+    const unit = files.get(systemdUnitPath(deps.unitDir))!;
+    const path = /^Environment=PATH=(.*)$/m.exec(unit)![1].split(":");
+    expect(path).toEqual([
+      "/home/alex/.bun/bin",
+      "/home/alex/.local/bin",
+      "/home/alex/.npm-global/bin",
+      "/home/alex/.bun/bin",
+      "/home/alex/.local/bin",
+      "/usr/local/bin",
+      "/usr/bin",
+      "/bin",
+    ].filter((d, i, all) => all.indexOf(d) === i));
+  });
+
+  test("eigener CODEX_PATH: dessen Ordner im PATH, kein which codex", async () => {
+    const { deps, calls, files } = fakeSystemd({ ...WHICH, "systemctl --user": {} });
+    await installSystemdService(deps, undefined, "/opt/codex/bin/codex");
+    const path = /^Environment=PATH=(.*)$/m.exec(files.get(systemdUnitPath(deps.unitDir))!)![1].split(":");
+    expect(path).toContain("/opt/codex/bin");
+    expect(calls).not.toContain("which codex");
+  });
+
+  test("CODEX_PATH mit unsicherem Ordner: keine Dienstdatei, nichts gestartet", async () => {
+    const { deps, calls, files } = fakeSystemd({ ...WHICH, "systemctl --user": {} });
+    expect(await installSystemdService(deps, undefined, "/opt/mein codex/codex")).toEqual({ ok: false, reason: "unsafe-path" });
+    expect(files.size).toBe(0);
+    expect(calls.some(c => c.startsWith("systemctl"))).toBe(false);
   });
 
   test("ohne Bun: nichts geschrieben, nichts gestartet", async () => {
@@ -147,6 +196,131 @@ describe("Einrichten", () => {
   test("enable scheitert: ehrlicher Grund", async () => {
     const { deps } = fakeSystemd({ ...WHICH, "systemctl --user daemon-reload": {}, "systemctl --user enable": { ok: false } });
     expect(await installSystemdService(deps)).toEqual({ ok: false, reason: "enable" });
+  });
+});
+
+describe("KillMode nachziehen (Issue #561)", () => {
+  const KILL = `${SHOW} --property=KillMode`;
+
+  test("Benutzer-Manager antwortet nicht: nichts gelesen, nichts geschrieben", async () => {
+    const files = new Map([["/home/alex/.config/systemd/user/tybo-telegram-relay.service", "[Service]\n"]]);
+    const { deps, calls } = fakeSystemd({}, files);
+    expect(await ensureKillMode(deps)).toEqual({ kind: "unreachable" });
+    expect(calls).toEqual([KILL]);
+    expect(files.get("/home/alex/.config/systemd/user/tybo-telegram-relay.service")).toBe("[Service]\n");
+  });
+
+  test("schon wirksam: nur eine Abfrage", async () => {
+    const { deps, calls } = fakeSystemd({ [KILL]: { stdout: "KillMode=process" } });
+    expect(await ensureKillMode(deps)).toEqual({ kind: "already" });
+    expect(calls).toEqual([KILL]);
+  });
+
+  test("Schreiben scheitert: Fehlercode, kein daemon-reload", async () => {
+    const path = "/home/alex/.config/systemd/user/tybo-telegram-relay.service";
+    const { deps, calls } = fakeSystemd({ [KILL]: { stdout: "KillMode=control-group" } }, new Map([[path, "[Service]\n"]]));
+    deps.replaceFile = () => {
+      throw Object.assign(new Error("nein"), { code: "EACCES" });
+    };
+    expect(await ensureKillMode(deps)).toEqual({ kind: "write", code: "EACCES" });
+    expect(calls.some(c => c.includes("daemon-reload"))).toBe(false);
+  });
+
+  test("keine Dienstdatei an der erwarteten Stelle: no-file", async () => {
+    const { deps } = fakeSystemd({ [KILL]: { stdout: "KillMode=control-group" } });
+    expect(await ensureKillMode(deps)).toEqual({ kind: "no-file" });
+  });
+});
+
+describe("Dienstdatei atomar ersetzen (Issue #561)", () => {
+  const ORIGINAL = "[Unit]\nDescription=tybo\n\n[Service]\n# eigene Anpassung\nEnvironment=EIGENE_VARIABLE=1\nExecStart=/usr/bin/true\n";
+  const NEU = ORIGINAL.replace("[Service]\n", "[Service]\nKillMode=process\n");
+  const enospc = () => Object.assign(new Error("kein Platz"), { code: "ENOSPC" });
+  /** echte Dateizugriffe; write schreibt nur den Anfang und scheitert dann (voller Datenträger) */
+  const brokenFs: ReplaceFs = {
+    realpath: path => path,
+    mode: path => statSync(path).mode & 0o7777,
+    write: (path, content, mode) => {
+      writeFileSync(path, content.slice(0, 12), { mode, flag: "wx" });
+      throw enospc();
+    },
+    rename: (from, to) => renameSync(from, to),
+    unlink: path => unlinkSync(path),
+  };
+  function unitIn(name: string, mode = 0o640) {
+    const dir = join(tmp, name);
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, "tybo-telegram-relay.service");
+    writeFileSync(file, ORIGINAL);
+    chmodSync(file, mode);
+    return { dir, file };
+  }
+
+  test("ersetzt vollständig, behält die Rechte, keine temporäre Datei bleibt", () => {
+    const { dir, file } = unitIn("atomar-ok");
+    replaceFileAtomic(file, NEU);
+    expect(readFileSync(file, "utf8")).toBe(NEU);
+    expect(statSync(file).mode & 0o777).toBe(0o640);
+    expect(readdirSync(dir)).toEqual(["tybo-telegram-relay.service"]);
+  });
+
+  test("Fehler nach begonnenem Schreiben: alte Datei Zeichen für Zeichen erhalten, temporäre entfernt", () => {
+    const { dir, file } = unitIn("atomar-abbruch");
+    let thrown: unknown;
+    try {
+      replaceFileAtomic(file, NEU, brokenFs);
+    } catch (e) {
+      thrown = e;
+    }
+    expect((thrown as NodeJS.ErrnoException).code).toBe("ENOSPC");
+    expect(readFileSync(file, "utf8")).toBe(ORIGINAL);
+    expect(readdirSync(dir)).toEqual(["tybo-telegram-relay.service"]);
+  });
+
+  test("Symlink bleibt Symlink, ersetzt wird sein Ziel", () => {
+    const { dir, file } = unitIn("atomar-link");
+    const link = join(dir, "link.service");
+    symlinkSync(file, link);
+    replaceFileAtomic(link, NEU);
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(readFileSync(file, "utf8")).toBe(NEU);
+  });
+
+  test("ensureKillMode mit Schreibfehler mittendrin: Datei samt Anpassungen unverändert, kein daemon-reload; Wiederholung trägt ein", async () => {
+    const { dir, file } = unitIn("atomar-ensure", 0o644);
+    const KILL = `${SHOW} --property=KillMode`;
+    let loaded = "control-group";
+    const calls: string[] = [];
+    const deps: SystemdDeps = {
+      ...fakeSystemd().deps,
+      unitDir: dir,
+      run: async cmd => {
+        const line = cmd.join(" ");
+        calls.push(line);
+        if (line === KILL) return { ok: true, stdout: `KillMode=${loaded}`, stderr: "" };
+        if (line === "systemctl --user daemon-reload") {
+          loaded = /^KillMode=process$/m.test(readFileSync(file, "utf8")) ? "process" : loaded;
+          return { ok: true, stdout: "", stderr: "" };
+        }
+        return { ok: false, stdout: "", stderr: "unerwartet" };
+      },
+      exists: existsSync,
+      readFile: path => readFileSync(path, "utf8"),
+      replaceFile: (path, content) => replaceFileAtomic(path, content, brokenFs),
+    };
+    expect(await ensureKillMode(deps)).toEqual({ kind: "write", code: "ENOSPC" });
+    expect(readFileSync(file, "utf8")).toBe(ORIGINAL);
+    expect(readdirSync(dir)).toEqual(["tybo-telegram-relay.service"]);
+    expect(calls).toEqual([KILL]);
+
+    deps.replaceFile = (path, content) => replaceFileAtomic(path, content);
+    expect(await ensureKillMode(deps)).toEqual({ kind: "fixed" });
+    const text = readFileSync(file, "utf8");
+    expect(text.match(/^KillMode=process$/gm)).toHaveLength(1);
+    expect(text).toContain("# eigene Anpassung\nEnvironment=EIGENE_VARIABLE=1\nExecStart=/usr/bin/true\n");
+    expect(text.replace(/^#.*\n(?=KillMode=process)/m, "").replace("KillMode=process\n", "")).toBe(ORIGINAL);
+    expect(statSync(file).mode & 0o777).toBe(0o644);
+    expect(readdirSync(dir)).toEqual(["tybo-telegram-relay.service"]);
   });
 });
 
@@ -359,6 +533,15 @@ describe("tybo pruefen", () => {
     expect((await verify({ "systemctl --user show": { stdout: "ActiveState=failed\nUnitFileState=enabled" }, "loginctl show-user": { stdout: "yes" } })).records[0].status).toBe("fail");
     const down = await verify({});
     expect(down.records).toEqual([{ name: "telegram-relay", status: "fail", message: expect.stringContaining("nicht über sudo") }]);
+  });
+
+  test("Issue #561: alte Dienstdatei (KillMode=control-group): Warnung mit Befehl; KillMode=process: keine Zeile", async () => {
+    const old = await verify({ "systemctl --user show": { stdout: "ActiveState=active\nUnitFileState=enabled\nMainPID=42\nKillMode=control-group" }, "loginctl show-user": { stdout: "yes" } });
+    expect(old.records.map(x => [x.name, x.status])).toEqual([["telegram-relay", "pass"], ["telegram-relay (Hintergrund-Jobs)", "warn"], ["telegram-relay (Linger)", "pass"]]);
+    expect(old.records[1].message).toContain("tybo setup autostart");
+    expect(old.calls.filter(c => c.startsWith("systemctl"))).toEqual(["systemctl --user show tybo-telegram-relay.service --property=ActiveState,SubState,UnitFileState,MainPID,KillMode"]);
+    const current = await verify({ "systemctl --user show": { stdout: "ActiveState=active\nUnitFileState=enabled\nMainPID=42\nKillMode=process" }, "loginctl show-user": { stdout: "yes" } });
+    expect(current.records.map(x => x.status)).toEqual(["pass", "pass"]);
   });
 
   test("loginctl scheitert: Prüfhinweis ohne sudo", async () => {

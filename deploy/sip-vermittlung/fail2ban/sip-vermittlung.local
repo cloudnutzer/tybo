@@ -1,0 +1,19 @@
+# fail2ban für die SIP-Vermittlung (Issue #511): nach /etc/fail2ban/jail.d/
+# kopieren. Nutzt den mitgelieferten Filter "asterisk" von fail2ban, der die
+# Sicherheitsereignisse (falsches Passwort, unbekanntes Konto) in
+# logs/messages erkennt. Pfad an den Ordner auf dem Server anpassen.
+# Rufnummern stehen dort gekürzt (container/logfilter.pl), die
+# Absenderadresse vollständig. Asterisk schreibt die Zeit in UTC (TZ in
+# compose.yaml); logtimezone sorgt dafür, dass fail2ban sie auch auf einem
+# Server mit anderer Zeitzone richtig einordnet.
+[sip-vermittlung]
+enabled  = true
+filter   = asterisk
+logpath  = /docker/sip-vermittlung/logs/messages
+logtimezone = UTC
+port     = 5061
+protocol = tcp
+banaction = nftables-allports
+maxretry = 5
+findtime = 10m
+bantime  = 24h

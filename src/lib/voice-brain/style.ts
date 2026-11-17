@@ -18,10 +18,12 @@ export interface VoiceStyleOptions {
   tools?: VoiceToolsStyle;
 }
 
+const SPOKEN_ONLY = "Keine Aufzaehlungen, keine Markdown-Zeichen, keine URLs vorlesen, keine Emojis. Zahlen so nennen, wie man sie sagt. ";
+
 const phoneStyle = (agentName: string) =>
   `Du bist gerade im Sprachgespraech (Voice-Agent ${agentName}). Du sprichst, du schreibst nicht: ` +
   "Antworte in ein bis drei gesprochenen Saetzen, ausser der Nutzer will ausdruecklich mehr. " +
-  "Keine Aufzaehlungen, keine Markdown-Zeichen, keine URLs vorlesen, keine Emojis. Zahlen so nennen, wie man sie sagt. " +
+  SPOKEN_ONLY +
   "Wenn dir Kontext aus frueheren Gespraechen fehlt, nutze history_search, statt zu raten. " +
   "Wenn eine Frage echte Analyse braucht, die laenger als eine halbe Minute dauert, nutze deep_think, statt den Nutzer warten zu lassen. " +
   "Merk-Tags wie [REMEMBER: ...] oder [GOAL: ...] darfst du ans Ende setzen; sie werden nicht vorgelesen. " +
@@ -54,6 +56,19 @@ const callStyle =(agentName: string, tools: VoiceToolsStyle) =>
   (tools.deepTask
     ? "[INVOKE:...]-Tags funktionieren hier nicht, andere Agenten fragst du über einen Denkauftrag."
     : "[INVOKE:...]-Tags funktionieren hier nicht, lass sie weg.");
+
+/**
+ * Sprechstil der Rezept-Stufen keins und thema (Issue #491): ohne Hinweis auf
+ * persönliche Werkzeuge und Merk-Tags, denn beides gibt es dort nicht.
+ */
+export function isolatedVoiceStyle(): string {
+  return (
+    "Du bist gerade im Sprachgespraech. Du sprichst, du schreibst nicht: " +
+    "Antworte in ein bis drei gesprochenen Saetzen, ausser dein Gegenueber will ausdruecklich mehr. " +
+    SPOKEN_ONLY +
+    "Du kennst keine frueheren Gespraeche und hast kein Gedaechtnis. Erfinde nichts dazu, sag offen, wenn du etwas nicht weisst."
+  );
+}
 
 export function voiceStyle({ agentName, channel, tools }: VoiceStyleOptions): string {
   return channel === "phone" ? phoneStyle(agentName) : callStyle(agentName, tools ?? { search: false, deepTask: false });

@@ -16,6 +16,7 @@ import {
 } from "../src/lib/engines/platform";
 import { CODEX_KILL_GRACE_MS, signalProcessGroup, terminateCodexProcess, type CodexRuntime } from "../src/lib/engines/codex";
 import { OPENCODE_KILL_GRACE_MS, terminateOpenCodeProcess } from "../src/lib/engines/opencode";
+import { abortAllEngineCalls, terminatingEngineProcCount } from "../src/lib/engines/calls";
 
 const OSES = ["darwin", "linux", "win32"] as const;
 
@@ -298,6 +299,42 @@ describe("Codex und OpenCode behalten SIGINT vor SIGKILL", () => {
       expect(f.timers.map((t) => t.ms)).toEqual([grace]);
       f.timers[0]!.fn();
       expect(f.sent).toEqual(["SIGINT", "SIGKILL"]);
+    });
+  }
+});
+
+describe("Abbruch-Nachlauf bleibt bis zum SIGKILL verfolgt (Issue #561)", () => {
+  test("stopTree: afterKill erst nach dem SIGKILL", () => {
+    const f = fakePlatform("linux");
+    let done = 0;
+    stopTree(f.proc, CLAUDE_STOP_PLAN, f.platform, () => void done++);
+    f.advance(1_499);
+    expect(done).toBe(0);
+    f.advance(1);
+    expect(signals(f.log)).toEqual(["group -4242 SIGTERM", "group -4242 SIGKILL"]);
+    expect(done).toBe(1);
+  });
+
+  for (const [name, stop, grace] of [
+    ["Codex", terminateCodexProcess, CODEX_KILL_GRACE_MS],
+    ["OpenCode", terminateOpenCodeProcess, OPENCODE_KILL_GRACE_MS],
+  ] as const) {
+    test(`${name}: Prozess steht bis zum SIGKILL in abortAllEngineCalls, danach nicht mehr; Attrappe mit PID 0 nie`, () => {
+      const f = fakePlatform("linux");
+      const rt = {
+        signal: (p: { pid: number; kill: () => void }, s: "SIGINT" | "SIGKILL") => signalProcessGroup(p, s, f.platform),
+        setTimeout: f.platform.setTimeout,
+      } as unknown as CodexRuntime;
+      const before = terminatingEngineProcCount();
+      stop(f.proc, rt);
+      stop({ pid: 0, kill() {} }, rt);
+      f.exitLeader();
+      expect(terminatingEngineProcCount()).toBe(before + 1);
+      expect(abortAllEngineCalls()).toContain(f.proc);
+      f.advance(grace);
+      expect(signals(f.log)).toEqual(["group -4242 SIGINT", "group -4242 SIGKILL"]);
+      expect(terminatingEngineProcCount()).toBe(before);
+      expect(abortAllEngineCalls()).not.toContain(f.proc);
     });
   }
 });

@@ -36,7 +36,7 @@ nicht; dort bleibt der lokale Health-Server mit `/health` und `/process`.
 |-----|------|---------------|
 | `GET /health` | Lebenszeichen: `status: ok` und `revision` aus `RELEASE_REVISION` (ohne Wert `working-tree`). Keine Session, keine Gesprächsdaten | immer |
 | `POST /deploy` | Push-Ereignis von GitHub startet das Deploy-Skript (`DEPLOY_SCRIPT`, Standard `deploy.sh`), höchstens eins zur Zeit | `DEPLOY_SECRET` |
-| `POST /webhook/elevenlabs` | Protokoll nach einem Anruf; tybo fasst es zusammen wie ein abgefragtes Protokoll | `ELEVENLABS_WEBHOOK_SECRET` |
+| `POST /webhook/elevenlabs` | Protokoll nach einem Gespräch; Gespräche eines Sprachagenten-Rezepts wertet der Nachlauf aus, alle anderen fasst tybo zusammen wie ein abgefragtes Protokoll | `ELEVENLABS_WEBHOOK_SECRET` |
 
 `/deploy`: In GitHub unter Settings → Webhooks die Adresse
 `https://…/deploy`, Content type `application/json` und als Secret den Wert
@@ -58,6 +58,11 @@ Zusammenfassung, antwortet tybo mit 500, damit ElevenLabs erneut zustellt;
 das Protokoll bleibt gespeichert, tybo versucht es auch selbst erneut und
 nimmt nach Ablauf der Frist (15 Minuten nach dem Wählen bzw. nach dem
 ersten Protokoll eines fremden Anrufs) den Anfang des Protokolls.
+
+Gehört das Protokoll laut `agent_id` oder Gesprächs-ID einem Sprachagenten aus
+einem Rezept, bekommt es nicht diesen Ablauf, sondern den Nachlauf des Rezepts
+(etwa die Trainingsauswertung des Experten); Einzelheiten in
+[Sprechen](sprechen.md#nach-dem-gespräch-nachlauf-und-training).
 
 Ohne Secret antwortet der jeweilige Weg mit 503 und tut nichts. Falsche
 oder fehlende Signatur ergibt 401, ein Body über 512 KiB 413.
@@ -121,13 +126,22 @@ Prüfen: `curl -s "https://api.telegram.org/bot<TOKEN>/getWebhookInfo"`.
 
 ## Zurück zum Polling
 
-`TYBO_PROFILE=local` setzen (oder die Zeile löschen) und den Bot neu
-starten. Beim Start des Pollings löscht grammY den Webhook bei Telegram
-selbst; liegengebliebene Nachrichten holt das Polling danach ab.
+`TYBO_PROFILE=local` setzen (oder die Zeile löschen), den Webhook bei
+Telegram von Hand löschen und den Bot neu starten:
 
-Nie beides gleichzeitig: Solange ein Webhook eingetragen ist, lehnt Telegram
-Polling mit demselben Token ab, und ein Bot, der pollt, löscht den Webhook
-eines anderen.
+```bash
+curl -s "https://api.telegram.org/bot<TOKEN>/deleteWebhook"
+```
+
+tybo löscht einen Webhook nie selbst, auch nicht beim ersten Start des
+Pollings: Er könnte einem anderen Bot gehören, etwa dem Server. Solange ein
+Webhook eingetragen ist, lehnt Telegram das Polling mit 409 ab; tybo pausiert
+dann den Telegram-Eingang und versucht es mit wachsender Pause erneut
+([Zwei Bots laufen gleichzeitig](troubleshooting.md#zwei-bots-laufen-gleichzeitig)).
+Liegengebliebene Nachrichten holt das Polling ab, sobald der Webhook weg ist.
+
+Nie beides gleichzeitig: Solange ein Webhook eingetragen ist, pollt kein
+zweiter Bot mit demselben Token.
 
 ## Verhalten
 

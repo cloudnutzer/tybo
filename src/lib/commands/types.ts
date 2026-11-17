@@ -19,6 +19,9 @@ import type { ActiveGoal } from "../goal-engine";
 import type { MemoryItem, Message } from "../store/types";
 import type { TaskStore } from "../store/ports";
 import type { PhoneAccess } from "../phone/access";
+import type { CoreChoices } from "../memory/core-choices";
+import type { VoiceAgentManager } from "../voice-agents/manage";
+import type { DraftService } from "../voice-agents/drafts";
 
 export type CommandChannel = "telegram" | "web" | "terminal";
 
@@ -151,6 +154,12 @@ export interface CommandServices {
   directChatIds?(): string[];
   /** /anruf (Issue #367): der Anrufdienst des Bots (src/lib/phone/access.ts); fehlt, meldet /anruf das */
   phone?: PhoneAccess;
+  /** /kern entwurf (Issue #522): Entwurf über das Rückfragen-Register; fehlt, meldet /kern das, alles andere geht trotzdem */
+  core?: Pick<CoreChoices, "offerDraft">;
+  /** /sprachagent (Issue #492): Sprachagenten aus Rezepten (src/lib/voice-agents/manage.ts); fehlt, meldet der Befehl das */
+  voiceAgents?: Pick<VoiceAgentManager, "overview" | "startTest" | "offerDelete" | "link">;
+  /** /sprachagent neu und aendern (Issue #493): Entwürfe per Hintergrund-Job (src/lib/voice-agents/drafts.ts); fehlt, meldet der Befehl das */
+  voiceDrafts?: Pick<DraftService, "startNew" | "startChange">;
 }
 
 /**

@@ -30,6 +30,7 @@ import { createWebServer, type WebServer } from "../src/web/server";
 import { ConversationStore } from "../src/web/store";
 import { ApiClient } from "../src/terminal/api";
 import { runChatApp } from "../src/terminal/app";
+import { SseParser } from "../src/terminal/sse";
 import { isolateAgentCatalog } from "./catalog-fixture";
 import { FakeStdin, FakeStdout } from "./terminal-fixture";
 
@@ -626,7 +627,7 @@ describe("Terminal (tybo)", () => {
    * POST-Antwort und die Live-Ereignisse erst nach slowMs beim Terminal an,
    * der Server rechnet aber schon (ctx.pending)
    */
-  async function openTybo(ctx: Ctx, stops: string[] = [], slowMs = 0) {
+  async function openTybo(ctx: Ctx, stops: string[] = [], slowMs = 0, transport: typeof fetch = fetch) {
     let holdUntil = 0;
     const hold = async () => {
       const wait = holdUntil - Date.now();
@@ -636,7 +637,7 @@ describe("Terminal (tybo)", () => {
     const recording = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       const url = String(input);
       if (slowMs && init?.method === "POST" && url.endsWith("/messages")) holdUntil = Date.now() + slowMs;
-      const res = await fetch(input, init);
+      const res = await transport(input, init);
       if (url.endsWith("/stop")) stops.push(url);
       if (!slowMs) return res;
       await hold();
@@ -670,11 +671,14 @@ describe("Terminal (tybo)", () => {
     return { stdin, stdout, exit };
   }
 
-  test("/board zeigt jeden Beitrag mit Sprecher-Zeile (Agent, Modell, Dauer), Fortschritt nennt den Agenten", async () => {
-    const ctx = await start();
-    const { stdin, stdout, exit } = await openTybo(ctx);
-    stdin.type("/board Preis\r");
-    await waitUntil(() => stdout.text.includes("Beitrag general"));
+  async function finishBoard(ctx: Ctx, { stdin, stdout, exit }: Awaited<ReturnType<typeof openTybo>>) {
+    // Beiträge können schon aus dem Verlaufsabgleich kommen, während SSE noch
+    // unterwegs ist. Erst alle geprüften Ausgaben abwarten, dann das Terminal
+    // schließen; die letzte Antwort allein bestätigt keine Live-Meldung.
+    await waitUntil(() => {
+      const text = stdout.text;
+      return ["Research", "Finance", "Critic", "General"].every(agent => text.includes(`Beitrag ${agent.toLowerCase()}`) && text.includes(`${agent} denkt nach …`));
+    });
     stdin.type("\u0004");
     await exit;
     const text = stdout.text;
@@ -688,7 +692,76 @@ describe("Terminal (tybo)", () => {
     expect(at("research") < at("finance") && at("finance") < at("critic") && at("critic") < at("general")).toBe(true);
     expect(ctx.saved[0]).toMatchObject({ role: "user", content: "/board Preis", metadata: { via: "terminal" } });
     expect(ctx.saved[1].metadata).toMatchObject({ via: "terminal", channel: "web", agent: "research" });
+  }
+
+  test("/board zeigt jeden Beitrag mit Sprecher-Zeile (Agent, Modell, Dauer), Fortschritt nennt den Agenten", async () => {
+    const ctx = await start();
+    const terminal = await openTybo(ctx);
+    try {
+      terminal.stdin.type("/board Preis\r");
+      await finishBoard(ctx, terminal);
+    } finally {
+      terminal.stdin.type("\u0004");
+      await terminal.exit;
+    }
   });
+
+  for (const delayedAgent of ["Research", "General"]) {
+    test(`Verlauf vor SSE ab ${delayedAgent}: vollständige Antworten beenden die Fortschrittsprüfung nicht vorzeitig (PR #545)`, async () => {
+      const ctx = await start();
+      const historyRequested = Promise.withResolvers<void>();
+      const releaseHistory = Promise.withResolvers<void>();
+      const releaseLive = Promise.withResolvers<void>();
+      let historyCalls = 0;
+      const transport = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/messages") && init?.method !== "POST" && ++historyCalls === 2) {
+          // Den Abgleich erst lesen lassen, wenn alle Beiträge gespeichert
+          // sind. Der erste GET lädt vor dem Verbindungsaufbau den Verlauf.
+          historyRequested.resolve();
+          await releaseHistory.promise;
+        }
+        const res = await fetch(input, init);
+        if (!url.endsWith("/events")) return res;
+        const parser = new SseParser();
+        const encoder = new TextEncoder();
+        const delayed = res.body!.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+          async transform(chunk, controller) {
+            for (const event of parser.push(chunk)) {
+              if (event.event === "notice" && JSON.parse(event.data).text === `${delayedAgent} denkt nach …`) await releaseLive.promise;
+              controller.enqueue(encoder.encode(`event: ${event.event}\ndata: ${event.data}\n\n`));
+            }
+          },
+        }));
+        return new Response(delayed, { status: res.status, headers: res.headers });
+      }) as typeof fetch;
+      const terminal = await openTybo(ctx, [], 0, transport);
+      let checking: Promise<void> | undefined;
+      try {
+        await historyRequested.promise;
+        terminal.stdin.type("/board Preis\r");
+        await waitUntil(() => ctx.saved.some(m => m.content === "Beitrag general") && !isBoardRunning(TOPIC_KEY));
+        releaseHistory.resolve();
+        await waitUntil(() => terminal.stdout.text.includes("Beitrag general"));
+        expect(terminal.stdout.text).not.toContain(`${delayedAgent} denkt nach …`);
+        checking = finishBoard(ctx, terminal);
+        // Auch ein fehlgeschlagener Gegenlauf wird unten abgeholt.
+        void checking.catch(() => {});
+        // Ein Durchlauf der Ereignisschleife, keine geschätzte Netzwartezeit:
+        // der alte Abschluss nur nach der Antwort hätte jetzt Strg+D gesendet.
+        await new Promise<void>(resolve => setImmediate(resolve));
+        expect(terminal.stdin.rawModes.at(-1)).toBe(true);
+        releaseLive.resolve();
+        await checking;
+      } finally {
+        releaseHistory.resolve();
+        releaseLive.resolve();
+        terminal.stdin.type("\u0004");
+        await terminal.exit;
+        await checking?.catch(() => {});
+      }
+    });
+  }
 
   test("Strg+C während eines Beitrags: der Beitrag kommt noch, danach Schluss", async () => {
     const ctx = await start();

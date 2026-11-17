@@ -3,43 +3,47 @@
  * Seiteneffekte importieren (kein .env-Lesen, kein Warten, kein Netz, kein
  * Schreiben); der Versand liegt in exportierten Funktionen mit übergebbarem
  * Sender. Die Arbeit startet nur unter import.meta.main.
+ *
+ * Netz und Timer beim Import zählt ein eigener Prozess
+ * (tests/fixtures/import-side-effects.ts): bun führt alle Testdateien in
+ * einem Prozess aus, und Arbeit einer früheren Datei, die noch nachläuft,
+ * legte sonst während des Imports eigene Timer an (unter hoher Last zwei,
+ * PR #631).
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { SendAndRecordInput } from "../src/lib/outbox";
+import * as briefing from "../src/routines/briefing";
+import * as checkin from "../src/routines/checkin";
 
-const fetchCalls: string[] = [];
-const originalFetch = globalThis.fetch;
-const originalSetTimeout = globalThis.setTimeout;
-let timers = 0;
-let briefing: typeof import("../src/routines/briefing");
-let checkin: typeof import("../src/routines/checkin");
-let importMs = 0;
+const ROOT = resolve(import.meta.dir, "..");
+const PROBE = join(import.meta.dir, "fixtures", "import-side-effects.ts");
+let probe: { fetchCalls: string[]; timers: string[]; importMs: number };
+let probeDir = "";
 
 beforeAll(async () => {
-  globalThis.fetch = (async (url: string | URL | Request) => {
-    fetchCalls.push(String(url));
-    throw new Error("kein Netz im Test");
-  }) as typeof fetch;
-  globalThis.setTimeout = ((fn: (...a: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
-    timers++;
-    return originalSetTimeout(fn, ms, ...rest);
-  }) as typeof setTimeout;
-  // Query-String erzwingt eine frische Modul-Instanz, auch wenn ein anderer
-  // Test die Module im selben Prozess schon geladen hat
-  const fresh = (path: string) => import(`${path}?import-test=${Date.now()}`);
-  const start = Date.now();
-  briefing = await fresh("../src/routines/briefing.ts");
-  checkin = await fresh("../src/routines/checkin.ts");
-  importMs = Date.now() - start;
-  globalThis.setTimeout = originalSetTimeout;
+  // Frischer Prozess ohne .env, Arbeitsordner leer: dieselbe Umgebung wie im Testprozess
+  probeDir = mkdtempSync(join(tmpdir(), "tybo-services-import-"));
+  const proc = Bun.spawn([process.execPath, "--no-env-file", PROBE, ROOT], {
+    cwd: probeDir,
+    env: { ...process.env, NO_COLOR: "1" },
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [out, err, code] = await Promise.all([
+    new Response(proc.stdout as ReadableStream).text(),
+    new Response(proc.stderr as ReadableStream).text(),
+    proc.exited,
+  ]);
+  if (code !== 0) throw new Error(`Import-Probe endete mit ${code}: ${err}`);
+  probe = JSON.parse(out.trim().split("\n").pop() ?? "");
 });
 
 afterAll(() => {
-  globalThis.fetch = originalFetch;
-  globalThis.setTimeout = originalSetTimeout;
+  rmSync(probeDir, { recursive: true, force: true });
 });
 
 function recorder(sent = true) {
@@ -53,10 +57,11 @@ function recorder(sent = true) {
 
 describe("Import ohne Seiteneffekte", () => {
   test("kein Netz, keine Wartezeit, keine Timer", () => {
-    expect(fetchCalls).toEqual([]);
-    expect(timers).toBe(0);
+    expect(probe.fetchCalls).toEqual([]);
+    // Bei einem Fehlschlag steht der Stack jedes Timers in der Meldung
+    expect(probe.timers).toEqual([]);
     // Die Dienste warten beim Start bis zu 30 s; der Import darf das nicht
-    expect(importMs).toBeLessThan(5000);
+    expect(probe.importMs).toBeLessThan(5000);
   });
 
   test("Versandfunktionen sind exportiert", () => {

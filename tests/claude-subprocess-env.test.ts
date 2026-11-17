@@ -7,6 +7,7 @@
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { callClaude, callClaudeStreaming, conversationEnv, runClaudeWithTimeout, setSpawnForTests } from "../src/lib/claude";
+import { DEFAULT_CLAUDE_MODEL } from "../src/lib/default-model";
 import { runExecution } from "../src/lib/execution-context";
 import { CONVERSATION_VARS, setMcpReaderForTests } from "../src/lib/subprocess-env";
 import { runJsonTurn, runStreamingTurn, resolveStreamingLimits, type ChatTurnDeps } from "../src/lib/chat-turn";
@@ -218,11 +219,11 @@ describe("Standardmodell im Prozessstart", () => {
     ["callClaudeStreaming", () => callClaudeStreaming({ prompt: "hallo" })],
   ];
   for (const [name, call] of WAYS) {
-    test(`${name}: --model claude-opus-5-5 ohne model-Option`, async () => {
+    test(`${name}: --model ${DEFAULT_CLAUDE_MODEL} ohne model-Option`, async () => {
       await call();
       expect(spawned).toHaveLength(1);
       const cmd = spawned[0].cmd;
-      expect(cmd[cmd.indexOf("--model") + 1]).toBe("claude-opus-5-5");
+      expect(cmd[cmd.indexOf("--model") + 1]).toBe(DEFAULT_CLAUDE_MODEL);
       expect(cmd.filter(arg => arg === "--model")).toHaveLength(1);
     });
   }

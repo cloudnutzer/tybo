@@ -42,13 +42,18 @@ const BUILT: Partial<Record<StorePart, string[]>> = {
     "boardRows",
     "lastUserMessageAt",
     "search",
+    "searchWithFacts",
     "history",
     "topicActivity",
+    "topicActivitySince",
     "displayOnlyPage",
+    "displayOnlyHeads",
+    "displayOnlyRows",
     "latestDisplayOnlyAt",
     "findDisplayOnlyFile",
   ],
   memory: [
+    "searchFacts",
     "addFact",
     "facts",
     "deleteFact",
@@ -60,6 +65,10 @@ const BUILT: Partial<Record<StorePart, string[]>> = {
     "factVectors",
     "matchingFacts",
     "matchingGoals",
+    "archivedFacts",
+    "archiveFact",
+    "restoreFact",
+    "rewriteFact",
     "deleteFactById",
     "completeGoalById",
     "cancelGoalById",
@@ -186,7 +195,7 @@ describe("Platzhalter werfen StoreNotReadyError", () => {
 });
 
 describe("Nachrichten unter Supabase (#309, #310)", () => {
-  test("alle elf Methoden sind gebaut (lastUserMessageAt seit #364)", () => {
+  test("alle fünfzehn Methoden sind gebaut (lastUserMessageAt seit #364, searchWithFacts seit #523, drei schlanke Leser seit #684)", () => {
     expect([...BUILT.messages!].sort()).toEqual([...STORE_METHODS.messages].sort() as string[]);
   });
 
@@ -203,9 +212,12 @@ describe("Nachrichten unter Supabase (#309, #310)", () => {
     expect(await store.messages.search("1", "x", 5)).toEqual([]);
     expect(await store.messages.history("1", null, { limit: 5 })).toEqual([]);
     expect(await store.messages.topicActivity("1", 30)).toEqual([]);
+    expect(await store.messages.topicActivitySince("1", "2026-11-16T10:00:00.000Z")).toEqual({ activity: [], truncated: false });
     // Die Meldungsleser und lastUserMessageAt werfen ohne Client absichtlich, aber nicht StoreNotReadyError
     for (const read of [
       () => store.messages.displayOnlyPage(["1"], { limit: 5 }),
+      () => store.messages.displayOnlyHeads(["1"], { limit: 5 }),
+      () => store.messages.displayOnlyRows(["1"], ["7"]),
       () => store.messages.latestDisplayOnlyAt(["1"]),
       () => store.messages.findDisplayOnlyFile("f", ["1"]),
       // #364: die letzte Nutzernachricht ebenso, „unbekannt" ist nie „keine"

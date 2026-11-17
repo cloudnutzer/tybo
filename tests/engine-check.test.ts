@@ -191,10 +191,30 @@ describe("Zwischenspeicher 60 s", () => {
   });
 });
 
-describe("andere Motoren", () => {
-  test("Claude Code wird hier nicht geprüft; keine Prozesse (OpenCode: tests/opencode-engine-check.test.ts)", async () => {
-    expect(await checkEngine("claude")).toEqual({ engine: "claude", checked: false, installed: true, loggedIn: true });
+describe("checkEngine(\"claude\") (Issue #567): echt geprüft", () => {
+  const AUTH_JSON = (loggedIn: boolean) => JSON.stringify({ loggedIn, email: "alex@example.test" });
+
+  test("bereit: claude --version und claude auth status --json, kein Modellaufruf", async () => {
+    fake.next({ stdout: "2.1.300 (Claude Code)\n", exitCode: 0 });
+    fake.next({ stdout: AUTH_JSON(true), exitCode: 0 });
+    expect(await checkEngine("claude")).toEqual({ engine: "claude", checked: true, installed: true, loggedIn: true, version: "2.1.300" });
+    expect(fake.spawns.map((s) => s.cmd)).toEqual([["claude", "--version"], ["claude", "auth", "status", "--json"]]);
+    expect(fake.spawns.some((s) => s.cmd.includes("-p"))).toBe(false);
+  });
+
+  test("nicht installiert: Fehlermeldung, keine Anmeldeprüfung", async () => {
+    fake.next({ throws: "ENOENT: no such file or directory, posix_spawn 'claude'", throwsCode: "ENOENT" });
+    expect(await checkEngine("claude")).toEqual({ engine: "claude", checked: true, installed: false, loggedIn: false, message: CLAUDE_NOT_INSTALLED });
+    // Der Startfehler zählt nicht als Prozess; auth status läuft danach nicht
     expect(fake.spawns).toHaveLength(0);
+  });
+
+  test("nicht angemeldet: Hinweis auf /login", async () => {
+    fake.next({ stdout: "2.1.300\n", exitCode: 0 });
+    fake.next({ stdout: AUTH_JSON(false), exitCode: 1 });
+    const status = await checkEngine("claude");
+    expect(status).toMatchObject({ installed: true, loggedIn: false, message: CLAUDE_NOT_LOGGED_IN });
+    expect(JSON.stringify(status)).not.toContain("alex@example.test");
   });
 });
 
@@ -264,7 +284,7 @@ describe("inspectEngine (Issue #126): Anzeige für Einstellungen und Status", ()
 
   test("Claude nicht installiert: Startfehler oder Exit 127, CLAUDE_PATH wird verwendet", async () => {
     process.env.CLAUDE_PATH = "/opt/claude/bin/claude";
-    fake.next({ throws: "ENOENT" });
+    fake.next({ throws: "ENOENT: no such file or directory, posix_spawn '/opt/claude/bin/claude'", throwsCode: "ENOENT" });
     expect(await inspectEngine("claude")).toEqual({ engine: "claude", checked: true, installed: false, loggedIn: false, message: CLAUDE_NOT_INSTALLED });
     resetEngineCheckCacheForTests();
     fake.next({ stdout: "", exitCode: 127 });
@@ -272,13 +292,13 @@ describe("inspectEngine (Issue #126): Anzeige für Einstellungen und Status", ()
     expect(fake.spawns.map((s) => s.cmd)).toEqual([["/opt/claude/bin/claude", "--version"]]);
   });
 
-  test("Ergebnis gilt 60 s; checkEngine(\"claude\") startet weiter nichts (Motor-Wahl unverändert)", async () => {
+  test("Ergebnis gilt 60 s; checkEngine(\"claude\") teilt denselben Zwischenspeicher (Issue #567)", async () => {
     fake.next(CLAUDE_VERSION);
     fake.next({ stdout: AUTH(true), exitCode: 0 });
     await inspectEngine("claude");
     await inspectEngine("claude");
     expect(fake.spawns).toHaveLength(2);
-    expect(await checkEngine("claude")).toEqual({ engine: "claude", checked: false, installed: true, loggedIn: true });
+    expect(await checkEngine("claude")).toEqual({ engine: "claude", checked: true, installed: true, loggedIn: true, version: "2.1.281" });
     expect(fake.spawns).toHaveLength(2);
     fake.advance(ENGINE_CHECK_CACHE_MS);
     fake.next(CLAUDE_VERSION);

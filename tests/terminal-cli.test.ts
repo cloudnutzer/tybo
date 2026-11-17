@@ -13,6 +13,8 @@ import { createDemoTelegram } from "../src/web/demo";
 import { createWebServer, type WebServer } from "../src/web/server";
 import { parseEnvFile, runTybo, startHint } from "../scripts/tybo";
 import { oldLaunchdLabel } from "./old-names";
+import { formatLockContent } from "../src/app/lifecycle";
+import { currentLockOf, spawnFakeBot } from "./bot-lock-fixture";
 
 const PASSWORD = "test-passwort-lang";
 const REPO = resolve(import.meta.dir, "..");
@@ -97,13 +99,67 @@ describe("tybo ohne laufenden Bot", () => {
     expect(startHint("/projekt", "darwin", home)).toBe("cd /projekt && bun run start");
   });
 
-  test("Bot-Prozess läuft (bot.lock), WebUI antwortet nicht: kein „läuft nicht“", async () => {
+  test("Bot-Prozess läuft (bot.lock mit PID und Startzeit), WebUI antwortet nicht: kein „läuft nicht“", async () => {
     const root = await fakeRoot(enabledEnv(freePort()));
-    await writeFile(join(root, "bot.lock"), String(process.pid));
+    await writeFile(join(root, "bot.lock"), currentLockOf(process.pid));
     const r = await run([], root);
     expect(r.code).toBe(1);
     expect(r.stderr).toContain("Der Bot läuft, aber die WebUI antwortet nicht");
     expect(r.stderr).not.toContain("läuft nicht. Starten");
+  });
+
+  test("bot.lock da, aber nicht lesbar (Ordner, ohne Leserecht): kein „läuft nicht“ (Issue #564)", async () => {
+    const root = await fakeRoot(enabledEnv(freePort()));
+    await mkdir(join(root, "bot.lock"));
+    const r = await run([], root);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("Der Bot läuft, aber die WebUI antwortet nicht");
+    expect(r.stderr).not.toContain("läuft nicht. Starten");
+    await rm(join(root, "bot.lock"), { recursive: true });
+
+    // Als root gilt das Leserecht nicht
+    if (process.getuid?.() !== 0) {
+      await writeFile(join(root, "bot.lock"), formatLockContent({ pid: 77, started: "Mon Jan  1 00:00:00 2001" }), { mode: 0o000 });
+      const unreadable = await run([], root);
+      expect(unreadable.stderr).toContain("Der Bot läuft, aber die WebUI antwortet nicht");
+      expect(unreadable.stderr).not.toContain("läuft nicht. Starten");
+    }
+  });
+
+  test("bot.lock mit PID, aber anderer Startzeit: verwaist, „läuft nicht“ (Issue #564)", async () => {
+    const root = await fakeRoot(enabledEnv(freePort()));
+    await writeFile(join(root, "bot.lock"), formatLockContent({ pid: process.pid, started: "Mon Jan  1 00:00:00 2001" }));
+    const r = await run([], root);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("läuft nicht. Starten");
+  });
+
+  test("alte bot.lock nur mit PID: verwaist nur, wenn der Prozess nachweislich kein src/bot.ts aus diesem Ordner ist (Issue #564)", async () => {
+    // PID dieses Testprozesses: lebt, ist aber kein Bot
+    const root = await fakeRoot(enabledEnv(freePort()));
+    await writeFile(join(root, "bot.lock"), String(process.pid));
+    expect((await run([], root)).stderr).toContain("läuft nicht. Starten");
+
+    // Platzhalter-Bot, relativ aus diesem Ordner gestartet: läuft
+    const here = await spawnFakeBot(root, "relative");
+    try {
+      await writeFile(join(root, "bot.lock"), String(here.pid));
+      const r = await run([], root);
+      expect(r.stderr).toContain("Der Bot läuft, aber die WebUI antwortet nicht");
+    } finally {
+      await here.stop();
+    }
+
+    // Derselbe relative Aufruf aus einem anderen Checkout: "run src/bot.ts" könnte
+    // selbst der Pfad sein (Ordner "run src", inzwischen entfernt), also unklar und belegt
+    const other = await fakeRoot("");
+    const elsewhere = await spawnFakeBot(other, "relative");
+    try {
+      await writeFile(join(root, "bot.lock"), String(elsewhere.pid));
+      expect((await run([], root)).stderr).toContain("Der Bot läuft, aber die WebUI antwortet nicht");
+    } finally {
+      await elsewhere.stop();
+    }
   });
 
   test("WebUI aus: eigene Meldung statt „läuft nicht“", async () => {

@@ -354,6 +354,37 @@ describe("search-memory", () => {
     ]);
   });
 
+  test("mit facts: ein Embedding für Nachrichten und Fakten, Antwort mit beiden, Kennungen gehen an die Datenbank", async () => {
+    answer = chain =>
+      chain[0].args[0] === "match_facts_checked" ? { data: [{ id: 7, content: "Fakt" }], error: null } : chain[0].method === "rpc" ? { data: HIT, error: null } : { data: [], error: null };
+    const res = await call("search-memory", { chat_id: "c1", query: "Notiz", facts: { limit: 3, exclude_ids: [1, "2"] } });
+    expect(await res.json()).toEqual({ messages: HIT, facts: [{ id: 7, content: "Fakt" }] });
+    expect(outbound.filter(o => o.url.includes("api.openai.com"))).toHaveLength(1);
+    const factCall = chainsWith("rpc", "match_facts_checked")[0][0].args[1] as Record<string, unknown>;
+    expect(factCall).toEqual({ p_provider: "openai", p_model: "text-embedding-3-small", query_embedding: vector, match_threshold: 0.4, match_count: 3, p_exclude_ids: ["1", "2"] });
+  });
+
+  test("mit facts, aber ohne die Migration: facts null, die Nachrichten bleiben", async () => {
+    answer = chain =>
+      chain[0].args[0] === "match_facts_checked" ? { data: null, error: { code: "PGRST202", message: "fehlt" } } : chain[0].method === "rpc" ? { data: HIT, error: null } : { data: [], error: null };
+    const res = await call("search-memory", { chat_id: "c1", query: "Notiz", facts: { limit: 3 } });
+    expect(await res.json()).toEqual({ messages: HIT, facts: null });
+  });
+
+  test("mit facts, aber ohne Vektor: keine Faktensuche, Textsuche für die Nachrichten", async () => {
+    delete env.OPENAI_API_KEY;
+    const res = await call("search-memory", { chat_id: "c1", query: "Notiz", facts: { limit: 3 } });
+    expect(await res.json()).toEqual({ messages: [], facts: null });
+    expect(chainsWith("rpc", "match_facts_checked")).toEqual([]);
+  });
+
+  test("ohne facts bleibt die Antwort die Liste und match_facts_checked ungefragt", async () => {
+    answer = chain => (chain[0].method === "rpc" ? { data: HIT, error: null } : { data: [], error: null });
+    const res = await call("search-memory", { chat_id: "c1", query: "Notiz" });
+    expect(await res.json()).toEqual(HIT);
+    expect(chainsWith("rpc", "match_facts_checked")).toEqual([]);
+  });
+
   test("limit aus dem Rumpf geht an match_count", async () => {
     answer = chain => (chain[0].method === "rpc" ? { data: HIT, error: null } : { data: [], error: null });
     await call("search-memory", { chat_id: "c1", query: "Notiz", limit: 3 });

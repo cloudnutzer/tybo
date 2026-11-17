@@ -13,6 +13,13 @@ export const PM2_PREFIX = "tybo-";
 export const BOT_SERVICE = "telegram-relay";
 
 /**
+ * Dienstkennung in der Antwort des Health-Servers (/health); der Nachtcheck
+ * erkennt den Bot daran (Issue #568). Hier statt in src/app/health-server.ts,
+ * damit Prüfskripte sie ohne den Bot-Code laden.
+ */
+export const HEALTH_SERVICE_ID = "tybo-telegram-bot";
+
+/**
  * Supabase auf diesem Rechner (Issue #165): einmaliger Aufruf von
  * `tybo datenbank start` beim Anmelden bzw. beim Start von PM2, kein Daemon
  */

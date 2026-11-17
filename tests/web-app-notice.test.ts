@@ -191,6 +191,45 @@ describe("Dateikarte", () => {
     }
   });
 
+  test("HTML: Knopf Öffnen führt in einen eigenen Tab, Herunterladen bleibt", () => {
+    const node = app.messageElement({ ...NOTICE, file });
+    const open = byClass(node, "file-open")!;
+    expect(open.tagName).toBe("A");
+    expect(open.textContent).toBe("Öffnen");
+    expect(open.attributes.href).toBe(`/api/files/${FILE_ID}?inline=1`);
+    expect(open.attributes.target).toBe("_blank");
+    expect(open.attributes.rel).toBe("noopener");
+    expect(byClass(node, "file-download")!.attributes.href).toBe(`/api/files/${FILE_ID}`);
+    const plain = app.messageElement({ ...NOTICE, file: { ...file, name: "a.html", mime: "text/plain" } });
+    expect(byClass(plain, "file-open")).toBeUndefined();
+  });
+
+  test("Audio und Video mit Player über der Karte, Herunterladen bleibt", () => {
+    const cases: [string, string, string | null][] = [
+      ["a.mp3", "audio/mpeg", "AUDIO"],
+      ["b.M4A", "audio/x-m4a", "AUDIO"],
+      ["c.ogg", "audio/ogg", "AUDIO"],
+      ["d.mp4", "video/mp4", "VIDEO"],
+      ["e.mov", "video/quicktime", "VIDEO"],
+      ["f.webm", "video/webm", "VIDEO"],
+      ["g.mp3", "text/html", null],
+      ["h.txt", "audio/mpeg", null],
+    ];
+    for (const [name, mime, tag] of cases) {
+      const node = app.messageElement({ ...NOTICE, file: { ...file, name, mime } });
+      const player = byClass(node, "file-media");
+      if (tag) {
+        expect(player!.tagName).toBe(tag);
+        expect(player!.attributes.src).toBe(`/api/files/${FILE_ID}?inline=1`);
+        expect(player!.attributes.controls).toBe("");
+        expect(byClass(node, "file")!.children.map(c => c.className)).toEqual(["file-media", "file-card"]);
+      } else {
+        expect(player).toBeUndefined();
+      }
+      expect(byClass(node, "file-download")!.attributes.href).toBe(`/api/files/${FILE_ID}`);
+    }
+  });
+
   test("ungültige Datei-ID: keine Karte, kein Link", () => {
     const node = app.messageElement({ ...NOTICE, file: { ...file, id: "../../etc/passwd" } });
     expect(byClass(node, "file")).toBeUndefined();
@@ -246,6 +285,6 @@ describe("style.css", () => {
 
   test("Herunterladen am Handy mit 44 px Tippfläche", () => {
     const mobile = css.slice(css.indexOf("@media (max-width: 55.99rem)"));
-    expect(mobile).toContain(".file-download { min-height: 2.75rem; }");
+    expect(mobile).toContain(".file-download, .file-open { min-height: 2.75rem; }");
   });
 });

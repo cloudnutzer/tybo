@@ -253,11 +253,56 @@ describe("Nachtcheck-Zeile Plattenplatz", () => {
     expect(parseDf("kaputt")).toBeNull();
   });
 
-  test("frei von gesamt mit Prozent; Schwellen 25 GB ⚠️ und 10 GB ❌", () => {
+  test("frei von gesamt mit Prozent", () => {
     expect(evaluateDisk(460 * GB, 129 * GB)).toEqual({ name: "Plattenplatz", status: "ok", detail: "129 GB von 460 GB frei (28 %)" });
-    expect(evaluateDisk(460 * GB, 20 * GB).status).toBe("warn");
-    expect(evaluateDisk(460 * GB, 5 * GB).status).toBe("fail");
     expect(evaluateDisk(0, 129 * GB).detail).toBe("129 GB frei");
+  });
+
+  const status = (total: number, free: number) => evaluateDisk(total * GB, free * GB).status;
+
+  test("⚠️ allein über die GB-Grenze: 24 GB von 100 GB (24 %), genau 25 GB ist noch ok", () => {
+    expect(status(100, 24)).toBe("warn");
+    expect(status(100, 25)).toBe("ok");
+  });
+
+  test("⚠️ allein über den Anteil: 149 GB von 1000 GB, genau 15 % ist noch ok", () => {
+    expect(status(1000, 149)).toBe("warn");
+    expect(status(1000, 150)).toBe("ok");
+  });
+
+  test("❌ allein über die GB-Grenze: 9 GB von 20 GB (45 %), genau 10 GB bleibt ⚠️", () => {
+    expect(status(20, 9)).toBe("fail");
+    expect(status(20, 10)).toBe("warn");
+  });
+
+  test("❌ allein über den Anteil: 49 GB von 1000 GB, genau 5 % bleibt ⚠️", () => {
+    expect(status(1000, 49)).toBe("fail");
+    expect(status(1000, 50)).toBe("warn");
+  });
+
+  test("❌ geht vor ⚠️, wenn beide Regeln greifen", () => {
+    expect(status(100, 4)).toBe("fail");
+    expect(status(460, 20)).toBe("fail");
+  });
+
+  test("unbekannte Gesamtgröße: nur die GB-Grenzen", () => {
+    expect(status(0, 9)).toBe("fail");
+    expect(status(0, 24)).toBe("warn");
+    expect(status(0, 25)).toBe("ok");
+    expect(status(0, 1)).toBe("fail");
+  });
+
+  test("verglichen wird vor dem Runden: 14,96 % zeigt 15 %, warnt aber", () => {
+    const r = evaluateDisk(1000 * GB, 149.6 * GB);
+    expect(r.status).toBe("warn");
+    expect(r.detail).toContain("(15 %)");
+  });
+
+  test("Hinweis nennt die Wartung, nur bei ⚠️ und ❌", () => {
+    for (const r of [evaluateDisk(100 * GB, 24 * GB), evaluateDisk(100 * GB, 4 * GB)]) {
+      expect(r.hint).toContain("tybo wartung --dry-run zeigt, was sofort ginge, mit der Summe");
+    }
+    expect(evaluateDisk(100 * GB, 90 * GB).hint).toBeUndefined();
   });
 });
 

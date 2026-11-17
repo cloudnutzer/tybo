@@ -6,6 +6,7 @@ import { abortAllExecutions, abortExecutions, currentExecution, runExecution } f
 import type { RunTurnOptions } from "../src/web/chat";
 import {
   MIRROR_FAILED_TEXT,
+  TELEGRAM_REJECTED_TEXT,
   TELEGRAM_UNAVAILABLE_TEXT,
   createApprovalTurns,
   createTelegramChat,
@@ -57,6 +58,7 @@ function setup(core: (o: TurnOptions) => Promise<string> = async () => "Antwort"
     coreCalls: [] as (TurnOptions & { key?: string; lockAgent?: string })[],
     group: GROUP as string | null,
     plainFails: false,
+    plainError: null as Error | null,
     agentSendFails: false,
     beforeSave: undefined as ((m: WebSavedMessage) => Promise<void>) | undefined,
     beforePlain: undefined as (() => Promise<void>) | undefined,
@@ -88,6 +90,7 @@ function setup(core: (o: TurnOptions) => Promise<string> = async () => "Antwort"
     isShuttingDown: () => false,
     scheduleRestartCheck: () => {},
     sendPlain: async (chatId, text, threadId) => {
+      if (state.plainError) throw state.plainError;
       if (state.plainFails) throw new Error("Telegram 400");
       await state.beforePlain?.();
       state.steps.push("mirror");
@@ -248,6 +251,54 @@ describe("createTelegramChat", () => {
     expect(state.coreCalls).toEqual([]);
     expect(state.agentSends).toEqual([]);
     expect(state.logs.join("\n")).not.toContain("Frage");
+  });
+
+  // Issue #562: Ein 409 betrifft nur das Abholen (getUpdates), Senden geht
+  // weiter, der Browser-Turn läuft wie sonst. Bei 401 scheitert auch das
+  // Spiegeln; der Turn läuft dann ohne Telegram weiter, Antwort nur im Browser
+  test("Token abgelehnt (401): Turn im Direktchat läuft ohne Telegram, Antwort im Browser", async () => {
+    const { state, chat } = setup();
+    state.plainError = Object.assign(new Error("Call to 'sendMessage' failed! (401: Unauthorized)"), { ok: false, error_code: 401 });
+    const notices: string[] = [];
+    const result = await chat.runTurn({ ...turn("dm"), sink: { progress() {}, notice: t => void notices.push(t) } });
+    expect(result.text).toBe("Antwort");
+    expect(result.failed).toBeUndefined();
+    expect(state.steps).toEqual(["claude", "save:user", "save:assistant", "intents"]);
+    expect(state.coreCalls[0]).toMatchObject({ chatId: USER, key: `dm:${USER}`, noTelegram: { conversationId: "dm" } });
+    expect(state.coreCalls[0].onQuestion).toBeUndefined();
+    // Gesprächshinweis des Telefonhörers bleibt für einen getippten Turn wie sonst
+    expect(state.coreCalls[0].skipCallRecap).toBeUndefined();
+    expect(state.agentSends).toEqual([]);
+    expect(notices).toEqual([TELEGRAM_REJECTED_TEXT]);
+    expect(state.saved.map(m => [m.chat_id, m.role, m.content])).toEqual([
+      [USER, "user", "Frage"],
+      [USER, "assistant", "Antwort"],
+    ]);
+  });
+
+  test("Token abgelehnt (401) im Topic: ebenso ohne Telegram", async () => {
+    const { state, chat } = setup();
+    state.plainError = Object.assign(new Error("Unauthorized"), { error_code: 401 });
+    const result = await chat.runTurn(turn("topic-443"));
+    expect(result.text).toBe("Antwort");
+    expect(state.coreCalls[0]).toMatchObject({ chatId: GROUP, topicId: 443, noTelegram: { conversationId: "topic-443" } });
+    expect(state.agentSends).toEqual([]);
+  });
+
+  test("anderer Fehler beim Spiegeln (kein 401): weiterhin nichts verarbeitet", async () => {
+    const { state, chat } = setup();
+    state.plainError = Object.assign(new Error("Too Many Requests"), { error_code: 429 });
+    expect(await chat.runTurn(turn("dm"))).toEqual({ text: MIRROR_FAILED_TEXT, failed: true });
+    expect(state.saved).toEqual([]);
+    expect(state.coreCalls).toEqual([]);
+  });
+
+  test("Polling-Konflikt (409): Senden geht, der Turn im Telegram-Gespräch läuft durch", async () => {
+    const { state, chat } = setup();
+    await chat.runTurn(turn("dm"));
+    expect(state.plain.length).toBe(1);
+    expect(state.coreCalls.length).toBe(1);
+    expect(state.agentSends.length).toBe(1);
   });
 
   test("ohne Gruppe: nicht erreichbar, nichts passiert", async () => {

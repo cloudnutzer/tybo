@@ -36,6 +36,12 @@ export interface BotSession {
   startedAt: number; // epoch ms
   lastActivity: number; // epoch ms
   messageCount: number;
+  /**
+   * Fakten, die diese Session schon gesehen hat (Issue #523): aus dem ersten
+   * Prompt, den Merk-Einträgen und den Fakten der Folgenachrichten. Fehlt bei
+   * alten Einträgen, dann kann ein Fakt einmal doppelt kommen.
+   */
+  shownFactIds?: string[];
 }
 
 /** Eintrag, wie er in Dateien vor Issue #122 stehen kann */
@@ -94,6 +100,7 @@ export function normalizeSession(raw: LegacyBotSession): BotSession {
   const engine: EngineId = rest.engine ?? "claude";
   const engineSessionId = rest.engineSessionId ?? (engine === "claude" ? claudeSessionId : undefined);
   const session: BotSession = { ...rest, engine };
+  if (rest.shownFactIds !== undefined && !Array.isArray(rest.shownFactIds)) delete session.shownFactIds;
   if (engineSessionId) session.engineSessionId = engineSessionId;
   else delete session.engineSessionId;
   return session;
@@ -237,6 +244,8 @@ export async function listStoredSessions(): Promise<BotSession[]> {
  * stored (file read and written); callers may promise a resume only then.
  * Mit epoch: nichts speichern, wenn der Schlüssel seitdem zurückgesetzt wurde.
  * Dieselbe Session heißt: gleicher Motor und gleiche Session-ID.
+ * shownFactIds: Fakten, die die Session nach diesem Turn kennt; ohne Angabe
+ * (Rückfrage-Antwort, Routine) bleibt bei derselben Session der alte Stand.
  */
 export async function recordSessionTurn(
   sessionKey: string,
@@ -245,7 +254,8 @@ export async function recordSessionTurn(
   engine: EngineId,
   engineSessionId: string,
   memoryWatermark = Date.now(),
-  epoch?: number
+  epoch?: number,
+  shownFactIds?: string[]
 ): Promise<boolean> {
   try {
     const sessions = await load();
@@ -256,6 +266,7 @@ export async function recordSessionTurn(
     const existing = sessions[key];
     const now = Date.now();
     const sameSession = existing?.engine === engine && existing?.engineSessionId === engineSessionId;
+    const shown = shownFactIds ?? (sameSession ? existing.shownFactIds : undefined);
     sessions[key] = {
       key,
       agentName,
@@ -266,6 +277,7 @@ export async function recordSessionTurn(
       startedAt: sameSession ? existing.startedAt : now,
       lastActivity: now,
       messageCount: sameSession ? existing.messageCount + 1 : 1,
+      ...(shown ? { shownFactIds: shown } : {}),
     };
     return await persist();
   } catch (err) {

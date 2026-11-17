@@ -8,7 +8,7 @@ import { atomicWriteFile } from "./atomic-file";
  * #122): bei Claude auf dem billigen Aux-Modell (AUX_MODEL_DISTILL), bei
  * anderen Motoren mit dem Modell der Session.
  *
- *   1. Durable insights as [REMEMBER:]/[GOAL:] intent tags.
+ *   1. Durable insights as [REMEMBER:]/[GOAL:]/[KNOWLEDGE:]/[FORGET:] intent tags.
  *   2. Routine detection: did this session demonstrate a repeatable
  *      workflow? If yes, a [ROUTINE: description] tag.
  *
@@ -28,7 +28,8 @@ import { dirname, join } from "path";
 import { mkdir, readFile } from "fs/promises";
 import { acquireFileLock, releaseFileLock } from "./file-lock";
 import { callAux } from "./aux-model";
-import { processIntents, type IntentConversation } from "./memory";
+import { processIntents, reportMemoryFailures, type IntentConversation } from "./memory";
+import { maskSecrets } from "./memory/secrets";
 import { storeOr } from "./store";
 import type { LogLevel } from "./store/types";
 import { getEngine } from "./engines";
@@ -47,7 +48,7 @@ const DISTILL_MIN_TURNS = parseInt(
 
 const AUTO_APPLY = () => process.env.DISTILL_AUTO_APPLY === "true";
 
-const DISTILL_PROMPT = `Diese Konversations-Session endet jetzt und wird verworfen.
+export const DISTILL_PROMPT = `Diese Konversations-Session endet jetzt und wird verworfen.
 
 Zwei Aufgaben:
 
@@ -59,8 +60,12 @@ Zwei Aufgaben:
 Gib sie AUSSCHLIESSLICH als Intent-Tags aus, maximal 5:
 [REMEMBER: praegnanter Fakt]
 [GOAL: Ziel | DEADLINE: Frist]   (DEADLINE nur wenn eine genannt wurde)
+[KNOWLEDGE: reference | Titel | Ergebnis]   (Recherche-Ergebnisse, Erkenntnisse mit learning statt reference)
+[FORGET: Woerter nur aus dem alten Fakt]   (wenn ein neuer Stand einen gespeicherten ersetzt)
 
-Nimm nur Dinge auf, die in Wochen noch relevant sind. Keine Smalltalk-Details,
+Nimm nur Dinge auf, durch die eine spaetere Session anders handelt. Zwischenstaende
+nur mit Datum. Recherche-Ergebnisse nie als REMEMBER, sondern als KNOWLEDGE. Keine
+eckigen Klammern innerhalb eines Tags. Keine Smalltalk-Details,
 nichts was bereits als Fakt/Goal gespeichert wurde (siehe MEMORY im Kontext).
 
 2. Pruefe, ob in dieser Session ein WIEDERHOLBARER ABLAUF vorgemacht oder
@@ -113,6 +118,14 @@ export const REVIEW_MAX_AGE_MS = 7 * 24 * 3_600_000;
 /** Abgelaufen ab genau 7 Tagen, wie eine Rueckfrage mit expiresAt (choices.ts) */
 export function isReviewExpired(review: Pick<PendingReview, "createdAt">, now = Date.now()): boolean {
   return review.createdAt + REVIEW_MAX_AGE_MS <= now;
+}
+
+/**
+ * Ablage unter diesem Projektordner, wie useChoicesFileIn: tybo gedaechtnis
+ * ziele-nachholen (Issue #518) laeuft im Arbeitsordner des Befehls.
+ */
+export function usePendingReviewsFileIn(root: string): void {
+  pendingFile = join(root, "data", "pending-reviews.json");
 }
 
 /** Nur fuer Tests: Ablage der Vorschlaege umlenken, null stellt zurueck. */
@@ -247,7 +260,8 @@ export interface StageMemoryReviewOptions {
  * Rueckgabe: die ID oder null ohne Vorschlag.
  */
 export async function stageMemoryReview(opts: StageMemoryReviewOptions): Promise<string | null> {
-  const preview = describeTags(opts.tags);
+  // Die Vorschau geht in den Chat und zeigt Geheimnisse nie (Issue #524); beim Übernehmen lehnt der Dienst sie ab
+  const preview = maskSecrets(describeTags(opts.tags));
   if (!preview) return null;
   const id = newId();
   const createdAt = Date.now();
@@ -437,7 +451,9 @@ export async function distillSession(
     if (AUTO_APPLY() || !notifier || !target) {
       if (hasMemoryTags) {
         // Mehrdeutige DONE/CANCEL/FORGET fragen im Gespraech der Session nach (Issue #316)
-        const processed = await deps.processIntents(memoryTags, target ? sessionConversation(target) : undefined);
+        const conversation = target ? sessionConversation(target) : undefined;
+        const processed = await deps.processIntents(memoryTags, conversation);
+        await reportMemoryFailures(processed, conversation);
         const added = processed.factsAdded.length + processed.goalsAdded.length;
         if (added > 0) {
           console.log(

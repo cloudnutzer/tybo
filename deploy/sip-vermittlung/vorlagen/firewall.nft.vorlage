@@ -1,0 +1,31 @@
+#!/usr/sbin/nft -f
+# Firewall der SIP-Vermittlung (Issue #511), erzeugt aus vorlagen/.
+# Eigene Tabelle: berührt keine anderen Regeln, Rückbau mit
+#   nft delete table inet sip_vermittlung
+#
+# - TLS-Port für ElevenLabs: offen, weil ElevenLabs keine festen Adressen
+#   veröffentlicht; je Absender höchstens 20 neue Verbindungen pro Minute.
+#   Schutz sind TLS, Digest-Anmeldung und fail2ban.
+# - UDP-SIP (nur mit EASYBELL_TRANSPORT=udp): nur von den Adressen im Set
+#   easybell, das firewall.sh aus dem DNS von easybell füllt.
+# - RTP: offen für den kleinen Bereich aus rtp.conf; Asterisk nimmt Medien
+#   nur von der Gegenstelle des Gesprächs an (strictrtp).
+# - Andere Asterisk-Ports bleiben zu, auch wenn ein Modul sie öffnen sollte.
+table inet sip_vermittlung
+delete table inet sip_vermittlung
+table inet sip_vermittlung {
+  set easybell {
+    type ipv4_addr
+    flags interval
+  }
+
+  chain eingang {
+    type filter hook input priority -10; policy accept;
+    tcp dport {{SIP_TLS_PORT}} ct state new meter sip_neu { ip saddr limit rate over 20/minute burst 40 packets } drop
+    tcp dport {{SIP_TLS_PORT}} accept
+{{UDP_SIP_REGEL}}
+    udp dport {{RTP_START}}-{{RTP_ENDE}} accept
+    tcp dport { 5038, 8088, 8089 } drop
+    udp dport { 4520, 4569, 2727 } drop
+  }
+}

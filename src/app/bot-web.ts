@@ -48,6 +48,12 @@ import { createBotRoutines } from "../web/bot-routines";
 import { createBotSessionReset } from "../web/bot-session-reset";
 import { botInstructions, botSettings, botVoice } from "../web/bot-settings";
 import { createBotSpeech } from "../web/bot-speech";
+import { createVoiceAgentAdmin } from "../web/bot-voice-agent-admin";
+import { createVoiceAgentSessions } from "../web/bot-voice-agent-session";
+import { createVoiceAgentWizard, elevenLabsSpeak } from "../web/bot-voice-agent-wizard";
+import { listProviderVoices } from "../lib/voice-agents/voice-catalog";
+import { callAux } from "../lib/aux-model";
+import { loadPriceBasis } from "../lib/voice-agents/cost";
 import { createBotStatus } from "../web/bot-status";
 import { createBotTelegram, createBotTelegramLive, botGroupId } from "../web/bot-telegram";
 import { createBotThreads } from "../web/bot-threads";
@@ -65,7 +71,7 @@ export interface BotWebDeps {
   root: string;
   env: Env;
   runtime: TelegramRuntime;
-  choices: Pick<BotChoices, "approvalTurns" | "routineChoices" | "goalChoices">;
+  choices: Pick<BotChoices, "approvalTurns" | "routineChoices" | "goalChoices" | "voiceAgents" | "voiceDrafts">;
   commands: { registry: CommandRegistry; services: CommandServices };
   call: BotCallPort;
   isShuttingDown(): boolean;
@@ -156,6 +162,10 @@ export async function startBotWeb(deps: BotWebDeps): Promise<WebServer | null> {
     sendVoice: runtime.voiceSender,
   });
 
+  // Web-Gespräch und Verwaltung der Sprachagenten: dieselbe Ablage wie /sprachagent (bot-choices.ts)
+  const voiceAgentPaths = { configDir: join(deps.root, "config", "voice-agents"), dataDir: join(deps.root, "data", "voice-agents") };
+  const voiceAgentSessions = createVoiceAgentSessions({ env, paths: voiceAgentPaths });
+
   return (deps.start ?? startWebUi)({
     env,
     createServer: createWebServer,
@@ -175,6 +185,28 @@ export async function startBotWeb(deps: BotWebDeps): Promise<WebServer | null> {
     call: deps.call,
     callMemory: createCallMemory(conversationOf),
     voiceClone: createBotVoiceClone(),
+    // Web-Gespräch je Rezept (Issue #494)
+    voiceAgentSessions,
+    // Bereich „Sprachagenten“ (Issue #495): derselbe Manager wie /sprachagent,
+    // Testergebnisse in den Direktchat (ohne Telegram der der WebUI)
+    voiceAgentAdmin: createVoiceAgentAdmin({
+      manager: deps.choices.voiceAgents,
+      paths: voiceAgentPaths,
+      sessions: voiceAgentSessions,
+      testResults: () => ({ type: "telegram", chatId: dmChatId(env) }),
+    }),
+    // Wizard für Sprachagenten (Issue #514): derselbe Entwurfsdienst wie /sprachagent neu,
+    // Rückfragen in den Direktchat wie die Testergebnisse oben
+    voiceAgentWizard: createVoiceAgentWizard({
+      drafts: deps.choices.voiceDrafts,
+      paths: voiceAgentPaths,
+      ask: (prompt, timeoutMs) => callAux("voice-wizard", prompt, { timeoutMs, quiet: true }),
+      conversation: () => ({ type: "telegram", chatId: dmChatId(env) }),
+      prices: () => loadPriceBasis(join(deps.root, "config")),
+      // Stimmenliste und Hörprobe (Issue #515): Stimmen des Kontos, Ton mit genau der gewählten Stimme
+      voices: () => listProviderVoices(env),
+      speak: elevenLabsSpeak(env),
+    }),
     opencodeModels: listOpenCodeModels,
     status: createBotStatus(env),
     routines: createBotRoutines(env, deps.choices.routineChoices),

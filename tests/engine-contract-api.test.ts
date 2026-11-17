@@ -10,6 +10,7 @@
  * tests/engine-api-*.test.ts.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { DEFAULT_CLAUDE_MODEL } from "../src/lib/default-model";
 import { setApiRuntimeForTests, API_KEY_MISSING, API_MAX_TOKENS } from "../src/lib/engines/api";
 import { abortEngineCalls, activeEngineCallCount, createApiEngine, getEngine, registeredEngineIds, type EngineRequest } from "../src/lib/engines";
 import { runCancelable, abortExecutions } from "../src/lib/execution-context";
@@ -223,11 +224,11 @@ describe("Anfrage und Kosten", () => {
   test("Kurzform oder [1m] der CLI wird zum Standardmodell, unbekannter Effort fehlt", async () => {
     fake.respond(textReply("ok"));
     await createApiEngine().run(request(false, { model: "opus", effort: "turbo" }));
-    expect(fake.lastBody()).toMatchObject({ model: "claude-opus-5-5" });
+    expect(fake.lastBody()).toMatchObject({ model: DEFAULT_CLAUDE_MODEL });
     expect(fake.lastBody()).not.toHaveProperty("output_config");
     fake.respond(textReply("ok"));
     await createApiEngine().run(request(false, { model: "claude-opus-5-5[1m]" }));
-    expect(fake.lastBody()).toMatchObject({ model: "claude-opus-5-5" });
+    expect(fake.lastBody()).toMatchObject({ model: DEFAULT_CLAUDE_MODEL });
   });
 
   test("Kosten aus usage samt Cache-Tokens, Verbrauch im Ergebnis", async () => {
