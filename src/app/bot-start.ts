@@ -31,8 +31,15 @@ import { isConversationListed } from "../web/store";
 import { probeSchema, schemaGapNotice, type SchemaProbeResult } from "../lib/schema-probe";
 import { botTopicState } from "../web/bot-telegram";
 import { checkClaudeAtStart, claudeAvailability, type ClaudeAvailability } from "../lib/claude-availability";
-import { inspectEngine } from "../lib/engines/check";
+import { checkEngine, inspectEngine } from "../lib/engines/check";
+import { codexSkillLinksInput, setCodexSkillSync, setCodexUsageReader } from "../lib/engines/codex";
+import { syncCodexSkillLinks } from "../lib/engines/codex-skills";
+import { readCodexUsage } from "../lib/engines/codex-usage";
+import { recordUsage } from "../lib/engines/usage";
 import { getSettings } from "../lib/settings";
+import { setSwitchNotifier, startSwitchWatch } from "../lib/engine-switch-notify";
+import { engineMeasurements } from "../lib/engine-check-now";
+import { measureClaudeUsage, requestClaudeUsageAfterChat, setClaudeUsageAfterChat, startClaudeUsageWatch } from "../lib/engines/claude-usage";
 
 type Env = Record<string, string | undefined>;
 
@@ -56,6 +63,13 @@ export interface BannerInfo {
 
 const RULE = "=".repeat(50);
 const LABEL_WIDTH = 13;
+
+/** Wirksamer Claude-Standard für die Routing-Zeile, mit Effort aus den Einstellungen. */
+export function defaultModelLabel(fallback: string): string {
+  const defaults = getSettings().defaults;
+  const model = defaults?.model ?? fallback;
+  return defaults?.effort ? `${model} (Effort ${defaults.effort})` : model;
+}
 
 /** Zeilen des Startbanners; jede Zeile „Bezeichnung: Wert" */
 export function startBanner(info: BannerInfo): string[] {
@@ -86,9 +100,23 @@ export interface BackgroundDeps {
   choices: TelegramChoices;
   routineChoices: ReturnType<typeof createRoutineChoices>;
   postWeb: PostWeb;
+  /** Rückgaben aus data/jobs dieses Projektordners; local und server nutzen denselben Abholer. */
+  pollJobReports?(): Promise<void>;
   /** Telegram-Nachricht einer Rückfrage nachziehen (ohne Telegram nichts) */
   refresh(choice: Choice, refs?: Parameters<NonNullable<Parameters<typeof startThreadReminders>[0]["refresh"]>>[1]): Promise<unknown>;
   services?: Partial<BackgroundServices>;
+}
+
+/** Keine Anmeldung beim Import: nur der laufende Bot aktiviert diese Quelle. */
+export function installClaudeUsageMeasurement(measure = measureClaudeUsage, afterChat = requestClaudeUsageAfterChat): () => void {
+  const source = { timeoutMs: 30_000, measure: (signal: AbortSignal) => measure({ signal, evaluate: false }) };
+  engineMeasurements.claude.push(source);
+  setClaudeUsageAfterChat(afterChat);
+  return () => {
+    const index = engineMeasurements.claude.indexOf(source);
+    if (index >= 0) engineMeasurements.claude.splice(index, 1);
+    setClaudeUsageAfterChat(null);
+  };
 }
 
 /** Bausteine der Hintergrunddienste; Tests ersetzen sie, damit keine echten Zeitgeber laufen */
@@ -101,6 +129,10 @@ export const BACKGROUND_SERVICES = {
   },
   /** Ist Claude Code installiert und angemeldet (Issue #566)? Echte Prüfung mit claude --version und auth status */
   inspectClaude: () => inspectEngine("claude"),
+  checkCodex: () => checkEngine("codex"),
+  installCodexSkillSync: setCodexSkillSync,
+  installCodexUsageReader: setCodexUsageReader,
+  syncCodexSkills: syncCodexSkillLinks,
   getSettings,
   checkEmbedding: checkEmbeddingAtStartup,
   drainEmbeddings: drainEmbeddingQueue,
@@ -111,6 +143,10 @@ export const BACKGROUND_SERVICES = {
   startRoutineWatch,
   startThreadReminders,
   startReminderPlanner,
+  setSwitchNotifier,
+  startSwitchWatch,
+  installClaudeUsageMeasurement,
+  startClaudeUsageWatch,
   webConversationExists: isConversationListed,
   topicDeleted: async (chatId: string, topicId: number) => (await botTopicState.get(chatId, topicId)).deleted === true,
   /** Wiederholung ohne den Prozess am Leben zu halten */
@@ -139,6 +175,7 @@ export interface Background {
   routineWatch: RoutineWatch;
   threadReminders: ThreadReminderTimer;
   reminderPlanner: ReminderPlannerTimer;
+  stopSwitchNotices(): void;
   /** Erste Ablauf-Prüfung der Rückfragen */
   firstSweep: Promise<void>;
 }
@@ -148,6 +185,13 @@ const errorName = (e: unknown) => (e instanceof Error ? e.name : "Fehler");
 export function startBackground(deps: BackgroundDeps): Background {
   const { env } = deps;
   const svc = { ...BACKGROUND_SERVICES, ...deps.services };
+
+  // Anmeldung ist für Links nicht nötig. Die Prüfung hält den Bot-Start nicht auf.
+  svc.installCodexSkillSync(svc.syncCodexSkills);
+  svc.installCodexUsageReader(readCodexUsage, recordUsage);
+  void Promise.resolve().then(() => svc.checkCodex()).then(status => {
+    if (status.installed) svc.syncCodexSkills(codexSkillLinksInput(svc.getSettings().engine?.codex?.skills !== false));
+  }).catch(() => svc.error("[Codex] Skill-Abgleich beim Start fehlgeschlagen; Start läuft weiter."));
 
   // Fehlende Migrationen nach einem Update (Issue #560): genau eine Meldung je Start über den
   // Meldeweg (Telegram und WebUI), dazu immer ins Log. Ohne Telegram hält die Outbox die Meldung
@@ -190,13 +234,19 @@ export function startBackground(deps: BackgroundDeps): Background {
   void svc.rotateLogs().catch(error => svc.error("Log rotation failed", error));
   svc.every(3_600_000, () => void svc.rotateLogs().catch(() => {}));
 
-  // Hintergrund-Jobs (Issue #103): verwaiste Jobs melden, halb gesendete Meldungen nachholen
-  void svc
-    .recoverJobs(deps.root, env)
-    .then(r => {
-      if (r.aborted.length || r.resent.length) svc.log(`[job] Beim Start: ${r.aborted.length} verwaiste Jobs gemeldet, ${r.resent.length} Meldungen nachgeholt`);
-    })
-    .catch(e => svc.error(`[job] Aufräumen beim Start gescheitert (${errorName(e)})`));
+  // Auch während des Betriebs: Fragefrist, verlorene Auswahlen und unterbrochene Handler nachholen.
+  const recover = () => {
+    void deps.pollJobReports?.().catch(e => svc.error(`[job] Rückgaben nicht abgeholt (${errorName(e)})`));
+    // Versandversuche eines Jobs dürfen die Fristprüfung anderer Jobs nicht blockieren.
+    // Statussperre und Versandbesitzer verhindern doppelte Arbeit je Job.
+    void svc.recoverJobs(deps.root, env)
+      .then(r => {
+        if (r.aborted.length || r.resent.length) svc.log(`[job] ${r.aborted.length} verwaiste Jobs gemeldet, ${r.resent.length} Meldungen nachgeholt`);
+      })
+      .catch(e => svc.error(`[job] Wiederherstellung gescheitert (${errorName(e)})`));
+  };
+  recover();
+  svc.every(60_000, recover);
 
   // Routinen (Issue #287/#288): ausgebliebene Läufe alle 10 Minuten, mit Menü im Direktchat
   const watchDeps = svc.watchDeps(deps.root, env);
@@ -225,6 +275,15 @@ export function startBackground(deps: BackgroundDeps): Background {
     send: createReminderSender({ deliver: deps.notices.deliverToUser, postWeb: deps.postWeb, telegram, refresh }),
   });
 
+  // startBackground läuft erst nach acquireLockOrExit, auch ohne WebUI.
+  svc.setSwitchNotifier(deps.notices.deliverToUser);
+  const stopSwitchWatch = svc.startSwitchWatch();
+  const removeClaudeMeasurement = svc.installClaudeUsageMeasurement();
+  const stopClaudeUsageWatch = svc.startClaudeUsageWatch();
+  const stopSwitchNotices = () => {
+    stopClaudeUsageWatch(); removeClaudeMeasurement(); stopSwitchWatch(); svc.setSwitchNotifier(null);
+  };
+
   // Rückfragen mit abgelaufener Frist, auch aus der Zeit, als der Bot aus war
   const sweep = () =>
     deps.choices
@@ -236,5 +295,5 @@ export function startBackground(deps: BackgroundDeps): Background {
   const firstSweep = sweep();
   svc.every(60_000, () => void sweep());
 
-  return { routineWatch, threadReminders, reminderPlanner, firstSweep };
+  return { routineWatch, threadReminders, reminderPlanner, stopSwitchNotices, firstSweep };
 }

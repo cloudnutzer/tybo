@@ -103,6 +103,8 @@ export interface FallbackRequest {
    * ohne ihn antwortet das Ersatzmodell ins Blaue (fallback/context.ts)
    */
   context: string;
+  /** Wechselregel: Modell frei und bereit, seine Familie in diesem Turn noch nicht gescheitert. */
+  allowClaudeCli?: (model: string) => boolean;
 }
 
 export interface ChainDeps {
@@ -273,6 +275,10 @@ export async function runFallbackChain(
     checkAborted();
     if (!stage.active()) continue;
     const model = stage.model();
+    if (stage === cliStage && request.allowClaudeCli && !request.allowClaudeCli(model)) {
+      console.log(`[Fallback] Claude-CLI (${model}) ausgelassen: gesperrt, bereits versucht oder nicht bereit.`);
+      continue;
+    }
     // Text aus log-lines.ts: der Nachtcheck zählt genau diese Zeile (Issue #568)
     console.log(fallbackTryLogLine(stage.name, model));
     try {

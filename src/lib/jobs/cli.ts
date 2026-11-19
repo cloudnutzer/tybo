@@ -3,9 +3,10 @@
  * `tybo job …`, beide über scripts/job.ts.
  *
  *   job start --title <t> (--brief <datei> | --text <auftrag>) [--topic <id>]
- *             [--max-hours <n>] [--model <m>] [--effort <e>] [--full-access]
+ *             [--engine claude|codex] [--max-hours <n>] [--model <m>] [--effort <e>] [--full-access] [--zurueck]
  *   job list
  *   job stop <id>
+ *   job resume <id>
  *   job log <id>
  *
  * Exit-Codes: 0 erledigt, 1 gescheitert, 2 falscher Aufruf.
@@ -15,10 +16,12 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { applyEnvTarget } from "../../../scripts/notify";
 import { checkOutboxTarget, type OutboxDeps } from "../outbox";
+import { CODEX_EFFORT_LEVELS, EFFORT_LEVELS, type Settings } from "../settings";
 import { formatJobList, jobLog, stopJob, type ControlDeps } from "./control";
 import { maskSecrets } from "./mask";
-import { DEFAULT_MAX_HOURS, EFFORTS, MAX_MAX_HOURS, MODEL_PATTERN, runWatcher, startJob, type JobDeps } from "./runner";
-import { isValidJobId, type JobTarget } from "./store";
+import { resumeJob, resumeMessage } from "./resume";
+import { DEFAULT_MAX_HOURS, MAX_MAX_HOURS, MODEL_PATTERN, runWatcher, startJob, type JobDeps } from "./runner";
+import { isValidJobId, jobModelLabel, type JobEngine, type JobTarget } from "./store";
 
 type Env = Record<string, string | undefined>;
 
@@ -28,26 +31,53 @@ export const EXIT_USAGE = 2;
 
 export const JOB_USAGE = `Aufruf:
   job start --title <Titel> (--brief <datei> | --text <Auftrag>) [--topic <id>]
-            [--max-hours <n>] [--model <modell>] [--effort <stufe>] [--full-access]
-            [--allow-duplicate]
+            [--engine claude|codex] [--max-hours <n>] [--model <modell>]
+            [--effort <stufe>] [--full-access]
+            [--allow-duplicate] [--zurueck]
   job list             laufende und die letzten 20 beendeten Jobs
   job stop <id>        Job beenden (ganzer Prozessbaum), Meldung „gestoppt"
+  job resume <id>      abgebrochenen Claude-Job mit derselben Session fortsetzen
   job log <id>         Log des Jobs (Werte aus .env verborgen)
+
+  resume         Nach Abbruch, Zeitlimit oder unbeantworteter Frage, mit Claude-Session;
+                 nach Abbruch/Zeitlimit voller Zeitraum erneut, bei Fragen nur der Rest.
+                 Dieselben Rechte und dasselbe Rückmeldeziel.
+                 Nicht für Codex, eigene Arbeitsordner oder bewusst gestoppte Jobs.
 
   --topic        Topic der Forum-Gruppe für die Rückmeldung (1 = General); ohne:
                  Gespräch aus TYBO_TOPIC_ID/TYBO_CHAT_ID, sonst Direktchat
   --max-hours    Zeitlimit in Stunden, Standard ${DEFAULT_MAX_HOURS}, höchstens ${MAX_MAX_HOURS}
-  --effort       ${EFFORTS.join(", ")}
-  --full-access  Claude ohne Rückfragen mit allen Werkzeugen (bypassPermissions).
+  --engine       claude (Standard) oder codex; eigene Arbeitsordner nur mit Claude
+  --model        Standard aus config/settings.json: defaults.model (Claude),
+                 engine.codex.model (Codex); sonst Claude-Standard bzw. Codex-Konfiguration
+  --effort       Claude: ${EFFORT_LEVELS.join(", ")}; Codex: ${CODEX_EFFORT_LEVELS.join(", ")}
+                 Standard aus defaults.effort bzw. engine.codex.effort;
+                 sonst zum Claude-Modell passend bzw. aus der Codex-Konfiguration
+  --full-access  Alle Werkzeuge ohne Rückfragen, Codex ohne Sandbox.
                  Nur für Aufträge, die tybo selbst formuliert hat, nie für
-                 übernommene fremde Inhalte (Mail, Web, Dateien). Ohne: Dateien
-                 bearbeiten ja, Befehle ausführen nein (acceptEdits).
+                 übernommene fremde Inhalte (Mail, Web, Dateien).
+                 Ohne: Claude mit acceptEdits (Dateien bearbeiten, keine Befehle);
+                 Codex mit workspace-write: nur im Projekt schreiben (apply_patch).
+                 Codex sieht als Arbeitsmaterial nur den Inhalt des Auftrags;
+                 lokale Textdateien kann er ohne --full-access nicht lesen.
+                 Dafür Claude nehmen oder, nur bei selbst formulierten Aufträgen,
+                 --full-access. Beide Motoren ohne Rückfragen.
+                 Bei Codex aus: Shell und Code-Ausführung, Websuche, Apps,
+                 Plugins, Browser, Computersteuerung, Bilder, MCP-Server,
+                 Unteragenten, Hooks und externe Benachrichtigungsbefehle.
+                 CLI 0.169.0 zeigt weiterhin exec/wait und MCP-Ressourcenwerkzeuge:
+                 Code-Host gesperrt, MCP ohne aktive Server. unified_exec bleibt
+                 intern an, Shell-Aufrufe sind trotzdem gesperrt. Konto-Apps konnten
+                 nur ohne Anmeldung geprüft werden. Mehr: docs/hintergrund-jobs.md
   --allow-duplicate  auch starten, wenn ein Job mit gleichem Titel oder
                  Auftrag schon läuft (sonst Abbruch mit Exit 2)
+  --zurueck      Bericht zusätzlich als Eingabe an tybo im Zielgespräch;
+                 ohne Gesprächskontext im Direktchat. Höchstens drei Jobs
+                 je Kette (TYBO_JOB_CHAIN), der vierte wird mit Exit 2 abgelehnt.
 Werte, die mit -- beginnen, als --text=<wert> übergeben.`;
 
-const VALUE_FLAGS = new Set(["title", "brief", "text", "topic", "max-hours", "model", "effort"]);
-const SWITCHES = new Set(["full-access", "allow-duplicate"]);
+const VALUE_FLAGS = new Set(["title", "brief", "text", "topic", "max-hours", "engine", "model", "effort"]);
+const SWITCHES = new Set(["full-access", "allow-duplicate", "zurueck"]);
 const TITLE_MAX = 200;
 const BRIEF_MAX_BYTES = 1_000_000;
 
@@ -57,10 +87,12 @@ export interface StartArgs {
   text?: string;
   topicId?: number;
   maxHours: number;
+  engine: JobEngine;
   model?: string;
   effort?: string;
   fullAccess: boolean;
   allowDuplicate?: boolean;
+  returnToChat?: boolean;
 }
 
 export function parseStartArgs(argv: string[]): StartArgs | { error: string } {
@@ -92,8 +124,11 @@ export function parseStartArgs(argv: string[]): StartArgs | { error: string } {
   if (title.length > TITLE_MAX) return { error: `--title länger als ${TITLE_MAX} Zeichen` };
   if ((values.brief === undefined) === (values.text === undefined)) return { error: "Genau eins von --brief oder --text angeben" };
   if (values.text !== undefined && !values.text.trim()) return { error: "--text ist leer" };
-  const result: StartArgs = { title, maxHours: DEFAULT_MAX_HOURS, fullAccess: switches.has("full-access") };
+  const engine = values.engine ?? "claude";
+  if (engine !== "claude" && engine !== "codex") return { error: "--engine muss claude oder codex sein" };
+  const result: StartArgs = { title, engine, maxHours: DEFAULT_MAX_HOURS, fullAccess: switches.has("full-access") };
   if (switches.has("allow-duplicate")) result.allowDuplicate = true;
+  if (switches.has("zurueck")) result.returnToChat = true;
   if (values.brief !== undefined) result.briefFile = values.brief;
   if (values.text !== undefined) result.text = values.text;
   if (values.topic !== undefined) {
@@ -113,7 +148,8 @@ export function parseStartArgs(argv: string[]): StartArgs | { error: string } {
     result.model = values.model;
   }
   if (values.effort !== undefined) {
-    if (!(EFFORTS as readonly string[]).includes(values.effort)) return { error: `--effort muss eins von ${EFFORTS.join(", ")} sein` };
+    const efforts = engine === "codex" ? CODEX_EFFORT_LEVELS : EFFORT_LEVELS;
+    if (!(efforts as readonly string[]).includes(values.effort)) return { error: `--effort muss für ${engine} eins von ${efforts.join(", ")} sein` };
     result.effort = values.effort;
   }
   return result;
@@ -145,6 +181,8 @@ export interface JobCliOptions {
   outbox: Pick<OutboxDeps, "groupId" | "userId">;
   defaultModel: string;
   defaultEffort(model: string): string | undefined;
+  /** Aus dem Projektordner gelesen, nicht aus cwd (Ordner des Aufrufers) */
+  settings?: Settings;
 }
 
 async function start(argv: string[], o: JobCliOptions): Promise<number> {
@@ -154,6 +192,16 @@ async function start(argv: string[], o: JobCliOptions): Promise<number> {
     return EXIT_USAGE;
   }
   const target = resolveJobTarget(parsed.topicId, o.callerEnv);
+  const inheritedChain = o.callerEnv.TYBO_JOB_CHAIN;
+  if (inheritedChain !== undefined && !/^[0-3]$/.test(inheritedChain)) {
+    o.err("Nicht gestartet: TYBO_JOB_CHAIN muss eine ganze Zahl von 0 bis 3 sein.");
+    return EXIT_USAGE;
+  }
+  const jobChain = Number(inheritedChain ?? 0) + (parsed.returnToChat ? 1 : 0);
+  if (jobChain > 3) {
+    o.err("Nicht gestartet: Höchstens drei Jobs mit --zurueck je Kette. Bitte das Ergebnis im Gespräch prüfen.");
+    return EXIT_USAGE;
+  }
   if ("error" in target) {
     o.err(`Nicht gestartet: ${target.error}`);
     return EXIT_USAGE;
@@ -181,17 +229,22 @@ async function start(argv: string[], o: JobCliOptions): Promise<number> {
     o.err("Nicht gestartet: Auftrag ist leer");
     return EXIT_USAGE;
   }
-  const model = parsed.model ?? o.defaultModel;
-  const effort = parsed.effort ?? o.defaultEffort(model);
+  const codex = parsed.engine === "codex";
+  const defaults = codex ? o.settings?.engine?.codex : o.settings?.defaults;
+  const model = parsed.model ?? defaults?.model ?? (codex ? undefined : o.defaultModel);
+  const effort = parsed.effort ?? defaults?.effort ?? (codex ? undefined : o.defaultEffort(model!));
   const result = await startJob(
     {
       title: parsed.title,
       brief,
       target,
       maxHours: parsed.maxHours,
+      engine: parsed.engine,
       model,
       ...(effort ? { effort } : {}),
       fullAccess: parsed.fullAccess,
+      ...(parsed.returnToChat ? { returnToChat: true } : {}),
+      ...(jobChain ? { jobChain } : {}),
       ...(parsed.allowDuplicate ? { allowDuplicate: true } : {}),
     },
     o.deps,
@@ -204,7 +257,7 @@ async function start(argv: string[], o: JobCliOptions): Promise<number> {
     o.err(`Job nicht gestartet: ${maskSecrets(result.error, o.deps.secrets())}`);
     return EXIT_FAILED;
   }
-  o.out(`Job ${result.id} ${result.confirmed ? "läuft" : "startet"}: ${maskSecrets(parsed.title, o.deps.secrets())}`);
+  o.out(maskSecrets(`Job ${result.id} ${result.confirmed ? "läuft" : "startet"} (${jobModelLabel(result.status)}): ${parsed.title}`, o.deps.secrets()));
   o.out(`Rückmeldung kommt automatisch. Stoppen: job stop ${result.id} · Log: job log ${result.id}`);
   return EXIT_OK;
 }
@@ -245,11 +298,20 @@ export async function runJobCli(argv: string[], o: JobCliOptions): Promise<numbe
       o.out(log);
       return EXIT_OK;
     }
+    case "resume": {
+      const id = idArg(rest, o, "resume");
+      if (!id) return EXIT_USAGE;
+      const result = await resumeJob(id, o.deps);
+      (result.ok ? o.out : o.err)(maskSecrets(resumeMessage(result), o.deps.secrets()));
+      return result.ok ? EXIT_OK : EXIT_FAILED;
+    }
     case "__watch": {
       // Nur für den Starter: der Wächter selbst
-      const id = rest.length === 1 && isValidJobId(rest[0]) ? rest[0] : null;
+      const id = (rest.length === 1 || rest.length === 2) && isValidJobId(rest[0]) ? rest[0] : null;
       if (!id) return EXIT_USAGE;
-      return runWatcher(id, o.deps);
+      const run = rest[1] === undefined ? undefined : Number(rest[1]);
+      if (run !== undefined && (!Number.isSafeInteger(run) || run < 1)) return EXIT_USAGE;
+      return runWatcher(id, o.deps, run);
     }
     case "help":
     case "--help":

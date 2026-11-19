@@ -46,6 +46,7 @@ import { installOpenCodeFake, oc } from "./opencode-fixture";
 
 const KEYS = [
   "ANTHROPIC_API_KEY",
+  "CLAUDE_AUTH",
   "BUDGET_DB_PATH",
   "CREDIT_CEILING_USD",
   "CREDIT_GUARD",
@@ -544,6 +545,34 @@ describe("Gelerntes Limit enthält den Limit-Lauf", () => {
     await bookEngineRun({ engine: "claude", origin: "chat", isError: true, text: limitText });
     expect(readCycle(1)?.observedCeilingUsd).toBeNull();
   });
+
+  for (const streaming of [false, true]) {
+    for (const [text, errorKind, ceiling] of [
+      ["You've hit your weekly limit · resets Nov 22, 4pm", "usage_limit", null],
+      ["You've reached your weekly limit", "usage_limit", null],
+      ["You're out of usage credits.", "quota", null],
+      // Der alte Marker trifft weiterhin: neu als Fehler erkannt, lernt er
+      // auch weiterhin aus genau diesem Text eine Obergrenze (Prüferhinweis).
+      ["You've hit your limit · resets Nov 22, 4pm", "usage_limit", 3.2],
+    ] as const) {
+      test(`${streaming ? "Strom" : "JSON"}: Abo-Zähler nach ${text}`, async () => {
+        process.env.CLAUDE_AUTH = "subscription";
+        addCycleSpend(3, 1);
+        useClaudeFake([{ lines: [
+          { type: "rate_limit_event", rate_limit_info: { status: "rejected" } },
+          result(text, 0.2),
+        ] }]);
+        const run = await (streaming
+          ? callClaudeStreaming({ prompt: "Probe" })
+          : callClaude({ prompt: "Probe", outputFormat: "json" }));
+        expect(run).toMatchObject({ text, isError: true, errorKind });
+        await bookEngineRun({ ...run, engine: "claude", origin: "chat" });
+        expect(readCycle(1)?.observedCeilingUsd).toBe(ceiling);
+        expect(readCycle(1)?.cycleSpendUsd).toBeCloseTo(3.2, 8);
+        expect(costs()).toEqual([0.2]);
+      });
+    }
+  }
 });
 
 async function putSettings(content: object): Promise<void> {

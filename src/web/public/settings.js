@@ -3,7 +3,7 @@
 // neuen, gelöschten und wiederhergestellten Agenten (Issue #51), „Modelle" mit Standard,
 // Nebenmodellen und Fallback sowie „Status" mit „Jetzt neu starten" (Issue #39),
 // „Schlüssel" zum Setzen, Ersetzen und Entfernen von .env-Werten (Issue #63),
-// oben im Reiter „Agenten" der Abschnitt „Motor" mit Standard-Motor, Codex- und OpenCode-Einstellungen (Issue #129)
+// oben im Reiter „Modelle" der Abschnitt „Motor" mit Standard-Motor, Codex- und OpenCode-Einstellungen (Issue #129)
 // und abweichenden Gesprächen (Issue #126), „Benachrichtigungen" für Web Push
 // auf diesem Gerät aus push.js (Issue #225), „Sprechen" mit Anbietern fürs Hören
 // und Sprechen, Sprache und Status des Sprechmodus (Issue #248), darunter der
@@ -116,6 +116,10 @@ const GLOBAL_SECTIONS = {
    * zurück (enginePatch). engine.topics ändert nur „Auf Standard".
    */
   engine: [
+    { key: "backups", kind: "backups" },
+    { key: "autoEnabled", kind: "auto-enabled" },
+    { key: "autoThreshold", kind: "auto-threshold" },
+    { key: "autoReturnBelow", kind: "auto-return" },
     { key: "default", kind: "choice" },
     { key: "codexModel", kind: "text" },
     { key: "codexEffort", kind: "choice" },
@@ -156,7 +160,7 @@ const ENGINE_FALLBACK = [{ id: "claude", label: "Claude Code" }, { id: "codex", 
 /** Wo man sich anmeldet, je Motor */
 const ENGINE_LOGIN = { claude: "im Terminal claude starten, dann /login", codex: "codex login im Terminal", opencode: "opencode auth login im Terminal", api: "ANTHROPIC_API_KEY in der .env setzen" };
 const ENGINE_TEXT = {
-  get intro() { return "Womit " + window.TYBO_BRAND.name + " antwortet. Der Standard gilt für jedes Gespräch ohne eigene Wahl; ein einzelnes Gespräch stellt /motor um."; },
+  get intro() { return "Womit " + window.TYBO_BRAND.name + " antwortet. Es gilt zuerst die Wahl des Gesprächs mit /motor, dann der Motor des Agenten, sonst der Standard."; },
   codexNote: "Leer heißt: Codex nimmt den Wert aus seiner eigenen Konfiguration. Gilt ab der nächsten Nachricht mit Codex.",
   opencodeNote: "Leer heißt: OpenCode nimmt Modell und Variante aus seiner eigenen Konfiguration. Gilt ab der nächsten Nachricht mit OpenCode. Anmeldung und Anbieter kommen aus OpenCode (opencode auth login).",
   opencodeNoList: "Keine Modell-Liste von OpenCode geladen. Eigenes Modell bleibt möglich.",
@@ -168,8 +172,8 @@ const ENGINE_TEXT = {
   failed: "Verfügbarkeit und abweichende Gespräche konnten nicht geladen werden.",
   availabilityUnknown: "Verfügbarkeit nicht ermittelbar.",
   overridesTitle: "Abweichende Gespräche",
-  overridesHint: "Gespräche, die mit /motor einen eigenen Motor haben. „Auf Standard\" entfernt die Ausnahme; die nächste Nachricht beginnt dort eine neue Session, das Gedächtnis bleibt.",
-  overridesEmpty: "Keine. Alle Gespräche nehmen den Standard.",
+  overridesHint: "Gespräche, die mit /motor einen eigenen Motor haben. „Auf Standard\" entfernt die Ausnahme; danach gilt der Motor des Agenten, sonst der Standard. Die nächste Nachricht beginnt dort eine neue Session; die letzten Nachrichten gehen mit.",
+  overridesEmpty: "Keine. Es gilt der Motor des Agenten, sonst der Standard.",
   gone: "Nicht mehr zuzuordnen",
   goneHint: "Das Gespräch gibt es in der WebUI nicht mehr (Topic gelöscht oder andere Gruppe).",
   resetDone: "Auf Standard gestellt.",
@@ -352,7 +356,7 @@ const SETTINGS_TEXT = {
   customInvalid: "Der Modellname darf höchstens 200 Zeichen lang sein, ohne Steuerzeichen.",
   instructionInvalid: "Eine Anweisung muss 1 bis " + INSTRUCTION_MAX + " Zeichen lang sein, ohne Steuerzeichen.",
   effortByModel: "Standard (richtet sich nach dem Modell)",
-  modelNote:"Modell und Effort gelten ab der nächsten Nachricht an diesen Agenten. Ein anderes Modell beginnt dabei eine neue Session.",
+  modelNote:"Motor, Modell und Effort gelten ab der nächsten Nachricht an diesen Agenten. Ein anderer Motor oder ein anderes Modell beginnt eine neue Session; der Verlauf geht mit.",
   instructionsNote: "Wirkt ab dem nächsten neuen Gespräch dieses Agenten. Sofort: in Telegram im betroffenen Topic /new senden.",
   // Name aus /brand.js (Issue #100); Getter, damit er erst beim Gebrauch gelesen wird
   get restartNote() { return "Diese Änderung greift erst nach einem Neustart von " + window.TYBO_BRAND.name + "."; },
@@ -367,6 +371,37 @@ const SETTINGS_TEXT = {
   restartTimeout: 'Noch kein Neustart erkannt. Vermutlich läuft noch eine Antwort. Mit „Aktualisieren" lässt sich später nachsehen.',
   restartOffline: "Server nicht erreichbar, kein Neustart angefordert.",
   keysNote: "Nur ob ein Wert gesetzt ist, nie der Wert selbst. Ändern lassen sich Schlüssel im Reiter „Schlüssel\".",
+  // Werkzeug-Bestand im Status (Issue #667): Gründe kommen allein aus der Antwort.
+  tools: {
+    label: "Werkzeuge",
+    details: "Einzelheiten",
+    empty: "keine eingerichtet",
+    unknown: "nicht vollständig ermittelbar",
+    baseline: "Maßstab",
+    missing: "Fehlt: ",
+    mcp: "MCP-Server",
+    skills: "Skills",
+    notes: "Notizen",
+    missingMcp: "Fehlende MCP-Server",
+    missingSkills: "Fehlende Skills",
+    hints: "Hinweise",
+    fixed: "Weitere Lücken",
+    origin: { tybo: "von tybo", engine: "im Motor" },
+    notesState: { self: "im Motor", passed: "von tybo", none: "keine vorhanden", off: "nicht mitgegeben" },
+    notesMissing: "Notizen von Claude Code fehlen",
+    pluginsUnknown: "Plugins von Claude Code: Zahl unbekannt",
+    pluginsCount: count => "Plugins von Claude Code: " + count,
+    mcpCount: count => count + " MCP-Server",
+    skillCount: count => count + (count === 1 ? " Skill" : " Skills"),
+    hintCount: count => count + (count === 1 ? " Hinweis" : " Hinweise"),
+    otherCount: count => count + (count === 1 ? " weitere Lücke" : " weitere Lücken"),
+    fixedShort: {
+      connectors: "Konnektoren des Claude-Kontos", plugins: "Plugins", hooks: "Hooks",
+      builtin: "eingebaute Werkzeuge", skills: "Skills",
+    },
+    get explanation() { return "Ein Ersatzmotor bekommt von " + window.TYBO_BRAND.name + " die Werkzeuge, die sich übertragen lassen. Was fehlt, steht mit Grund dabei."; },
+    documentation: "Werkzeuge im Ersatzmotor",
+  },
 };
 
 /**
@@ -481,6 +516,10 @@ function agentSettingsPatch(form, own) {
   } else model = form.model;
   const effort = form.effort === EFFORT_DEFAULT ? null : form.effort;
   const patch = {};
+  if (form.engine !== undefined) {
+    const engine = form.engine === CHOICE_DEFAULT ? null : form.engine;
+    if ((saved.engine ?? null) !== engine) patch.engine = engine;
+  }
   if ((saved.model === undefined ? null : saved.model) !== model) patch.model = model;
   if ((saved.effort === undefined ? null : saved.effort) !== effort) patch.effort = effort;
   return { patch: Object.keys(patch).length ? patch : null };
@@ -496,6 +535,7 @@ function agentFieldEdits(form, own) {
   const result = agentSettingsPatch(form, saved);
   const effort = form.effort === EFFORT_DEFAULT ? null : form.effort;
   return {
+    engine: form.engine !== undefined && (saved.engine ?? null) !== (form.engine === CHOICE_DEFAULT ? null : form.engine),
     model: !!result.error || !!(result.patch && "model" in result.patch),
     effort: (saved.effort === undefined ? null : saved.effort) !== effort,
   };
@@ -571,6 +611,10 @@ function filterEntries(entries, filter) {
  * Liste die IDs. Werte, die nicht in der Liste stehen, werden „Eigenes".
  */
 function globalFieldState(spec, saved, lists) {
+  if (spec.kind === "auto-enabled") return { choice: saved === false ? "false" : "true" };
+  if (spec.kind === "auto-threshold") return { text: String(saved ?? 95) };
+  if (spec.kind === "auto-return") return { text: saved == null ? "" : String(saved) };
+  if (spec.kind === "backups") return { stages: (saved || []).map(stage => ({ ...stage })) };
   if (spec.kind === "effort") return { choice: typeof saved === "string" ? saved : EFFORT_DEFAULT };
   if (spec.kind === "choice") return { choice: typeof saved === "string" ? saved : CHOICE_DEFAULT };
   if (spec.kind === "text") return { text: typeof saved === "string" ? saved : "" };
@@ -599,6 +643,13 @@ function globalFieldState(spec, saved, lists) {
  * entfernt den eigenen Wert) oder { error }.
  */
 function globalFieldValue(spec, f) {
+  if (spec.kind === "auto-enabled") return { value: f.choice === "true" };
+  if (spec.kind === "auto-threshold") return { value: Number(f.text) };
+  if (spec.kind === "auto-return") return { value: String(f.text).trim() ? Number(f.text) : null };
+  if (spec.kind === "backups") {
+    const error = engineBackupError(f.stages);
+    return error ? { error } : { value: f.stages.length ? f.stages.map(stage => ({ ...stage })) : null };
+  }
   if (spec.kind === "effort") return { value: f.choice === EFFORT_DEFAULT ? null : f.choice };
   if (spec.kind === "choice") return { value: f.choice === CHOICE_DEFAULT ? null : f.choice };
   // Voller Zugriff ist der Standard: ohne eigenen Wert gespeichert
@@ -645,13 +696,19 @@ function globalFieldValue(spec, f) {
  */
 /** Gespeicherter Wert zum Vergleich: fehlt er, null; „Voller Zugriff" ist wie kein eigener Wert */
 function savedFieldValue(spec, saved) {
-  if (saved === undefined) return null;
+  if (spec.kind === "auto-enabled") return saved ?? true;
+  if (spec.kind === "auto-threshold") return saved ?? 95;
+  if (saved === undefined || (spec.kind === "backups" && !saved?.length)) return null;
   if (spec.kind === "sandbox" && saved === SANDBOX_DEFAULT) return null;
   if (spec.kind === "permission" && saved === PERMISSION_DEFAULT) return null;
   return saved;
 }
 
 function globalSectionPatch(section, fields, saved) {
+  if (section === "engine") {
+    const error = Object.values(engineAutoErrors(fields))[0];
+    if (error) return { error };
+  }
   const own = saved && typeof saved === "object" ? saved : {};
   const patch = {};
   for (const spec of GLOBAL_SECTIONS[section] || []) {
@@ -671,29 +728,33 @@ function globalFieldEdited(spec, f, saved) {
   return !sameFieldValue(savedFieldValue(spec, saved), result.value);
 }
 
-/** Gleicher Wert; die Ruhezeit ist ein Objekt { from, to } und wird nach Inhalt verglichen */
+/** Listen von Ersatzstufen und die Ruhezeit { from, to } werden nach Inhalt verglichen. */
 function sameFieldValue(a, b) {
+  if (Array.isArray(a) || Array.isArray(b)) return Array.isArray(a) && Array.isArray(b) && a.length === b.length
+    && a.every((stage, index) => ["engine", "model", "effort"].every(key => stage[key] === b[index][key]));
   if (a && b && typeof a === "object" && typeof b === "object") return a.from === b.from && a.to === b.to;
   return a === b;
 }
 
 /** Flache Formularfelder je Motor-Unterabschnitt und Feld in der Datei */
 const ENGINE_SUBFIELDS = {
+  auto: { autoEnabled: "enabled", autoThreshold: "threshold", autoReturnBelow: "returnBelow" },
   codex: { codexModel: "model", codexEffort: "effort", codexSandbox: "sandbox" },
   opencode: { opencodeModel: "model", opencodeVariant: "variant", opencodePermission: "permission" },
 };
 
 /**
  * engine aus der Datei flach für das Formular: default, codexModel,
- * codexEffort, codexSandbox, opencodeModel, opencodeVariant, opencodePermission
+ * Motor-Unterfelder, backups und die drei auto-Felder.
  */
 function engineFlat(engine) {
   const e = engine && typeof engine === "object" ? engine : {};
   const out = {};
   if (typeof e.default === "string") out.default = e.default;
+  if (Array.isArray(e.backups)) out.backups = e.backups.map(stage => ({ ...stage }));
   for (const [name, fields] of Object.entries(ENGINE_SUBFIELDS)) {
     const sub = e[name] && typeof e[name] === "object" ? e[name] : {};
-    for (const [flat, key] of Object.entries(fields)) if (typeof sub[key] === "string") out[flat] = sub[key];
+    for (const [flat, key] of Object.entries(fields)) if (["string", "number", "boolean"].includes(typeof sub[key])) out[flat] = sub[key];
   }
   return out;
 }
@@ -702,12 +763,137 @@ function engineFlat(engine) {
 function enginePatch(flat) {
   const out = {};
   if ("default" in flat) out.default = flat.default;
+  if ("backups" in flat) out.backups = flat.backups === null ? null : flat.backups.map(stage => ({ ...stage }));
   for (const [name, fields] of Object.entries(ENGINE_SUBFIELDS)) {
     const sub = {};
     for (const [key, target] of Object.entries(fields)) if (key in flat) sub[target] = flat[key];
     if (Object.keys(sub).length) out[name] = sub;
   }
   return out;
+}
+
+/** Wie stageId in src/lib/engine-switch.ts; der Zustand gehört zur Stufe, nicht zur Position. */
+function engineStageId(stage) {
+  return stage.engine === "claude" && stage.model ? "claude:" + stage.model : stage.engine;
+}
+
+/** Fensternamen wie switchWindowLabel; die Wortgleichheit ist durch Tests gesichert. */
+function engineWindowLabel(window) {
+  if (window === "weekly_all") return "Woche, alle Modelle";
+  if (window === "session") return "5 Stunden";
+  if (window.startsWith("weekly_scoped:")) {
+    const family = window.slice("weekly_scoped:".length);
+    return "Woche, " + family.charAt(0).toUpperCase() + family.slice(1);
+  }
+  const minutes = Number(window.slice("window_".length));
+  const value = minutes < 120 ? minutes : minutes < 2880 ? minutes / 60 : minutes / 1440;
+  const unit = minutes < 120 ? (value === 1 ? "Minute" : "Minuten") : minutes < 2880 ? "Stunden" : "Tage";
+  return "Fenster, " + String(Math.round(value * 100) / 100).replace(".", ",") + " " + unit;
+}
+
+/** Bot-Zeitzone und feste Wochentage wie formatShortSwitchTime, nie die Zone des Browsers. */
+function engineTime(iso, timeZone, withDay = true) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(new Date(iso));
+  const value = type => parts.find(part => part.type === type).value;
+  const day = new Date(value("year") + "-" + value("month") + "-" + value("day") + "T00:00:00Z").getUTCDay();
+  return (withDay ? ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"][day] + " " : "") + value("hour") + ":" + value("minute");
+}
+
+/** Reine Textfunktion, wortgleich mit motorStageStateText aus /motor. */
+function engineStateText(status, timeZone) {
+  if (status.state === "answering") return "antwortet";
+  if (status.state === "free") return "frei";
+  if (status.state !== "blocked") return "nicht bereit" + (status.message ? " (" + status.message + ")" : "");
+  const reset = status.resetKnown && status.cause !== "outage";
+  const window = status.window ? engineWindowLabel(status.window) : undefined;
+  const percent = status.percent === undefined ? undefined : Math.round(status.percent) + " %";
+  const threshold = window && percent ? window + ": " + percent : window ?? percent ?? "Schwelle erreicht";
+  const detail = status.cause === "outage" ? "Ausfall" : status.cause === "limit" ? "Limit erreicht" : threshold;
+  return (reset ? "gesperrt" : "pausiert") + " bis " + engineTime(status.blockedUntil, timeZone, reset) + " (" + detail + (!reset && status.cause !== "outage" ? ", Reset unbekannt" : "") + ")";
+}
+
+/** Nur Zusatzdaten aus blocks/availability, niemals den Zustand daraus ableiten. */
+function engineOrderState(stage, data) {
+  if (!stage) return "noch nicht gespeichert";
+  const block = (data.blocks || []).find(b => b.engine === stage.engine && b.cause === stage.cause && b.window === stage.window);
+  const availability = (data.availability || []).find(a => a.engine === stage.engine);
+  return engineStateText({ ...stage, percent: block && block.percent, message: availability && availability.message }, data.timeZone || "UTC");
+}
+
+const ENGINE_AUTO_TEXT = {
+  on: "Erreicht ein Limit die Schwelle, antwortet ab der nächsten Nachricht die nächste freie Stufe. Zurück geht es nach dem Reset oder wenn der Stand unter die zweite Zahl fällt.",
+  off: "An der Schwelle wird nicht gewechselt, Sperren wegen der Schwelle sind aufgehoben. Nach einem Limit-Fehler oder Ausfall springt weiter die nächste Stufe ein.",
+};
+function engineAutoErrors(fields) {
+  const errors = {};
+  const threshold = Number(fields.autoThreshold.text);
+  if (!String(fields.autoThreshold.text).trim() || !Number.isInteger(threshold) || threshold < 50 || threshold > 99) errors.autoThreshold = "Wechseln ab: eine ganze Zahl von 50 bis 99 %.";
+  const raw = String(fields.autoReturnBelow.text).trim();
+  const below = raw ? Number(raw) : null;
+  if (below !== null && (!Number.isInteger(below) || below < 0 || (!errors.autoThreshold && below > threshold - 5))) {
+    errors.autoReturnBelow = "Zurück unter: eine ganze Zahl ab 0, mindestens 5 Punkte unter „Wechseln ab“.";
+  }
+  return errors;
+}
+
+const ENGINE_MEASUREMENT_SOURCES = { stream: "aus dem letzten Lauf", report: "Verbrauchsbericht", "session-file": "Sitzungsdatei von Codex", extern: "eingeliefert" };
+function engineMeasurementAge(measuredAt, now) {
+  const minutes = Math.max(0, Math.floor((now - Date.parse(measuredAt)) / 60000));
+  if (!minutes) return "gerade eben";
+  if (minutes < 60) return "vor " + minutes + (minutes === 1 ? " Minute" : " Minuten");
+  if (minutes < 1440) return "vor " + Math.floor(minutes / 60) + (minutes < 120 ? " Stunde" : " Stunden");
+  return "vor " + Math.floor(minutes / 1440) + (minutes < 2880 ? " Tag" : " Tagen");
+}
+
+function engineUsageText(reading, timeZone, now) {
+  if (!reading) return "noch nicht gemessen";
+  const state = reading.state === "known" ? Math.round(reading.percent) + " %" : "Reset vorbei, noch nicht neu gemessen";
+  return engineWindowLabel(reading.id) + ": " + state + " · Reset " + (reading.resetsAt ? engineTime(reading.resetsAt, timeZone) : "unbekannt")
+    + " · " + engineMeasurementAge(reading.measuredAt, now) + " · " + (ENGINE_MEASUREMENT_SOURCES[reading.source] || "Quelle unbekannt");
+}
+
+/** Nur Anzeige des Ersatzmodell-Schlüssels (Issue #674), unabhängig von Motorzustand und Wechselregel. */
+const OPENROUTER_KEY_ERRORS = {
+  rejected: "OpenRouter lehnt den Schlüssel ab",
+  timeout: "OpenRouter antwortet nicht (Zeitüberschreitung)",
+  unavailable: "OpenRouter ist gerade nicht erreichbar",
+};
+const OPENROUTER_KEY_LABEL = "OpenRouter (Schlüssel der Ersatzmodelle)";
+const OPENROUTER_KEY_NOTE = "OpenCode nutzt seine eigene Anmeldung. Das kann ein anderer Schlüssel sein als dieser.";
+function openRouterKeyText(reading, now) {
+  if (!reading || reading.configured !== true) return null;
+  if (reading.error) return Object.values(OPENROUTER_KEY_ERRORS).includes(reading.error) ? reading.error : OPENROUTER_KEY_ERRORS.unavailable;
+  if (!Number.isFinite(reading.usageMonthly) || !Number.isFinite(Date.parse(reading.fetchedAt))
+    || (reading.limit !== null && (!Number.isFinite(reading.limit) || !Number.isFinite(reading.remaining)))) return OPENROUTER_KEY_ERRORS.unavailable;
+  const dollars = value => value.toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2, useGrouping: false }) + " $";
+  let text;
+  if (reading.limit === null) {
+    text = "kein Limit am Schlüssel, in diesem Monat " + dollars(reading.usageMonthly) + " verbraucht";
+  } else {
+    text = dollars(Math.max(0, reading.remaining)) + " von " + dollars(reading.limit) + " übrig";
+    const reset = { daily: "täglich", weekly: "wöchentlich", monthly: "monatlich" };
+    if (Object.hasOwn(reset, reading.limitReset)) text += " · Limit erneuert sich " + reset[reading.limitReset];
+  }
+  return text + " · " + engineMeasurementAge(reading.fetchedAt, now);
+}
+
+/** Ein neues Claude-Modell braucht einen Namen; vorhandene Stufen ohne Modell bleiben zulässig. */
+const ENGINE_BACKUP_MODEL_PATTERN = /^[A-Za-z0-9][\w.[\]-]*$/;
+const ENGINE_BACKUP_ENGINES = ["claude", "codex", "opencode"];
+const ENGINE_FALLBACK_TEXT = "Ersatzmodelle mit eingeschränktem Werkzeugumfang";
+function engineBackupError(stages) {
+  if (!Array.isArray(stages) || stages.length > 4) return "Höchstens vier Ersatzstufen sind möglich.";
+  const ids = new Set();
+  for (const stage of stages) {
+    if (!ENGINE_BACKUP_ENGINES.includes(stage.engine)) return "Als Ersatzstufe sind Claude Code, Codex und OpenCode möglich.";
+    if (stage.model !== undefined && (stage.engine !== "claude" || !ENGINE_BACKUP_MODEL_PATTERN.test(stage.model) || stage.model.length > 100)) return "Claude-Modell: 1 bis 100 Zeichen, nur Buchstaben, Ziffern, Punkt, Bindestrich, Unterstrich und eckige Klammern.";
+    const id = engineStageId(stage);
+    if (ids.has(id)) return "Diese Stufe ist schon vorhanden.";
+    ids.add(id);
+  }
+  return null;
 }
 
 /**
@@ -725,6 +911,84 @@ function engineAvailabilityText(a) {
 }
 
 // --- Reiter „Status": Anzeige-Hilfen (Issue #39) ------------------------------
+
+/** Nur bekannte Felder übernehmen, nie zusätzliche Angaben oder rohe Kennungen zeigen. */
+function engineToolInventory(items) {
+  return (Array.isArray(items) ? items : [])
+    .filter(item => item && typeof item.name === "string" && item.name && Object.hasOwn(SETTINGS_TEXT.tools.origin, item.origin))
+    .map(item => ({ name: item.name, text: SETTINGS_TEXT.tools.origin[item.origin] }));
+}
+
+function engineToolGaps(items, key = "name") {
+  return (Array.isArray(items) ? items : [])
+    .filter(item => item && typeof item[key] === "string" && item[key] && typeof item.text === "string" && item.text)
+    .map(item => ({ [key]: item[key], text: item.text }));
+}
+
+/** undefined kennzeichnet einen älteren Server; null einen nicht ermittelbaren Bestand. */
+function engineToolsSummary(engine, tools) {
+  if (tools === undefined) return null;
+  const t = SETTINGS_TEXT.tools;
+  if (!tools || !tools.inventory) return t.unknown;
+  const { inventory, gaps = {} } = tools;
+  const have = [];
+  const mcp = engineToolInventory(inventory.mcp).length;
+  const skills = engineToolInventory(inventory.skills).length;
+  if (mcp) have.push(t.mcpCount(mcp));
+  if (skills) have.push(t.skillCount(skills));
+  if (inventory.notes === "self" || inventory.notes === "passed") have.push(t.notes);
+  const parts = have.length ? [have.join(", ")] : inventory.state === "ok" ? [t.empty] : [];
+  if (inventory.state !== "ok") parts.push(t.unknown);
+  if (engine === "claude") return [...parts, t.baseline].join(" · ");
+  const missing = [];
+  const missingMcp = engineToolGaps(gaps.mcp).length;
+  const missingSkills = engineToolGaps(gaps.skills).length;
+  if (missingMcp) missing.push(t.mcpCount(missingMcp));
+  if (missingSkills) missing.push(t.skillCount(missingSkills));
+  if (gaps.notes === true) missing.push(t.notes);
+  let unknown = 0;
+  for (const gap of engineToolGaps(gaps.fixed, "id")) {
+    if (Object.hasOwn(t.fixedShort, gap.id)) missing.push(t.fixedShort[gap.id]);
+    else unknown++;
+  }
+  if (unknown) missing.push(t.otherCount(unknown));
+  if (missing.length) parts.push(t.missing + missing.join(", "));
+  const hints = engineToolGaps(gaps.hints).length;
+  if (hints) parts.push(t.hintCount(hints));
+  return parts.join(" · ");
+}
+
+/** Gruppen mit Namen und unverändertem Antworttext; feste Lücken stehen zuletzt. */
+function engineToolsDetails(engine, tools) {
+  if (!tools || !tools.inventory) return [];
+  const t = SETTINGS_TEXT.tools;
+  const { inventory, gaps = {} } = tools;
+  const groups = [];
+  const add = (label, items) => { if (items.length) groups.push({ label, items }); };
+  add(t.mcp, engineToolInventory(inventory.mcp));
+  add(t.skills, engineToolInventory(inventory.skills));
+  const fixed = engine === "claude" ? [] : engineToolGaps(gaps.fixed, "id");
+  const hasNotes = inventory.notes === "self" || inventory.notes === "passed";
+  const plugins = Number.isInteger(gaps.plugins) && gaps.plugins >= 0 ? gaps.plugins : null;
+  if (engine !== "claude") {
+    add(t.missingMcp, engineToolGaps(gaps.mcp));
+    add(t.missingSkills, engineToolGaps(gaps.skills));
+    add(t.hints, engineToolGaps(gaps.hints));
+  }
+  // Ein leerer Bestand allein braucht keinen Aufklapper für „keine vorhanden“.
+  if (!groups.length && !hasNotes && (engine === "claude" || (!fixed.length && gaps.notes !== true && !(plugins > 0)))) return [];
+  if (Object.hasOwn(t.notesState, inventory.notes)) {
+    const notes = { label: t.notes, items: [{ text: t.notesState[inventory.notes] }] };
+    const inventoryGroups = Number(engineToolInventory(inventory.mcp).length > 0) + Number(engineToolInventory(inventory.skills).length > 0);
+    groups.splice(inventoryGroups, 0, notes);
+  }
+  if (engine !== "claude") {
+    if (gaps.notes === true) add("", [{ text: t.notesMissing }]);
+    add("", [{ text: plugins === null ? t.pluginsUnknown : t.pluginsCount(plugins) }]);
+    add(t.fixed, fixed.map(gap => ({ text: gap.text })));
+  }
+  return groups;
+}
 
 /** Laufzeit in Worten: „unter einer Minute", „42 Min", „2 Std 17 Min", „3 Tage 4 Std" */
 function formatUptime(seconds) {
@@ -754,7 +1018,7 @@ function formatSessions(sessions) {
  * onTab ruft der Reiter show(tab) direkt. onAgentsChanged bekommt jeden
  * übernommenen Stand von /api/agents (data null: nur Topics neu holen),
  * topicTitle nennt den Namen eines Topics aus der Seitenleiste oder null.
- * Rückgabe: { show(tab), hide(), isOpen(), hasUnsavedChanges() }.
+ * Rückgabe: { show(tab), hide(), isOpen(), hasUnsavedChanges(), refreshEngines() }.
  */
 function createSettingsView(deps) {
   const el = {
@@ -813,7 +1077,10 @@ function createSettingsView(deps) {
      * Antworten; resetting: Schlüssel, der gerade auf Standard gestellt wird;
      * rowError/rowDone: Meldung zu genau einer Zeile { key, text }.
      */
-    engines: { phase: "idle", data: null, error: null, seq: 0, resetting: null, rowError: null, notice: null },
+    engineAdd: { open: false, engine: "claude", model: "", effort: "", error: null },
+    engineSaveNotice: null,
+    engines: { measuring: false, measureError: null, measureResults: null, reloadAfterMeasure: false, phase: "idle", data: null, error: null, seq: 0, resetting: null, rowError: null, notice: null },
+    openrouterKey: { data: null, seq: 0 },
     /** Status des Sprechmodus aus GET /api/voice (Issue #248): phase idle|loading|ok|failed */
     voice: { phase: "idle", data: null, seq: 0, call: null },
     /**
@@ -826,7 +1093,7 @@ function createSettingsView(deps) {
     /** Hörprobe der Stimme (Issue #276): phase idle|busy|done, url des Tons (blob:) */
     callListen: { phase: "idle", url: "", error: null, autoplay: false, node: null },
     /** Reiter „Status": phase idle|loading|ok|failed, seq wie bei den Anweisungen */
-    status: { phase: "idle", data: null, error: null, seq: 0 },
+    status: { phase: "idle", data: null, error: null, seq: 0, toolsOpen: new Set() },
     /** Reiter „Routinen" (Issue #284): wie status; daemonsOpen: Dauerdienste aufgeklappt */
     /** Reiter „Erinnerungen" (Issue #323): wie status; act: Absage mit Rückfrage, step idle|confirm|busy */
     reminders: { phase: "idle", data: null, error: null, seq: 0, loading: false, act: { id: null, step: "idle" }, message: null, failed: false },
@@ -876,6 +1143,10 @@ function createSettingsView(deps) {
      */
     keys: { phase: "idle", data: null, error: null, seq: 0, loadSeq: 0, loading: false, editors: new Map(), confirm: null, removing: null, rows: new Map(), restart: null, writes: new Map(), applied: new Map(), pending: new Map(), overlapped: new Set(), reconcile: new Set() },
   };
+
+  // Bleibt beim Neuzeichnen stehen, damit die neue Position angesagt wird.
+  const engineLive = h("p", { className: "visually-hidden settings-engine-live", "aria-live": "polite", "aria-atomic": "true" });
+  el.view.appendChild(engineLive);
 
   /** Reiter „Benachrichtigungen" (Issue #225) aus push.js; ohne push.js gibt es ihn nicht */
   const pushSettings = typeof createPushSettings === "function"
@@ -1026,7 +1297,7 @@ function createSettingsView(deps) {
         custom = own.model;
       }
     }
-    return { model, custom, effort: typeof own.effort === "string" ? own.effort : EFFORT_DEFAULT };
+    return { model, custom, engine: own.engine ?? CHOICE_DEFAULT, effort: typeof own.effort === "string" ? own.effort : EFFORT_DEFAULT };
   }
 
   /** Formular aus dem gespeicherten Stand; Meldungen bleiben stehen */
@@ -1130,7 +1401,8 @@ function createSettingsView(deps) {
         f.custom = fresh.custom;
       }
       if (!edit.effort) f.effort = fresh.effort;
-      if (!edit.model && !edit.effort) f.error = null;
+      if (!edit.engine) f.engine = fresh.engine;
+      if (!edit.model && !edit.effort && !edit.engine) f.error = null;
     }
     // Abschnitte im Reiter „Modelle" genauso: unveränderte Felder folgen dem Server
     for (const [section, g] of state.globals) {
@@ -1235,6 +1507,16 @@ function createSettingsView(deps) {
     render();
     const body = {};
     body[section] = section === "engine" ? enginePatch(result.patch) : result.patch;
+    let engineSaveNotice = null;
+    if (section === "engine" && "default" in result.patch) {
+      const standard = selectedEngine();
+      const stages = g.fields.backups.stages;
+      const remaining = stages.filter(stage => stage.engine !== standard || stage.model);
+      if (remaining.length !== stages.length) {
+        body.engine.backups = remaining;
+        engineSaveNotice = "Die Ersatzstufe " + engineName(standard) + " ohne eigenes Modell entfällt, weil sie jetzt der Standard-Motor ist.";
+      }
+    }
     const attempt = ++state.sync.next;
     let error = null;
     try {
@@ -1244,6 +1526,7 @@ function createSettingsView(deps) {
         resetGlobal(section);
         const next = globalForm(section);
         next.saved = true;
+        if (section === "engine") state.engineSaveNotice = engineSaveNotice;
         next.savedTimer = later(() => {
           next.saved = false;
           next.savedTimer = null;
@@ -1299,6 +1582,7 @@ function createSettingsView(deps) {
   /** Stand aus GET /api/engines oder der Antwort auf „Auf Standard" übernehmen */
   function adoptEngines(data) {
     if (!data || typeof data !== "object" || !Array.isArray(data.overrides)) return false;
+    if (!isNotOlder(state.engines.data?.revision, data.revision)) return false;
     state.engines.data = data;
     state.engines.phase = "ok";
     state.engines.error = null;
@@ -1307,6 +1591,7 @@ function createSettingsView(deps) {
 
   async function loadEngines() {
     const e = state.engines;
+    if (e.measuring) { e.reloadAfterMeasure = true; return; }
     const seq = ++e.seq;
     if (!e.data) e.phase = "loading";
     render();
@@ -1324,10 +1609,51 @@ function createSettingsView(deps) {
     render();
   }
 
+  async function checkEngines() {
+    const e = state.engines;
+    if (e.measuring || e.resetting) return;
+    e.measuring = true;
+    e.measureError = null;
+    e.measureResults = null;
+    const seq = ++e.seq;
+    render();
+    try {
+      const res = await deps.api("POST", "/api/engines/check", {});
+      if (seq !== e.seq) return;
+      if (res.ok && adoptEngines(res.data)) {
+        e.measureResults = res.data.measurementResults || Object.fromEntries((res.data.notMeasured || []).map(engine => [engine, "failed"]));
+      } else e.measureError = errorText(res.data, "Messen fehlgeschlagen (Fehler " + res.status + ").");
+    } catch {
+      if (seq === e.seq) e.measureError = "Server nicht erreichbar. Es liegt keine neue Messung vor.";
+    } finally {
+      e.measuring = false;
+      render();
+      if (e.reloadAfterMeasure) { e.reloadAfterMeasure = false; void loadEngines(); }
+      if (state.open) void loadOpenRouterKey();
+    }
+  }
+
+  /** Nur beim Öffnen und nach „Jetzt messen“, nie bei Speichern oder Motorereignissen. */
+  async function loadOpenRouterKey() {
+    const key = state.openrouterKey;
+    const seq = ++key.seq;
+    try {
+      const res = await deps.api("GET", "/api/engines/openrouter");
+      if (seq !== key.seq) return;
+      if (!res.ok || typeof res.data?.configured !== "boolean") throw new Error();
+      key.data = res.data;
+    } catch {
+      if (seq !== key.seq) return;
+      // Ohne bestätigte Konfiguration keine Zeile erfinden; einen alten Erfolg nie als frisch zeigen.
+      if (key.data?.configured) key.data = { configured: true, error: OPENROUTER_KEY_ERRORS.unavailable };
+    }
+    render();
+  }
+
   /** „Auf Standard": entfernt genau die Ausnahme dieses Schlüssels */
   async function resetEngineOverride(key) {
     const e = state.engines;
-    if (e.resetting) return;
+    if (e.resetting || e.measuring) return;
     e.resetting = key;
     e.rowError = null;
     e.notice = null;
@@ -2733,14 +3059,63 @@ function createSettingsView(deps) {
     const eff = state.data && state.data.effective && state.data.effective.agents && state.data.effective.agents[name];
     if (!eff) return "";
     const parts = [];
+    const engine = ownEntry(name).engine;
+    if (engine && engine !== agentStandardEngine()) parts.push(engineName(engine));
     if (eff.model && eff.model.value) parts.push(String(eff.model.value));
     parts.push("Effort " + (eff.effort && eff.effort.value ? String(eff.effort.value) : "automatisch"));
     return parts.join(" · ");
   }
 
+  function agentStandardEngine() {
+    return state.data?.effective?.engine?.default?.value || state.engines.data?.default?.engine || "claude";
+  }
+
+  function agentFormEngine(f) {
+    return !f.engine || f.engine === CHOICE_DEFAULT ? agentStandardEngine() : f.engine;
+  }
+
+  function agentUsesMotorSettings(f) {
+    return ["codex", "opencode"].includes(agentFormEngine(f));
+  }
+
+  function motorSettingsLink(text) {
+    const link = h("a", { href: SETTINGS_HASH + "/modelle", text });
+    link.addEventListener("click", event => {
+      if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      selectTab("modelle");
+      const scroll = el.view.querySelector(".settings-scroll");
+      if (scroll) scroll.scrollTop = 0;
+      focusKey("tab:modelle");
+    });
+    return link;
+  }
+
+  function agentEngineField(name, f) {
+    const select = h("select", { id: "settings-engine-" + name, className: "settings-input", "data-focus-key": "engine:" + name, disabled: f.saving });
+    select.appendChild(h("option", { value: CHOICE_DEFAULT, text: "Standard (" + engineName(agentStandardEngine()) + ")" }));
+    for (const engine of state.data.engineOptions?.engines || []) {
+      const availability = state.engines.data?.availability?.find(a => a.engine === engine.id);
+      const suffix = !availability ? "" : !availability.installed ? " (nicht installiert)"
+        : availability.loggedIn === false ? " (nicht angemeldet)" : availability.loggedIn === null ? " (Anmeldung unbekannt)" : "";
+      select.appendChild(h("option", { value: engine.id, text: engine.label + suffix }));
+    }
+    select.value = f.engine;
+    select.addEventListener("change", () => {
+      f.engine = select.value;
+      f.error = null;
+      clearSaved(f);
+      render();
+    });
+    return h("div", { className: "settings-field" }, [
+      h("label", { className: "settings-label", for: "settings-engine-" + name, text: "Motor" }),
+      h("span", { className: "settings-select" }, [select]),
+    ]);
+  }
+
   function modelField(name, f) {
     const inherited = state.data.inherited && state.data.inherited[name];
-    const select = h("select", { id: "settings-model-" + name, className: "settings-input", "data-focus-key": "model:" + name, disabled: f.saving });
+    const select = h("select", { id: "settings-model-" + name, className: "settings-input", "data-focus-key": "model:" + name, disabled: f.saving || agentUsesMotorSettings(f) });
     select.appendChild(h("option", { value: MODEL_DEFAULT, text: inheritedLabel(inherited && inherited.model) }));
     for (const model of state.claudeModels) select.appendChild(h("option", { value: model, text: model }));
     select.appendChild(h("option", { value: MODEL_CUSTOM, text: "Eigenes Modell …" }));
@@ -2756,7 +3131,7 @@ function createSettingsView(deps) {
       h("label", { className: "settings-label", for: "settings-model-" + name, text: "Modell" }),
       h("span", { className: "settings-select" }, [select]),
       // Issue #126: Agenten-Modelle gehen nie an Codex oder OpenCode
-      h("p", { className: "actions-hint settings-engine-scope", text: "gilt für Claude Code" }),
+      h("p", { className: "actions-hint settings-engine-scope", text: "gilt für Claude Code und Anthropic API" }),
     ]);
     if (f.model === MODEL_CUSTOM) {
       const custom = h("input", {
@@ -2769,7 +3144,7 @@ function createSettingsView(deps) {
         autocomplete: "off",
         spellcheck: "false",
         "data-focus-key": "custom:" + name,
-        disabled: f.saving,
+        disabled: f.saving || agentUsesMotorSettings(f),
       });
       custom.value = f.custom;
       custom.addEventListener("input", () => {
@@ -2802,7 +3177,7 @@ function createSettingsView(deps) {
 
   function effortField(name, f) {
     const levels = Array.isArray(state.data.effortLevels) ? state.data.effortLevels : [];
-    const select = h("select", { id: "settings-effort-" + name, className: "settings-input", "data-focus-key": "effort:" + name, disabled: f.saving });
+    const select = h("select", { id: "settings-effort-" + name, className: "settings-input", "data-focus-key": "effort:" + name, disabled: f.saving || agentUsesMotorSettings(f) });
     select.appendChild(h("option", { value: EFFORT_DEFAULT, text: effortDefaultLabel(name, f) }));
     for (const level of levels) select.appendChild(h("option", { value: String(level), text: String(level) }));
     select.value = f.effort;
@@ -3410,8 +3785,15 @@ function createSettingsView(deps) {
     }
     // Prompt oberhalb von Modell und Anweisungen (Issue #51)
     body.appendChild(promptBlock(name));
+    body.appendChild(agentEngineField(name, f));
     body.appendChild(modelField(name, f));
     body.appendChild(effortField(name, f));
+    if (agentUsesMotorSettings(f)) body.appendChild(h("p", { className: "actions-hint settings-agent-engine-note" }, [
+      h("span", { text: "Modell und Effort kommen aus den Einstellungen des Motors. " }),
+      motorSettingsLink("Zum Abschnitt Motor"),
+    ]));
+    if (agentFormEngine(f) === "api") body.appendChild(h("p", { className: "actions-hint settings-agent-engine-note",
+      text: "Die Anthropic API nimmt nur volle Modellnamen (claude-…) und zahlt je Verbrauch." }));
     body.appendChild(h("p", { className: "actions-hint settings-note", text: SETTINGS_TEXT.modelNote }));
     for (const node of saveBlock(name, f)) body.appendChild(node);
     const board = boardBlock(name);
@@ -3556,6 +3938,7 @@ function createSettingsView(deps) {
   /** Speichern-Knopf und „Standard" beim Effort ohne Neuzeichnen nachführen (beim Tippen) */
   function updateGlobalSave(section) {
     if (typeof document.querySelector !== "function") return;
+    if (section === "engine") { updateEngineModelLabels(); updateEngineAutoFields(); }
     const g = globalForm(section);
     const button = document.querySelector('[data-focus-key="save:section-' + section + '"]');
     if (button) button.disabled = g.saving || !isGlobalDirty(section) || !!(state.data && state.data.fileInvalid);
@@ -3626,7 +4009,7 @@ function createSettingsView(deps) {
       ]),
     ].concat(globalSaveNodes("defaults"));
     return sectionNode("defaults", "Standard für alle Agenten", [
-      "Gilt für jeden Agenten ohne eigenen Wert, ab seiner nächsten Nachricht. Gilt für Claude Code; Codex und OpenCode haben eigene Werte im Reiter Agenten unter Motor.",
+      "Gilt für jeden Agenten ohne eigenen Wert, ab seiner nächsten Nachricht. Gilt für Claude Code und die Anthropic API; Codex und OpenCode haben eigene Werte oben im Abschnitt Motor.",
       ownersHint(),
     ], nodes);
   }
@@ -4077,7 +4460,7 @@ function createSettingsView(deps) {
         h("span", { className: "engine-pill", "data-engine": String(o.engine), text: typeof o.label === "string" ? o.label : engineName(o.engine) }),
       ]);
       const button = quietButton("engine-reset:" + o.key, busy ? "Wird zurückgesetzt …" : "Auf Standard", () => void resetEngineOverride(o.key), {
-        disabled: !!e.resetting,
+        disabled: !!e.resetting || e.measuring,
       });
       button.setAttribute("aria-label", "Auf Standard: " + (gone ? ENGINE_TEXT.gone : o.title));
       const row = h("li", { "data-key": o.key }, [name, button]);
@@ -4089,6 +4472,271 @@ function createSettingsView(deps) {
     // Fehler zu einer Zeile, die es nicht mehr gibt (404): über der Liste
     if (e.rowError && !list.some(o => o.key === e.rowError.key)) nodes.push(h("p", { className: "actions-error", role: "alert", text: e.rowError.text }));
     return h("div", { className: "settings-field", role: "group", "aria-labelledby": titleId }, nodes);
+  }
+
+  function selectedEngine() {
+    const choice = globalForm("engine").fields.default.choice;
+    return choice === CHOICE_DEFAULT ? inheritedGlobal("engine").default?.value || "claude" : choice;
+  }
+
+  function engineFormModel(engine) {
+    const fields = globalForm("engine").fields;
+    if (engine === "codex") return fields.codexModel.text.trim() || null;
+    if (engine === "opencode") {
+      const f = fields.opencodeModel;
+      return f.choice === MODEL_DEFAULT ? null : f.choice === MODEL_CUSTOM ? f.custom.trim() || null : f.choice;
+    }
+    return state.engines.data?.resolvedModels?.[engine] ?? null;
+  }
+
+  function engineModelLabel(stage) {
+    const model = stage.model || engineFormModel(stage.engine);
+    if (stage.engine === "codex") return model || "Standard aus der Codex-Konfiguration";
+    if (stage.engine === "opencode") return model || "Standard aus der OpenCode-Konfiguration";
+    return (model || "Modell noch nicht ermittelt") + (!stage.model ? " · Modell des Agenten" : "") + (stage.effort ? " · Effort " + stage.effort : "");
+  }
+
+  function enginePaidLabel(stage) {
+    return stage.engine === "api" || (stage.engine === "opencode" && (engineFormModel("opencode") || "").startsWith("openrouter/")) ? "zahlt je Verbrauch" : "";
+  }
+
+  function engineFormStages() {
+    return [{ engine: selectedEngine() }, ...globalForm("engine").fields.backups.stages];
+  }
+
+  /** Beim Tippen nur die Modellzeilen ändern; Textfeld, Fokus und Cursor bleiben stehen. */
+  function updateEngineModelLabels() {
+    engineFormStages().forEach((stage, index) => {
+      const model = document.querySelector('[data-focus-key="engine-model:' + index + '"]');
+      const paid = document.querySelector('[data-focus-key="engine-paid:' + index + '"]');
+      if (model) model.textContent = engineModelLabel(stage);
+      if (paid) paid.textContent = enginePaidLabel(stage);
+    });
+  }
+
+  function editEngineStages(stages) {
+    const g = globalForm("engine");
+    g.fields.backups.stages = stages;
+    g.error = null;
+    state.engineSaveNotice = null;
+    clearSaved(g);
+    render();
+  }
+
+  function engineOrderNode() {
+    const g = globalForm("engine");
+    const stages = engineFormStages();
+    const data = state.engines.data || {};
+    const seen = new Set();
+    const list = h("ol", { className: "settings-motor-order", "aria-label": "Reihenfolge der Motoren" });
+    stages.forEach((stage, index) => {
+      const id = engineStageId(stage);
+      const saved = !seen.has(id) && (data.order || []).find(entry => entry.id === id);
+      seen.add(id);
+      const name = engineName(stage.engine);
+      const details = h("div", { className: "settings-motor-details" }, [
+        index === 0 ? engineSelect("default", "Standard-Motor", [{ value: CHOICE_DEFAULT, text: engineDefaultLabel() }].concat(engineList().map(e => ({ value: e.id, text: e.label }))))
+          : h("span", { className: "settings-motor-name", text: name }),
+        h("span", { className: "settings-motor-model", "data-focus-key": "engine-model:" + index, text: engineModelLabel(stage) }),
+        h("span", { className: "actions-hint settings-motor-paid", "data-focus-key": "engine-paid:" + index, text: enginePaidLabel(stage) }),
+      ]);
+      if (index === 0 && ["claude", "api"].includes(stage.engine) && Object.values(state.data.settings?.agents || {}).some(agent => agent.model)) {
+        details.appendChild(h("p", { className: "actions-hint", text: "Bei Claude Code und Anthropic API gilt das Modell des Agenten. Codex und OpenCode nutzen die Einstellungen des Motors." }));
+      }
+      const row = h("li", { "data-stage-id": id }, [h("div", { className: "settings-motor-row" }, [
+        details,
+        h("span", { className: "settings-motor-state", "data-state": saved?.state || "unsaved", text: engineOrderState(saved, data) }),
+      ])]);
+      if (index > 0) {
+        const actions = h("div", { className: "settings-motor-actions" });
+        for (const [direction, text, delta] of [["up", "nach oben", -1], ["down", "nach unten", 1]]) {
+          const edge = index + delta < 1 || index + delta >= stages.length;
+          const key = "engine-stage:" + id + ":" + direction;
+          const button = quietButton(key, delta < 0 ? "Hoch" : "Runter", () => {
+            if (edge || g.saving) return;
+            const backups = [...g.fields.backups.stages];
+            [backups[index - 1], backups[index - 1 + delta]] = [backups[index - 1 + delta], backups[index - 1]];
+            editEngineStages(backups);
+            focusKey(key);
+            engineLive.textContent = name + (stage.model ? " mit " + stage.model : "") + " steht jetzt an Position " + (index + delta + 1) + ".";
+          }, { disabled: g.saving });
+          button.setAttribute("aria-label", name + " " + text);
+          button.setAttribute("aria-disabled", edge || g.saving ? "true" : "false");
+          actions.appendChild(button);
+        }
+        const remove = quietButton("engine-stage:" + id + ":remove", "Entfernen", () => {
+          if (g.saving) return;
+          editEngineStages(g.fields.backups.stages.filter((_, i) => i !== index - 1));
+          focusKey("engine-add");
+        }, { disabled: g.saving });
+        remove.setAttribute("aria-label", name + " entfernen");
+        actions.appendChild(remove);
+        row.appendChild(actions);
+      }
+      list.appendChild(row);
+    });
+    list.appendChild(h("li", { className: "settings-motor-fallback" }, [quietButton("engine-fallback", ENGINE_FALLBACK_TEXT, () => {
+      const title = document.getElementById("settings-g-title-fallback");
+      title.setAttribute("tabindex", "-1");
+      title.scrollIntoView({ block: "start", behavior: "instant" });
+      title.focus();
+    })]));
+    return list;
+  }
+
+  function engineAddNode() {
+    const g = globalForm("engine");
+    const add = state.engineAdd;
+    const nodes = [quietButton("engine-add", "Stufe hinzufügen", () => {
+      add.open = !add.open;
+      add.error = null;
+      render();
+      if (add.open) focusKey("engine-add-engine");
+    }, { disabled: g.saving || g.fields.backups.stages.length >= 4 })];
+    if (g.fields.backups.stages.length >= 4) nodes.push(h("p", { className: "actions-hint", text: "Höchstens vier Ersatzstufen sind möglich." }));
+    if (!add.open) return h("div", { className: "settings-field" }, nodes);
+    const select = h("select", { id: "settings-engine-add-engine", className: "settings-input", "data-focus-key": "engine-add-engine", disabled: g.saving });
+    for (const engine of ENGINE_BACKUP_ENGINES) select.appendChild(h("option", { value: engine, text: engineName(engine) }));
+    select.value = add.engine;
+    select.addEventListener("change", () => { add.engine = select.value; add.error = null; render(); });
+    nodes.push(h("label", { className: "settings-label", for: "settings-engine-add-engine", text: "Motor der Ersatzstufe" }), h("span", { className: "settings-select" }, [select]));
+    if (add.engine === "claude") {
+      const input = h("input", { id: "settings-engine-add-model", className: "settings-input", type: "text", maxlength: "100", required: true,
+        placeholder: "z.B. claude-opus-5-5", "data-focus-key": "engine-add-model", disabled: g.saving, "aria-invalid": add.error ? "true" : "false" });
+      input.value = add.model;
+      input.addEventListener("input", () => { add.model = input.value; });
+      const effort = h("select", { id: "settings-engine-add-effort", className: "settings-input", "data-focus-key": "engine-add-effort", disabled: g.saving });
+      effort.appendChild(h("option", { value: "", text: "Wie der Agent" }));
+      for (const value of state.data.effortLevels || ["low", "medium", "high", "xhigh", "max"]) effort.appendChild(h("option", { value, text: value }));
+      effort.value = add.effort;
+      effort.addEventListener("change", () => { add.effort = effort.value; });
+      nodes.push(h("label", { className: "settings-label", for: input.id, text: "Claude-Modell (Pflicht)" }), input,
+        h("label", { className: "settings-label", for: effort.id, text: "Effort" }), h("span", { className: "settings-select" }, [effort]));
+    }
+    nodes.push(quietButton("engine-add-confirm", "Hinzufügen", () => {
+      if (g.saving) return;
+      const stage = { engine: add.engine, ...(add.engine === "claude" ? { model: add.model.trim(), ...(add.effort ? { effort: add.effort } : {}) } : {}) };
+      const stages = [...g.fields.backups.stages, stage];
+      add.error = engineBackupError(stages) || (engineStageId(stage) === selectedEngine() ? "Diese Stufe ist schon der Standard-Motor." : null);
+      if (add.error) { render(); return; }
+      add.open = false;
+      add.model = "";
+      add.effort = "";
+      editEngineStages(stages);
+      focusKey("engine-stage:" + engineStageId(stage) + ":up");
+    }, { disabled: g.saving }));
+    if (add.error) nodes.push(h("p", { className: "actions-error", role: "alert", text: add.error }));
+    nodes.push(h("p", { className: "actions-hint", text: "Die Anthropic API bleibt eine Wahl von Hand und springt nie von selbst ein." }));
+    return h("div", { className: "settings-field settings-motor-add" }, nodes);
+  }
+
+  function engineUsageNode() {
+    const e = state.engines;
+    const data = e.data || {};
+    const list = h("ul", { className: "settings-motor-usage" });
+    for (const engine of engineList()) {
+      const readings = data.usage?.[engine.id] || [];
+      const rows = [h("h5", { className: "settings-label", text: engine.label })];
+      if (engine.id === "api" || engine.id === "opencode") rows.push(h("p", { className: "actions-hint", text: "keine Messung in Prozent" }));
+      else if (!readings.length) rows.push(h("p", { className: "actions-hint", text: engineUsageText(null) }));
+      else for (const reading of readings) rows.push(h("p", { className: "settings-motor-reading", text: engineUsageText(reading, data.timeZone || "UTC", now()) }));
+      const result = e.measureResults?.[engine.id];
+      if (result) rows.push(h("p", { className: "actions-hint settings-motor-measure-result", role: "status",
+        text: result === "measured" ? "Neu gemessen." : result === "failed" ? "Keine neue Messung erhalten. Der bisherige Stand bleibt sichtbar." : "Ohne Nachricht nicht messbar." }));
+      list.appendChild(h("li", { "data-engine": engine.id }, rows));
+    }
+    return h("div", { className: "settings-field", role: "group", "aria-labelledby": "settings-engine-usage-title" }, [
+      h("h4", { className: "settings-label", id: "settings-engine-usage-title", text: "Stand je Motor" }), list,
+      quietButton("engine-check", e.measuring ? "Misst …" : "Jetzt messen", () => void checkEngines(), { disabled: e.measuring || !!e.resetting }),
+      h("p", { className: "actions-hint", text: "Misst neu, soweit ein Motor das ohne Nachricht kann, und bewertet alle Sperren neu. Eine Sperre ohne neue Messung wird freigegeben; ob das Limit wirklich frei ist, zeigt der nächste Lauf." }),
+      e.measureError ? h("p", { className: "actions-error", role: "alert", text: e.measureError }) : null,
+    ]);
+  }
+
+  function openRouterKeyNode() {
+    const reading = state.openrouterKey.data;
+    const text = openRouterKeyText(reading, now());
+    if (text === null) return null;
+    return h("div", { className: "settings-field settings-openrouter-key", role: "group", "aria-labelledby": "settings-openrouter-key-title" }, [
+      h("h4", { className: "settings-label", id: "settings-openrouter-key-title", text: OPENROUTER_KEY_LABEL }),
+      h("p", { className: Object.values(OPENROUTER_KEY_ERRORS).includes(text) ? "actions-hint settings-motor-reading" : "settings-motor-reading", role: "status", text }),
+      h("p", { className: "actions-hint", text: OPENROUTER_KEY_NOTE }),
+    ]);
+  }
+
+  function updateEngineAutoFields() {
+    const fields = globalForm("engine").fields;
+    const errors = engineAutoErrors(fields);
+    for (const key of ["autoThreshold", "autoReturnBelow"]) {
+      const input = document.querySelector('[data-focus-key="g-engine:' + key + '"]');
+      const error = document.querySelector('[data-focus-key="g-engine-error:' + key + '"]');
+      if (input) input.setAttribute("aria-invalid", errors[key] ? "true" : "false");
+      if (error) { error.textContent = errors[key] || ""; error.hidden = !errors[key]; error.className = errors[key] ? "actions-error" : ""; }
+    }
+    const below = document.querySelector('[data-focus-key="g-engine:autoReturnBelow"]');
+    if (below && !errors.autoThreshold) {
+      below.setAttribute("max", String(Number(fields.autoThreshold.text) - 5));
+      below.setAttribute("placeholder", String(Number(fields.autoThreshold.text) - 15));
+    }
+  }
+
+  function engineAutoNode() {
+    const g = globalForm("engine");
+    const fields = g.fields;
+    const enabled = fields.autoEnabled.choice === "true";
+    const noBackups = !fields.backups.stages.length;
+    const group = h("div", { className: "theme-switch settings-switch", role: "radiogroup", "aria-labelledby": "settings-engine-auto-title" });
+    const choose = value => {
+      if (g.saving || noBackups) return;
+      fields.autoEnabled.choice = value;
+      clearSaved(g);
+      g.error = null;
+      render();
+      focusKey("engine-auto:" + value);
+    };
+    for (const [value, label] of [["true", "An"], ["false", "Aus"]]) {
+      const button = h("button", { type: "button", className: "theme-option", role: "radio", text: label,
+        "data-focus-key": "engine-auto:" + value, "aria-checked": fields.autoEnabled.choice === value ? "true" : "false",
+        tabindex: fields.autoEnabled.choice === value ? "0" : "-1", disabled: g.saving || noBackups });
+      button.addEventListener("click", () => choose(value));
+      button.addEventListener("keydown", event => {
+        let next = null;
+        if (["ArrowRight", "ArrowDown", "ArrowLeft", "ArrowUp"].includes(event.key)) next = value === "true" ? "false" : "true";
+        else if (event.key === "Home") next = "true";
+        else if (event.key === "End") next = "false";
+        else if (event.key === " ") next = value;
+        if (next === null) return;
+        event.preventDefault();
+        choose(next);
+      });
+      group.appendChild(button);
+    }
+    const nodes = [h("h4", { className: "settings-label", id: "settings-engine-auto-title", text: "Automatik" }), group];
+    if (noBackups) nodes.push(h("p", { className: "actions-hint", text: "Erst eine Ersatzstufe hinzufügen" }));
+    nodes.push(h("p", { className: "actions-hint settings-engine-auto-explanation", text: enabled ? ENGINE_AUTO_TEXT.on : ENGINE_AUTO_TEXT.off }));
+    const errors = engineAutoErrors(fields);
+    for (const [key, label, min, max] of [["autoThreshold", "Wechseln ab (%)", 50, 99], ["autoReturnBelow", "Zurück unter (%)", 0, Number(fields.autoThreshold.text) - 5]]) {
+      const id = "settings-g-engine-" + key;
+      const input = h("input", { id, className: "settings-input", type: "number", min, max, step: "1", inputmode: "numeric", disabled: g.saving,
+        "data-focus-key": "g-engine:" + key, "aria-invalid": errors[key] ? "true" : "false", "aria-describedby": id + "-error" + (key === "autoReturnBelow" ? " settings-engine-return-hint" : ""),
+        ...(key === "autoReturnBelow" ? { placeholder: String(Number(fields.autoThreshold.text) - 15) } : { required: true }) });
+      input.value = fields[key].text;
+      input.addEventListener("input", () => {
+        fields[key].text = input.value;
+        g.error = null;
+        clearSaved(g);
+        updateGlobalSave("engine");
+      });
+      input.addEventListener("keydown", event => {
+        if (event.key !== "Enter" || event.isComposing) return;
+        event.preventDefault(); void saveGlobal("engine");
+      });
+      nodes.push(h("div", { className: "settings-field" }, [h("label", { className: "settings-label", for: id, text: label }), input,
+        h("p", { id: id + "-error", "data-focus-key": "g-engine-error:" + key, className: errors[key] ? "actions-error" : "", role: "alert", hidden: !errors[key], text: errors[key] || "" }),
+      ]));
+    }
+    nodes.push(h("p", { className: "actions-hint", id: "settings-engine-return-hint", text: "Leer heißt: Schwelle minus 15 Punkte. Mindestens 5 Punkte Abstand zur Schwelle." }));
+    return h("div", { className: "settings-field settings-engine-auto", role: "group", "aria-labelledby": "settings-engine-auto-title" }, nodes);
   }
 
   function engineSection() {
@@ -4111,17 +4759,22 @@ function createSettingsView(deps) {
     ]);
     return sectionNode("engine", "Motor", [ENGINE_TEXT.intro], [
       availabilityNode(),
-      engineSelect("default", "Standard-Motor", [{ value: CHOICE_DEFAULT, text: engineDefaultLabel() }].concat(engineList().map(e => ({ value: e.id, text: e.label })))),
+      engineOrderNode(),
+      engineAddNode(),
+      engineUsageNode(),
+      openRouterKeyNode(),
+      engineAutoNode(),
       codex,
       // Nur, wenn der Server OpenCode als wählbar nennt (ältere Antworten kennen engine.opencode nicht)
       engineList().some(e => e.id === "opencode") ? openCodeGroup(options) : null,
       ...globalSaveNodes("engine"),
+      state.engineSaveNotice ? h("p", { className: "actions-hint", role: "status", text: state.engineSaveNotice }) : null,
       overridesNode(),
     ]);
   }
 
   function modelsPanel() {
-    const nodes = [h("p", { className: "settings-intro", text: "Modelle für alle Agenten, die Nebenaufgaben und den Fallback, dazu die offenen Fäden. Speichern gilt pro Abschnitt." })];
+    const nodes = [engineSection(), h("p", { className: "settings-intro", text: "Modelle für alle Agenten, die Nebenaufgaben und den Fallback, dazu die offenen Fäden. Speichern gilt pro Abschnitt." })];
     if (state.listsFailed) nodes.push(h("p", { className: "actions-hint settings-lists-failed", role: "status", text: SETTINGS_TEXT.listsFailed }));
     nodes.push(defaultsSection(), auxSection(), fallbackSection());
     // Ältere Server kennen den Abschnitt nicht
@@ -4982,19 +5635,64 @@ function createSettingsView(deps) {
     return sectionNode("keys", "Schlüssel", [SETTINGS_TEXT.keysNote], children);
   }
 
-  /** Motoren (Issue #126): je Motor installiert, angemeldet, Version; nur diese Felder */
+  /** Motoren und Werkzeuge (Issue #667): reine Darstellung der Statusantwort. */
   function engineStatusSection(engines) {
     if (!Array.isArray(engines)) return sectionNode("engines", "Motoren", [], [h("p", { className: "actions-hint", text: "unbekannt" })]);
-    const ul = h("ul", { className: "settings-keys settings-engines", "aria-label": "Motoren" });
+    const ul = h("ul", { className: "settings-keys settings-engines settings-status-engines", "aria-label": "Motoren" });
+    let hasTools = false;
     for (const a of engines) {
       if (!a || typeof a.engine !== "string") continue;
       const ready = a.installed === true && a.loggedIn === true;
-      ul.appendChild(h("li", { "data-set": ready ? "true" : "false", "data-engine": a.engine }, [
+      const summary = engineToolsSummary(a.engine, a.tools);
+      const heading = [
         h("span", { className: "settings-key-name", text: typeof a.label === "string" ? a.label : a.engine }),
         h("span", { className: "settings-key-state", text: engineAvailabilityText(a) }),
-      ]));
+      ];
+      const li = h("li", {
+        "data-set": ready ? "true" : "false", "data-engine": a.engine,
+        className: summary === null ? "" : "settings-engine-with-tools",
+      }, summary === null ? heading : [h("div", { className: "settings-engine-heading" }, heading)]);
+      if (summary !== null) {
+        hasTools = true;
+        li.appendChild(h("div", { className: "settings-engine-tools" }, [
+          h("span", { className: "settings-engine-tools-label", text: SETTINGS_TEXT.tools.label }),
+          h("span", { className: "settings-engine-tools-summary", text: summary }),
+        ]));
+        const groups = engineToolsDetails(a.engine, a.tools);
+        if (groups.length) {
+          const details = h("details", { className: "settings-engine-details" }, [
+            h("summary", { text: SETTINGS_TEXT.tools.details, "data-focus-key": "engine-tools:" + a.engine }),
+          ]);
+          details.open = state.status.toolsOpen.has(a.engine);
+          details.addEventListener("toggle", () => {
+            // Ein ausstehendes Ereignis des ersetzten Panels darf den Stand nicht ändern.
+            if (details.isConnected === false) return;
+            if (details.open) state.status.toolsOpen.add(a.engine);
+            else state.status.toolsOpen.delete(a.engine);
+          });
+          for (const group of groups) {
+            if (group.label) details.appendChild(h("p", { className: "settings-group-label", text: group.label }));
+            details.appendChild(h("ul", { className: "settings-engine-tool-items" }, group.items.map(item =>
+              h("li", {}, [
+                item.name ? h("span", { className: "settings-engine-tool-name", text: item.name }) : null,
+                h("span", { className: "settings-engine-tool-text", text: item.text }),
+              ])
+            )));
+          }
+          li.appendChild(details);
+        }
+      }
+      ul.appendChild(li);
     }
-    return sectionNode("engines", "Motoren", [], [ul]);
+    const nodes = [ul];
+    if (hasTools) nodes.push(h("p", { className: "actions-hint settings-engine-tools-note" }, [
+      h("span", { text: SETTINGS_TEXT.tools.explanation + " " }),
+      h("a", {
+        href: "https://github.com/" + window.TYBO_BRAND.repo + "/blob/HEAD/docs/erweiterungen.md#werkzeuge-im-ersatzmotor",
+        target: "_blank", rel: "noopener noreferrer", text: SETTINGS_TEXT.tools.documentation,
+      }),
+    ]));
+    return sectionNode("engines", "Motoren", [], nodes);
   }
 
   function restartSection() {
@@ -5368,9 +6066,13 @@ function createSettingsView(deps) {
     el.panel.replaceChildren(...[
       ...failed,
       ...catalogProblemNodes(),
-      // Motor oben (Issue #126): Standard, Codex, abweichende Gespräche
-      engineSection(),
-      h("p", { className: "settings-intro", text: "System-Prompt, Modell, Effort und zusätzliche Anweisungen je Agent. Modell und Effort gelten für Claude Code. Speichern gilt pro Agent." }),
+      // Motorwahl steht bei den Modellen (Issue #673).
+      h("p", { className: "settings-intro settings-engine-link" }, [
+        h("span", { text: "Standard-Motor und Ersatzstufen stehen unter " }),
+        motorSettingsLink("Modelle"),
+        h("span", { text: "." }),
+      ]),
+      h("p", { className: "settings-intro", text: "System-Prompt, Motor, Modell, Effort und zusätzliche Anweisungen je Agent. Modell und Effort gelten für Claude Code und Anthropic API. Speichern gilt pro Agent." }),
       agentNoticeNode(),
       catalogReady ? createSection() : null,
       list,
@@ -5424,6 +6126,7 @@ function createSettingsView(deps) {
     if (state.tab === "status" && (!wasOpen || previousTab !== "status")) {
       void loadStatus().then(() => scheduleStatusPoll());
     }
+    if (wasOpen && state.tab === "agenten" && previousTab !== "agenten") void loadEngines();
     // Bei jedem Öffnen frisch laden (in Telegram per /agent geändert, andere Browser)
     if (!wasOpen) {
       void load();
@@ -5431,6 +6134,7 @@ function createSettingsView(deps) {
       state.engines.notice = null;
       state.engines.rowError = null;
       void loadEngines();
+      void loadOpenRouterKey();
       state.agentNotice = null;
       void loadCatalog();
       // Prompts wie die Anweisungen; ein offener Entwurf bleibt stehen (Issue #51)
@@ -5465,6 +6169,7 @@ function createSettingsView(deps) {
 
   function hide() {
     state.open = false;
+    state.openrouterKey.seq++;
     // Eigene Stimme (Issue #253): kein Mikrofon bei geschlossenen Einstellungen
     if (voiceClone) voiceClone.close();
     stopStatusPoll();
@@ -5492,5 +6197,5 @@ function createSettingsView(deps) {
     return false;
   }
 
-  return { show, hide, isOpen: () => state.open, hasUnsavedChanges };
+  return { show, hide, isOpen: () => state.open, hasUnsavedChanges, refreshEngines: () => state.open ? loadEngines() : Promise.resolve() };
 }

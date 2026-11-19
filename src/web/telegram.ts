@@ -103,6 +103,8 @@ export interface TelegramTopicChangeEvent {
 
 /** Quelle der Live-Nachrichten; subscribe gibt die Abmeldung zurück */
 export interface TelegramLiveFeed {
+  /** Vor einer Job-Antwort bereits abgelegte Meldungen an die Browser weiterreichen. */
+  flush?(): Promise<boolean>;
   subscribe(listener: (event: TelegramLiveEvent) => void): () => void;
   /** Namensänderungen aus Telegram (Issue #32); gibt die Abmeldung zurück */
   subscribeTopicChanges?(listener: (event: TelegramTopicChangeEvent) => void): () => void;

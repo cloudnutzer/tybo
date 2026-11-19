@@ -15,19 +15,23 @@ import {
   resolveEngine,
   engineModelAndEffort,
   engineLabel,
+  stageLabel,
   sessionModel,
   shouldNotifyUnavailable,
+  shouldNotifyNoFreeStage,
   markEngineRecovered,
   unavailableNotice,
   modelFitsEngine,
   shouldNotifyModelMisfit,
   modelMisfitNotice,
+  triedStageIds,
 } from "./engine-choice";
 import { maskSecrets, projectSecretsOrThrow, type SecretValue } from "./jobs/mask";
-import { isAbortError } from "./execution-context";
+import { currentExecution, isAbortError } from "./execution-context";
+import { currentJobChain, withJobChain } from "./jobs/chain-context";
 import { sanitizeModelOutput } from "./telegram";
 import { fallbackReplyText, runFallbackChain, type FallbackResult } from "./fallback/chain";
-import { buildPromptContext, buildResumePrompt, type PromptChannel } from "./prompt-builder";
+import { buildPromptContext, buildResumePrompt, type PromptChannel, type PromptHandover } from "./prompt-builder";
 import { storeOr } from "./store";
 import { sessionKeyFor } from "./store/message-rules";
 import type { LogLevel } from "./store/types";
@@ -39,11 +43,22 @@ import {
   resetSession,
   getSessionsForKey,
   sessionEpoch,
+  retainHandover,
+  takeHandover,
+  SESSION_IDLE_MS,
+  type BotSession,
+  type SessionHandover,
+  type HandoverReason,
 } from "./session-manager";
 import { shouldDistill, distillSession } from "./session-distill";
 import { getAgentConfigOrGeneral } from "../agents";
 import { takeCallRecap } from "./call-recap";
-import { getSettings } from "./settings";
+import { getSettings, engineAuto } from "./settings";
+import { formatSwitchTime, modelFamily, pickStage, stageBlock, stageId, type Stage, type StageId } from "./engine-switch";
+import { readSwitchState } from "./engine-switch-state";
+import { checkSwitchNotices, conversationSwitchHint } from "./engine-switch-notify";
+import { ERROR_KIND_TEXT, failedAttemptPrompt, noteStageRun, stageFailureOf } from "./engine-switch-run";
+import { scheduleClaudeUsageAfterChat } from "./engines/claude-usage";
 import { bookRunOutcome } from "./spend/credit";
 import type { TurnTools } from "./turn-tools";
 import { stallPhaseLogText, stallPhaseUserText, type StallPhase } from "./stream-phase";
@@ -262,6 +277,11 @@ export interface TurnInfo {
    * niemand geantwortet hat. Bei Codex ohne eingestelltes Modell fehlt model.
    */
   engine?: EngineId;
+  /** Stufenkennung und Auswahlgrund bei aktiver Wechselregel (M14-06). */
+  stage?: StageId;
+  reason?: string;
+  /** Der Stand-Bericht nach einem Zeitlimit ist keine Antwort eines Ersatzmodells. */
+  timedOut?: boolean;
   durationMs: number;
 }
 
@@ -271,6 +291,9 @@ export interface ChatTurnDeps {
   getEngine: typeof getEngine;
   /** Motor des Gesprächs samt Verfügbarkeit (src/lib/engine-choice.ts, Issue #125) */
   resolveEngine: typeof resolveEngine;
+  readSwitchState: typeof readSwitchState;
+  noteStageRun: typeof noteStageRun;
+  scheduleClaudeUsageAfterChat: typeof scheduleClaudeUsageAfterChat;
   /** Ein Lauf meldete „nicht angemeldet/installiert": nächste Prüfung frisch */
   forgetEngineCheck: () => void;
   /** Fallback-Kette (src/lib/fallback/chain.ts), Kontext ist Pflicht */
@@ -280,6 +303,8 @@ export interface ChatTurnDeps {
   isSessionModeEnabled: typeof isSessionModeEnabled;
   getResumableSession: typeof getResumableSession;
   takeExpiredSession: typeof takeExpiredSession;
+  retainHandover: typeof retainHandover;
+  takeHandover: typeof takeHandover;
   recordSessionTurn: typeof recordSessionTurn;
   getSessionsForKey: typeof getSessionsForKey;
   sessionEpoch: typeof sessionEpoch;
@@ -308,6 +333,9 @@ export interface ChatTurnDeps {
 const defaultDeps: ChatTurnDeps = {
   getEngine,
   resolveEngine,
+  readSwitchState,
+  noteStageRun,
+  scheduleClaudeUsageAfterChat,
   forgetEngineCheck,
   runFallbackChain,
   buildPromptContext,
@@ -315,6 +343,8 @@ const defaultDeps: ChatTurnDeps = {
   isSessionModeEnabled,
   getResumableSession,
   takeExpiredSession,
+  retainHandover,
+  takeHandover,
   recordSessionTurn,
   getSessionsForKey,
   sessionEpoch,
@@ -358,11 +388,22 @@ export type SessionIdListener = (id: string, meta: TurnSessionMeta) => void;
 /** Rückruf für Motor und Modell eines Turns, auch ohne Session-ID (Issue #122) */
 export type SessionMetaListener = (meta: TurnSessionMeta) => void;
 
+/** Für dieselbe Eingabe bereits außerhalb des Turns gescheiterter Stufenversuch. */
+export interface PriorAttempt {
+  stage: { engine: EngineId; model?: string };
+  result: EngineResult;
+}
+
 export interface TurnOptions {
+  /** --zurueck-Kette dieses Turns, an alle Subprozess-Motoren weitergereicht. */
+  jobChain?: number;
   userMessage: string;
   chatId: string;
   agentName: string;
   topicId?: number;
+  priorAttempts?: PriorAttempt[];
+  /** Gesammelte Hinweise dürfen nach Abschluss keinen veralteten Laufzeit-Hinweis zeigen. */
+  longRunNotices?: boolean;
   /** Motor des Turns; fehlt: Motor des Gesprächs (resolveEngine: /motor, Standard, TYBO_ENGINE, Claude) */
   engine?: EngineId;
   /**
@@ -446,6 +487,9 @@ export interface TurnQuestion extends FoundQuestion {
  * slim resume prompt. Otherwise: full context prompt (fresh session). Eine
  * Session eines anderen Motors wird nie fortgesetzt (Issue #122), sondern
  * wie eine abgelaufene über ihren eigenen Motor destilliert.
+ * Bei einem Motor- oder Modellwechsel bekommt der volle Prompt zusätzlich
+ * den Übergabe-Verlauf. Seine Herkunft bleibt ohne Session-ID als Notiz bis
+ * zum Speichern der neuen Session erhalten, auch nach Fehler oder /stop.
  */
 export async function prepareClaudeCall(
   userMessage: string, // Nachricht des Nutzers, so wie sie in den Prompt geht
@@ -455,7 +499,8 @@ export async function prepareClaudeCall(
   model?: string,
   deps?: Partial<ChatTurnDeps>,
   engine: EngineId = DEFAULT_ENGINE,
-  channel?: PromptChannel // Kanal der Antwort (Issue #358); fehlt er, gelten die Telegram-Regeln
+  channel?: PromptChannel, // Kanal der Antwort (Issue #358); fehlt er, gelten die Telegram-Regeln
+  handoverReason: (session: BotSession) => HandoverReason = () => "changed",
 ): Promise<{
   sessionKey: string;
   resumeId?: string;
@@ -464,12 +509,16 @@ export async function prepareClaudeCall(
   memoryWatermark: number;
   /** Fakten, die die Session mit diesem Prompt kennt; verbucht erst nach einem gelungenen Lauf */
   shownFactIds?: string[];
+  expiredSession?: BotSession;
+  resumedSession?: BotSession;
+  handover?: SessionHandover;
 }> {
   const d = resolveDeps(deps);
   // Modell der Session: Agenten-Modell nur für Claude, sonst das des Motors oder "" (Issue #125)
   const resolvedModel = model ?? sessionModel(engineModelAndEffort(engine, agentName, d).model);
   const memoryWatermark = Date.now();
   const sessionKey = sessionKeyFor(chatId, topicId ?? null);
+  const epoch = d.sessionEpoch(sessionKey);
   const session = d.isSessionModeEnabled()
     ? await d.getResumableSession(sessionKey, agentName, resolvedModel, engine)
     : undefined;
@@ -491,6 +540,7 @@ export async function prepareClaudeCall(
     return {
       sessionKey,
       resumeId: session.engineSessionId,
+      resumedSession: session,
       fullPrompt,
       fallbackContext: "",
       memoryWatermark,
@@ -500,19 +550,42 @@ export async function prepareClaudeCall(
 
   // Fresh session ahead: if an expired/model-mismatched session is lying
   // around, distill its insights into memory first (fire-and-forget).
+  let expiredSession: BotSession | undefined;
+  let handover: SessionHandover | undefined;
   if (d.isSessionModeEnabled()) {
-    const expired = await d.takeExpiredSession(sessionKey, agentName, resolvedModel, engine);
-    if (expired && d.shouldDistill(expired)) void d.distillSession(expired);
+    expiredSession = await d.takeExpiredSession(sessionKey, agentName, resolvedModel, engine);
+    if (expiredSession) {
+      if (Date.now() - expiredSession.lastActivity <= SESSION_IDLE_MS
+        && (expiredSession.engine !== engine || expiredSession.model !== resolvedModel)) {
+        await d.retainHandover(sessionKey, sessionHandover(expiredSession, handoverReason(expiredSession)), epoch);
+        handover = await d.takeHandover(sessionKey, agentName, { preserveUntilRecorded: true });
+      }
+      if (d.shouldDistill(expiredSession)) void d.distillSession(expiredSession);
+    } else {
+      handover = await d.takeHandover(sessionKey, agentName, { preserveUntilRecorded: true });
+    }
   }
 
   const { fullPrompt, fallbackContext, shownFactIds } = await d.buildPromptContext({
     userMessage,
     chatId,
     agentName,
+    ...(engine === "codex" ? { engine } : {}),
     topicId,
     ...(channel ? { channel } : {}),
+    ...(handover ? { handover: promptHandover(handover) } : {}),
   });
-  return { sessionKey, resumeId: undefined, fullPrompt, fallbackContext, memoryWatermark, ...(shownFactIds ? { shownFactIds } : {}) };
+  return { sessionKey, resumeId: undefined, fullPrompt, fallbackContext, memoryWatermark,
+    expiredSession, handover, ...(shownFactIds ? { shownFactIds } : {}) };
+}
+
+function sessionHandover(session: BotSession, reason: HandoverReason): SessionHandover {
+  return { agentName: session.agentName, engine: session.engine, model: session.model,
+    since: session.startedAt, notedAt: Date.now(), reason };
+}
+
+function promptHandover(note: SessionHandover): PromptHandover {
+  return { fromLabel: stageLabel({ engine: note.engine, model: note.model || undefined }), reason: note.reason, since: note.since };
 }
 
 /**
@@ -645,22 +718,22 @@ function isLostApiSession(result: EngineResult): boolean {
   return result.engine === "api" && result.isError && !result.aborted && !result.timedOut && result.errorKind === "context";
 }
 
-/** Hinweis, wenn die Sitzung des Motors fehlt und Claude Code antwortet */
-export function sessionLostNotice(engine: EngineId): string {
-  return `Die Sitzung von ${engineLabel(engine)} ist nicht mehr vorhanden, ich antworte mit ${engineLabel("claude")}.`;
+/** Nur Fehler, die eine frische Session beheben könnte, rechtfertigen den Retry. */
+export function canRetryResume(result: EngineResult): boolean {
+  if (result.aborted || result.timedOut || (!result.isError && result.text)) return false;
+  return !result.isError || result.errorKind === undefined || result.errorKind === "other"
+    || result.errorKind === "context" || result.errorKind === "rate_limit";
+}
+
+/** Hinweis zur verlorenen Sitzung mit der tatsächlich einspringenden Stufe. */
+export function sessionLostNotice(engine: EngineId, answering: Stage | null = { engine: "claude" }): string {
+  return `Die Sitzung von ${engineLabel(engine)} ist nicht mehr vorhanden, `
+    + (answering ? `ich antworte mit ${stageLabel(answering)}.` : "es antwortet das Ersatzmodell.");
 }
 
 function unavailableReason(engine: EngineId, kind: EngineErrorKind | undefined): string {
   return kind === "auth" ? `${engineLabel(engine)} ist nicht angemeldet.` : `${engineLabel(engine)} ist nicht installiert.`;
 }
-
-const ERROR_KIND_TEXT: Partial<Record<EngineErrorKind, string>> = {
-  usage_limit: "Nutzungsgrenze erreicht",
-  rate_limit: "zu viele Anfragen",
-  quota: "Kontingent aufgebraucht",
-  capacity: "überlastet",
-  context: "Gespräch zu lang",
-};
 
 /** Hinweis, wenn ein anderer Motor als Claude ausfällt und die Fallback-Kette antwortet */
 export function engineFailedNotice(engine: EngineId, kind?: EngineErrorKind): string {
@@ -668,62 +741,43 @@ export function engineFailedNotice(engine: EngineId, kind?: EngineErrorKind): st
   return `${engineLabel(engine)} hat keine Antwort geliefert${why ? ` (${why})` : ""}, es antwortet das Ersatzmodell.`;
 }
 
+function freeAgainText(freeAt?: string): string {
+  return freeAt ? ` Frühestens wieder frei: ${formatSwitchTime(freeAt, process.env.USER_TIMEZONE || "UTC")} Uhr.` : "";
+}
+
+/** Gemeinsame feste Antwort vor dem ersten Lauf und nach aufgegebenen Stufen. */
+export function noFreeEngineReply(freeAt?: string): string {
+  return "Gerade ist kein Motor frei, und auch die Ersatzmodelle haben nicht geantwortet."
+    + freeAgainText(freeAt) + (freeAt ? " Bitte versuch es dann noch einmal." : " Bitte versuch es in ein paar Minuten noch einmal.");
+}
+
 async function runTurn(mode: TurnMode, opts: TurnOptions): Promise<string> {
+  let claudeRan = false;
+  try {
+    return await withJobChain(opts.jobChain ?? currentJobChain(), () => runTurnBody(mode, opts, () => { claudeRan = true; }));
+  } finally {
+    // Der Messlauf beginnt verzögert nach dem Turn und hält dessen Antwort nicht auf.
+    if (claudeRan) (opts.deps?.scheduleClaudeUsageAfterChat ?? scheduleClaudeUsageAfterChat)();
+  }
+}
+
+async function runTurnBody(mode: TurnMode, opts: TurnOptions, claudeFinished: () => void): Promise<string> {
   const { userMessage, chatId, agentName, topicId } = opts;
-  const d = resolveDeps(opts.deps);
+  const resolved = resolveDeps(opts.deps);
+  const settings = resolved.getSettings();
+  const d = { ...resolved, getSettings: () => settings };
   const startedAt = d.now();
   const sink = guardSink(opts.sink);
   const agentConfig = d.getAgentConfig(agentName);
   const conversationKey = sessionKeyFor(chatId, topicId ?? null);
 
-  // Vor allem anderen: ein /new ab hier verwirft die Session dieses Turns
+  // Reiner /new-Merker im Arbeitsspeicher, kein Zugriff auf eine Session oder
+  // deren Datei. Auch ein Reset während der Motorprüfung verwirft das Ergebnis.
   const epoch = d.sessionEpoch(conversationKey);
   // Telefongespräch (Issue #260): genau einmal als Turn-Hinweis, also an jedem Prompt dieses Turns
   const callRecap = opts.skipCallRecap ? undefined : d.takeCallRecap(conversationKey);
   const turnHint = [opts.turnHint?.trim(), callRecap].filter(Boolean).join("\n\n") || undefined;
 
-  // Motor vor der Prompt-Auswahl (Issue #125): /motor des Gesprächs, Standard,
-  // TYBO_ENGINE, Claude; ein nicht bereiter Motor wird übersprungen. Eine
-  // Session eines anderen Motors wird nicht fortgesetzt.
-  let engineNotice: string | undefined;
-  let engineId: EngineId;
-  if (opts.engine) {
-    engineId = opts.engine;
-  } else {
-    const chosen = await d.resolveEngine(conversationKey, { getSettings: d.getSettings });
-    engineId = chosen.engine;
-    engineNotice = chosen.notice;
-  }
-  // Modell und Effort je Motor, einmal pro Turn aufgeloest (Claude: Einstellungen
-  // vor .env vor Agenten-Datei; Codex: engine.codex, OpenCode: engine.opencode,
-  // leer = Konfiguration des Motors).
-  // Sessionpruefung, Aufruf, Retry, Speicherung und TurnInfo nutzen dasselbe.
-  let current = { engineId, ...engineModelAndEffort(engineId, agentName, d) };
-  // Modell des Aufrufs: das Turn-Modell (Sprech-Turn), wenn es zum Motor passt, sonst das des Gesprächs.
-  // Je Motor einmal bestimmt; ein unpassendes Modell ergibt einen Hinweis, einmal je Gespräch
-  const misfits: string[] = [];
-  const callModels = new Map<EngineId, { model?: string; effort?: string }>();
-  const callModel = (): { model?: string; effort?: string } => {
-    const known = callModels.get(current.engineId);
-    if (known) return known;
-    let chosen: { model?: string; effort?: string } = { model: current.model, effort: current.effort };
-    const wanted = opts.turnModel?.model?.trim();
-    if (wanted) {
-      if (modelFitsEngine(current.engineId, wanted)) {
-        const effort = current.engineId === "claude" ? opts.turnModel?.effort : current.effort;
-        chosen = { model: wanted, ...(effort ? { effort } : {}) };
-      } else if (shouldNotifyModelMisfit(conversationKey, current.engineId, wanted)) {
-        misfits.push(modelMisfitNotice(current.engineId, wanted));
-      }
-    }
-    callModels.set(current.engineId, chosen);
-    return chosen;
-  };
-  /** Hinweise zu einem unpassenden Turn-Modell ins Gespräch, sobald der Kanal bereit ist */
-  const flushMisfits = async () => {
-    for (const text of misfits.splice(0)) await sink.notice(text);
-  };
-  const streaming = mode === "streaming";
   const reportTools = (tools: TurnTools | undefined) => {
     try {
       opts.onTools?.(tools);
@@ -731,11 +785,14 @@ async function runTurn(mode: TurnMode, opts: TurnOptions): Promise<string> {
       // Die Werkzeugliste darf den Turn nie stoeren
     }
   };
-  const report = (model: string | undefined, engine?: EngineId) => {
+  const report = (model: string | undefined, engine?: EngineId, stage?: StageId, reason?: string, timedOut?: boolean) => {
     const info: TurnInfo = {
       agent: agentName,
       ...(model ? { model } : {}),
       ...(engine ? { engine } : {}),
+      ...(stage ? { stage } : {}),
+      ...(reason ? { reason } : {}),
+      ...(timedOut ? { timedOut: true } : {}),
       durationMs: Math.max(0, Math.round(d.now() - startedAt)),
     };
     try {
@@ -744,14 +801,140 @@ async function runTurn(mode: TurnMode, opts: TurnOptions): Promise<string> {
       // Die Anzeige-Angaben duerfen den Turn nie stoeren
     }
   };
+  // Motor vor der Prompt-Auswahl: /motor, Agent, Standard, TYBO_ENGINE, Claude und
+  // bei Ersatzstufen die Wechselregel. Andere Motoren/Modelle beginnen frisch.
+  const priorAttempts = opts.priorAttempts ?? [];
+  const priorStages = priorAttempts.map(attempt => attempt.stage);
+  const chosen = opts.engine ? undefined : await d.resolveEngine(conversationKey,
+    { getSettings: d.getSettings, getAgentConfig: d.getAgentConfig, now: d.now,
+      checkSwitch: (statuses, choiceDeps) => checkSwitchNotices(statuses, { ...choiceDeps, readSwitchState: d.readSwitchState }) },
+    { agentName, ...(priorStages.length ? { tried: priorStages } : {}) });
+  const modelOf = (stage: Stage) => stage.model ?? engineModelAndEffort(stage.engine, agentName, d).model;
+  const tried = triedStageIds(chosen?.order ?? [], modelOf, priorStages);
+  let stageAttempts = priorAttempts.length;
+  const failedClaudeModels = new Set<string | undefined>();
+  const failedAttempts: string[] = [];
+  const addFailedAttempt = (stage: Stage, result: EngineResult) => {
+    let secrets: readonly SecretValue[] | undefined;
+    try { secrets = d.reportSecrets(); } catch { /* Ohne lesbare Quelle nur Werkzeugnamen. */ }
+    failedAttempts.push(failedAttemptPrompt(stage, result.isError ? result.errorKind : "empty", result.tools, secrets));
+  };
+  const withFailedAttempts = (prompt: string) => [prompt, ...failedAttempts].join("\n\n");
+  for (const attempt of priorAttempts) {
+    addFailedAttempt(attempt.stage, attempt.result);
+    if (attempt.stage.engine === "claude") failedClaudeModels.add(modelFamily(attempt.stage.model) ?? attempt.stage.model);
+  }
+  const allowClaudeCli = chosen?.claudeReady === undefined && !priorAttempts.length ? undefined : (model: string): boolean =>
+    chosen?.claudeReady !== false && !stageBlock({ engine: "claude" }, model, d.readSwitchState(), d.now())
+      && !failedClaudeModels.has(modelFamily(model) ?? model);
+  if (chosen?.kind === "none" || stageAttempts >= 3) {
+    // Kein Zugriff auf Sessions: auch ein vorhandener Zeiger bleibt unangetastet.
+    const { fallbackContext } = await d.buildPromptContext({ userMessage, chatId, agentName, topicId,
+      ...(opts.channel ? { channel: opts.channel } : {}) });
+    const freeAt = chosen?.kind === "none" ? chosen.freeAt : undefined;
+    const freeAgain = freeAgainText(freeAt);
+    const failedReply = noFreeEngineReply(freeAt);
+    await sink.start();
+    if (shouldNotifyNoFreeStage(conversationKey)) {
+      await sink.notice("Gerade ist kein Motor frei (Limit erreicht oder nicht bereit). Es antwortet ein Ersatzmodell mit eingeschränktem Werkzeugumfang." + freeAgain);
+    }
+    await sink.finish();
+    reportTools(undefined);
+    try {
+      const fallback = await d.runFallbackChain({ question: withTurnHint(userMessage, turnHint), context: withFailedAttempts(fallbackContext), allowClaudeCli });
+      report(fallback.source !== "none" ? fallback.model || fallback.source : undefined);
+      return fallback.source === "none" ? failedReply : renderQuestionTags(fallbackReplyText(fallback));
+    } catch (error) {
+      report(undefined);
+      if (isAbortError(error)) return ABORT_REPLY;
+      console.error("[Fallback] Kette ohne freien Motor mit Fehler beendet.");
+      return failedReply;
+    }
+  }
+  const engineId = opts.engine ?? chosen!.engine;
+  const engineNotice = chosen?.notice;
+  const useSwitchRule = chosen?.claudeReady !== undefined;
+  const auto = engineAuto(settings);
+  // Auch alte Attrappen ohne kind bleiben gültig. order bleibt für den ganzen
+  // Turn fest; weitere Stufen stammen ausschließlich von hier.
+  const order: readonly Stage[] = chosen?.order ?? [{ engine: engineId }];
+  const skippedWish = chosen?.skipped?.find(entry => stageId(entry.stage) === stageId(order[0]));
+  let hintReason: "limit" | "outage" = skippedWish?.reason === "blocked" && skippedWish.block.cause !== "outage" ? "limit" : "outage";
+  for (const attempt of priorAttempts) {
+    if (attempt.stage.engine === order[0].engine && sessionModel(attempt.stage.model) === sessionModel(modelOf(order[0]))) {
+      hintReason = stageFailureOf(attempt.result) ?? hintReason;
+    }
+  }
+  const nextStage = () => pickStage(order, modelOf, d.readSwitchState(), chosen!.ready!, d.now(), tried);
+  const selectedStage = chosen?.stage ?? { engine: engineId };
+  // Modell und Effort je Motor, einmal pro Turn aufgeloest (Claude: Einstellungen
+  // vor .env vor Agenten-Datei; Codex: engine.codex, OpenCode: engine.opencode,
+  // leer = Konfiguration des Motors).
+  // Sessionpruefung, Aufruf, Retry, Speicherung und TurnInfo nutzen dasselbe.
+  let current = { stage: selectedStage, stageId: chosen?.stageId ?? stageId(selectedStage), engineId,
+    ...(useSwitchRule ? { model: chosen?.model, effort: chosen?.effort } : engineModelAndEffort(engineId, agentName, d, selectedStage)),
+    reason: chosen?.reason };
+  // Modell des Aufrufs: das Turn-Modell (Sprech-Turn), wenn es zum Motor passt, sonst das des Gesprächs.
+  // Je Stufe einmal bestimmt; ein unpassendes Modell ergibt einen Hinweis, einmal je Gespräch
+  const misfits: string[] = [];
+  const callModels = new Map<StageId, { model?: string; effort?: string }>();
+  const callModel = (): { model?: string; effort?: string } => {
+    const known = callModels.get(current.stageId);
+    if (known) return known;
+    let chosen: { model?: string; effort?: string } = { model: current.model, effort: current.effort };
+    const wanted = opts.turnModel?.model?.trim();
+    const desiredStage = !useSwitchRule || current.stageId === stageId(order[0]);
+    const turnModelBlocked = wanted && useSwitchRule
+      && stageBlock({ engine: current.engineId }, wanted, d.readSwitchState(), d.now());
+    if (wanted && desiredStage && !turnModelBlocked) {
+      if (modelFitsEngine(current.engineId, wanted)) {
+        const effort = current.engineId === "claude" ? opts.turnModel?.effort : current.effort;
+        chosen = { model: wanted, ...(effort ? { effort } : {}) };
+      } else if (shouldNotifyModelMisfit(conversationKey, current.engineId, wanted)) {
+        misfits.push(modelMisfitNotice(current.engineId, wanted));
+      }
+    }
+    callModels.set(current.stageId, chosen);
+    return chosen;
+  };
+  /** Hinweise zu einem unpassenden Turn-Modell ins Gespräch, sobald der Kanal bereit ist */
+  const flushMisfits = async () => {
+    for (const text of misfits.splice(0)) await sink.notice(text);
+  };
+  const streaming = mode === "streaming";
 
   // Assemble the prompt (topic-isolated conversation, memory, knowledge base,
   // semantic search on every message): see lib/prompt-builder. In resume
   // mode the prompt is slim: the Claude session already holds the context.
-  let { sessionKey, resumeId, fullPrompt, fallbackContext, memoryWatermark, shownFactIds } =
-    await prepareClaudeCall(userMessage, chatId, agentName, topicId, sessionModel(current.model), d, engineId, opts.channel);
+  const reasonForHandover = (old: BotSession): HandoverReason => {
+    const priorFailure = priorAttempts.length ? stageFailureOf(priorAttempts[priorAttempts.length - 1].result) : undefined;
+    if (priorFailure) return priorFailure;
+    const skipped = chosen?.skipped?.find(entry => entry.stage.engine === old.engine && sessionModel(modelOf(entry.stage)) === old.model);
+    if (skipped?.reason === "not_ready") return "outage";
+    if (skipped?.reason === "blocked") return skipped.block.cause === "outage" ? "outage" : "limit";
+    // Ohne Ersatzstufen kennt resolveEngine keine skipped-Liste, aber den nicht bereiten Wunschmotor.
+    if (chosen && !useSwitchRule && chosen.requested === old.engine && chosen.engine !== old.engine) return "outage";
+    return "changed";
+  };
+  let { sessionKey, resumeId, fullPrompt, fallbackContext, memoryWatermark, shownFactIds, resumedSession, handover } =
+    await prepareClaudeCall(userMessage, chatId, agentName, topicId, sessionModel(current.model), d, engineId, opts.channel, reasonForHandover);
   // Fortsetzungs-Prompt ist schlank; ein Wechsel auf einen anderen Motor braucht den vollen
   let promptIsFull = !resumeId;
+  let builtHandover = handover;
+  let builtEngine = engineId;
+  const needsFullPrompt = () => !promptIsFull || builtHandover !== handover
+    || (builtEngine === "codex") !== (current.engineId === "codex");
+
+  const beginHandover = async (reason: HandoverReason) => {
+    if (!d.isSessionModeEnabled()) return;
+    // Auch nach gescheitertem Resume und frischem Versuch bleibt der ursprüngliche Beginn bekannt.
+    const origin = handover ?? (resumedSession ? sessionHandover(resumedSession, reason) : undefined);
+    if (!origin) return;
+    await d.retainHandover(sessionKey, { ...origin, reason }, epoch);
+    handover = await d.takeHandover(sessionKey, agentName, { preserveUntilRecorded: true });
+    // Kein Zeiger auf einen aufgegebenen Motor bleibt zum Fortsetzen liegen.
+    await d.resetSession(sessionKey, agentName);
+  };
 
   await sink.start();
   if (engineNotice) await sink.notice(engineNotice);
@@ -798,7 +981,13 @@ async function runTurn(mode: TurnMode, opts: TurnOptions): Promise<string> {
   // for the duration of each call and repeats every 20 minutes below the
   // upper bound; it names the minutes actually passed.
   const maxMs = limits?.maxMs ?? JSON_CALL_TIMEOUT_MS;
+  let pendingStageRun = Promise.resolve();
   const call = async (prompt: string, resumeSessionId?: string): Promise<EngineResult> => {
+    if (currentExecution()?.controller.signal.aborted) return { engine: current.engineId, text: "", isError: true, aborted: true };
+    if (useSwitchRule) {
+      const hint = conversationSwitchHint(conversationKey, order[0], current.stage, hintReason, !!builtHandover, d.now(), agentName);
+      if (hint) await sink.notice(hint);
+    }
     const callStartedAt = d.now();
     let notices = 0;
     let done = false;
@@ -819,17 +1008,23 @@ async function runTurn(mode: TurnMode, opts: TurnOptions): Promise<string> {
         if (due + LONG_RUN_NOTICE_MS < maxMs) arm();
       }, LONG_RUN_NOTICE_MS);
     };
-    arm();
+    if (opts.longRunNotices !== false) arm();
     try {
       const request: EngineRequest = {
         // Turn-Hinweis (Sprech-Turn) an jedem Aufruf: erster Lauf, neuer Versuch, Wechsel auf Claude Code
-        prompt: withTurnHint(prompt, turnHint),
+        prompt: withTurnHint(withFailedAttempts(prompt), turnHint),
         ...(resumeSessionId ? { resumeSessionId } : {}),
         ...baseOpts(),
         ...timeouts,
         ...(streaming ? streamCallbacks : {}),
       };
+      if (!tried.has(current.stageId)) stageAttempts++;
+      tried.add(current.stageId);
       const result = await engine.run(request);
+      // Auch leer oder rate_limit zählt als gescheitert, unabhängig von Sperren.
+      if (current.engineId === "claude" && (result.isError || !result.text)) {
+        failedClaudeModels.add(modelFamily(request.model) ?? request.model);
+      }
       // Genau eine Buchung je Lauf (Issue #346): vor Abbruch, neuem Versuch,
       // Motorwechsel und Fehler-Rückgabe, also für jeden gestarteten Lauf
       void bookRunOutcome("chat", result.engine, request.model, result);
@@ -846,86 +1041,108 @@ async function runTurn(mode: TurnMode, opts: TurnOptions): Promise<string> {
       userMessage,
       chatId,
       agentName,
+      ...(current.engineId === "codex" ? { engine: current.engineId } : {}),
       topicId,
       ...(opts.channel ? { channel: opts.channel } : {}),
+      ...(handover ? { handover: promptHandover(handover) } : {}),
     }));
     promptIsFull = true;
+    builtHandover = handover;
+    builtEngine = current.engineId;
   };
 
-  /**
-   * Der Motor meldet beim Lauf „nicht angemeldet" oder „nicht installiert",
-   * obwohl die Prüfung bereit sagte (Entscheidung 0018, Issue #125): wie
-   * beim Überspringen vor dem Turn antwortet Claude Code, mit einer Meldung
-   * je Gespräch, frisch ohne Resume. Nicht nach Abbruch oder Zeitlimit.
-   */
-  const switchToClaude = async (failed: EngineResult, why: "unavailable" | "session" = "unavailable"): Promise<EngineResult> => {
+  /** Ohne Ersatzstufen bleibt das bisherige Einspringen auf Claude Code erhalten. */
+  const legacyClaudeRetry = async (failed: EngineResult, why: "unavailable" | "session"): Promise<EngineResult> => {
     const from = failed.engine;
+    await beginHandover("outage");
     console.warn(`[Motor] ${engineLabel(from)} meldet ${failed.errorKind} für ${conversationKey}, antworte mit Claude Code`);
     if (why === "session") {
       await sink.notice(sessionLostNotice(from));
-    } else {
-      d.forgetEngineCheck();
-      if (shouldNotifyUnavailable(conversationKey, from, "run")) {
-        await sink.notice(unavailableNotice(from, unavailableReason(from, failed.errorKind)));
-      }
+    } else if (shouldNotifyUnavailable(conversationKey, from, "run")) {
+      await sink.notice(unavailableNotice(from, unavailableReason(from, failed.errorKind)));
     }
-    current = { engineId: "claude", ...engineModelAndEffort("claude", agentName, d) };
+    current = { stage: { engine: "claude" }, stageId: "claude", engineId: "claude",
+      ...engineModelAndEffort("claude", agentName, d), reason: undefined };
     engine = d.getEngine("claude");
-    // Das Turn-Modell neu gegen Claude Code prüfen
     callModel();
     await flushMisfits();
-    if (!promptIsFull) await rebuildFullPrompt();
-    return await call(fullPrompt);
+    if (needsFullPrompt()) await rebuildFullPrompt();
+    return call(fullPrompt);
   };
 
+  const noteResult = (result: EngineResult, abandoned = true) => {
+    if (useSwitchRule) pendingStageRun = d.noteStageRun(current.stage, callModel().model, result, auto, d.now(), undefined, { abandoned });
+    if (result.engine === "claude" && !result.aborted) claudeFinished();
+  };
   let result = await call(fullPrompt, resumeId);
+  while (true) {
+    // Gilt nach jedem Lauf und auch bei /stop während der Zustandsablage.
+    if (result.aborted || currentExecution()?.controller.signal.aborted) {
+      noteResult({ ...result, aborted: true }, false);
+      await sink.finish();
+      return ABORT_REPLY;
+    }
+    const lostSession = !!resumeId && isLostApiSession(result);
+    if (useSwitchRule && !result.timedOut && (result.isError || !result.text)) {
+      addFailedAttempt({ ...current.stage, model: callModel().model }, result);
+    }
+    if (!result.timedOut && result.isError && (result.errorKind === "auth" || result.errorKind === "not_installed")) {
+      d.forgetEngineCheck();
+    }
+    const retryResume = resumeId && !lostSession && canRetryResume(result);
+    if (retryResume) {
+      // Noch nicht aufgegeben: Messung übernehmen, aber keine Fehlersperre.
+      noteResult(result, false);
+      console.warn(`[Session] Fortsetzen für ${sessionKey} fehlgeschlagen, versuche frisch.`);
+      await d.resetSession(sessionKey, agentName);
+      await rebuildFullPrompt();
+      resumeId = undefined;
+      result = await call(fullPrompt);
+      continue;
+    }
 
-  // Vom User abgebrochen (/stop): kein Retry, kein Fallback
-  if (result.aborted) {
-    await sink.finish();
-    return ABORT_REPLY;
-  }
-
-  if (isEngineUnavailable(result)) {
-    result = await switchToClaude(result);
-    if (result.aborted) {
-      await sink.finish();
-      return ABORT_REPLY;
+    noteResult(result);
+    const failure = stageFailureOf(result);
+    if (lostSession) await d.resetSession(sessionKey, agentName);
+    if (useSwitchRule && (failure || lostSession)) {
+      await pendingStageRun;
+      if (currentExecution()?.controller.signal.aborted) {
+        await sink.finish();
+        return ABORT_REPLY;
+      }
+      await beginHandover(failure ?? "outage");
+      const next = nextStage();
+      if (stageAttempts >= 3 || next.kind === "none") {
+        if (lostSession) await sink.notice(sessionLostNotice(result.engine, null));
+        break;
+      }
+      const previous = current.stage;
+      if (stageId(previous) === stageId(order[0])) hintReason = failure ?? "outage";
+      const reason = `${stageLabel(previous)}: ${failure ?? "Sitzung verloren"}`;
+      if (lostSession) await sink.notice(sessionLostNotice(result.engine, next.stage));
+      sink.progress({ kind: "tool", text: `${stageLabel(previous)} ${failure === "limit" ? "ist am Limit" : "antwortet nicht"}, ${stageLabel(next.stage)} übernimmt.` });
+      current = { stage: next.stage, stageId: stageId(next.stage), engineId: next.stage.engine,
+        ...engineModelAndEffort(next.stage.engine, agentName, d, next.stage), reason };
+      engine = d.getEngine(current.engineId);
+      callModel();
+      await flushMisfits();
+      if (needsFullPrompt()) await rebuildFullPrompt();
+      resumeId = undefined;
+      result = await call(fullPrompt);
+      continue;
     }
-  } else if (resumeId && isLostApiSession(result)) {
-    // Sitzung des Motors api fehlt, ist ungültig oder beschädigt (Issue #348):
-    // kein frischer Lauf auf der API, Claude Code antwortet mit dem vollen Prompt
-    await d.resetSession(sessionKey, agentName);
-    result = await switchToClaude(result, "session");
-    if (result.aborted) {
-      await sink.finish();
-      return ABORT_REPLY;
+    if (!useSwitchRule && (isEngineUnavailable(result) || lostSession)) {
+      result = await legacyClaudeRetry(result, lostSession ? "session" : "unavailable");
+      resumeId = undefined;
+      continue;
     }
-  } else if (isClaudeMissing(result)) {
-    // Ohne Programm hilft auch eine frische Session nicht (Issue #565): die
-    // Session bleibt, nur der volle Kontext wird für das Ersatzmodell gebaut
-    if (!promptIsFull) await rebuildFullPrompt();
-  } else if (resumeId && !result.timedOut && (result.isError || !result.text)) {
-    // Resume can fail (session file gone, CLI updated, context limit):
-    // reset the session and retry once with a fresh full prompt. Not after a
-    // timeout: that would burn another full window on the same task.
-    console.warn(
-      `[Session] ${streaming ? "streaming resume" : "resume"} failed for ${sessionKey}, retrying fresh`
-    );
-    await d.resetSession(sessionKey, agentName);
-    await rebuildFullPrompt();
-    result = await call(fullPrompt);
-    if (!result.aborted && isEngineUnavailable(result)) result = await switchToClaude(result);
-    if (result.aborted) {
-      await sink.finish();
-      return ABORT_REPLY;
-    }
+    break;
   }
 
   // Der Motor hat geantwortet: nachgewiesen wieder bereit, ein späterer Ausfall
   // wird erneut gemeldet (eine positive Vorprüfung allein reicht nicht). Gilt
   // auch für Claude Code, dessen fehlendes Programm einmal gemeldet wird (Issue #565)
-  if (!result.isError && !result.timedOut) markEngineRecovered(conversationKey, result.engine);
+  if (!result.isError && !result.timedOut && result.text) markEngineRecovered(conversationKey, result.engine);
 
   // Die getippte Nachricht hat eine offene Rückfrage beantwortet (Motor api):
   // im Register schließen, noch unter der Sperre des Gesprächs, damit ein
@@ -1012,7 +1229,7 @@ async function runTurn(mode: TurnMode, opts: TurnOptions): Promise<string> {
     });
     // Werkzeuge des abgebrochenen Laufs: fremde Inhalte gelten auch hier
     reportTools(result.tools);
-    report(undefined);
+    report(undefined, undefined, undefined, undefined, true);
     return reply;
   }
 
@@ -1036,26 +1253,33 @@ async function runTurn(mode: TurnMode, opts: TurnOptions): Promise<string> {
 
     // Was das Fallback-Modell an Werkzeugen nutzte, ist nicht bekannt
     reportTools(undefined);
+    const fallbackFreeAt = () => {
+      const picked = nextStage();
+      return picked.kind === "none" ? picked.freeAt : undefined;
+    };
     let fallback: FallbackResult;
     try {
-      // Der Hinweis hängt an der Frage, nicht am Kontext: der kann leer sein (fortgesetzte Session)
-      fallback = await d.runFallbackChain({ question: withTurnHint(userMessage, turnHint), context: fallbackContext });
+      if (needsFullPrompt()) await rebuildFullPrompt();
+      // Neue Messwerte müssen vor der synchronen Freigabe der CLI sichtbar sein.
+      await pendingStageRun;
+      fallback = await d.runFallbackChain({ question: withTurnHint(userMessage, turnHint), context: withFailedAttempts(fallbackContext),
+        ...(allowClaudeCli ? { allowClaudeCli } : {}) });
     } catch (chainError) {
       report(undefined);
       // /stop während der Kette: wie ein Abbruch des Hauptmotors, keine Fehlerantwort
       if (isAbortError(chainError)) return ABORT_REPLY;
       console.error("[Fallback] Kette mit Fehler beendet:", chainError);
-      return FALLBACK_FAILED_REPLY;
+      return useSwitchRule ? noFreeEngineReply(fallbackFreeAt()) : FALLBACK_FAILED_REPLY;
     }
     // Strukturierte Herkunft statt den Herkunftszusatz zu parsen
     report(fallback.source !== "none" ? fallback.model || fallback.source : undefined);
     // Keine Rückfrage: das Ersatzmodell hat keine Session, die eine Antwort fortsetzen könnte
-    return renderQuestionTags(fallbackReplyText(fallback));
+    return useSwitchRule && fallback.source === "none" ? noFreeEngineReply(fallbackFreeAt()) : renderQuestionTags(fallbackReplyText(fallback));
   }
 
   reportTools(result.tools);
   // Das Modell, das geantwortet hat: bei einem Sprech-Turn das Turn-Modell
-  report(callModel().model, result.engine);
+  report(callModel().model, result.engine, useSwitchRule ? current.stageId : undefined, current.reason);
   const scan = scanForQuestion(result.text);
   if (scan.found && opts.onQuestion) {
     const question = turnQuestion(scan.found, {

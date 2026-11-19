@@ -33,7 +33,7 @@ afterEach(async () => {
 });
 
 function setup(overrides: Partial<BotTelegramDeps> = {}, start?: string) {
-  const table = start ? fakeMessagesTable(start) : fakeMessagesTable();
+  const table = fakeMessagesTable(start);
   cleanups.push(() => table.restore());
   const logs: string[] = [];
   const messages = () => getStore().messages;
@@ -346,9 +346,7 @@ describe("Telegram-Liste: letzte Aktivität im Prozess (Issue #684)", () => {
   });
 
   test("ohne activitySince bleibt es beim alten Weg, das Nachschlagen ohne Aktivität fragt trotzdem nicht ab", async () => {
-    // Der alte Weg rechnet den Zeitraum im Speicher mit der echten Uhr, nicht mit der Uhr der Quelle.
-    // Die Datenbank-Attrappe startet hier deshalb kurz vor jetzt statt am festen Datum: mit dem festen
-    // Datum scheiterte der Test, sobald die echte Uhr mehr als einen Tag weiter war (CI vom 17.11.2026).
+    // Der alte Abfrageweg nutzt die echte Uhr, deshalb beginnt auch die Attrappe relativ dazu.
     const { table, source } = setup({ activitySince: undefined }, new Date(Date.now() - 60 * 60 * 1000).toISOString());
     const finance = say(table, 443);
     await source.listConversations();

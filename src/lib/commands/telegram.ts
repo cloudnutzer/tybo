@@ -74,37 +74,40 @@ export interface TelegramSessionResetDeps<S> {
   shouldDistill(session: S): boolean;
   distill(session: S): Promise<unknown>;
   /** Alle Sessions des Schlüssels (alle Agenten) entfernen, Anzahl zurück */
-  reset(sessionKey: string): Promise<number>;
+  reset(sessionKey: string, options?: { preserveHandover?: boolean }): Promise<number>;
   sessionModeEnabled(): boolean;
 }
 
 /**
- * Session-Reset eines Telegram-Gesprächs. Ohne whileBlocked (/new) wie
+ * Session-Reset eines Telegram-Gesprächs. Ohne Reset-Optionen (/new) wie
  * bisher ohne Sperre: endende Sessions destillieren, dann verwerfen; ein
- * laufender Turn speichert danach nichts mehr (Epoche). Mit whileBlocked
+ * laufender Turn speichert danach nichts mehr (Epoche). Mit Reset-Optionen
  * (/motor, Issue #125) wie im Browser: läuft im Gespräch eine Antwort,
  * „busy" und keine Wirkung; sonst sind neue Ausführungen des Schlüssels von
  * vor dem Reset bis nach whileBlocked gesperrt (sie enden wie nach /stop).
  * Prüfen und Sperren geschehen ohne await dazwischen.
+ * beforeReset hält vor dem Löschen die Herkunft fest; preserveHandover erhält
+ * sie beim Löschen. Erst danach schreibt whileBlocked die Motorwahl.
  */
 export function createTelegramSessionReset<S>(
   sessionKey: string,
   deps: TelegramSessionResetDeps<S>
 ): (options?: SessionResetOptions) => Promise<SessionResetOutcome> {
-  const resetNow = async (): Promise<SessionResetOutcome> => {
+  const resetNow = async (options?: SessionResetOptions): Promise<SessionResetOutcome> => {
+    await options?.beforeReset?.();
     for (const s of await deps.sessionsForKey(sessionKey)) {
       if (deps.shouldDistill(s)) void Promise.resolve(deps.distill(s)).catch(() => {});
     }
-    const reset = await deps.reset(sessionKey);
+    const reset = await deps.reset(sessionKey, { preserveHandover: options?.preserveHandover });
     return { status: "done", reset, sessionMode: deps.sessionModeEnabled() };
   };
   return async options => {
-    if (!options?.whileBlocked) return resetNow();
+    if (!options?.whileBlocked && !options?.beforeReset && !options?.preserveHandover) return resetNow();
     if (deps.isActive(sessionKey)) return { status: "busy" };
     const release = deps.block(sessionKey);
     try {
-      const outcome = await resetNow();
-      await options.whileBlocked();
+      const outcome = await resetNow(options);
+      await options.whileBlocked?.();
       return outcome;
     } finally {
       release();

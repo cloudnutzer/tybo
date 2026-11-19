@@ -297,9 +297,14 @@ export async function startTyboServer(options: TyboServerOptions = {}): Promise<
             conversationStore,
             topics: demoTopics!.topics,
             instructions,
-            resetConversation: async (id: string) => {
+            resetConversation: async (id: string, resetOptions?: import("../src/web/session-reset").ConversationSessionResetOptions) => {
               resets.push(id);
-              return options.resetResult?.(id) ?? { status: "done" as const, reset: 1, sessionMode: true };
+              const result = options.resetResult?.(id) ?? { status: "done" as const, reset: 1, sessionMode: true };
+              if (result.status === "done") {
+                await resetOptions?.beforeReset?.();
+                await resetOptions?.whileBlocked?.();
+              }
+              return result;
             },
           }
         : {}),

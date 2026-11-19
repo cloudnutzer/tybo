@@ -33,6 +33,17 @@ export const MASK = "[verborgen]";
 /** Ein Wert, der nie in einer Meldung oder einem Log stehen darf */
 export type SecretValue = string;
 
+/** Zusätzliche Laufwerte wie .env-Werte behandeln: kein Leerraum allein, auch getrimmte Werte. */
+export function mergeSecretValues(...lists: readonly (readonly SecretValue[])[]): SecretValue[] {
+  const values = new Set<string>();
+  for (const raw of lists.flat()) {
+    if (!raw.trim()) continue;
+    values.add(raw);
+    values.add(raw.trim());
+  }
+  return [...values].sort((a, b) => b.length - a.length);
+}
+
 export function secretValues(dotenv: Env, processEnv: Env = {}): SecretValue[] {
   const values = new Set<string>();
   const add = (raw: string | undefined) => {

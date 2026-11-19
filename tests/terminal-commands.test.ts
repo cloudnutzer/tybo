@@ -12,6 +12,12 @@ import { activityText } from "../src/terminal/view";
 const AGENTS = ["general", "research", "finance", "critic"];
 
 describe("parseInput", () => {
+  test("lesende Motor-Befehle gehen sofort, Wechsel warten weiter", () => {
+    for (const text of ["/motor", "/motor werkzeuge", "/motor auto aus", "/motor auto an", "/motor auto falsch", "/motor pruefen", "/engine", "/engine WERKZEUGE", "/engine PRÜFEN", "/engine PRU\u0308FEN", "/motor  AUTO  AUS"]) {
+      expect(parseInput(text)).toEqual({ kind: "message", text, urgent: true });
+    }
+    expect(parseInput("/motor codex")).toEqual({ kind: "message", text: "/motor codex" });
+  });
   test("normale Nachricht bleibt unverändert", () => {
     expect(parseInput("Hallo /help")).toEqual({ kind: "message", text: "Hallo /help" });
   });

@@ -19,6 +19,9 @@ Mit Sessions gilt:
 
 - **Erste Nachricht einer Session:** voller Kontext-Prompt (F-3). Die
   Session-ID aus der Antwort der CLI wird am Session-Schlüssel gespeichert.
+- **Codex:** Nur der volle Prompt enthält zusätzlich die lesende Übersicht
+  der Claude-Code-Notizen, auch nach Motorwechsel oder Neuversuch ohne Session;
+  ohne Session-Modus bei jeder Nachricht ([Kontext und Abschalten](erweiterungen.md#was-codex-an-kontext-bekommt)).
 - **Folgenachrichten:** `claude -p --resume <sessionId>` mit einem schlanken
   Prompt: aktuelle Zeit, neue Suchtreffer, Memory-Änderungen seit
   Session-Start und die Nachricht (`buildResumePrompt()` in
@@ -70,6 +73,36 @@ Eine neue Session beginnt, wenn
 - das Gespräch mit einem anderen Motor weiterläuft als die Session. Eine
   Session gehört zu genau einem Motor und wird nie an einen anderen
   übergeben; der nächste Turn baut den vollen Prompt, das Gedächtnis bleibt.
+
+Bei einem Motor- oder Modellwechsel im Chat kommt seit M14-08 (Entscheidung
+0027) ein Übergabe-Verlauf dazu, auch nach `/motor` und „Auf Standard“ in den
+Einstellungen. Er beginnt bei der ersten Nutzernachricht der alten Session,
+einschließlich unmittelbar aufeinanderfolgender Nutzerbeiträge vor der ersten
+Antwort. Fünf Sekunden Toleranz gleichen kleine Unterschiede zwischen der
+Rechner- und Datenbankuhr aus. Eine kurze Session verkleinert den üblichen
+Verlauf nicht: mindestens die letzten zehn Nachrichten werden berücksichtigt,
+vor dem Sessionbeginn mit den bisherigen Kürzungsgrenzen.
+
+Die Obergrenzen bleiben 30 Nachrichten und 24.000 Zeichen. Das Zeichenbudget
+zählt auch Zeitangaben, Sprecher und Zeilenumbrüche; passen nicht alle hinein,
+fallen die ältesten Nachrichten zuerst weg. Die jüngsten vier Beiträge ab
+Sessionbeginn dürfen je 6.000 Zeichen einschließlich Auslassungspunkten haben.
+Ältere Antworten bleiben auf 800, ältere Nutzerbeiträge auf 20.000 Zeichen
+zuzüglich Auslassungspunkten begrenzt. Die Übergabezeile vor dem Verlauf nennt
+die vorherige Stufe und den Grund. Gibt es keinen passenden Verlauf im
+Nachrichtenspeicher, entfällt auch diese Zeile. Der Fallback-Kontext bleibt bei
+den üblichen zehn Nachrichten; fortgesetzte Sessions bleiben unverändert.
+
+`data/session-handover.json` hält je Gespräch und Agent nur Herkunft, Beginn,
+Grund und Zeitpunkt fest, niemals eine Session-ID. Bei manuellen Wechseln
+entsteht die Notiz unter der Gesprächssperre vor dem Löschen der Sessions.
+Weitere Wechsel ohne Nachricht dazwischen behalten den ursprünglichen Beginn.
+Die Notiz bleibt bis zum erfolgreichen Speichern der neuen Session, auch wenn
+zuvor ein Ersatzmodell antwortet oder der Nutzer abbricht. Nach der Ruhezeit
+verfällt sie. `/new`, der Session-Reset in der WebUI und das Löschen eines
+Topics oder Web-Gesprächs entfernen sie. Nach Ablauf einer alten Session und
+ohne Session-Modus gibt es keine Übergabe. Der Verlauf stammt aus tybos
+Nachrichtenspeicher; für die Übergabe wird kein Motor zusätzlich aufgerufen.
 
 Destillat (F-4), `/routine` und Knopf-Antworten setzen eine Session immer
 über ihren eigenen Motor fort: bei Claude das Destillat auf dem Aux-Modell

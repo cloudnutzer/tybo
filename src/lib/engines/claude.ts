@@ -12,10 +12,12 @@ import {
   type ClaudeStreamOptions,
 } from "../claude";
 import type { Engine, EngineRequest, EngineResult } from "./types";
+import { recordUsage } from "./usage";
 
 export interface ClaudeEngineDeps {
   callClaude: typeof callClaudeSubprocess;
   callClaudeStreaming: typeof callClaudeStreamingSubprocess;
+  recordUsage: typeof recordUsage;
 }
 
 /** Optionen für callClaude/callClaudeStreaming; nur gesetzte Felder, wie vorher im Chat-Kern */
@@ -44,12 +46,16 @@ export function claudeOptionsFor(req: EngineRequest): ClaudeStreamOptions {
 export function createClaudeEngine(deps?: Partial<ClaudeEngineDeps>): Engine {
   const call = deps?.callClaude ?? callClaudeSubprocess;
   const callStreaming = deps?.callClaudeStreaming ?? callClaudeStreamingSubprocess;
+  const record = deps?.recordUsage ?? recordUsage;
   return {
     id: "claude",
     describe: () => "Claude Code",
     async run(req: EngineRequest): Promise<EngineResult> {
       const options = claudeOptionsFor(req);
       const result = req.streaming ? await callStreaming(options) : await call(options);
+      // Die Ablage fängt Fehler selbst ab. Antworten warten weder auf die
+      // Dateisperre noch auf das Schreiben, auch bei Abbruch oder Zeitlimit.
+      if (req.streaming && result.rateLimit?.windows.length) void record("claude", result.rateLimit.windows);
       // tools bleibt undefined, wenn die CLI nichts meldete (unbekannt, nicht leer)
       return { ...result, engine: "claude" };
     },

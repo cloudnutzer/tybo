@@ -1,7 +1,7 @@
 /**
  * Abschlussmeldung eines Hintergrund-Jobs (Issue #103).
  *
- * Genau eine logische Meldung pro Job: Nur wer den Übergang nach ended
+ * Genau eine logische Meldung pro Lauf: Nur wer den Übergang nach ended
  * gewonnen hat (claimOutcome in ./store), ist Besitzer der Meldung und ruft
  * deliverNotice (bzw. settleAndDeliver, wenn vorher noch Claudes
  * Prozessgruppe zu beenden ist). Die Meldung ist ein einziger
@@ -65,6 +65,11 @@ export interface NoticeDeps {
   sleep(ms: number): Promise<void>;
   log(line: string): void;
   retryDelaysMs?: readonly number[];
+  /** Eigene kurze Rückfrage nach dem Abschluss; Fehler wiederholen niemals die Meldung. */
+  offerResume?(status: JobStatus): Promise<void>;
+  /** Offene Frage zustellen, bereits gespeicherte Antwort nachholen oder Frist prüfen. */
+  recoverWaiting?(status: JobStatus): Promise<void>;
+  expireResumeChoices?(id: string): Promise<void>;
 }
 
 export function formatDuration(ms: number): string {
@@ -76,14 +81,18 @@ export function formatDuration(ms: number): string {
   return rest ? `${hours} Std ${rest} Min` : `${hours} Std`;
 }
 
-/** Log-Zeile ohne Werte aus .env (Fehlertexte können sie enthalten) */
+/** Log-Zeile ohne geschützte Werte (Fehlertexte können sie enthalten) */
 export function logSafe(deps: Pick<NoticeDeps, "log" | "secrets">, line: string): void {
   deps.log(maskSecrets(line, deps.secrets()));
 }
 
 /** Dauer von Start (oder Anlage) bis Ende (oder jetzt) */
 export function jobDuration(status: JobStatus, now: Date): string {
-  const from = Date.parse(status.startedAt ?? status.createdAt);
+  if (status.activeMs !== undefined || status.phase === "waiting") {
+    const current = status.phase === "running" && status.startedAt ? Math.max(0, now.getTime() - Date.parse(status.startedAt)) : 0;
+    return formatDuration((status.activeMs ?? 0) + current);
+  }
+  const from = Date.parse(status.startedAt ?? status.runCreatedAt ?? status.createdAt);
   const to = status.endedAt ? Date.parse(status.endedAt) : now.getTime();
   return formatDuration(to - from);
 }
@@ -123,7 +132,7 @@ function leftoversText(status: JobStatus, content: (text: string) => string): st
   const list = status.leftovers ?? [];
   if (!list.length) return "";
   const lines = list.map(p => `- PID ${p.pid}: \`${oneLine(content(p.command), 160).replace(/`/g, "'")}\``);
-  return `Nach Claudes Ende liefen noch Prozesse aus dem Job (nicht beendet; falls ungewollt: kill <PID>):\n${lines.join("\n")}`;
+  return `Nach dem Job-Ende liefen noch Prozesse aus dem Job (nicht beendet; falls ungewollt: kill <PID>):\n${lines.join("\n")}`;
 }
 
 /** Passt die gesendete Darstellung (HTML) in eine Telegram-Nachricht? */
@@ -134,7 +143,7 @@ export function noticeFits(text: string): boolean {
 function terminationWarning(status: JobStatus): string {
   const result = status.termination?.result;
   if (result !== "survived" && result !== "unverified") return "";
-  return `\n\nAchtung: Claudes Prozessgruppe (PID ${status.claude?.pid ?? "unbekannt"}) ließ sich nicht sicher beenden, bitte prüfen.`;
+  return `\n\nAchtung: Die Prozessgruppe des Jobs (PID ${status.claude?.pid ?? "unbekannt"}) ließ sich nicht sicher beenden, bitte prüfen.`;
 }
 
 /** Inhaltsteile einer Meldung, die aus dem Job stammen */
@@ -256,9 +265,11 @@ export function safeValues(raw: readonly string[], render: (values: readonly str
  * „ab**cd**" mit dem Wert abcd), wird er ganz verborgen.
  */
 export async function composeNotice(root: string, status: JobStatus, secrets: readonly SecretValue[], now: Date): Promise<string> {
+  secrets = [...secrets, ...(status.sessionId ? [status.sessionId] : [])];
   // Markierungen im Inhalt entfernen, bevor maskiert wird (danach entfernte Zeichen könnten Werte zusammensetzen)
   const content = (text: string) => maskSecrets(text.replace(MARKS, ""), secrets);
   const title = oneLine(content(status.title), TITLE_MAX_CHARS);
+  const engine = content(status.engine ?? "claude");
   const duration = jobDuration(status, now);
   const detail = status.detail ? oneLine(content(status.detail), DETAIL_MAX_CHARS) : "";
   const warning = terminationWarning(status);
@@ -269,9 +280,9 @@ export async function composeNotice(root: string, status: JobStatus, secrets: re
   const hiddenText: Record<Part, string> = {
     title: MASK,
     detail: MASK,
-    report: `_Bericht verborgen: er hätte in Telegram oder der WebUI einen Wert aus .env gezeigt. Ganzer Bericht: ${reportPath}_`,
-    log: "_Log-Auszug verborgen: er hätte in Telegram oder der WebUI einen Wert aus .env gezeigt, siehe job log_",
-    procs: "\n\n_Nach Claudes Ende liefen noch Prozesse aus dem Job; Befehle verborgen (Wert aus .env), PIDs in status.json_",
+    report: `_Bericht verborgen: er hätte in Telegram oder der WebUI einen geschützten Wert gezeigt. Ganzer Bericht: ${reportPath}_`,
+    log: "_Log-Auszug verborgen: er hätte in Telegram oder der WebUI einen geschützten Wert gezeigt, siehe job log_",
+    procs: "\n\n_Nach dem Job-Ende liefen noch Prozesse aus dem Job; Befehle verborgen (geschützter Wert), PIDs in status.json_",
   };
   const procs = leftoversText(status, content);
 
@@ -287,7 +298,7 @@ export async function composeNotice(root: string, status: JobStatus, secrets: re
       // Anfang vor dem Absatz: Markdown am Zeilenanfang (# Titel, > Zitat) wirkt wie ohne Markierung
       return `${markStart(name)}${lead}${text}${lead ? "\n" : ""}${markEnd(name)}`;
     };
-    const head = (label: string) => `**${label}: ${part("title", title)}** (${duration}, Job ${status.id})`;
+    const head = (label: string) => `**${label}: ${part("title", title)}** (${engine}, ${duration}, Job ${status.id}${(status.run ?? 1) > 1 ? `, Lauf ${status.run}` : ""})`;
     const why = (fallback: string) => (detail ? part("detail", detail, "\n\n") : `\n\n${fallback}`);
     // Prozesse, die Claude überlebt haben: bei jedem Ausgang, gleich nach dem Kopf
     const still = () => (procs ? part("procs", procs, "\n\n") : "");
@@ -315,11 +326,11 @@ export async function composeNotice(root: string, status: JobStatus, secrets: re
       }
       case "no_report":
         text =
-          `${head("Job ohne Bericht")}\n\nClaude hat aufgehört, ohne einen Bericht zu schreiben (Exit-Code 0). Der Job ist beendet: ` +
-          `Steht unten „läuft noch" oder „ich melde mich", kommt nichts mehr nach.${still()} Letzte Log-Zeilen:\n\n${tail()}`;
+          `${head("Job ohne Bericht")}\n\n${status.engine === "codex" ? "Codex" : "Claude"} hat aufgehört, ohne einen Bericht zu schreiben (Exit-Code 0). Der Job ist beendet: ` +
+          `Steht unten „läuft noch" oder „ich melde mich", kommt nichts mehr nach.${detail ? why("") : ""}${still()} Letzte Log-Zeilen:\n\n${tail()}`;
         break;
       case "failed":
-        text = `${head("Job fehlgeschlagen")}\n\n${EXIT_TEXT(status)}.${still()} Letzte Log-Zeilen:\n\n${tail()}`;
+        text = `${head("Job fehlgeschlagen")}\n\n${EXIT_TEXT(status)}.${detail ? why("") : ""}${still()} Letzte Log-Zeilen:\n\n${tail()}`;
         break;
       case "timeout":
         text = `${head("Job abgebrochen, Zeit überschritten")}\n\nNach ${status.maxHours} Std beendet.${warning} Letzte Log-Zeilen:\n\n${tail()}`;
@@ -332,6 +343,15 @@ export async function composeNotice(root: string, status: JobStatus, secrets: re
         break;
       case "start_failed":
         text = `${head("Job nicht gestartet")}${why("Der Start ist gescheitert.")}`;
+        break;
+      case "unanswered":
+        text = `${head("Frage unbeantwortet")}\n\nSeit 48 Stunden keine Antwort. Mit Fortsetzen fragt der Job erneut, soweit noch Fragen verfügbar sind.`;
+        break;
+      case "question_limit":
+        text = `${head("Fragenlimit erreicht")}\n\nHöchstens 5 Fragen je Job. Eine weitere Frage wurde nicht gestellt.`;
+        break;
+      case "question_failed":
+        text = `${head("Job beendet, Frage nicht zugestellt")}${why("Die Frage konnte auch nach mehreren Versuchen nicht zugestellt werden.")}`;
         break;
       default:
         text = head("Job beendet");
@@ -421,11 +441,25 @@ export async function deliverNotice(id: string, token: string, deps: NoticeDeps)
       if (!result.recorded) logSafe(deps, `[job] ${id}: Meldung gesendet, aber nicht für die WebUI festgehalten`);
       // Nachweis der Zustellung im watcher.log (status.json hält nur den letzten Stand)
       else logSafe(deps, `[job] ${id}: Meldung zugestellt (Versuch ${attempt}, Telegram ${result.sent ? "ja" : "nein"}, WebUI ja)`);
+      await offerResumeAfterNotice(id, deps);
       return "sent";
     }
     logSafe(deps, `[job] ${id}: Meldung nicht zugestellt (Versuch ${attempt}/${maxAttempts}: ${result.error?.message ?? "unbekannt"})`);
-    if (!retry) return "failed";
+    if (!retry) {
+      await offerResumeAfterNotice(id, deps);
+      return "failed";
+    }
     await deps.sleep(delays[attempt - 1] ?? 0);
+  }
+}
+
+async function offerResumeAfterNotice(id: string, deps: NoticeDeps): Promise<void> {
+  if (!deps.offerResume) return;
+  try {
+    const status = await readStatus(deps.root, id);
+    if (status) await deps.offerResume(status);
+  } catch {
+    logSafe(deps, `[job] ${id}: Fortsetzen-Frage nicht zugestellt; job resume bleibt verfügbar`);
   }
 }
 
@@ -460,7 +494,8 @@ export async function settleAndDeliver(
   id: string,
   token: string,
   deps: NoticeDeps,
-): Promise<{ tree?: TerminateResult; delivered: DeliverResult }> {
+  delivery: "wait" | "background" = "wait",
+): Promise<{ tree?: TerminateResult; delivered: DeliverResult | "pending" }> {
   const status = await readStatus(deps.root, id);
   if (!status || status.notice?.owner?.token !== token) return { delivered: "not_owner" };
   let tree = status.termination?.result;
@@ -468,6 +503,12 @@ export async function settleAndDeliver(
     tree = await terminateGroup(status.claude, deps.proc);
     if (tree !== "gone") logSafe(deps, `[job] ${id}: Prozessgruppe beim Beenden: ${tree}`);
     if (!(await recordTermination(deps.root, id, token, tree))) return { tree, delivered: "not_owner" };
+  }
+  // HTTP wartet auf die sichere Beendigung, nicht auf die Versandwiederholungen.
+  // Besitzer und ausstehende Zustellung bleiben für recoverJobs gespeichert.
+  if (delivery === "background") {
+    void deliverNotice(id, token, deps).catch(() => logSafe(deps, `[job] ${id}: Zustellung nach Stopp fehlgeschlagen`));
+    return { tree, delivered: "pending" };
   }
   return { tree, delivered: await deliverNotice(id, token, deps) };
 }

@@ -8,8 +8,9 @@
  * src/bot.ts wird weder importiert noch gestartet.
  */
 
-import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, writeFile } from "node:fs/promises";
+import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { mkdir, writeFile, unlink } from "node:fs/promises";
+import { readFileSync, realpathSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { runTybo } from "../scripts/tybo";
 import { claudeLoginUnknown, engineCheckPath, engineFindings, plistPath, servicePath, unitPath } from "../src/setup/checks/engine";
@@ -22,6 +23,14 @@ import { CLAUDE_API_KEY_MISSING } from "../src/lib/engines/claude-auth";
 import { writePlist } from "../src/lib/services/plist";
 import type { CallModelDeps } from "../src/lib/voice-brain/call-model";
 import { cleanup, FULL_ENV, leakedSecrets, makeCtx } from "./setup-fixture";
+import { engineToolChecks, engineToolFindings, parseCodexSkillNames, TOOL_COMPARE_TIMEOUT_MS, type EngineToolDeps } from "../src/setup/checks/engine-tools";
+import { collectReport, formatReport, reportExitCode } from "../src/setup/checks/report";
+import { applyCodexMcpEnv, planCodexMcp, setCodexMcpReaderForTests, type CodexMcpPlan } from "../src/lib/engines/codex-mcp";
+import { codexSandbox } from "../src/lib/engines/codex";
+import { inspectCodexSkillLinks, syncCodexSkillLinks } from "../src/lib/engines/codex-skills";
+import { CODEX_JOB_TOOL_ARGS, parseCodexMcpNames } from "../src/lib/jobs/codex-tools";
+import { setToolParityReadersForTests } from "../src/lib/engines/tool-parity";
+import type { EngineTools } from "../src/web/tool-parity-types";
 
 afterAll(cleanup);
 
@@ -423,6 +432,222 @@ describe("tybo pruefen: jeder Störfall einzeln bei sonst gesunder Einrichtung (
       expect(r.out.filter(l => l.startsWith("  ✗"))).toHaveLength(1);
       expect(r.code).toBe(1);
       noEffects(r);
+    }
+  });
+});
+
+/** Die echte CLI-Probe ist als gekürzter, rein künstlicher Ausschnitt festgehalten. */
+const SKILL_FIXTURE = readFileSync(join(import.meta.dir, "fixtures/codex-prompt-input-skills.json"), "utf8");
+const skillOutput = (root: string) => SKILL_FIXTURE.replaceAll("/project", realpathSync(root));
+const emptyInspection = () => ({ expected: [], linked: [], foreign: [], skipped: [] });
+const toolData = (): EngineTools => ({
+  inventory: { mcp: [{ name: "mail", origin: "tybo" }], skills: [], notes: "passed", state: "ok" },
+  gaps: { mcp: [{ name: "oauth", reason: "auth_unknown" }], skills: [], hints: [], notes: false, plugins: null, fixed: ["connectors", "hooks", "builtin"] },
+});
+const mcpPlan = (): CodexMcpPlan => ({ passed: [{ name: "mail", kind: "stdio", source: "tybo" }], own: [], skipped: [],
+  args: ["-c", 'mcp_servers.mail.command="bun"'], env: {}, secretValues: [] });
+function toolDeps(extra: Partial<EngineToolDeps> = {}): Partial<EngineToolDeps> {
+  return { ready: async () => true, snapshot: () => ({ inventory: () => toolData().inventory, gaps: () => toolData().gaps }),
+    plan: () => mcpPlan(), mcpServers: async () => ["mail"], inspectSkills: emptyInspection,
+    prompt: async () => { throw new Error("Unerwarteter CLI-Aufruf"); }, ...extra };
+}
+
+describe("Werkzeuge im Prüfbericht (Issue #666)", () => {
+  let logs: ReturnType<typeof spyOn>[];
+  let spawn: ReturnType<typeof spyOn>;
+  beforeEach(() => {
+    spawn = spyOn(Bun, "spawn").mockImplementation(() => { throw new Error("Kein echtes Programm im Test"); });
+    logs = ["log", "error", "warn"].map(method => spyOn(console, method as "log").mockImplementation(() => {}));
+  });
+  afterEach(() => {
+    expect(spawn).not.toHaveBeenCalled(); spawn.mockRestore();
+    logs.forEach(log => log.mockRestore());
+  });
+  test("Lücken bleiben pass, nur bereite Ersatzmotoren; ein Snapshot für den ganzen Bericht", async () => {
+    const ctx = await makeCtx({ env: FULL_ENV });
+    let snapshots = 0;
+    const checks = engineToolChecks(toolDeps({ ready: async engine => engine !== "opencode", snapshot: () => {
+      snapshots++; return { inventory: () => toolData().inventory, gaps: () => toolData().gaps };
+    } }));
+    const report = await collectReport({ ctx, steps: [], specials: checks });
+    expect(report.lines.filter(l => l.section === "Motor").map(l => [l.label, l.status])).toEqual([["Werkzeuge Codex", "pass"], ["Werkzeuge Anthropic API", "pass"]]);
+    expect(formatReport(report).join("\n")).toContain("Fehlt: 1 MCP-Server");
+    expect(reportExitCode(report)).toBe(0);
+    expect(snapshots).toBe(1);
+    await collectReport({ ctx, steps: [], specials: checks });
+    expect(snapshots).toBe(2);
+  });
+  test("MCP: genau die Planargumente, angewandte Umgebung und Rechte aus codexSandbox", async () => {
+    const ctx = await makeCtx({ env: "CODEX_PATH=codex-test\n", settings: JSON.stringify({ engine: { codex: { sandbox: "read-only" } } }) });
+    ctx.enginePath = SERVICE_PATH;
+    const plan = mcpPlan(); const base = { HOME: ctx.home, PATH: SERVICE_PATH }; const applied = { ...base, EXTRA: "erfunden" };
+    let sandboxCalls = 0, planCalls = 0, applyCalls = 0, reads = 0;
+    const [line] = await engineToolFindings(ctx, "codex", toolDeps({
+      codexEnv: (root, key, options) => { expect(root).toBe(ctx.root); expect(key).toBeUndefined(); expect(options).toMatchObject({ quiet: true, home: ctx.home, env: { PATH: SERVICE_PATH } }); return base; },
+      codexSandbox: settings => { sandboxCalls++; return codexSandbox(settings); },
+      plan: input => { planCalls++; expect(input.baseEnv).toBe(base); expect(input.sandbox).toBe("read-only"); expect(input.cwd).toBe(ctx.root); return plan; },
+      applyEnv: (env, p) => { applyCalls++; expect(env).toBe(base); expect(p).toBe(plan); return applied; },
+      mcpServers: async options => { reads++; expect(options.args).toBe(plan.args); expect(options.env).toBe(applied); expect(options.root).toBe(ctx.root); expect(options.codexPath).toBe("codex-test"); expect(options.signal).toBeInstanceOf(AbortSignal); return []; },
+    }));
+    expect([sandboxCalls, planCalls, applyCalls, reads]).toEqual([1, 1, 1, 1]);
+    expect(line).toMatchObject({ status: "warn" }); expect(line!.detail).toContain("MCP nicht angekommen: mail");
+    expect(reportExitCode({ lines: [{ ...line!, section: "Motor" }] })).toBe(0);
+  });
+  test("echter HTTP-Plan mit Kopfzeilen kommt durch applyCodexMcpEnv bis zum Leser", async () => {
+    const ctx = await makeCtx(); let read = false;
+    const [line] = await engineToolFindings(ctx, "codex", toolDeps({ plan: input => planCodexMcp({
+      sources: [{ name: "mail", source: "tybo", config: { type: "http", url: "https://example.invalid/mcp", headers: { Authorization: "Bearer erfundene-kopfzeile", "X-Team": "erfundenes-team" } } }],
+      own: { names: new Set(), readable: true }, settings: {}, sandbox: input.sandbox, baseEnv: input.baseEnv,
+      parentEnv: {}, lookup: () => undefined, knownSecrets: [],
+    }), applyEnv: applyCodexMcpEnv, mcpServers: async options => {
+      read = true;
+      expect(options.env.TYBO_MCP_MAIL_BEARER_TOKEN).toBe("erfundene-kopfzeile");
+      expect(options.env.TYBO_MCP_MAIL_HEADER_X_TEAM_TOKEN).toBe("erfundenes-team");
+      expect(options.args!.join(" ")).toContain("env_http_headers");
+      return ["mail"];
+    } }));
+    expect(read).toBe(true); expect(line!.status).toBe("pass"); expect(line!.detail).not.toContain("nicht geprüft");
+    expect(JSON.stringify(line)).not.toContain("TYBO_MCP_");
+    expect(JSON.stringify(line)).not.toContain("erfundene-kopfzeile");
+  });
+  test("leerer Plan und leere expected fragen keine CLI und erzeugen keinen Vergleichsvermerk", async () => {
+    const ctx = await makeCtx(); let calls = 0;
+    const [line] = await engineToolFindings(ctx, "codex", toolDeps({ plan: () => ({ ...mcpPlan(), passed: [] }),
+      mcpServers: async () => { calls++; return []; }, prompt: async () => { calls++; throw new Error(); } }));
+    expect(calls).toBe(0); expect(line!.status).toBe("pass");
+    expect(line!.detail).not.toContain("nicht geprüft"); expect(line!.detail).not.toContain("nicht angekommen");
+  });
+  test.each(["plan", "applyEnv"] as const)("Wurf in %s: MCP nicht geprüft, kein Leser und pass", async key => {
+    const ctx = await makeCtx(); let reads = 0;
+    const [line] = await engineToolFindings(ctx, "codex", toolDeps({ [key]: () => { throw new Error("PRIVAT_MARKER"); }, mcpServers: async () => { reads++; return []; } }));
+    expect(reads).toBe(0); expect(line).toMatchObject({ status: "pass" }); expect(line!.detail).toContain("MCP: nicht geprüft");
+    expect(JSON.stringify(line)).not.toContain("PRIVAT");
+  });
+  test("Skills: expected ist maßgeblich, abweichender Kopfname funktioniert, linked und foreign werden nicht verlangt", async () => {
+    const ctx = await makeCtx(); let prompts = 0;
+    const [line] = await engineToolFindings(ctx, "codex", toolDeps({ inspectSkills: () => ({ expected: ["folder_probe", "geloescht"], linked: ["nur_linked"], foreign: ["nur_foreign"], skipped: [] }),
+      prompt: async (cmd, options) => {
+        prompts++; expect(cmd.slice(0, 4)).toEqual(["codex", "debug", "prompt-input", "hallo"]);
+        expect(cmd.slice(4, 4 + CODEX_JOB_TOOL_ARGS.length)).toEqual([...CODEX_JOB_TOOL_ARGS]);
+        expect(cmd.at(-1)).toBe('mcp_servers={"mail"={enabled=false}}');
+        expect(options).toMatchObject({ cwd: ctx.root, timeoutMs: 15_000 });
+        expect(options!.signal).toBeInstanceOf(AbortSignal);
+        return { code: 0, stdout: skillOutput(ctx.root), stderr: "PRIVAT_STDERR" };
+      } }));
+    expect(prompts).toBe(1); expect(line!.status).toBe("warn"); expect(line!.detail).toContain("Skills nicht angekommen: geloescht");
+    for (const name of ["folder_probe", "header-probe", "nur_linked", "nur_foreign", "PRIVAT_STDERR"]) expect(line!.detail).not.toContain(name);
+  });
+  test("gelöschter echter Link und CODEX_HOME-Kollision: inspect statt Bestand; CLI über ctx.run", async () => {
+    const ctx = await makeCtx({ env: "CODEX_HOME=codex-eigen\n", settings: '{"engine":{"codex":{"skills":true}}}' });
+    const dir = join(ctx.root, ".claude", "skills", "folder_probe");
+    await mkdir(dir, { recursive: true }); await writeFile(join(dir, "SKILL.md"), "---\nname: header-probe\ndescription: Beispiel\n---\n");
+    const input = { root: ctx.root, home: ctx.home, enabled: true, codexHome: join(ctx.root, "codex-eigen") };
+    syncCodexSkillLinks(input);
+    await unlink(join(ctx.root, ".agents", "skills", "folder_probe"));
+    let calls = 0;
+    ctx.run = Object.assign(async () => { calls++; return { code: 0, stdout: skillOutput(ctx.root).replaceAll("folder_probe/SKILL.md", "anderer/SKILL.md"), stderr: "" }; }, { calls: [] });
+    const deps = toolDeps({ inspectSkills: (actual, onError) => { expect(actual).toEqual(input); return inspectCodexSkillLinks(actual, onError); } });
+    delete deps.prompt;
+    const [line] = await engineToolFindings(ctx, "codex", deps);
+    expect(line!.detail).toContain("Skills nicht angekommen: folder_probe"); expect(calls).toBe(1);
+    const own = join(input.codexHome, "skills", "kollision"); await mkdir(own, { recursive: true });
+    await writeFile(join(own, "SKILL.md"), "---\nname: header-probe\ndescription: Beispiel\n---\n");
+    await engineToolFindings(ctx, "codex", deps); expect(calls).toBe(1);
+  });
+  for (const kind of ["Wurf", "Zeitlimit", "unlesbar", "CLI-Timeout"] as const) {
+    test(`beide Vergleiche: ${kind} wird nicht geprüft und bleibt pass`, async () => {
+      const ctx = await makeCtx(); const aborted: string[] = [];
+      const hang = (signal: AbortSignal, label: string) => new Promise<never>(() => { signal.addEventListener("abort", () => aborted.push(label)); });
+      const [line] = await engineToolFindings(ctx, "codex", toolDeps({ timeoutMs: 15, inspectSkills: () => ({ ...emptyInspection(), expected: ["folder_probe"] }),
+        mcpServers: async options => {
+          if (kind === "Zeitlimit") return hang(options.signal!, "mcp");
+          if (kind === "unlesbar") return parseCodexMcpNames({ secret: "PRIVAT" });
+          throw new Error("PRIVAT");
+        }, prompt: async (_, options) => {
+          if (kind === "Zeitlimit") return hang(options!.signal!, "skills");
+          if (kind === "Wurf") throw new Error("PRIVAT");
+          return { code: 0, stdout: kind === "unlesbar" ? "PRIVAT" : skillOutput(ctx.root), stderr: "", timedOut: kind === "CLI-Timeout" };
+        } }));
+      expect(line!.status).toBe("pass"); expect(line!.detail).toContain("MCP: nicht geprüft"); expect(line!.detail).toContain("Skills: nicht geprüft");
+      if (kind === "Zeitlimit") expect(aborted.sort()).toEqual(["mcp", "skills"]);
+    });
+  }
+  test("Abbruch erreicht beide Vergleiche, ihr Zeitbudget ist parallel und vom Motor getrennt", async () => {
+    const ctx = await makeCtx(); const controller = new AbortController(); const aborted: string[] = [];
+    let started = 0;
+    const hang = (signal: AbortSignal, label: string) => new Promise<never>(() => {
+      signal.addEventListener("abort", () => aborted.push(label));
+      if (++started === 2) controller.abort();
+    });
+    const [line] = await engineToolFindings(ctx, "codex", toolDeps({ inspectSkills: () => ({ ...emptyInspection(), expected: ["x"] }),
+      mcpServers: o => hang(o.signal!, "mcp"), prompt: (_, o) => hang(o!.signal!, "skills") }), controller.signal);
+    expect(aborted.sort()).toEqual(["mcp", "skills"]); expect(line!.status).toBe("pass");
+    expect(TOOL_COMPARE_TIMEOUT_MS).toBe(15_000);
+    expect(defaultSpecials().filter(c => c.section === "Motor").map(c => c.id)).toEqual(["motor", "werkzeuge-codex", "werkzeuge-opencode", "werkzeuge-api"]);
+  });
+  test("unvollständiger Bestand oder Ersatzname startet keine Skill-CLI", async () => {
+    const ctx = await makeCtx();
+    for (const inventory of [{ ...toolData().inventory, state: "unknown" as const }, { ...toolData().inventory, mcp: [{ name: "unzulaessig-12345678", origin: "engine" as const }] }]) {
+      let calls = 0;
+      const [line] = await engineToolFindings(ctx, "codex", toolDeps({ snapshot: () => ({ inventory: () => inventory, gaps: () => toolData().gaps }), inspectSkills: () => ({ ...emptyInspection(), expected: ["x"] }),
+        prompt: async () => { calls++; throw new Error(); } }));
+      expect(calls).toBe(0); expect(line!.detail).toContain("Skills: nicht geprüft"); expect(line!.status).toBe("pass");
+      if (inventory.state === "unknown") expect(line!.detail).toStartWith("Bestand unvollständig lesbar.");
+    }
+  });
+  test("Berichtsgrenze bewahrt beide Vergleichsergebnisse und zählt weitere Namen", async () => {
+    const ctx = await makeCtx();
+    const plan = mcpPlan(); plan.passed = Array.from({ length: 20 }, (_, i) => ({ name: `server_mit_langem_namen_${i}`, kind: "stdio", source: "tybo" }));
+    const [line] = await engineToolFindings(ctx, "codex", toolDeps({ plan: () => plan, mcpServers: async () => [],
+      inspectSkills: () => ({ ...emptyInspection(), expected: plan.passed.map(s => s.name) }), prompt: async () => ({ code: 0, stdout: skillOutput(ctx.root), stderr: "" }) }));
+    expect(line!.detail.length).toBeLessThanOrEqual(300); expect(line!.detail).toContain("MCP nicht angekommen"); expect(line!.detail).toContain("Skills nicht angekommen"); expect(line!.detail).toContain("(+17)");
+  });
+  test("CLI-Inhalte, Planargumente und Umgebungswerte bleiben aus Bericht und Log", async () => {
+    const ctx = await makeCtx({ env: FULL_ENV });
+    const plan = mcpPlan(); plan.args.push("-c", 'mcp_servers.mail.args=["PRIVAT_ARGS"]'); plan.env = { BEISPIEL_TOKEN: "PRIVAT_ENV" }; plan.secretValues = ["PRIVAT_SECRET"];
+    const report = await collectReport({ ctx, steps: [], specials: engineToolChecks(toolDeps({ plan: () => plan,
+      mcpServers: async () => parseCodexMcpNames({ mcp_servers: { mail: { url: "https://PRIVAT.invalid", env: { BEISPIEL_TOKEN: "PRIVAT_ANTWORT" } } } }),
+      inspectSkills: () => ({ ...emptyInspection(), expected: ["folder_probe"] }),
+      prompt: async () => ({ code: 0, stdout: skillOutput(ctx.root).replace("Public test description.", "PRIVAT_SKILL BEISPIEL_TOKEN"), stderr: "PRIVAT_STDERR" }),
+    })) });
+    const text = formatReport(report).join("\n") + JSON.stringify(logs.map(log => log.mock.calls));
+    for (const forbidden of ["PRIVAT", "-c mcp_servers", "TYBO_MCP_", "BEISPIEL_TOKEN", ctx.home]) expect(text).not.toContain(forbidden);
+    expect(reportExitCode(report)).toBe(0);
+  });
+  test("TYBO_ROOT aus fremdem Arbeitsordner: dieselben Quellen, Einstellungen und Umgebung wie im Projekt", async () => {
+    const ctx = await makeCtx({ profile: PROFILE, env: `${FULL_ENV}MCP_CONFIG_PATH=config/extra-mcp.json\nCODEX_HOME=codex-eigen\nCODEX_PATH=codex-test\nQUELLE_TOKEN=ERFUNDENER_KONTEXT\n`, settings: '{"engine":{"codex":{"sandbox":"full","skills":false}}}' });
+    ctx.enginePath = SERVICE_PATH;
+    await writeBotPlist(ctx);
+    await writeFile(join(ctx.root, "config", "extra-mcp.json"), JSON.stringify({ servers: { quelle: { type: "http", url: "https://example.invalid/mcp", headers: { Authorization: "Bearer ${QUELLE_TOKEN}" } } } }));
+    const read = (path: string) => {
+      if (!path.startsWith(ctx.root + "/")) throw Object.assign(new Error("fehlt"), { code: "ENOENT" });
+      return readFileSync(path, "utf8");
+    };
+    setCodexMcpReaderForTests(read);
+    setToolParityReadersForTests({ text: read, children: path => readdirSync(path), stat: path => statSync(path), inspectSkills: inspectCodexSkillLinks });
+    const calls: string[] = [];
+    const specials = engineToolChecks({ ready: async id => id === "codex", mcpServers: async o => {
+      expect(o.root).toBe(ctx.root); expect(o.codexPath).toBe("codex-test"); expect(o.env.PATH).toBe(SERVICE_PATH);
+      expect(o.env.TYBO_MCP_QUELLE_BEARER_TOKEN).toBe("ERFUNDENER_KONTEXT"); calls.push("read"); return ["quelle"];
+    } });
+    const run = async () => {
+      const out: string[] = [];
+      const code = await runTybo({ args: ["pruefen"], env: { TYBO_ROOT: ctx.root }, out: text => out.push(text), err: text => out.push(text), setup: { ctx }, checks: { specials } });
+      expect([0, 1]).toContain(code);
+      return out.filter(text => text.includes("Werkzeuge Codex"));
+    };
+    const cwd = process.cwd();
+    try {
+      process.chdir(ctx.root); const inside = await run();
+      process.chdir(ctx.home); const outside = await run();
+      expect(outside).toEqual(inside); expect(outside.join("\n")).toContain("1 MCP-Server"); expect(calls).toHaveLength(2);
+      expect(outside.join("\n")).not.toContain("ERFUNDENER_KONTEXT");
+    } finally { process.chdir(cwd); }
+  });
+  test("Parser lehnt fehlende, gekürzte und unbekannte Listen ab", () => {
+    expect(parseCodexSkillNames(SKILL_FIXTURE, "/project")).toEqual(["folder_probe"]);
+    for (const output of ["kaputt", "{}", "[]", SKILL_FIXTURE.replace("### Available skills", "### Skills"), SKILL_FIXTURE.replace("Public test description. (file: r1/folder_probe/SKILL.md)", "…"), SKILL_FIXTURE.replace("</skills_instructions>", "")]) {
+      expect(() => parseCodexSkillNames(output, "/project")).toThrow();
     }
   });
 });

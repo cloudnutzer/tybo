@@ -22,7 +22,8 @@ import { botInstructions, botSettings, botVoice } from "../src/web/bot-settings"
 import type { BotCallPort } from "../src/web/bot-call";
 import { createApprovalTurns, mirrorChunks, webMediaDir } from "../src/web/bot-turn";
 import { generateVapidKeys } from "../src/web/push";
-import type { StartWebUiOptions } from "../src/web/startup";
+import { startWebUi, type StartWebUiOptions } from "../src/web/startup";
+import type { WebServer, WebServerDeps } from "../src/web/server";
 import { webSessionKey } from "../src/web/store";
 import type { TelegramTopicApi } from "../src/web/topics";
 import { UploadStore } from "../src/web/uploads";
@@ -49,12 +50,43 @@ async function wire(env: Record<string, string | undefined> = {}, overrides: Par
 }
 
 describe("startBotWeb", () => {
+  test("OpenRouter-Port gelangt über startWebUi zum Server und liest den Schlüssel zur Aufrufzeit", async () => {
+    const env: Record<string, string | undefined> = {};
+    const authorizations: string[] = [];
+    const { options } = await wire(env, { openrouterKeyFetch: async (_url, init) => {
+      authorizations.push(init.headers.Authorization);
+      return Response.json({ data: { limit: 50, limit_remaining: 12.4, limit_reset: null, usage: 37.6, usage_monthly: 3.2 } });
+    } });
+    let received: WebServerDeps | undefined;
+    await startWebUi({ ...options,
+      env: { WEB_ENABLED: "true", WEB_PASSWORD: "test-passwort-lang" },
+      createServer: async (_config, deps) => {
+        received = deps;
+        return { url: "http://127.0.0.1:3199" } as WebServer;
+      },
+      log: () => {}, lanAddresses: () => [],
+    });
+    expect(received?.openrouterKey).toBe(options.openrouterKey);
+    const port = received!.openrouterKey!;
+    expect(port).toBeDefined();
+    expect(await port.read()).toEqual({ configured: false });
+    env.OPENROUTER_API_KEY = " \t ";
+    expect(await port.read()).toEqual({ configured: false });
+    expect(authorizations).toEqual([]);
+    env.OPENROUTER_API_KEY = "  testwert-674-verdrahtung  ";
+    expect(await port.read()).toMatchObject({ configured: true, limit: 50, remaining: 12.4 });
+    expect(authorizations).toEqual(["Bearer testwert-674-verdrahtung"]);
+    delete env.OPENROUTER_API_KEY;
+    expect(await port.read()).toEqual({ configured: false });
+  });
+
   test("Agenten über den Katalog, keine eigene Liste; Einstellungen, Anweisungen, Stimme", async () => {
     const { options, result } = await wire();
     expect(result).toBeNull();
     expect(options.agentCatalog).toBe(botAgentCatalog);
     expect("agents" in options).toBe(false);
     expect(options.settings).toBe(botSettings);
+    expect(options.onSettingsSaved).toBeFunction();
     expect(options.instructions).toBe(botInstructions);
     expect(options.voice).toBe(botVoice);
   });

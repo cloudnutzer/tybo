@@ -90,7 +90,7 @@ function deps(extra: Partial<ChatTurnDeps> = {}): Partial<ChatTurnDeps> {
       return e;
     },
     // Echte Motorwahl samt echter Prüfung von api (Schlüssel aus der Attrappe)
-    resolveEngine: (key) => resolveEngine(key, { env: () => ({}), log: () => {} }),
+    resolveEngine: (key, d, turn) => resolveEngine(key, { ...d, env: () => ({}), log: () => {} }, turn),
     forgetEngineCheck: () => {},
     runFallbackChain: async () => {
       fallbackCalls++;
@@ -282,4 +282,12 @@ describe("Rückfrage über den Chat-Kern (Issue #348, Verhalten festgehalten)", 
       model: "claude-opus-5-5",
     });
   });
+});
+
+for (const model of ["claude-opus-5-5", "opus"]) test(`Agent mit api und ${model}: echter API-Motor erhält Modell und Effort`, async () => {
+  putSettings({ agents: { general: { engine: "api", model, effort: "high" } } });
+  fake.respond(textReply("Antwort des Agenten"));
+  expect(await turn("json")).toBe("Antwort des Agenten");
+  expect(fake.lastBody()).toMatchObject({ model: model === "opus" ? DEFAULT_CLAUDE_MODEL : model, output_config: { effort: "high" } });
+  expect(claudeCalls).toHaveLength(0);
 });

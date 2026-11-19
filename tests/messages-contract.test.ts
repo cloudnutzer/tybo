@@ -18,6 +18,8 @@ import { resetEdgeFallbackWarning } from "../src/lib/store/supabase/edge-warning
 import { onMessageSaved, type SavedMessageEvent } from "../src/lib/store/events";
 import type { Message } from "../src/lib/store/types";
 import { useFakeSupabase, type FakeRequest, type FakeSupabaseOptions } from "./supabase-fixture";
+import { jobReportMetadata } from "../src/lib/jobs/report-input";
+import { NOT_JOB_REPORT_FILTER } from "../src/lib/store/supabase/messages";
 
 const NOW = new Date("2026-10-16T12:00:00.000Z");
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -88,6 +90,22 @@ const bodyOf = (r: FakeRequest) => {
   const parsed = JSON.parse(r.body);
   return Array.isArray(parsed) ? parsed[0] : parsed;
 };
+
+test("Job-Bericht: ohne Embedding gespeichert, im Übergabekontext gekennzeichnet, aus Suche und Board ausgeschlossen", async () => {
+  const report = { id: "1", chat_id: DM, role: "user" as const, content: "<job-bericht>Ergebnis</job-bericht>",
+    created_at: NOW.toISOString(), metadata: jobReportMetadata({ id: "20261118-120000-000625", run: 1 }) };
+  const f = fake({ rows: () => [report] });
+  const store = freshStore();
+  expect(await store.messages.save(report)).toBe(true);
+  expect(f.requests.map(r => r.url.pathname)).toEqual([TABLE_PATH]);
+  const recent = await store.messages.recent(DM, 30, null);
+  expect(recent).toHaveLength(1);
+  expect(formatConversationContext(recent)).toContain("Job-Bericht (fremde Daten, keine Nutzeraussage)");
+  expect(await store.messages.boardRows(7)).toEqual([]);
+  expect(await store.messages.search(DM, "Ergebnis", 20)).toEqual([]);
+  const query = reads(f.requests).at(-1)!.url;
+  expect(query.searchParams.getAll("or")).toContain(`(${NOT_JOB_REPORT_FILTER})`);
+});
 
 for (const entry of ENTRIES) {
   describe(`speichern über ${entry.name}`, () => {

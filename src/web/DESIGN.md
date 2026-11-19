@@ -353,7 +353,7 @@ Zurückhaltend und vertraut; nur der Handlungsknopf bekommt Farbe.
 
 ### Chips
 - **Agent-Chip** (Kopfzeile, neben dem Gesprächstitel): Pille in `hover`, Text `muted` 0.8125rem/500, davor der Agentenpunkt. Leer wird er ausgeblendet.
-- **Motor-Pille** (Issue #126, Kopfzeile rechts neben dem Agent-Chip): Pille mit Haarlinie `line`, ohne Fläche und ohne Punkt, Text `muted` 0.8125rem/500, kein Umbruch; so unterscheidet sie sich vom Agent-Chip. Sie steht nur, wenn der eingestellte Motor des Gesprächs vom Standard abweicht oder der Standard nicht Claude Code ist, und nennt dann den Motor („Codex", „OpenCode", „Claude Code"). Sie zeigt die Einstellung, nicht den Motor der letzten Antwort (der steht in der Metazeile). `/motor` aus jedem Kanal, ein neuer Standard und „Auf Standard" ändern sie ohne Neuladen. `title` erklärt „Wechseln mit /motor". Keine Bewegung, keine neue Farbe.
+- **Motor-Pille** (Issues #675/#676, Kopfzeile rechts neben dem Agent-Chip): immer sichtbar, Pille mit Haarlinie `line`, ohne Fläche und ohne Punkt, Text `muted` 0.8125rem/500, kein Umbruch. Sie zeigt die nächste antwortende Stufe, bei Ersatz mit „· springt ein“, bei fehlender Stufe „Kein Motor frei“. Ohne Vorschau steht der eingestellte Motor da. `data-engine` nennt den antwortenden Motor, bei keiner freien Stufe ist es leer. `title` und eine versteckte Live-Zeile (`role="status"`, auch `aria-describedby`) erklären Zustand, Grund und Zeit in der Zeitzone des Bots. Die Pille ist ein Knopf mit `aria-haspopup="menu"` und `aria-expanded`; ihr zugänglicher Name bleibt der sichtbare Text. Die Trefferfläche ist mindestens 44 px hoch, ohne die Kopfzeile zu erhöhen. Das Menü sitzt direkt darunter: Fläche `raised`, Haarlinie `line`, kein Schatten und keine Bewegung. Oben steht der Zustandssatz, darunter mindestens 44 px hohe `menuitemradio`-Zeilen (Name links, Zustand rechts, Hinweise darunter), unten „Reihenfolge und Limits“. Gesperrte Motoren bleiben neutral und wählbar, nicht bereite sind `aria-disabled`. Escape, Klick daneben und Auswahl schließen das Menü und geben den Fokus an die Pille zurück; Pfeile, Pos1 und Ende bewegen den Fokus. Beim Aktualisieren bleibt er in derselben Zeile. Unter 40rem stehen Agent und Motor gemeinsam in einer zweiten Kopfzeilen-Reihe; das Claude-Modell bleibt dann im vollständigen Zustandstext, Name und Zusatz werden nie abgeschnitten. Der Titel hat mindestens 4rem Platz und wird gekürzt. Sperren sind neutral, ohne Rot, neue Farbe oder Bewegung. Das Ereignis `engine` aktualisiert die Anzeige ohne Neuladen.
 
 ### Inputs / Fields
 - **Passwortfeld:** Rahmen `line`, Fläche `raised`, Radius 0.75rem, 1rem Schrift; Fokus über den Akzentring.
@@ -466,13 +466,31 @@ Nur vorhandene Bausteine, keine neuen Farben, keine Bewegung.
 
 ### Einstellungen: Motor (Issue #126)
 Nur vorhandene Bausteine, keine neuen Farben, keine Bewegung.
-- **Abschnitt „Motor"** ganz oben im Reiter Agenten, vor der Agentenliste, wie die Abschnitte im Reiter Modelle (Haarlinie oben, Titel als Label, Erklärung in `.actions-hint`, eigener Primärknopf „Speichern").
+- **Abschnitt „Motor"** ganz oben im Reiter Modelle, vor „Standard für alle Agenten“ (Haarlinie oben, Titel als Label, Erklärung in `.actions-hint`, eigener Primärknopf „Speichern").
+- **Reihenfolge (Issue #673):** nummerierte `ol`, Haarlinien zwischen den Stufen. Links Name, Modell in `muted` und gegebenenfalls „zahlt je Verbrauch“, rechts der vollständige Zustand in `ink`, auch bei Sperren und Pausen. Unter 40rem steht der Zustand links unter dem Namen. Die erste Stufe trägt die Auswahl „Standard-Motor“. Darunter leise Knöpfe „Hoch“, „Runter“, „Entfernen“, mindestens 2.75rem in beiden Richtungen; Randknöpfe mit `aria-disabled`, damit der Fokus bleibt. Ein dauerhafter `aria-live`-Bereich sagt die neue Position an. Die feste letzte Zeile führt mit einem Knopf zu „Fallback“, ohne den Router-Hash zu ändern.
+- **Automatik (Issue #673):** Segment „An“/„Aus“ wie die Darstellung, aus der gespeicherten Einstellung, ohne Wert „An“. Ohne Ersatzstufen gesperrt mit Hinweis. Darunter beide Zahlenfelder mit ganzen Prozentwerten, Grenzen als native Attribute und Fehler direkt am Feld mit `aria-invalid`. Die Erklärzeile folgt dem Segment; der Zustand der Stufen folgt weiter allein der Serverantwort.
+- **Stand je Motor (Issue #673):** Liste mit Motor als Gruppenlabel und einer Textzeile je Fenster: Name, Prozentzahl, Reset, Alter und Quelle; Zahlen mit `tabular-nums`. Prozent als Zahl, ohne Balken. „Jetzt messen“ als leiser Knopf, während der Anfrage deaktiviert; Ergebnis je Motor in `.actions-hint`, Anfragefehler unter dem Knopf in `.actions-error`. Lange Zeilen brechen um.
+- **Stufe hinzufügen:** leiser Knopf, darunter Felder wie im übrigen Formular, Claude-Modell als Pflichtfeld und optionaler Effort. Hinweise und Fehler stehen direkt darunter. Keine Geste zum Ziehen.
+- **Verweis im Reiter Agenten:** „Standard-Motor und Ersatzstufen stehen unter Modelle.“ als `.settings-intro`, „Modelle“ verlinkt den Reiter.
 - **Verfügbarkeit** je Motor als Liste wie die Schlüssel im Status, Name in normaler Schrift, rechts der Zustand: „angemeldet, Version …" in `ink`, sonst in `muted` („nicht angemeldet: codex login im Terminal", „nicht installiert", „installiert, …; Anmeldung nicht feststellbar"). Ungeprüft heißt nie angemeldet.
 - **Standard-Motor** als Auswahl mit „Standard (…)" wie die übrigen Felder, darunter die Gruppe „Codex" wie ein Nebenmodell (Titel als Label, Hinweis): Modell als freies Feld mit Platzhalter „Standard aus der Codex-Konfiguration", Effort und Rechte als Auswahl. Rechte in der Reihenfolge Voller Zugriff (Standard), Projekt schreiben, Nur lesen, darunter die Erklärung der Stufen in `.actions-hint`.
 - **Gruppe „OpenCode"** (Issue #129) unter „Codex", gleich gebaut: Hinweis, eine Zeile Verfügbarkeit in `.actions-hint` („OpenCode: angemeldet, Version …" oder die Meldung der Prüfung), Modell wie die Modell-Felder im Reiter Modelle (Auswahl aus `opencode models` mit Filter bei langen Listen, „Standard aus der OpenCode-Konfiguration", „Eigenes Modell …"; OpenRouter-Modelle zuerst; Fehler der Liste darunter mit „Eigenes Modell bleibt möglich."), Variante als freies Feld mit Platzhalter „Standard von OpenCode", Rechte als Auswahl in der Reihenfolge Automatisch freigeben (Standard), Fragen ablehnen. Fehlt OpenCode unter den Motoren des Servers, fehlt die Gruppe.
 - **Abweichende Gespräche** unter dem Speichern: Liste mit Haarlinien, links Name und Motor als Motor-Pille, rechts der leise Knopf „Auf Standard" (ohne Rückfrage, wie `/motor standard`). Nicht zuzuordnende Einträge heißen „Nicht mehr zuzuordnen" mit Erklärung darunter. Fehler je Zeile in `.actions-error`, Erfolg als „Auf Standard gestellt." in der Statuszeile. Am Handy bricht der Knopf unter den Namen.
-- **Agenten-Modelle** tragen unter der Auswahl den Hinweis „gilt für Claude Code" in `.actions-hint`, ebenso der Standard im Reiter Modelle.
+- **Agenten-Modelle** tragen unter der Auswahl den Hinweis „gilt für Claude Code und Anthropic API" in `.actions-hint`, ebenso der Standard im Reiter Modelle.
 - **Status:** Abschnitt „Motoren" zwischen den Angaben und den Schlüsseln, gleiche Liste wie die Verfügbarkeit.
+
+### Einstellungen: Werkzeuge je Motor im Status (Issue #667)
+Nur im Reiter „Status“, mit eigenen Klassen unter `.settings-status-engines`. Die Motorliste im Reiter „Modelle“ bleibt bei ihrer bisherigen Form. Keine neuen Farben, keine Bewegung.
+- **Motorzeile:** Name links, Bereitschaft rechts; darunter „Werkzeuge“ in `muted` links und die Kurzform in `ink` rechts. Unter 40rem steht die Kurzform links unter dem Label. Lücken und unbekannter Bestand sind Hinweise, keine Fehler; sie bleiben auch bei einem nicht bereiten Motor in `ink` lesbar.
+- **Einzelheiten:** natives `details` mit `summary` „Einzelheiten“, nur bei aufzählbaren Angaben. Der native Dreiecksmarker bleibt sichtbar in `muted`; die ganze Zeile ist mindestens 2.75rem hoch, mit Radius 0.6rem und Hover `hover`/`ink`. Der Fokusring hat 2 px in `accent` mit 2 px Abstand. Enter und Leertaste bedienen den Aufklapper ohne eigene Tastaturlogik. Offen-Zustand je Motor und Fokus bleiben beim Aktualisieren erhalten.
+- **Inhalt:** Gruppenlabels wie in der Schlüsselliste; Namen in normaler Schrift mit Gewicht 500, darunter Herkunft bzw. unveränderter Grund vom Server. Zuletzt die festen Lücken. Keine verschachtelten Karten oder zusätzlichen Trennlinien. Alle Namen, Gründe und Kurzformen brechen mit `overflow-wrap: anywhere` um, auch bei 64 Zeichen ohne Leerzeichen.
+- **Erklärung:** unter der Liste eine `.actions-hint` mit dem Link „Werkzeuge im Ersatzmotor“ in der vorhandenen Linkfarbe. Die Doku öffnet in einem neuen Tab. Kennt der Server das Feld `tools` noch nicht, fehlen Werkzeugzeilen, Aufklapper und Erklärung.
+
+### Einstellungen: Motor je Agent (Issue #678)
+Nur vorhandene Bausteine, Farben und Abstände, keine neue Bewegung.
+- **Motor** als Auswahl im aufgeklappten Agenten über Modell und Effort, mit „Standard (<Motor>)“ und den Motoren aus der Einstellungsantwort. Nicht bereite Motoren tragen den Zusatz „nicht installiert“ oder „nicht angemeldet“ und bleiben wählbar.
+- **Modell und Effort** bei Codex und OpenCode mit dem vorhandenen Stil für deaktivierte Felder. Darunter in `.actions-hint` die Erklärung und ein Link zum Abschnitt Motor im Reiter Modelle. Bei Anthropic API bleiben die Felder aktiv; der Hinweis nennt volle Modellnamen und Zahlung je Verbrauch.
+- **Agentenliste:** ein vom Standard abweichender Motor steht in der vorhandenen Metazeile neben Modell und Effort. Lange Zeilen brechen wie bisher um, auch bei 390 px.
 
 ### Einstellungen: Agenten verwalten (Issue #51)
 Nur vorhandene Farben, keine Bewegung.
@@ -507,7 +525,8 @@ Nur vorhandene Bausteine und Farben, keine Bewegung.
 - **Zeitstempel** (Issue #186): bei Antworten vorn in der Metazeile, bei eigenen Nachrichten rechtsbündig 0.25rem unter der Blase bzw. den Anhängen, beides 0.75rem `muted` mit `tabular-nums`, ohne Umbruch in der Zeit. Heute „21:08", gestern „gestern 21:08", dieses Jahr „26.09. 21:08", sonst „26.09.2025 21:08", Zeitzone des Browsers. In der Fußzeile bricht nur die Metazeile um (die Fußzeile selbst bleibt eine Reihe, oben ausgerichtet, erste Textzeile mittig zum Knopf), Uhrzeit und „Kopiert" bleiben daneben. Als `<time datetime>`, das volle Datum („Samstag, 26. September 2026, 21:08 Uhr") steht im `title` und als unsichtbarer Text für Screenreader (`visually-hidden`), die Kurzform ist für sie verborgen. Ohne gültigen Zeitpunkt keine Zeit. Bleibt die Seite über Mitternacht offen, wird der Verlauf kurz danach bzw. beim Zurückkehren in den Tab neu gezeichnet. Keine Bewegung, keine neue Farbe.
 - **Meldung** (Issue #47): Nachricht eines Dienstes (Pipeline, Briefing, Check-in, Watchdog, Watcher, Datei), keine Blase und kein Agentenkopf. Oben eine Zeile „Absender · Uhrzeit" in 0.75rem `muted`, Absender 600; unbekannte Absender erscheinen mit ihrer Kennung, ohne Angabe „Meldung". Darunter das Markdown des Servers in 0.9375rem `muted` an einer Haarlinie links (wie die Fortschrittsliste).
 - **Rückfrage-Knöpfe** (Issue #115, Entscheidung 0017): unter einer Nachricht mit Rückfrage aus dem Register (Werkzeug-Freigabe, Merk-Vorschlag, „Weiter?", Topic-Zuordnung) eine umbrechende Reihe leiser Knöpfe (`button-quiet`, Abstand 0.35rem), Beschriftung aus dem Register nur als Text. Der erste Knopf trägt die Handlungsfarbe (`button-choice-primary`: Fläche `accent`, Text `accent-ink`, 500), die übrigen bleiben leise; kein Rot, auch nicht für „Ablehnen". Mindestens 2.25rem hoch, am Handy 2.75rem. Während ein Klick beim Server liegt, sind alle Knöpfe der Frage gesperrt (`aria-busy`), auch über Neuzeichnen und Gesprächswechsel hinweg. Nach der Entscheidung ersetzt eine Zeile in 0.8125rem `muted` mit `tabular-nums` die Knöpfe: „Erledigt: <Knopf> · im Browser/in Telegram/im Terminal · <Uhrzeit>" bzw. „Abgelaufen"; kommt 409, zeigt sie den gemeldeten Endzustand statt eines Fehlers. Andere Fehler stehen darunter in 0.8125rem `error` (`role="alert"`), die Knöpfe sind wieder frei. Steht die Frage in einem anderen Gespräch als ihrem eigenen (Kopie einer Web-Frage im Direktchat), gibt es keine Knöpfe, sondern die Zeile „Antwort im Gespräch, aus dem die Frage kommt." und einen leisen Knopf „Zum Gespräch". Keine Fläche um die Reihe, kein Schatten, keine Bewegung.
-- **Dateikarte** (Issue #47): höchstens 28rem breit, Rahmen `line`, Fläche `raised`, Radius 0.6rem, kein Schatten. Blatt-Icon in `muted`, Name in `ink` 0.9375rem, Größe in 0.75rem `muted`, rechts ein leiser Knopf „Herunterladen" (am Handy 2.75rem hoch). PNG, JPEG, WebP und GIF zusätzlich als Vorschau darüber (höchstens 20rem hoch, Rahmen `line`, Radius 0.6rem). Steht in der Meldung nur der Dateiname, entfällt der Text über der Karte.
+- **Dateikarte** (Issue #47): höchstens 28rem breit, Rahmen `line`, Fläche `raised`, Radius 0.6rem, kein Schatten. Blatt-Icon in `muted`, Name in `ink` 0.9375rem, Größe in 0.75rem `muted`, rechts ein leiser Knopf „Herunterladen" (am Handy 2.75rem hoch). PNG, JPEG, WebP und GIF zusätzlich als Vorschau darüber (höchstens 20rem hoch, Rahmen `line`, Radius 0.6rem). Steht in der Meldung nur der Dateiname, entfällt der Text über der Karte. Die Vorschau ist ein Knopf („<Name> groß ansehen") und öffnet den Betrachter. In der installierten App auf iPhone oder iPad (Issue #708) sind „Herunterladen" und bei HTML „Öffnen" Knöpfe statt Links: „Herunterladen" lädt die Datei und öffnet den Teilen-Dialog des Systems, beim Laden steht „Lädt …" (`aria-busy`, 60 % Deckkraft); verfällt die Geste, heißt der Knopf „Sichern oder teilen". Hinweise und Fehler stehen in einer Zeile unter der Karte (0.8125rem, `muted` bzw. `error`, `role="status"`).
+- **Betrachter** (Issue #708): Bild oder HTML-Datei über der ganzen Seite, ein `<dialog>` (`showModal`), Fläche `bg`, kein Schatten, keine Bewegung. Kopfzeile an einer Haarlinie: Dateiname in 0.9375rem/600 (eine Zeile, abgeschnitten), rechts „Schließen" als runder Knopf, 2.75rem, Fläche `raised`, Haarlinie `line`, Icon in `ink`; er bekommt beim Öffnen den Fokus. Die sicheren Ränder (`env(safe-area-inset-*)`) sind Innenabstand des Dialogs. Das Bild passt sich mittig ein (kein Zoom), ein Tipp daneben, Escape oder „Schließen" schließt, der Fokus kehrt zum auslösenden Knopf zurück. HTML füllt die Fläche unter der Kopfzeile als iframe auf weißem Blatt, auch im Dunkelmodus.
 - **Einblenden:** neue Nachrichten (`data-fresh`) in 180 ms von 20 % Deckkraft und 4 px tiefer.
 
 ### Statuszeile (Signaturkomponente)
@@ -539,3 +558,53 @@ Eine zentrierte Spalte von 21rem: Wortmarke 1.75rem, eine Zeile Einleitung in `m
 - **Don't** Antworten in Blasen oder Rahmen setzen; nur die Nutzerblase ist eine Blase.
 - **Don't** einen vom Nutzer gewollten Stopp rot darstellen.
 - **Don't** weitere Bewegung als Einblenden und Schublade hinzufügen, auch keine Übergänge an Knöpfen oder am Chevron.
+
+
+### Jobs (Issue #626)
+
+- „Jobs“ steht neben „Offene Fäden“ im Fuß der Seitenleiste. Die Pille zählt
+  zuerst wartende Jobs (`active`/`accent`), sonst laufende Jobs (`hover`/`ink`).
+  Ohne aktive Jobs bleibt sie verborgen; der Eintrag bleibt erreichbar.
+- `#/jobs` öffnet dieselbe Lesespalte und Kopfzeile mit Zurück-Pfeil wie die
+  Fäden. Gruppen: „Warten auf dich“, „In Arbeit“, „Zuletzt beendet“. Titel in
+  0.9375rem/600, Status als Pille, Arbeitszeit, Laufnummer und Gespräch in der
+  vorhandenen Meta-Zeile. Haarlinien statt Karten und Schatten.
+- Die Frage lässt sich unter „Frage n beantworten“ aufklappen. Frage und
+  Kontext sind Klartext; die Knöpfe sind dieselbe Auswahl-Komponente wie im
+  Gespräch. Ohne zuordenbare Auswahl steht ein Hinweis statt wirkungsloser
+  Knöpfe. Beim Abgleich bleiben geöffnete Fragen und der Fokus erhalten.
+- Nur Aktionen der Quelle erscheinen. „Stoppen“ öffnet die vorhandene
+  Bestätigungsfläche der Routinen, nennt den Titel und die Folge. Fokus liegt
+  zuerst auf „Abbrechen“. Gewolltes Stoppen bleibt neutral, ohne Rot.
+- Log und Bericht öffnen unter der Knopfzeile. Das Log steht als umbrechender
+  Monospace-Text auf `code`, höchstens 24rem hoch. Der Bericht nutzt `.content`
+  für Markdown. Beide nennen den Lauf und haben „Schließen“. Ein Laufwechsel
+  entfernt alte Inhalte und Bestätigungen.
+- Lade-, Leer- und Fehlerzustand nutzen die bestehenden Hinweisstile. Bei
+  Fehlern bleibt der letzte Stand sichtbar, mit „Erneut laden“ und gesperrten
+  Aktionen. Rückmeldungen stehen in einer `role="status"`-Zeile. Auf dem Handy
+  sind Knöpfe und die Frage-Zeile mindestens 2.75rem hoch. Keine neuen Farben,
+  Schriften oder Animationen.
+
+### Pipelines (Issue #646)
+
+- „Pipelines“ steht neben „Jobs“. Ohne Statusdaten fehlt der gesamte Eintrag.
+  Die Pille zählt Wartende mit `active`/`accent`, sonst Laufende mit
+  `hover`/`ink`. Ein veralteter Stand behält den Zähler ohne Hervorhebung.
+- `#/pipelines` verwendet Kopfzeile, Lesespalte, Haarlinien und Statuspillen
+  der Jobs. Reihenfolge: „Warten auf dich“, „Angehalten“, „Läuft“, „Ruht“.
+  Ruhe ist ein zunächst geschlossenes `details`; aufgeklappt steht der letzte
+  Zustand dabei. Dauer wird aus dem Zeitstempel berechnet und kennt Tage.
+- Die letzte Frage ist Klartext in einem `details` mit Datum, Chevron und
+  Vorschau bis 150 Zeichen. Aufgeklappt ersetzt der ganze Text die Vorschau.
+  „Zum Gespräch“ ist die einzige Aktion an einer Pipeline und erscheint nur
+  mit vorhandenem Ziel. Es gibt keine Antwort- oder Steuerknöpfe.
+- Die fünf letzten Ereignisse lassen sich aufklappen, mit Datum und Uhrzeit
+  und festen Bezeichnungen für die Schritte. Kein freies Protokoll.
+- Stopp- und Veralten-Hinweis stehen über der Liste auf `hover` mit `ink`.
+  Ein alter Stand wird ausdrücklich als solcher bezeichnet. Eine unabhängige
+  Uhr nimmt Warte-Hervorhebungen nach fünf Minuten zurück, auch ohne Antwort
+  vom Server. Fehler erhalten den letzten Stand und bieten „Erneut laden“.
+- Beim Abgleich bleiben aufgeklappte Bereiche, Fokus und Scrollposition
+  erhalten. Frage, Ereignisse, Ruhe und Gespräch haben am Handy mindestens
+  2.75rem Tippfläche. Dieselben Bausteine gelten in Hell und Dunkel.

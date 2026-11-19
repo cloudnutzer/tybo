@@ -41,6 +41,7 @@ config/voice-agent-preise.json
 
 # --- Laufzeitdaten und Arbeitskopien, in jedem Ordner ---
 data/
+.agents/skills/
 tmp/
 models/
 knowledge-base/

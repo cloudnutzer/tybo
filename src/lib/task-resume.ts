@@ -21,16 +21,22 @@
  * Agent SDK laufen seit Issue #349 über den Mac-Pfad (Art task_resume).
  */
 
-import { getEngine, type EngineId, type EngineResult } from "./engines";
-import { runExecution, isAbortError } from "./execution-context";
+import { checkEngine, ENGINE_IDS, EngineNotAvailableError, getEngine, type EngineId, type EngineResult } from "./engines";
+import { runExecution, isAbortError, checkAborted, currentExecution } from "./execution-context";
 import { isSessionModeEnabled, getResumableSession, sessionEpoch } from "./session-manager";
-import { finalizeClaudeSession } from "./chat-turn";
+import { ABORT_REPLY, canRetryResume, finalizeClaudeSession, runJsonTurn, type PriorAttempt, type TurnInfo } from "./chat-turn";
 import { sessionKeyFor } from "./store/message-rules";
 import { bookRunOutcome } from "./spend/credit";
 import { getAgentConfigOrGeneral } from "../agents";
 import { DEFAULT_PROMPT_CHANNEL, formatChannelRules, type PromptChannel } from "../agents/prompt-parts";
-import { engineModelAndEffort, sessionModel } from "./engine-choice";
+import { engineIsReady, engineModelAndEffort, sessionModel } from "./engine-choice";
+import { stageBlock } from "./engine-switch";
+import { readSwitchState } from "./engine-switch-state";
+import { noteStageRun, stageFailureOf } from "./engine-switch-run";
+import { scheduleClaudeUsageAfterChat } from "./engines/claude-usage";
+import { engineAuto, engineBackups, getSettings } from "./settings";
 import type { IntentTarget } from "./intent-gate";
+import type { FoundQuestion } from "./turn-questions";
 
 /** Was von einem gespeicherten Task gebraucht wird (Supabase oder Datei) */
 export interface ResumableTask {
@@ -50,6 +56,13 @@ export interface TaskResumeDeps {
   getResumableSession: typeof getResumableSession;
   sessionEpoch: typeof sessionEpoch;
   finalizeClaudeSession: typeof finalizeClaudeSession;
+  handoverTurn: typeof runJsonTurn;
+  readSwitchState: typeof readSwitchState;
+  noteStageRun: typeof noteStageRun;
+  scheduleClaudeUsageAfterChat: typeof scheduleClaudeUsageAfterChat;
+  checkEngine: typeof checkEngine;
+  getSettings: typeof getSettings;
+  now: () => number;
   /** Modell je Motor (Issue #125): Claude pro Agent, Codex aus engine.codex, OpenCode aus engine.opencode; undefined = Standard des Motors */
   resolveModel: (agent: string, engine: EngineId) => string | undefined;
   resolveEffort: (agent: string, engine: EngineId) => string | undefined;
@@ -64,6 +77,13 @@ const defaultDeps: TaskResumeDeps = {
   getResumableSession,
   sessionEpoch,
   finalizeClaudeSession,
+  handoverTurn: runJsonTurn,
+  readSwitchState,
+  noteStageRun,
+  scheduleClaudeUsageAfterChat,
+  checkEngine,
+  getSettings,
+  now: Date.now,
   resolveModel: (agent, engine) => engineModelAndEffort(engine, agent).model,
   resolveEffort: (agent, engine) => engineModelAndEffort(engine, agent).effort,
   allowedTools: (agent) => getAgentConfigOrGeneral(agent)?.allowedTools,
@@ -104,16 +124,38 @@ export function taskResumePrompt(choice: string, channel: PromptChannel = DEFAUL
   return `${formatChannelRules(channel)}\n\n---\n\nUser responded: ${choice}`;
 }
 
+export interface TaskHandover {
+  question: string;
+  options: string[];
+  originalPrompt: string;
+}
+
+/** Frage und Knopf-Antwort als gewöhnliche Nachricht an die nächste Stufe. */
+export function taskHandoverPrompt(handover: TaskHandover, answer: string): string {
+  return [
+    "Der Nutzer hat eine Rückfrage aus diesem Gespräch per Knopf beantwortet.",
+    `Ursprünglicher Auftrag: ${handover.originalPrompt.slice(0, 2_000)}`,
+    `Rückfrage: ${handover.question}`,
+    ...(handover.options.length ? [`Zur Auswahl standen: ${handover.options.join(" | ")}`] : []),
+    `Antwort des Nutzers: ${answer}`,
+    "Setze den Auftrag mit dieser Antwort fort.",
+  ].join("\n");
+}
+
 export type MacResumeOutcome =
   /** Weder Task noch Topic haben eine Session: nur bestätigen */
   | { status: "no-session" }
   /** /stop oder Neustart, auch schon in der Warteschlange: nichts speichern */
   | { status: "aborted" }
-  | { status: "done"; result: EngineResult; resumeId: string; agent: string; engine: EngineId; model: string };
+  /** Alte Übersetzer und Attrappen ohne via gelten weiterhin als Resume. */
+  | { status: "done"; via?: "resume"; result: EngineResult; resumeId: string; agent: string; engine: EngineId; model: string }
+  | { status: "done"; via: "handover"; result: EngineResult; resumeId: string; agent: string;
+      engine?: EngineId; model?: string; followUp?: Pick<FoundQuestion, "question" | "options">; notices?: string[] };
 
 /**
- * Setzt die Session der Rückfrage mit der Knopf-Antwort fort, immer über den
- * Motor der Rückfrage, auch wenn das Topic inzwischen einen anderen nutzt.
+ * Setzt die Session der Rückfrage mit der Knopf-Antwort über ihren Motor fort.
+ * Mit Frage und Ersatzstufen übergibt eine gesperrte, nicht bereite oder
+ * gescheiterte Stufe einmal an den Chat-Kern, unter derselben Gesprächssperre.
  * Bevorzugt die Session, in der die Frage gestellt wurde (task.session_id),
  * sonst die laufende Topic-Session desselben Motors und Modells. Nur wenn
  * genau die Topic-Session fortgesetzt wurde (Motor und ID gleich), zählt der
@@ -126,11 +168,13 @@ export async function resumeMacTask(
   choice: string,
   deps?: Partial<TaskResumeDeps>,
   /** Kanal des Klicks; ohne Angabe Telegram */
-  channel?: PromptChannel
+  channel?: PromptChannel,
+  handover?: TaskHandover
 ): Promise<MacResumeOutcome> {
   const d = deps ? { ...defaultDeps, ...deps } : defaultDeps;
-  const { sessionKey, agent } = taskTarget(task, fallbackChatId);
+  const { sessionKey, agent, chatId, topicId } = taskTarget(task, fallbackChatId);
   const allowedTools = d.allowedTools(agent);
+  let claudeRan = false;
   try {
     return await d.runExecution(
       sessionKey,
@@ -150,9 +194,50 @@ export async function resumeMacTask(
         const resumeId = task.session_id || topicSession?.engineSessionId;
         if (!resumeId) return { status: "no-session" };
 
-        // Unbekannter oder nicht verfügbarer Motor: getEngine wirft, die
-        // Session-ID geht nie an einen anderen Motor
-        const engine = d.getEngine(engineId);
+        // Unbekannte Motoren bleiben Fehler; bekannte, nicht verfügbare dürfen übergeben.
+        if (!ENGINE_IDS.includes(engineId)) throw new EngineNotAvailableError(engineId);
+        const settings = handover ? d.getSettings() : {};
+        const useHandover = !!handover && engineBackups(settings).length > 0;
+        const transfer = async (priorAttempts?: PriorAttempt[]): Promise<MacResumeOutcome> => {
+          checkAborted();
+          let info: TurnInfo | undefined;
+          let sessionId: string | undefined;
+          let tools: EngineResult["tools"];
+          let followUp: Pick<FoundQuestion, "question" | "options"> | undefined;
+          const notices: string[] = [];
+          const text = await d.handoverTurn({
+            userMessage: taskHandoverPrompt(handover!, choice), chatId, topicId, agentName: agent, channel,
+            ...(priorAttempts ? { priorAttempts } : {}),
+            longRunNotices: false,
+            sink: { progress() {}, notice: text => { notices.push(text); } },
+            onInfo: value => { info = value; },
+            onTools: value => { tools = value; },
+            onSessionId: id => { sessionId = id; },
+            onQuestion: question => { followUp = { question: question.question, options: question.options }; },
+          });
+          checkAborted();
+          if (text === ABORT_REPLY) return { status: "aborted" };
+          // Eine Session des gescheiterten Motors gehört nie zu einem Ersatzmodell.
+          const answeredSession = info?.engine ? sessionId : undefined;
+          return { status: "done", via: "handover", agent, engine: info?.engine, model: info?.engine ? sessionModel(info.model) : info?.model,
+            notices, ...(info?.engine && followUp ? { followUp } : {}),
+            resumeId: answeredSession ?? "", result: { engine: info?.engine ?? engineId, text, tools,
+              isError: !info?.engine && !info?.model, ...(info?.timedOut ? { timedOut: true } : {}),
+              ...(answeredSession ? { sessionId: answeredSession } : {}) } };
+        };
+        if (useHandover) {
+          let ready = false;
+          if (!stageBlock({ engine: engineId }, model || undefined, d.readSwitchState(), d.now())) {
+            try { ready = engineIsReady(engineId, await d.checkEngine(engineId)); } catch { /* Nicht bereit. */ }
+          }
+          checkAborted();
+          if (!ready) return transfer();
+        }
+        let engine;
+        try { engine = d.getEngine(engineId); } catch (error) {
+          if (useHandover) return transfer();
+          throw error;
+        }
         const result = await engine.run({
           prompt: taskResumePrompt(choice, channel),
           streaming: false,
@@ -167,19 +252,34 @@ export async function resumeMacTask(
           abortKey: sessionKey, // /stop beendet auch diesen Prozess
         });
         void bookRunOutcome("task-resume", result.engine, model || undefined, result);
-        if (result.aborted) return { status: "aborted" };
+        const aborted = result.aborted || currentExecution()?.controller.signal.aborted;
+        claudeRan = result.engine === "claude" && !aborted;
+        if (useHandover) {
+          // Eine verlorene Session sperrt nicht den ganzen Motor. Messwerte gelten trotzdem.
+          const noted = d.noteStageRun({ engine: engineId }, model || undefined, aborted ? { ...result, aborted: true } : result,
+            engineAuto(settings), d.now(), undefined, { abandoned: !aborted && !canRetryResume(result) });
+          // Erfolg reiht die Auswertung nur ein; die Auswahl nach einem Fehler wartet darauf.
+          if (!aborted && stageFailureOf(result)) {
+            await noted;
+            checkAborted();
+            return transfer([{ stage: { engine: engineId, ...(model ? { model } : {}) }, result }]);
+          }
+        }
+        if (aborted) return { status: "aborted" };
 
         if (topicSession && topicSession.engine === result.engine && topicSession.engineSessionId === resumeId) {
           await d.finalizeClaudeSession(sessionKey, agent, result, undefined, sessionModel(model), undefined, epoch);
         }
         // Immer mit Modell ("" = Standard des Motors): eine Folgefrage am Task erbt es so, statt als alt zu gelten
-        return { status: "done", result, resumeId, agent, engine: engineId, model: sessionModel(model) };
+        return { status: "done", via: "resume", result, resumeId, agent, engine: engineId, model: sessionModel(model) };
       },
       allowedTools
     );
   } catch (error) {
     if (isAbortError(error)) return { status: "aborted" };
     throw error;
+  } finally {
+    if (claudeRan) d.scheduleClaudeUsageAfterChat();
   }
 }
 

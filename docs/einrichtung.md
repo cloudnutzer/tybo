@@ -1190,8 +1190,15 @@ Modell geladen ist.
 Der Motor landet als `engine.default` in `config/settings.json` und gilt
 vor `TYBO_ENGINE` aus der `.env`. Ist ein anderer Motor als Claude Code
 gewählt, prüft der Test, ob er installiert und angemeldet ist. Ändern geht
-auch später in der WebUI unter Einstellungen, Reiter Agenten, oder je
-Gespräch mit `/motor`.
+auch später in der WebUI unter Einstellungen, Reiter Modelle, Abschnitt Motor, oder je
+Gespräch mit `/motor claude`, `/motor codex`, `/motor opencode` oder
+`/motor api`. Das wählt einen Motor, kein Modell; `/motor standard` hebt die
+Gesprächswahl auf. Ersatzstufen richtet man anschließend im selben Abschnitt
+„Motor“ ein. `/motor auto an` und `/motor auto aus` steuern den Wechsel an
+der Schwelle, `/motor pruefen` misst und bewertet Sperren neu,
+`/motor werkzeuge` zeigt Bestand und Lücken. Nach den Motorstufen bleiben
+Ersatzmodelle mit eingeschränktem Werkzeugumfang. Mehr:
+[Ersatzstufen und Automatik](erweiterungen.md#ersatzstufen-und-automatik).
 
 ### 8. Sprache (optional)
 

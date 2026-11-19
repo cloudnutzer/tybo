@@ -104,6 +104,16 @@ describe("Meldung", () => {
     for (const n of all(head)) expect(n.innerHTMLWrites).toEqual([]);
   });
 
+  test("Motorwechsel aus dem gemeinsamen Meldeweg nutzt die Dienst-Darstellung", () => {
+    const notice = { ...NOTICE, source: "system", text: "Motorwechsel: Codex antwortet.", html: "<p>Motorwechsel: Codex antwortet.</p>" };
+    const node = app.messageElement(notice, "general");
+    expect(node.className).toBe("msg msg-notice");
+    expect(byClass(node, "notice-source")!.textContent).toBe("System");
+    expect(byClass(node, "notice-time")).toBeDefined();
+    expect(byClass(node, "notice-body")!.innerHTMLWrites).toEqual([notice.html]);
+    expect(byClass(node, "msg-head")).toBeUndefined();
+  });
+
   test("Absender: bekannte deutsch, unbekannte roh, ohne Angabe „Meldung“", () => {
     expect(["pipeline", "briefing", "checkin", "watchdog", "watcher", "datei"].map(app.noticeSourceLabel)).toEqual([
       "Pipeline",

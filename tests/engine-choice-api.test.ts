@@ -42,7 +42,11 @@ describe("Auswahl", () => {
   });
 
   test("/motor listet api mit Bereitschaft", async () => {
-    const services = createEngineCommandServices({ checkEngine, getSettings: () => ({}), env: () => ({}) });
+    const services = createEngineCommandServices({
+      // Nur die API-Bereitschaft ist Gegenstand dieser Probe; keine echten CLI-Prüfungen.
+      checkEngine: id => id === "api" ? checkEngine(id) : Promise.resolve({ engine: id, checked: true, installed: false, loggedIn: false }),
+      getSettings: () => ({}), env: () => ({}),
+    });
     let list = await services.available();
     expect(list.find((e) => e.engine === "api")).toEqual({ engine: "api", label: "Anthropic API", ready: true });
     key = undefined;

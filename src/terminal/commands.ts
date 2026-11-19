@@ -20,6 +20,7 @@
  * /gespraeche-Liste, keine Telegram-Topic-IDs (dafür topic-<n>).
  */
 
+import { motorUnscoped } from "../lib/commands/motor-args";
 import { BRAND } from "../brand";
 import type { ConversationSummary } from "./api";
 import { sanitizeLine } from "./sanitize";
@@ -57,6 +58,7 @@ const URGENT_GOAL = new Set(["pause", "stop", "cancel", "done", "abbrechen"]);
 
 function isUrgent(raw: string, args: string): boolean {
   if (URGENT.has(raw)) return !args;
+  if (raw === "motor" || raw === "engine") return motorUnscoped(args);
   return raw === "goal" && URGENT_GOAL.has(args.toLowerCase());
 }
 

@@ -27,6 +27,7 @@ import { getTopicNames } from "../lib/topic-names";
 import { TopicStateStore, type TopicStateEntry } from "../lib/topic-state";
 import { pickApiAttachments } from "./attachments";
 import { toApiMessage } from "./chat";
+import { isJobReport } from "../lib/store/message-rules";
 import { isDisplayOnlyMetadata, pickNotice } from "./notice";
 import { isChoiceId, pickReplyInfo } from "./store";
 import {
@@ -161,6 +162,7 @@ function telegramMessageId(metadata: Record<string, unknown> | null): string | n
  * der für den Speicher um Anhang-Zeilen ergänzte.
  */
 export function toTelegramApiMessage(row: HistoryRow, seen: Set<string> = new Set(), conversationId?: string): TelegramApiMessage | null {
+  if (isJobReport(row.metadata)) return null;
   if (row.role !== "user" && row.role !== "assistant") return null;
   if (typeof row.content !== "string") return null;
   const createdAt = isoOrNull(row.created_at);
@@ -471,6 +473,7 @@ export function createTelegramLiveFeed(deps: TelegramLiveDeps): TelegramLiveFeed
   const listeners = new Set<(event: TelegramLiveEvent) => void>();
   let stopHook: (() => void) | null = null;
   let stopPoll: (() => void) | null = null;
+  let flushPoll: (() => Promise<boolean>) | undefined;
   /** Schon gemeldete Meldungen (msgId), älteste zuerst */
   const delivered = new Set<string>();
   /** Meldungen (msgId), deren Topic-Zustand gerade geprüft wird; Ergebnis wie handleSaved */
@@ -720,6 +723,11 @@ export function createTelegramLiveFeed(deps: TelegramLiveDeps): TelegramLiveFeed
     const stopTimer = every(poll.intervalMs ?? DISPLAY_ONLY_POLL_MS, tick);
     // Sofort den Startstand holen, damit die erste echte Abfrage nur Neues meldet
     void tick();
+    flushPoll = async () => {
+      await running;
+      await tick();
+      return !stopped && !failing && !resumeAfter && retryRows.size === 0;
+    };
     return () => {
       stopped = true;
       stopTimer();
@@ -745,9 +753,11 @@ export function createTelegramLiveFeed(deps: TelegramLiveDeps): TelegramLiveFeed
     stopHook = null;
     stopPoll?.();
     stopPoll = null;
+    flushPoll = undefined;
   }
 
   const feed: TelegramLiveFeed = {
+    flush: async () => flushPoll ? flushPoll() : true,
     subscribe(listener) {
       listeners.add(listener);
       if (listeners.size === 1) {

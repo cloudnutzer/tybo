@@ -299,6 +299,18 @@ describe("Klick", () => {
     expect(app.error()).toBeUndefined();
   });
 
+  test("alter Job-Knopf zeigt läuft schon als Text und wird nicht wieder freigegeben", async () => {
+    const app = setup({ messages: { "topic-8": [question("1", open("Abc123", { options: [{ key: "resume", label: "Fortsetzen" }] }), { source: "job" })] } });
+    await settle();
+    app.buttons()[0].dispatch("click");
+    await settle();
+    app.server.posts[0].resolve(409, { expired: true, choice: { id: "Abc123", options: [], state: "expired" }, message: "Job 20261118-120000-000623 läuft schon." });
+    await settle();
+    expect(app.status()).toBe("Job 20261118-120000-000623 läuft schon.");
+    expect(app.buttons()).toEqual([]);
+    expect(app.error()).toBeUndefined();
+  });
+
   test("409 abgelaufen und 404: „Abgelaufen“, kein Fehler", async () => {
     const app = setup({ messages: { "topic-8": [question("1", open("Abc123")), question("2", open("Def456"))] } });
     await settle();

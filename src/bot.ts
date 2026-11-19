@@ -29,12 +29,13 @@ import { registerBotShutdown } from "./app/bot-shutdown";
 import { createLastSessionStore } from "./app/last-session";
 import { describeAssetFromReply, healthAddress, loadTelegramPhoto, startHealthServer } from "./app/health-server";
 import { createBotTurns, goalAgentCall } from "./app/bot-turns";
+import { createBotJobReports } from "./app/job-reports";
 import { bootBot } from "./app/bot-boot";
 import { createBotCommandServices } from "./app/command-services";
 import { wireBotChoices } from "./app/bot-choices";
 import { wireTelegramChannel } from "./app/bot-telegram-channel";
 import { startBotWeb } from "./app/bot-web";
-import { checkClaudeBeforeWork, startBackground, startBanner, type Background } from "./app/bot-start";
+import { checkClaudeBeforeWork, defaultModelLabel, startBackground, startBanner, type Background } from "./app/bot-start";
 import { allowedChat } from "./lib/http-security";
 import { processInBackground } from "./lib/process-background";
 import { createBotNotices } from "./lib/bot-notices";
@@ -147,6 +148,7 @@ registerBotShutdown(lifecycle, {
   abortRunning: abortAllEngineCalls,
   routineWatch: () => background?.routineWatch ?? null,
   threadReminders: () => background?.threadReminders ?? null,
+  stopSwitchNotices: () => background?.stopSwitchNotices(),
   stopReminders: () => (background ? stopReminderPlanner(background.reminderPlanner) : null),
   telegram: runtime,
   web: () => web,
@@ -303,7 +305,7 @@ for (const line of startBanner({
   transcription: isTranscriptionEnabled() ? getTranscriptionProvider() : undefined,
   mcp: mcpManager.isReady ? mcpManager.getStatus() : undefined,
   sessionId: lastSession.current().sessionId,
-  defaultModel: DEFAULT_CLAUDE_MODEL,
+  defaultModel: defaultModelLabel(DEFAULT_CLAUDE_MODEL),
 })) {
   console.log(line);
 }
@@ -317,6 +319,8 @@ background = startBackground({
   routineChoices: choices.routineChoices,
   postWeb: choices.postWeb,
   refresh: choices.refresh,
+  pollJobReports: createBotJobReports({ root, env, runtime, web: () => web, isShuttingDown,
+    scheduleRestartCheck: trigger => scheduleRestartCheck(trigger) }).poll,
 });
 
 // Polling erst nach WebUI, Goal-Engine, Vorschlägen, MCP und der ersten

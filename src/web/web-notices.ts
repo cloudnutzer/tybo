@@ -114,7 +114,7 @@ function isoMs(value: string): number {
 }
 
 /** Startet Hook und Abfrage; gibt das Anhalten zurück. Wirft nicht. */
-export function startWebNoticeImport(deps: WebNoticeImportDeps): () => void {
+export function startWebNoticeImport(deps: WebNoticeImportDeps): (() => void) & { flush(): Promise<boolean> } {
   const log = deps.log ?? ((m: string) => console.log(`[web] ${m}`));
   let stopped = false;
   let running: Promise<void> | null = null;
@@ -201,9 +201,14 @@ export function startWebNoticeImport(deps: WebNoticeImportDeps): () => void {
   const stopTimer = every(deps.intervalMs ?? WEB_NOTICE_POLL_MS, tick);
   // Sofort nachholen, was während einer Ausfallzeit kam
   void tick();
-  return () => {
+  return Object.assign(() => {
     stopped = true;
     stopTimer();
     stopHook?.();
-  };
+  }, { async flush() {
+    // Ein bereits laufender Durchgang kann vor der Job-Meldung begonnen haben.
+    await running;
+    await tick();
+    return !stopped && !failing && !resumeAfter;
+  } });
 }

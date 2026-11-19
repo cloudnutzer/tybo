@@ -17,6 +17,15 @@ import type { WebServer } from "../src/web/server";
 import { RESTART_NOTE, STATUS_TEXT, type Supervisor } from "../src/web/status";
 import { topicServer } from "./topic-fixture";
 
+// Werkzeug-Vertrag: feste Texte und Mengen ohne Kopie im Browser (M14-15).
+import { createDemoStatus, DEMO_STATUS_ENGINES } from "../src/web/demo";
+import { createStatusApi, statusEngine, type StatusEngineAvailability } from "../src/web/status";
+import { TOOL_GAP_IDS, TOOL_GAP_TEXT, toolGapsResponse, type ToolGaps, type ToolInventory } from "../src/web/tool-parity-types";
+import { createToolParitySnapshot, safeSkillName, setToolParityReadersForTests, type ToolParityInput, type ToolParitySnapshot } from "../src/lib/engines/tool-parity";
+import { safeMcpName, setCodexMcpInputsForTests } from "../src/lib/engines/codex-mcp";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, resolve, sep } from "node:path";
+
 const root = await mkdtemp(join(tmpdir(), "bot-status-api-"));
 afterAll(() => rm(root, { recursive: true, force: true }));
 const servers: WebServer[] = [];
@@ -46,6 +55,7 @@ async function setup(supervisor: Supervisor | null | "throws", overrides: Partia
       activeClaudeCalls: () => 1,
       restartMarker: marker,
       requestRestart: note => requestRestart(note, marker),
+      toolParity: () => { throw new Error("Test ohne Werkzeug-Quelle"); },
       // Nie ein echtes claude oder codex (Issue #126): Prüf-Attrappe
       inspectEngine: async (id: EngineId): Promise<EngineStatus> => ({ engine: id, checked: true, installed: true, loggedIn: true, version: "1.0.0" }),
       ...overrides,
@@ -196,7 +206,7 @@ describe("Motoren auf der Statusseite (Issue #126)", () => {
     });
     const body = await (await ctx.api("/api/status")).json();
     expect(asked.sort()).toEqual(["api", "claude", "codex", "opencode"]);
-    expect(body.engines).toEqual([
+    expect(body.engines.map(({ tools, ...availability }: any) => { expect(tools).toBeNull(); return availability; })).toEqual([
       { engine: "claude", label: "Claude Code", installed: true, loggedIn: true, version: "2.1.281" },
       { engine: "codex", label: "Codex", installed: true, loggedIn: false, version: "0.155.1", message: CODEX_NOT_LOGGED_IN },
       { engine: "opencode", label: "OpenCode", installed: true, loggedIn: true, version: "1.18.33" },
@@ -214,7 +224,7 @@ describe("Motoren auf der Statusseite (Issue #126)", () => {
       },
     });
     const body = await (await ctx.api("/api/status")).json();
-    expect(body.engines).toEqual([
+    expect(body.engines.map(({ tools, ...availability }: any) => { expect(tools).toBeNull(); return availability; })).toEqual([
       { engine: "claude", label: "Claude Code", installed: true, loggedIn: null, version: "2.1.281", message: CLAUDE_LOGIN_UNKNOWN },
       { engine: "codex", label: "Codex", installed: false, loggedIn: false, message: "Codex ließ sich nicht prüfen" },
       { engine: "opencode", label: "OpenCode", installed: false, loggedIn: false, message: "OpenCode ist nicht installiert" },
@@ -227,5 +237,143 @@ describe("Motoren auf der Statusseite (Issue #126)", () => {
     const { engines: _engines, ...withoutEngines } = status;
     const ctx = await topicServer(root, servers, null, { status: withoutEngines });
     expect((await (await ctx.api("/api/status")).json()).engines).toBeNull();
+  });
+});
+
+const exampleInventory = (): ToolInventory => ({ mcp: [{ name: "dateien", origin: "tybo" }],
+  skills: [{ name: "gruss", origin: "engine" }], notes: "passed", state: "ok" });
+const exampleGaps = (): ToolGaps => ({ mcp: [{ name: safeMcpName("mein server"), reason: "invalid_name" }],
+  hints: [{ name: "nurtybo", reason: "secret_in_url" }],
+  skills: [{ name: safeSkillName("mein skill"), reason: "name" }], notes: false, plugins: 2, fixed: ["connectors", "plugins"] });
+const exampleSnapshot = (): ToolParitySnapshot => ({ inventory: exampleInventory, gaps: exampleGaps });
+
+describe("Werkzeuge in GET /api/status", () => {
+  test("je Motor geprüfte Form, Texte je Eintrag und feste Lücken als Objekte; ein Snapshot je Abruf", async () => {
+    let reads = 0;
+    const ctx = await setup("launchd", { toolParity: () => { reads++; return exampleSnapshot(); } });
+    const body = await (await ctx.api("/api/status")).json();
+    expect(reads).toBe(1);
+    expect(body.engines).toHaveLength(4);
+    for (const engine of body.engines) {
+      const tools = engine.tools;
+      expect(tools.inventory).toEqual(exampleInventory());
+      expect(tools.gaps).toEqual(toolGapsResponse(exampleGaps()));
+      for (const list of [tools.gaps.mcp, tools.gaps.hints, tools.gaps.skills]) for (const entry of list) {
+        expect(Object.keys(entry).sort()).toEqual(["name", "reason", "text"]);
+        expect(entry.text).toBe(TOOL_GAP_TEXT[entry.reason as keyof typeof TOOL_GAP_TEXT]);
+      }
+      for (const entry of tools.gaps.fixed) {
+        expect(Object.keys(entry).sort()).toEqual(["id", "text"]);
+        expect(TOOL_GAP_IDS).toContain(entry.id);
+        expect(entry.text).toBe(TOOL_GAP_TEXT[entry.id as keyof typeof TOOL_GAP_TEXT]);
+      }
+    }
+    expect(exampleGaps().fixed).toEqual(["connectors", "plugins"]);
+  });
+
+  test("Fehler je Motor macht nur dessen tools null; Verfügbarkeit und übriger Status bleiben", async () => {
+    const ctx = await setup("launchd", { toolParity: () => ({ ...exampleSnapshot(), inventory: engine => {
+      if (engine === "codex") throw new Error("ERFUNDENE_PRIVATE_FEHLERMELDUNG");
+      return exampleInventory();
+    } }) });
+    const body = await (await ctx.api("/api/status")).json();
+    expect(body.running).toEqual({ executions: 1, claudeCalls: 1 });
+    expect(body.version).toEqual({ app: "2.12.0", commit: "0fe4c19" });
+    for (const engine of body.engines) {
+      expect(engine.installed).toBe(true); expect(engine.loggedIn).toBe(true);
+      if (engine.engine === "codex") expect(engine.tools).toBeNull(); else expect(engine.tools).not.toBeNull();
+    }
+    expect(JSON.stringify(body)).not.toContain("ERFUNDENE_PRIVATE_FEHLERMELDUNG");
+  });
+
+  test("Einträge außerhalb der Mengen und fremde Texte entfallen einzeln, Zusatzfelder verlassen die Antwort nicht", async () => {
+    const tools: any = { inventory: exampleInventory(), gaps: toolGapsResponse(exampleGaps()), secret: SECRET };
+    for (const field of ["mcp", "skills"]) tools.inventory[field].push(
+      { name: "https://privat.invalid", origin: "engine" }, { name: "falsche-herkunft", origin: "extern" },
+      { name: "zeilenende\n", origin: "engine" }, { name: "x".repeat(65), origin: "engine" });
+    for (const field of ["mcp", "hints", "skills"]) {
+      const valid = tools.gaps[field][0];
+      tools.gaps[field].push({ ...valid, reason: "fremd" }, { ...valid, text: SECRET }, { ...valid, name: "mein name" },
+        { ...valid, reason: field === "skills" ? "invalid_name" : "head", text: field === "skills" ? TOOL_GAP_TEXT.invalid_name : TOOL_GAP_TEXT.head });
+      valid.env = { ERFUNDENE_VARIABLE: SECRET };
+      valid.path = "/privater/pfad";
+    }
+    tools.gaps.fixed.push("connectors", { id: "fremd", text: SECRET }, { id: "hooks", text: SECRET });
+    tools.gaps.fixed[0].secret = SECRET;
+    const rawEngine = { engine: "codex", label: "Codex", installed: true, loggedIn: true, tools };
+    const demo = createDemoStatus();
+    const ctx = await topicServer(root, servers, null, { status: { ...demo, engines: async () => [rawEngine] } });
+    const body = await (await ctx.api("/api/status")).json();
+    expect(body.engines[0].tools).toEqual({ inventory: exampleInventory(), gaps: toolGapsResponse(exampleGaps()) });
+    for (const marker of [SECRET, "ERFUNDENE_VARIABLE", "https://", "/privater/pfad"]) expect(JSON.stringify(body)).not.toContain(marker);
+  });
+
+  test("höchstens 100 gültige Einträge je Liste, Zahlen ganzzahlig; ungültiger Gesamtzustand wird null", () => {
+    const tools: any = { inventory: exampleInventory(), gaps: toolGapsResponse(exampleGaps()) };
+    for (const field of ["mcp", "skills"]) tools.inventory[field] = Array.from({ length: 105 }, (_, i) => ({ name: `skill-${i}`, origin: "engine" }));
+    for (const field of ["mcp", "hints", "skills"]) tools.gaps[field] = Array.from({ length: 105 }, (_, i) => ({ ...tools.gaps[field][0], name: `name-${i}` }));
+    tools.gaps.fixed = Array.from({ length: 105 }, () => ({ id: "hooks", text: TOOL_GAP_TEXT.hooks }));
+    const engine: StatusEngineAvailability = { engine: "codex", label: "Codex", installed: true, loggedIn: true, tools };
+    const clean = statusEngine(engine).tools!;
+    for (const list of [clean.inventory.mcp, clean.inventory.skills, clean.gaps.mcp, clean.gaps.hints, clean.gaps.skills, clean.gaps.fixed]) expect(list).toHaveLength(100);
+    for (const value of [1.2, -1, Infinity, NaN, "2", Number.MAX_SAFE_INTEGER + 1]) {
+      tools.gaps.plugins = value; expect(statusEngine(engine).tools!.gaps.plugins).toBeNull();
+    }
+    for (const [field, value] of [["notes", "fremd"], ["state", "fremd"]]) {
+      const original = tools.inventory[field!]; tools.inventory[field!] = value;
+      expect(statusEngine(engine).tools).toBeNull(); tools.inventory[field!] = original;
+    }
+    tools.gaps.notes = "ja"; expect(statusEngine(engine).tools).toBeNull();
+  });
+
+  test("Demo-Antwort besteht dieselbe Prüfung unverändert und hat Codex-Hinweise und OpenCode-Lücken", async () => {
+    const api = createStatusApi(createDemoStatus(), () => {});
+    const response = await api.get();
+    expect(response.body.engines).toEqual(DEMO_STATUS_ENGINES);
+    for (const engine of DEMO_STATUS_ENGINES) expect(statusEngine(engine)).toEqual(engine);
+    const codex = DEMO_STATUS_ENGINES.find(s => s.engine === "codex")!.tools!;
+    expect(codex.gaps.mcp.length).toBeGreaterThan(0); expect(codex.gaps.hints.length).toBeGreaterThan(0);
+    expect(codex.gaps.fixed.length).toBeGreaterThanOrEqual(2);
+    expect(DEMO_STATUS_ENGINES.find(s => s.engine === "opencode")!.tools!.gaps.mcp.length).toBeGreaterThan(0);
+  });
+
+  test("Echte temporäre Quellen über die Status-Verdrahtung: Ersatznamen bleiben, keine Geheimnisse aus irgendeiner Quelle", async () => {
+    const base = resolve(root, `werkzeuge-${++counter}`), project = join(base, "projekt"), home = join(base, "heim"), codexHome = join(base, "codex");
+    const markers = ["ERFUNDEN_ENV_STATUS", "ERFUNDEN_HEADER_STATUS", "ERFUNDEN_URL_STATUS", "ERFUNDEN_ARG_STATUS", "ERFUNDENE_VARIABLE_STATUS", "ERFUNDEN_KOPF_STATUS"];
+    const secret = { command: "bun", args: ["--token", markers[3]], env: { [markers[4]!]: markers[0] },
+      headers: { "X-Beispiel": markers[1] }, url: `https://privat.invalid/${markers[2]}` };
+    const file = (path: string, value: unknown) => {
+      mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, typeof value === "string" ? value : JSON.stringify(value));
+    };
+    const input: ToolParityInput = { skills: { root: project, home, codexHome, enabled: true }, opencodeConfig: join(base, "opencode"),
+      extraFile: join(base, "extra.json"), claudeNotes: true, opencodeClaudeSkills: true,
+      mcpInput: () => ({ cwd: project, sandbox: "full", baseEnv: { HOME: home } }) };
+    file(join(home, ".claude.json"), { mcpServers: { benutzer: secret, "mein server": secret },
+      projects: { [project]: { mcpServers: { projekt: secret }, enabledMcpjsonServers: ["geteilt"] } } });
+    file(join(project, ".mcp.json"), { mcpServers: { geteilt: secret } });
+    file(join(project, "config", "mcp-servers.json"), { servers: { tybo: secret } });
+    file(input.extraFile!, { servers: { extra: secret } });
+    file(join(project, ".claude", "settings.json"), { mcpServers: { einstellung: secret } });
+    file(join(input.opencodeConfig, "opencode.json"), { mcp: { offen: secret } });
+    file(join(codexHome, "config.toml"), `[mcp_servers.eigen]\ncommand="bun"\nargs=["${markers[3]}"]\n[mcp_servers.eigen.env]\n${markers[4]}="${markers[0]}"`);
+    file(join(home, ".claude", "skills", "mein skill", "SKILL.md"), `---\nname: ${markers[5]}\ndescription: Erfunden.\n---\n`);
+    setCodexMcpInputsForTests({ parentEnv: () => ({ HOME: home, CODEX_HOME: codexHome, MCP_CONFIG_PATH: input.extraFile }),
+      projectRoot: () => project, settings: () => ({}), lookup: () => undefined, secrets: () => [] });
+    setToolParityReadersForTests({ text: path => {
+      if (!path.startsWith(base + sep)) throw Object.assign(new Error("fehlt"), { code: "ENOENT" });
+      return readFileSync(path, "utf8");
+    } });
+    try {
+      const snapshot = createToolParitySnapshot(input);
+      const internal = snapshot.gaps("codex");
+      const ctx = await setup("launchd", { toolParity: () => snapshot });
+      const body = await (await ctx.api("/api/status")).json();
+      const codex = body.engines.find((s: any) => s.engine === "codex").tools;
+      expect(codex.gaps.mcp).toContainEqual({ name: safeMcpName("mein server"), reason: "invalid_name", text: TOOL_GAP_TEXT.invalid_name });
+      expect(codex.gaps.skills).toContainEqual({ name: safeSkillName("mein skill"), reason: "name", text: TOOL_GAP_TEXT.name });
+      expect(internal.fixed.every(id => typeof id === "string")).toBe(true);
+      const visible = JSON.stringify(body.engines);
+      for (const marker of [...markers, "https://", base, "X-Beispiel", "mein server", "mein skill"]) expect(visible).not.toContain(marker);
+    } finally { setToolParityReadersForTests(null); setCodexMcpInputsForTests(null); }
   });
 });

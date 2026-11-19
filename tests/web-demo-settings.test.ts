@@ -115,9 +115,9 @@ test("Demo-Motoren, Codex-Stufen und Rechte stimmen mit src/lib/settings.ts übe
   expect(JSON.parse(JSON.stringify(DEMO_ENGINE_OPTIONS))).toEqual(JSON.parse(JSON.stringify(botSettings.engineOptions)));
 });
 
-test("Demo mit OpenCode (Issue #129): verfügbar, Modell-Liste aus der Attrappe, Topic Finanzen mit OpenCode-Antwort", async () => {
+test("Demo mit OpenCode: aktuell nicht bereit, Modell-Liste und frühere Antwort aus der Attrappe", async () => {
   const { DEMO_ENGINE_AVAILABILITY, DEMO_OPENCODE_MODELS, DEMO_OPENCODE_TOPIC, DEMO_SETTINGS, createDemoModels, createDemoTelegram, demoSessionKey } = await import("../src/web/demo");
-  expect(DEMO_ENGINE_AVAILABILITY.find(a => a.engine === "opencode")).toEqual({ engine: "opencode", label: "OpenCode", installed: true, loggedIn: true, version: "1.18.33" });
+  expect(DEMO_ENGINE_AVAILABILITY.find(a => a.engine === "opencode")).toEqual({ engine: "opencode", label: "OpenCode", installed: false, loggedIn: false, message: "OpenCode ist nicht installiert" });
   const lists = await createDemoModels().list();
   expect(lists.opencode).toEqual({ models: [...DEMO_OPENCODE_MODELS] });
   expect(DEMO_OPENCODE_MODELS.every(m => /^[A-Za-z0-9][\w.:/@-]*$/.test(m) && m.includes("/"))).toBe(true);
@@ -158,6 +158,74 @@ test("Demo-Einstellungen prüfen den Motor grob wie das Schema, Demo-Motor entfe
   expect(await engines.removeOverride(key)).toBe(false);
   expect(Object.values(engines.overrides())).toEqual(["opencode"]);
   expect(await engines.removeOverride(opencodeKey)).toBe(true);
-  expect(settings.data().engine).toBeUndefined();
+  const { topics: _topics, ...engine } = DEMO_SETTINGS.engine!;
+  expect(settings.data().engine).toEqual(engine);
   expect(settings.data().agents).toEqual(DEMO_SETTINGS.agents);
+});
+
+test("Demo-GET zeigt fünf Stufen, jeden Zustand und passende Sperren und Messwerte; Prüfen ergänzt notMeasured", async () => {
+  const { status, body } = await api("/api/engines");
+  expect(status).toBe(200);
+  expect(body.order).toHaveLength(5);
+  expect(body.order.map((stage: any) => stage.state)).toEqual(["blocked", "blocked", "answering", "free", "not_ready"]);
+  expect(body.order.filter((stage: any) => stage.state === "answering")).toHaveLength(1);
+  expect(body.order[0]).toMatchObject({ cause: "threshold", window: "weekly_scoped:fable", resetKnown: true });
+  expect(body.order[1]).toMatchObject({ cause: "limit", resetKnown: false });
+  expect(body.order[1]).not.toHaveProperty("window");
+  expect(body.usage.codex).toMatchObject([{ id: "weekly_all", state: "known", percent: 42, source: "session-file" }]);
+  for (const stage of body.order.filter((entry: any) => entry.state === "blocked")) {
+    const block = body.blocks.find((entry: any) => entry.engine === stage.engine && entry.until === stage.blockedUntil && entry.cause === stage.cause);
+    expect(block).toBeDefined();
+    expect(block.resetKnown).toBe(stage.resetKnown);
+    expect(block.window).toBe(stage.window);
+    if (block.window) {
+      const window = body.usage[block.engine].find((entry: any) => entry.id === block.window);
+      expect(window).toMatchObject({ state: "known", percent: block.percent, resetsAt: block.until });
+    }
+  }
+  const checked = await api("/api/engines/check", "POST", {});
+  expect(checked.status).toBe(200);
+  expect(checked.body).toEqual({ ...body, notMeasured: ["claude", "codex"] });
+});
+
+test("Demo prüft Ersatzstufen und Automatik wie das echte Schema, einschließlich Grenzwerten", async () => {
+  const { settingsSchema } = await import("../src/lib/settings");
+  const port = createDemoSettings({});
+  const cases = [
+    {}, { auto: {} }, { auto: { enabled: true } }, { auto: { threshold: 50, returnBelow: 0 } },
+    { auto: { threshold: 99, returnBelow: 94 } }, { auto: { returnBelow: 90 } },
+    { backups: [{ engine: "claude", model: " opus[1m] ", effort: "max" }, { engine: "codex" }] },
+    { backups: [{ engine: "claude", model: "a".repeat(100) }] },
+    { backups: [{ engine: "api" }] }, { backups: [{ engine: "codex", model: "gpt-test" }] },
+    { backups: [{ engine: "opencode", effort: "high" }] },
+    { backups: [{ engine: "claude", model: "opus" }, { engine: "claude", model: "opus", effort: "high" }] },
+    { backups: ["a", "b", "c", "d", "e"].map(model => ({ engine: "claude", model })) },
+    ...["-x", "../credentials", "", "a b", "a".repeat(101)].map(model => ({ backups: [{ engine: "claude", model }] })),
+    { backups: [null] }, { backups: {} }, { backups: [{ engine: "claude", extra: true }] },
+    { backups: [{ engine: "claude", effort: "ultra" }] },
+    ...[49, 100, 95.5, "95"].map(threshold => ({ auto: { threshold } })),
+    ...[-1, 92, 70.5].map(returnBelow => ({ auto: { returnBelow } })),
+    { auto: { threshold: 90, returnBelow: 86 } }, { auto: { enabled: "true" } }, { auto: [] }, { auto: { extra: 1 } },
+  ];
+  for (const engine of cases) {
+    const expected = settingsSchema.safeParse({ engine });
+    const actual = port.validate({ engine });
+    expect({ engine, ok: actual.ok }).toEqual({ engine, ok: expected.success });
+    if (actual.ok && expected.success) expect(actual.value).toEqual(expected.data);
+  }
+});
+
+test("Demo-PATCH übernimmt neue Felder, lehnt api und widersprüchliche Teiländerungen ohne Änderung ab", async () => {
+  const valid = { backups: [{ engine: "codex" }], auto: { enabled: true, threshold: 95, returnBelow: 85 } };
+  expect((await api("/api/settings", "PATCH", { engine: valid })).status).toBe(200);
+  const before = (await api("/api/settings")).body.settings;
+  for (const engine of [{ backups: [{ engine: "api" }] }, { auto: { threshold: 89 } }, { auto: { threshold: 120 } },
+    { backups: ["a", "b", "c", "d", "e"].map(model => ({ engine: "claude", model })) }]) {
+    expect((await api("/api/settings", "PATCH", { engine })).status).toBe(400);
+    expect((await api("/api/settings")).body.settings).toEqual(before);
+  }
+  expect((await api("/api/settings", "PATCH", { engine: { backups: [], auto: null } })).status).toBe(200);
+  const body = (await api("/api/engines")).body;
+  expect(body.order).toHaveLength(1);
+  expect(body.auto).toEqual({ enabled: false, threshold: 95, returnBelow: 80 });
 });

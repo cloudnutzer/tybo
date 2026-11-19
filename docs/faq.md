@@ -101,9 +101,20 @@ Schlüssel aus der `.env` bekommen die Subprozesse nur, wenn du sie freigibst.
 ## Kann ich statt Claude ein anderes Modell nehmen?
 
 Ja, auf zwei Ebenen. Der Motor, der eine Antwort schreibt, ist wählbar:
-Claude Code (Standard), Codex oder OpenCode, als Standard in den
-Einstellungen oder je Gespräch mit `/motor`. Fällt der Motor aus, springen
-Ersatzmodelle ein, etwa über OpenRouter oder Ollama (`tybo setup modelle`).
+Claude Code (Standard), Codex, OpenCode oder die Anthropic API, als Standard
+unter Einstellungen, Modelle, Motor, je Agent in dessen Formular oder je
+Gespräch mit `/motor codex` (entsprechend `claude`, `opencode`, `api`). Es gilt
+der Vorrang Gespräch, Agent, Standard. `/motor standard` entfernt nur die
+Gesprächswahl; dann gilt der Motor des Agenten, sonst der Standard. Der Befehl wählt einen Motor,
+kein Modell. Mit Ersatzstufen springt bei einem Limit oder Ausfall die nächste
+freie Stufe ein; danach bleiben Ersatzmodelle mit eingeschränktem
+Werkzeugumfang, etwa über OpenRouter oder Ollama (`tybo setup modelle`).
+`/motor` erklärt die aktuelle Wahl, `/motor werkzeuge` zeigt Bestand und
+Lücken. `/motor auto an` und `/motor auto aus` steuern den Wechsel an der
+Prozentschwelle; Einspringen bei Fehlern bleibt aktiv. `/motor pruefen` misst
+neu und bewertet Sperren, erzwingt aber keine Freigabe bei einem frischen
+hohen Stand. Einrichtung und Rückkehr:
+[Ersatzstufen und Automatik](erweiterungen.md#ersatzstufen-und-automatik).
 Was bei Codex und OpenCode einzurichten ist, steht in
 [Störungen beheben](troubleshooting.md#codex-als-motor).
 

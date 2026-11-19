@@ -46,6 +46,7 @@ import type { TurnTools } from "./turn-tools";
 import { storeOr } from "./store";
 import type { LogLevel, Message } from "./store/types";
 import { sanitizeModelOutput, truncateBeforeSanitize } from "./telegram";
+import { formatSwitchTime } from "./engine-switch-text";
 
 // Speicher (Issue #314): ohne Datenbank false bzw. still
 const saveMessage = (message: Message) => storeOr(false, store => store.messages.save(message));
@@ -439,7 +440,7 @@ interface Verdict {
   reason: string;
 }
 
-async function judgeGoalUnlocked(g: ActiveGoal, lastResponse: string): Promise<Verdict | null | "disabled"> {
+async function judgeGoalUnlocked(g: ActiveGoal, lastResponse: string): Promise<Verdict | null | { disabled: true; blockedUntil?: string }> {
   const prompt = `Du bist der Ziel-Judge eines autonomen Assistenten. Bewerte streng, ob das Ziel des Users durch die bisherige Arbeit ERREICHT ist.
 
 ZIEL: ${g.goal}
@@ -460,8 +461,8 @@ Antworte AUSSCHLIESSLICH mit einem JSON-Objekt, ohne weiteren Text:
   // callAux macht aus einem Abbruch isError; der zaehlte sonst als
   // Judge-Fehlschlag (judgeFailures), obwohl /stop ihn ausgeloest hat (Issue #563)
   checkAborted();
-  // Abgeschaltet (Issue #566): Claude fehlt und kein AUX_MODEL_JUDGE; kein Fehlschlag, der wiederholt wird
-  if (result.disabled) return "disabled";
+  // Abgeschaltet: fehlendes Claude oder Limit ohne Ersatz, kein wiederholbarer Fehlschlag.
+  if (result.disabled) return { disabled: true, blockedUntil: result.blockedUntil };
   if (result.isError) return null;
   const parsed = parseAuxJSON(result.text);
   if (!parsed || !["done", "continue", "wait"].includes(parsed.verdict)) return null;
@@ -715,10 +716,14 @@ async function afterChecks(sessionKey: string, goalId: number, g: ActiveGoal, la
   // 2. Judge
   const verdict = await judgeGoal(g, lastResponse);
   if (deps.isShuttingDown?.()) return false;
-  if (verdict === "disabled") {
-    const paused = await pauseGoal(sessionKey, "Judge abgeschaltet (Claude fehlt)", goalId);
+  if (verdict && "disabled" in verdict) {
+    const blockedAt = verdict.blockedUntil ? formatSwitchTime(verdict.blockedUntil, process.env.USER_TIMEZONE || "UTC") : undefined;
+    const reason = blockedAt ? `Richter abgeschaltet (Claude Code am Limit bis ${blockedAt})` : "Judge abgeschaltet (Claude fehlt)";
+    const paused = await pauseGoal(sessionKey, reason, goalId);
     if (!paused) return false;
-    await deps.sendStatus(paused, { kind: "judge-failed", text: GOAL_JUDGE_DISABLED_TEXT });
+    await deps.sendStatus(paused, { kind: "judge-failed", text: blockedAt
+      ? `⚠️ Ziel pausiert: Der Richter von /goal läuft über Claude Code, und Claude Code ist bis ${blockedAt} am Limit. Abhilfe: ein anderes Nebenmodell für den Richter einstellen (WebUI, Modelle) oder nach dem Reset /goal weiter.`
+      : GOAL_JUDGE_DISABLED_TEXT });
     return false;
   }
   if (!verdict) {

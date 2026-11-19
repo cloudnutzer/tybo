@@ -31,6 +31,7 @@ export async function main(argv: string[], callerEnv: Env): Promise<number> {
   const { runJobCli } = await import("../src/lib/jobs/cli");
   const { DEFAULT_CLAUDE_MODEL } = await import("../src/lib/default-model");
   const { defaultEffort } = await import("../src/lib/claude");
+  const { getSettings } = await import("../src/lib/settings");
   return runJobCli(argv, {
     cwd,
     callerEnv,
@@ -40,6 +41,7 @@ export async function main(argv: string[], callerEnv: Env): Promise<number> {
     outbox: outboxDepsFor(root, env),
     defaultModel: DEFAULT_CLAUDE_MODEL,
     defaultEffort,
+    settings: getSettings(),
   });
 }
 

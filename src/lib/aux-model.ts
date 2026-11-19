@@ -27,8 +27,11 @@ import { checkAborted, executionSignal } from "./execution-context";
 import { callClaude } from "./claude";
 import { claudeMissing, whenClaudeChecked } from "./claude-availability";
 import { bookRunOutcome } from "./spend/credit";
-import { getSettings, type Settings } from "./settings";
-import { auxTargetFor, describeAuxFrom, type AuxPurpose, type AuxSource, type AuxTarget } from "./aux-targets";
+import { engineBackups, getSettings, type Settings } from "./settings";
+import { auxTargetFor, describeAuxFrom, LIMIT_AWARE_PURPOSES, type AuxPurpose, type AuxSource, type AuxTarget } from "./aux-targets";
+import { claudeBlockedFor } from "./engine-switch";
+import { readSwitchState } from "./engine-switch-state";
+import { describeFallback } from "./fallback/chain";
 
 export { auxEnvName, type AuxPurpose } from "./aux-targets";
 
@@ -62,24 +65,42 @@ export function resolveAuxTarget(purpose: AuxPurpose, resume: boolean): AuxTarge
 }
 
 /**
- * Ist dieser Aufruf abgeschaltet (Issue #566)? Ja, wenn er über Claude
- * liefe und Claude laut Startprüfung fehlt (src/lib/claude-availability.ts).
- * Unbekannt (noch nicht geprüft) zählt nicht: dann läuft der Aufruf wie
- * bisher.
+ * Startprüfung und Limit-Sperre wie in callAux. Unbekannte Bereitschaft
+ * zählt nicht als fehlend; ein nutzbares Ersatzmodell bleibt eingeschaltet.
  */
 export function auxDisabled(purpose: AuxPurpose, resume = false): boolean {
-  return claudeMissing() && resolveAuxTarget(purpose, resume).kind === "claude";
+  const target = resolveAuxTarget(purpose, resume);
+  if (target.kind !== "claude") return false;
+  if (claudeMissing()) return true;
+  const route = limitRoute(purpose, target, resume);
+  return !!route.blockedUntil && !route.replacement;
+}
+
+/** Ohne Ersatzstufen bleiben auch übrig gebliebene Sperren wirkungslos (0027). */
+function limitRoute(purpose: AuxPurpose, target: AuxTarget, resume: boolean): {
+  blockedUntil?: string;
+  replacement?: AuxTarget;
+} {
+  const settings = getSettings();
+  if (target.kind !== "claude" || !LIMIT_AWARE_PURPOSES.includes(purpose) || !engineBackups(settings).length) return {};
+  const blockedUntil = claudeBlockedFor(readSwitchState(), target.model, Date.now());
+  if (!blockedUntil) return {};
+  const fallback = describeFallback(settings);
+  if (resume || !process.env.OPENROUTER_API_KEY || fallback.offlineOnly.value) return { blockedUntil };
+  return { blockedUntil, replacement: { kind: "openrouter", model: fallback.openrouterModel.value } };
 }
 
 export interface AuxResult {
   text: string;
   isError: boolean;
   /**
-   * Abgeschaltet (Issue #566): Claude fehlt und kein anderes Nebenmodell ist
-   * eingestellt. Dann ist isError true, aufgerufen wurde nichts, und der
+   * Claude fehlt oder ist am Limit ohne nutzbaren Ersatz. Dann ist
+   * isError true, aufgerufen wurde nichts, und der
    * Aufrufer schreibt keine Fehlerzeile und versucht es nicht erneut.
    */
   disabled?: true;
+  /** Ende der Limit-Sperre; fehlt bei abgeschaltetem, nicht verfügbarem Claude. */
+  blockedUntil?: string;
 }
 
 /**
@@ -93,15 +114,16 @@ export async function callAux(
     resumeSessionId?: string;
     timeoutMs?: number;
     /**
-     * Keine eigenen Log-Zeilen (Issue #290): der Aufrufer schreibt selbst
+     * Keine eigenen Fehlerzeilen (Issue #290): der Aufrufer schreibt selbst
      * genau eine Zeile ohne Inhalt, etwa bei offenen Fäden, wo ein rohes
-     * Fehlerobjekt Teile von Frage oder Antwort enthalten könnte.
+     * Fehlerobjekt Teile von Frage oder Antwort enthalten könnte. Der
+     * Wechsel aufs Ersatzmodell wird immer ohne Inhalt protokolliert.
      */
     quiet?: boolean;
   }
 ): Promise<AuxResult> {
   checkAborted();
-  const target = resolveAuxTarget(purpose, !!opts?.resumeSessionId);
+  let target = resolveAuxTarget(purpose, !!opts?.resumeSessionId);
   if (target.kind === "claude") {
     // Läuft die Startprüfung noch, erst ihr Ergebnis abwarten (Issue #566)
     await whenClaudeChecked();
@@ -111,6 +133,12 @@ export async function callAux(
   const timeoutMs = opts?.timeoutMs ?? 180_000;
 
   try {
+    const route = limitRoute(purpose, target, !!opts?.resumeSessionId);
+    if (route.blockedUntil) {
+      if (!route.replacement) return { text: "", isError: true, disabled: true, blockedUntil: route.blockedUntil };
+      target = route.replacement;
+      console.log(`[AuxModel] ${purpose}: Claude Code gesperrt bis ${route.blockedUntil}, Ersatz ${target.model}`);
+    }
     if (target.kind === "claude") {
       const result = await callClaude({
         prompt,

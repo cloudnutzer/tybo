@@ -15,6 +15,8 @@ import {
   ENGINE_CHECK_CACHE_MS,
   ENGINE_CHECK_TIMEOUT_MS,
   checkEngine,
+  forgetEngineCheck,
+  forgetEngineCheckFor,
   parseCodexVersion,
   resetEngineCheckCacheForTests,
 } from "../src/lib/engines/check";
@@ -50,6 +52,20 @@ const VERSION_OK = { stdout: "codex-cli 0.155.1\n", exitCode: 0 };
 /** Ausgabe mit Konto- und Schlüsselangaben: darf nirgends ankommen */
 const LOGIN_OK = { stdout: "Logged in using ChatGPT (alex@example.test) sk-test-abcdefghijklmnop\n", exitCode: 0 };
 const LOGIN_MISSING = { stdout: "Not logged in (Konto alex@example.test)\n", exitCode: 1 };
+
+test("Prüfung von Hand verwirft auch Claude; der bisherige Chat-Aufruf bleibt unverändert", async () => {
+  fake.next({ stdout: "2.1.300 (Claude Code)", exitCode: 0 });
+  fake.next({ stdout: '{"loggedIn":false}', exitCode: 1 });
+  expect((await checkEngine("claude")).loggedIn).toBe(false);
+  forgetEngineCheck();
+  expect((await checkEngine("claude")).loggedIn).toBe(false);
+  expect(fake.spawns).toHaveLength(2);
+  forgetEngineCheckFor("claude");
+  fake.next({ stdout: "2.1.300 (Claude Code)", exitCode: 0 });
+  fake.next({ stdout: '{"loggedIn":true}', exitCode: 0 });
+  expect((await checkEngine("claude")).loggedIn).toBe(true);
+  expect(fake.spawns).toHaveLength(4);
+});
 
 describe("checkEngine(\"codex\")", () => {
   test("installiert und angemeldet: Version, zwei Befehle ohne Projekt- und Sandbox-Argumente", async () => {

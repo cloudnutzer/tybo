@@ -12,6 +12,9 @@ import { parseAuxSpec, type Settings } from "./settings";
 
 export type AuxPurpose = "judge" | "distill" | "review" | "threads" | "call-summary" | "checkin" | "voice-training" | "voice-wizard";
 
+/** Nur diese Nebenaufgaben weichen in M14 während einer Limit-Sperre aus. */
+export const LIMIT_AWARE_PURPOSES: readonly AuxPurpose[] = ["judge", "threads", "review", "distill"];
+
 /** Alle Zwecke in fester Reihenfolge (Log-Zeile, Einrichtung, Doku) */
 export const AUX_PURPOSES: readonly AuxPurpose[] = [
   "judge",

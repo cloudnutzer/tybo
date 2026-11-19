@@ -6,6 +6,14 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { blockExecutions, isExecutionActive, isExecutionBlocked, runCancelable, runExecution } from "../src/lib/execution-context";
+import { createTelegramSessionReset } from "../src/lib/commands/telegram";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { getSessionsForKey, noteHandover, recordSessionTurn, resetSession, resetSessionOrThrow, setSessionsFileForTests, takeHandover } from "../src/lib/session-manager";
+import type { WebServer } from "../src/web/server";
+import { topicServer } from "./topic-fixture";
+import { handoverProbe } from "./handover-fixture";
 import { conversationSessionKey } from "../src/web/bot-turn";
 import { createConversationSessionReset, SESSION_RESET_TEXT, sessionResetNote } from "../src/web/session-reset";
 import { startTyboServer, type TyboServerOptions, type TerminalTestServer } from "./terminal-fixture";
@@ -27,6 +35,36 @@ async function reset(s: TerminalTestServer, id: string, method = "POST") {
 }
 
 describe("POST /api/conversations/<id>/reset", () => {
+  test.each(["reset", "delete"] as const)("echte Ablage: %s entfernt Übergabenotizen aller Agenten", async action => {
+    const dir = await mkdtemp(join(tmpdir(), "web-handover-reset-"));
+    const webServers: WebServer[] = [];
+    setSessionsFileForTests(join(dir, "sessions.json"));
+    try {
+      const resetConversation = createConversationSessionReset({
+        sessionKey: id => `web:${id}`, isActive: () => false, block: () => () => {},
+        sessionsForKey: getSessionsForKey, shouldDistill: () => false, distill: async () => {},
+        reset: resetSessionOrThrow, sessionModeEnabled: () => true,
+      });
+      const ctx = await topicServer(dir, webServers, null, { resetConversation, resetSession: key => resetSession(key) });
+      const conversation = await ctx.store.createConversation("general");
+      const key = `web:${conversation.id}`;
+      for (const agent of ["general", "research"]) await recordSessionTurn(key, agent, "claude-modell", "claude", `s-${agent}`);
+      const since = (await getSessionsForKey(key))[0]!.startedAt;
+      await noteHandover(key, "user");
+      await resetSessionOrThrow(key, { preserveHandover: true });
+      expect(await takeHandover(key, "general", { preserveUntilRecorded: true })).toBeDefined();
+      const response = await ctx.api(`/api/conversations/${conversation.id}${action === "reset" ? "/reset" : ""}`, action === "reset" ? "POST" : "DELETE");
+      expect(response.status).toBe(200);
+      expect(JSON.parse(await readFile(join(dir, "session-handover.json"), "utf8"))).toEqual({});
+      const calls = await handoverProbe({ chatId: key, since, engine: "codex" });
+      expect(calls[0]!.prompt).not.toContain("Du übernimmst");
+    } finally {
+      for (const server of webServers) await server.stop();
+      setSessionsFileForTests(null);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("Topic: setzt zurück, Hinweis wie in Telegram, Verlauf bleibt", async () => {
     const s = await start();
     const before = await s.client().messages("topic-443");
@@ -98,6 +136,44 @@ describe("POST /api/conversations/<id>/reset", () => {
 });
 
 describe("createConversationSessionReset", () => {
+  for (const channel of ["telegram", "web"] as const) {
+    test(`${channel}: prüfen, sperren, beforeReset, löschen mit Option, schreiben, freigeben`, async () => {
+      const calls: string[] = [];
+      let busy = false;
+      const deps = {
+        sessionKey: () => "key",
+        isActive: () => (calls.push("prüfen"), busy),
+        block: () => { calls.push("sperren"); return () => { calls.push("freigeben"); }; },
+        sessionsForKey: async () => [],
+        shouldDistill: () => false,
+        distill: async () => {},
+        reset: async (_key: string, options?: { preserveHandover?: boolean }) => {
+          expect(options).toEqual({ preserveHandover: true });
+          calls.push("löschen");
+          return 1;
+        },
+        sessionModeEnabled: () => true,
+      };
+      const web = createConversationSessionReset(deps);
+      const reset = channel === "telegram" ? createTelegramSessionReset("key", deps) : (options?: Parameters<typeof web>[1]) => web("dm", options);
+      const options = {
+        beforeReset: async () => { calls.push("notieren"); },
+        whileBlocked: async () => { calls.push("schreiben"); },
+        preserveHandover: true,
+      };
+      expect((await reset(options)).status).toBe("done");
+      expect(calls).toEqual(["prüfen", "sperren", "notieren", "löschen", "schreiben", "freigeben"]);
+      calls.length = 0;
+      busy = true;
+      expect((await reset(options)).status).toBe("busy");
+      expect(calls).toEqual(["prüfen"]);
+      calls.length = 0;
+      busy = false;
+      await expect(reset({ beforeReset: async () => { throw new Error("vorher kaputt"); } })).rejects.toThrow("vorher kaputt");
+      expect(calls).toEqual(["prüfen", "sperren", "freigeben"]);
+    });
+  }
+
   function setup(overrides: Partial<Parameters<typeof createConversationSessionReset<{ id: string; turns: number }>>[0]> = {}) {
     const calls: string[] = [];
     const reset = createConversationSessionReset<{ id: string; turns: number }>({
@@ -146,12 +222,12 @@ describe("createConversationSessionReset", () => {
       },
     });
     const whileBlocked = async () => void calls.push(`schreiben gesperrt=${blocked}`);
-    expect((await reset("topic-5", whileBlocked)).status).toBe("done");
+    expect((await reset("topic-5", { whileBlocked })).status).toBe("done");
     expect(calls).toEqual(["distill key:topic-5:general", "reset key:topic-5", "schreiben gesperrt=true"]);
     expect(blocked).toBe(false);
 
     const busy = setup({ isActive: () => true });
-    expect(await busy.reset("topic-5", async () => void busy.calls.push("schreiben"))).toEqual({ status: "busy" });
+    expect(await busy.reset("topic-5", { whileBlocked: async () => void busy.calls.push("schreiben") })).toEqual({ status: "busy" });
     expect(busy.calls).toEqual([]);
   });
 

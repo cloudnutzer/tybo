@@ -1,7 +1,11 @@
 // Issue #344: Startbanner und Anzeigename aus dem Profil als Verhalten
 // (ersetzt die Quelltext-Prüfungen des Banners und von extractUserName in bot.ts).
 import { describe, expect, test } from "bun:test";
-import { startBanner, type BannerInfo } from "../src/app/bot-start";
+import { defaultModelLabel, startBanner, type BannerInfo } from "../src/app/bot-start";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { getSettingsPath, setSettingsPath } from "../src/lib/settings";
+import { tempRoot } from "./jobs-fixture";
 import { BRAND } from "../src/brand";
 import { FALLBACK_USER_NAME, profileDisplayName } from "../src/lib/profile-name";
 
@@ -38,6 +42,29 @@ describe("startBanner", () => {
     const routing = line(startBanner(info), "Routing");
     expect(routing).toEqual(["Routing:     festes Standardmodell claude-test-1, Einstellungen je Agent haben Vorrang"]);
     expect(routing[0]).not.toContain("haiku");
+  });
+
+  test("Routing nennt das wirksame Modell und gesetzten Effort, Einstellung vor Konstante", () => {
+    const { root, cleanup } = tempRoot("bot-start-modell-");
+    const previous = getSettingsPath();
+    const path = join(root, "config", "settings.json");
+    mkdirSync(join(root, "config"));
+    setSettingsPath(path);
+    try {
+      expect(defaultModelLabel("claude-konstante")).toBe("claude-konstante");
+      for (const [defaults, expected] of [
+        [{ model: "claude-einstellung", effort: "high" }, "claude-einstellung (Effort high)"],
+        [{ model: "claude-nur-modell" }, "claude-nur-modell"],
+        [{ effort: "low" }, "claude-konstante (Effort low)"],
+      ] as const) {
+        writeFileSync(path, JSON.stringify({ defaults }));
+        const routing = line(startBanner({ ...info, defaultModel: defaultModelLabel("claude-konstante") }), "Routing");
+        expect(routing).toEqual([`Routing:     festes Standardmodell ${expected}, Einstellungen je Agent haben Vorrang`]);
+      }
+    } finally {
+      setSettingsPath(previous);
+      cleanup();
+    }
   });
 
   test("HITL nennt das Rückfragen-Register für Telegram und WebUI", () => {

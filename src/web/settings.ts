@@ -23,6 +23,9 @@
  * selbst ist nie null, und engine.topics (Ausnahmen mit /motor) ändert PATCH
  * nie: die stehen unverändert weiter in der Datei, entfernt werden sie
  * einzeln über POST /api/engines/reset (./engines.ts).
+ * M14-05: backups ersetzt die ganze Liste, null oder [] entfernt sie. auto
+ * wird feldweise zusammengeführt; null entfernt den Abschnitt. Der Hook nach
+ * PATCH läuft erst nach Freigabe der Einstellungssperre.
  *
  * Hören und Sprechen (Issue #248): speech.stt, speech.tts und speech.language
  * als Text, null oder leer entfernt das Feld (dann gilt SPEECH_STT/SPEECH_TTS
@@ -69,12 +72,14 @@ export interface ModelAndEffort {
 /** Form von config/settings.json (Settings in src/lib/settings.ts) */
 export interface SettingsData {
   defaults?: ModelAndEffort;
-  agents?: Record<string, ModelAndEffort>;
+  agents?: Record<string, ModelAndEffort & { engine?: string }>;
   aux?: { judge?: string; distill?: string; review?: string; threads?: string; "call-summary"?: string };
   fallback?: { openrouterModel?: string; ollamaModel?: string; offlineOnly?: boolean };
   /** Motor (Entscheidungen 0018/0019): Standard, Ausnahmen je Session-Schlüssel, Codex- und OpenCode-Einstellungen */
   engine?: {
     default?: string;
+    backups?: { engine: string; model?: string; effort?: string }[];
+    auto?: { enabled?: boolean; threshold?: number; returnBelow?: number };
     topics?: Record<string, string>;
     codex?: { model?: string; effort?: string; sandbox?: string };
     opencode?: { model?: string; variant?: string; permission?: string };
@@ -319,7 +324,7 @@ export function applySettingsPatch(
         if (!agentNames.includes(name)) throw new PatchError(`${SETTINGS_TEXT.unknownAgent}: ${safeName(name)}`);
       }
       const target: Record<string, any> = isPlainObject(next.agents) ? next.agents : {};
-      for (const name of Object.keys(agents)) section(name, agents[name], MODEL_EFFORT, target, `agents.${name}`);
+      for (const name of Object.keys(agents)) section(name, agents[name], { ...MODEL_EFFORT, engine: "string" }, target, `agents.${name}`);
       next.agents = target;
     }
     // Motor (Issues #126/#129): nie als Ganzes entfernen, topics bleiben unberührt
@@ -327,13 +332,21 @@ export function applySettingsPatch(
     if (engine !== undefined) {
       if (!isPlainObject(engine)) throw new PatchError("Falscher Typ: engine");
       for (const key of Object.keys(engine)) {
-        if (key !== "default" && key !== "codex" && key !== "opencode") throw new PatchError(`Unbekanntes Feld: engine.${safeName(key)}`);
+        if (!["default", "codex", "opencode", "backups", "auto"].includes(key)) throw new PatchError(`Unbekanntes Feld: engine.${safeName(key)}`);
       }
       const target: Record<string, any> = isPlainObject(next.engine) ? next.engine : {};
       leaf(target, "default", engine.default, "string", "engine.default");
       section("codex", engine.codex, { model: "string", effort: "string", sandbox: "string" }, target, "engine.codex");
       section("opencode", engine.opencode, { model: "string", variant: "string", permission: "string" }, target, "engine.opencode");
-      for (const name of ["codex", "opencode"]) {
+      section("auto", engine.auto, { enabled: "boolean", threshold: "number", returnBelow: "number" }, target, "engine.auto");
+      // Die Ersatzliste wird immer ganz ersetzt. Das Schema prüft ihre Einträge.
+      if (engine.backups !== undefined) {
+        if (engine.backups === null || (Array.isArray(engine.backups) && !engine.backups.length)) delete target.backups;
+        else if (Array.isArray(engine.backups)) target.backups = structuredClone(engine.backups);
+        else throw new PatchError("Falscher Typ: engine.backups");
+        changed.push("engine.backups");
+      }
+      for (const name of ["codex", "opencode", "auto"]) {
         if (isPlainObject(target[name]) && Object.keys(target[name]).length === 0) delete target[name];
       }
       next.engine = target;
@@ -475,7 +488,8 @@ export interface SettingsApi {
 export function createSettingsApi(
   port: SettingsPort,
   log: (message: string) => void,
-  clock: RevisionClock = createRevisionClock()
+  clock: RevisionClock = createRevisionClock(),
+  afterPatch?: () => Promise<unknown>,
 ): SettingsApi {
   // Schreibkette: Lesen, Zusammenführen und Schreiben am Stück. Auch GET läuft
   // durch die Kette, damit ein Stand nie mitten aus einem Schreibvorgang kommt
@@ -558,6 +572,12 @@ export function createSettingsApi(
         if (merged.changed.length) log(`Einstellungen geändert: ${merged.changed.join(", ")}`);
         // Alle Werte dieses Meilensteins greifen ohne Neustart (Hot-Reload an den Aufrufstellen)
         return { status: 200, body: view(checked.value, false, { restartRequired: false }) };
+      }).then(async result => {
+        // Erst nach Freigabe der Einstellungssperre. Gespeichert bleibt gespeichert.
+        if (result.status === 200 && afterPatch) {
+          try { await afterPatch(); } catch { log("Motor-Automatik konnte noch nicht abgeglichen werden"); }
+        }
+        return result;
       });
     },
   };

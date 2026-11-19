@@ -88,8 +88,8 @@ function setup(opts: { offer?: (o: AskOffer) => Promise<AskOfferOutcome>; events
   const sink: TurnSink = { progress: () => {}, notice: () => {} };
   const deps: Partial<ChatTurnDeps> = {
     getEngine: id => engines[id],
-    resolveEngine: (key, d?: Partial<EngineChoiceDeps>) =>
-      resolveEngine(key, { ...d, env: () => ({}), checkEngine: async id => ({ ...READY, engine: id }), log: () => {} }),
+    resolveEngine: (key, d: Partial<EngineChoiceDeps> | undefined, turn) =>
+      resolveEngine(key, { ...d, env: () => ({}), checkEngine: async id => ({ ...READY, engine: id }), log: () => {} }, turn),
     forgetEngineCheck: () => {},
     runFallbackChain: async () => ({ text: "Ersatz. [FRAGE: Soll ich? | Ja | Nein]", source: "none" }),
     buildPromptContext: async o => ({ fullPrompt: `voll: ${o.userMessage}`, fallbackContext: "kontext" }),

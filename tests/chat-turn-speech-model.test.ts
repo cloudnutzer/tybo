@@ -79,8 +79,8 @@ function setup() {
   const sink: TurnSink = { progress: () => {}, notice: t => void notices.push(t) };
   const deps: Partial<ChatTurnDeps> = {
     getEngine: id => engines[id],
-    resolveEngine: (key, d?: Partial<EngineChoiceDeps>) =>
-      resolveEngine(key, { ...d, env: () => ({}), checkEngine: async id => ({ ...READY, engine: id }), log: () => {} }),
+    resolveEngine: (key, d: Partial<EngineChoiceDeps> | undefined, turn) =>
+      resolveEngine(key, { ...d, env: () => ({}), checkEngine: async id => ({ ...READY, engine: id }), log: () => {} }, turn),
     forgetEngineCheck: () => {},
     runFallbackChain: async () => ({ text: "ersatz-antwort", source: "openrouter", model: "ersatz-modell" }),
     buildPromptContext: async o => ({ fullPrompt: `voll: ${o.userMessage}`, fallbackContext: "kontext" }),

@@ -1,0 +1,60 @@
+{
+  "date": "2026-11-17",
+  "claude": {
+    "version": "2.1.326",
+    "source": "system.tools, claude -p --output-format stream-json --verbose --safe-mode --strict-mcp-config --no-session-persistence --permission-mode dontAsk",
+    "tools": [
+      "Task",
+      "Bash",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "DesignSync",
+      "Edit",
+      "EnterWorktree",
+      "ExitWorktree",
+      "ListAgents",
+      "Monitor",
+      "NotebookEdit",
+      "PushNotification",
+      "Read",
+      "RemoteTrigger",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "Skill",
+      "TaskStop",
+      "ToolSearch",
+      "WebFetch",
+      "WebSearch",
+      "Workflow",
+      "Write"
+    ]
+  },
+  "codex": {
+    "version": "0.169.0",
+    "source": "codex debug prompt-input \"hallo\"",
+    "tools": [
+      "clock.sleep",
+      "collaboration.followup_task",
+      "collaboration.interrupt_agent",
+      "collaboration.list_agents",
+      "collaboration.send_message",
+      "collaboration.spawn_agent",
+      "collaboration.wait_agent",
+      "functions.exec",
+      "functions.request_user_input",
+      "functions.request_user_input_async",
+      "functions.wait",
+      "tools.apply_patch",
+      "tools.clock__curr_time",
+      "tools.exec_command",
+      "tools.list_mcp_resource_templates",
+      "tools.list_mcp_resources",
+      "tools.read_mcp_resource",
+      "tools.request_plugin_install",
+      "tools.view_image",
+      "tools.write_stdin"
+    ]
+  }
+}

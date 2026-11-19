@@ -876,11 +876,11 @@ function pidAlive(pid: number | undefined): boolean {
 
 /** Laufende Jobs über ihrer Frist oder ohne lebenden Wächter */
 export function findStuckJobs(jobs: JobStatus[], now: number, alive: (pid: number | undefined) => boolean = pidAlive): { running: number; stuck: string[] } {
-  const active = jobs.filter(j => j.phase !== "ended");
+  const active = jobs.filter(j => j.phase === "starting" || j.phase === "running");
   const stuck: string[] = [];
   for (const j of active) {
-    const start = Date.parse(j.startedAt ?? j.createdAt);
-    const over = Number.isFinite(start) && now - start > j.maxHours * 60 * 60 * 1000 + JOB_GRACE_MS;
+    const start = Date.parse(j.startedAt ?? j.runCreatedAt ?? j.createdAt);
+    const over = Number.isFinite(start) && now - start + (j.budgetUsedMs ?? 0) > j.maxHours * 60 * 60 * 1000 + JOB_GRACE_MS;
     const orphaned = j.watcher ? !alive(j.watcher.pid) : false;
     if (over || orphaned) stuck.push(`${j.title.slice(0, 40)} (${over ? "über der Frist" : "Wächter tot"})`);
   }

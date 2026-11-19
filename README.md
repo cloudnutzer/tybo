@@ -8,10 +8,10 @@ own machine.
   browser with the built-in WebUI (installable as an app on your phone);
   both share the same conversations. Telegram is optional: with the WebUI
   alone tybo runs without Telegram, and you need at least one of the two.
-- **Claude Code as the engine:** every message runs through the Claude Code
-  CLI, so your MCP servers, skills, hooks and `CLAUDE.md` are available.
-  Codex, OpenCode or the Anthropic API can take over, by default or for a
-  single conversation with `/motor`.
+- **Engines and automatic switching:** Claude Code provides MCP servers, skills, hooks and `CLAUDE.md`; ordered backup stages can use another Claude model, Codex or OpenCode, with a notice when the engine changes. The Anthropic API is a manual choice.
+  Configure backup stages and automatic switching in Settings → Models → Motor; [setup and limits](docs/erweiterungen.md#ersatzstufen-und-automatik) (German).
+  Choose an engine per conversation with `/motor`, reset with `/motor standard`, control automation with `/motor auto an` or `/motor auto aus`, refresh with `/motor pruefen`, and inspect tools with `/motor werkzeuge`.
+  The chat's engine pill shows the current choice and reason; Settings → Status → Werkzeuge lists available tools and gaps for each engine.
 - **Agents with topics:** eight agents (research, content, finance,
   strategy, critic and more), each bound to a Telegram forum topic;
   `/board` asks the board agents in turn about one decision.
@@ -24,8 +24,8 @@ own machine.
   after a crash.
 - **Goals with `/goal`:** set a standing goal per topic and tybo keeps
   working on it, checked after each step, until it is done or needs you.
-- **Fallback models:** when Claude is unavailable, tybo answers via
-  OpenRouter or a local Ollama model instead of going silent.
+- **Fallback models with a restricted tool set:** after the engine stages,
+  tybo can answer via OpenRouter or a local Ollama model.
 - **[Talk to tybo](docs/sprechen.md):** speak instead of typing in the WebUI.
   Recommended and private: Parakeet listens, Pocket TTS speaks with the German
   voice "Jürgen", all on your machine; ElevenLabs is an optional cloud extra.

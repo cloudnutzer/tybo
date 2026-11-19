@@ -38,14 +38,14 @@ import { StreamPhaseTracker, stallPhaseLogText, type StallPhase } from "./stream
 import { PRINT_MODE_DISALLOWED_TOOLS, subprocessEnv } from "./subprocess-env";
 import { toolUsesFromEvent, type TurnTools } from "./turn-tools";
 import { runClaudeProcess, STOP_GRACE_MS, type ClaudeProcessOutcome, type ClaudeRuntime } from "./claude/process";
-import { isClaudeErrorResponse, judgeClaudeResult } from "./claude/result";
+import { claudeLimitError, claudeLimitText, judgeClaudeResult, type CliErrorSignal } from "./claude/result";
 import {
   classifyExit,
   classifySpawnError,
   startFailureLogText,
   type ClaudeStartFailure,
 } from "./claude/start-failure";
-import type { EngineErrorKind } from "./engines/types";
+import type { EngineErrorKind, EngineRateLimit } from "./engines/types";
 import {
   finishStreamReading,
   parseStreamLine,
@@ -86,9 +86,11 @@ export interface ClaudeOptions {
   timeoutMs?: number;
   /** Schlüssel im Abbruch-Register, meist der Session-Schlüssel des Topics: /stop beendet den Aufruf darüber */
   abortKey?: string;
+  /** Abbruch eines eigenen Aufrufers, unabhängig vom Gespräch. */
+  signal?: AbortSignal;
   /**
-   * Keine eigene Log-Zeile bei Zeitüberschreitung (Issue #290): der Aufrufer
-   * schreibt selbst genau eine Zeile, etwa callAux mit quiet.
+   * Keine eigene Log-Zeile bei Zeitüberschreitung; im Streaming gar keine
+   * Aufrufdiagnose. Der Aufrufer schreibt selbst einen kontrollierten Grund.
    */
   quiet?: boolean;
 }
@@ -116,10 +118,10 @@ export interface ClaudeResult {
   text: string;
   isError: boolean;
   /**
-   * Nur bei einem gescheiterten Start (Issue #565): "not_installed", wenn das
-   * Programm fehlt, sonst "other". Andere Fehler tragen kein errorKind.
+   * Bei gescheitertem Start "not_installed" oder "other" (Issue #565), bei
+   * erkanntem Limit "usage_limit" oder "quota" (Issue #652). Nur bei isError.
    */
-  errorKind?: Extract<EngineErrorKind, "not_installed" | "other">;
+  errorKind?: Extract<EngineErrorKind, "not_installed" | "other" | "usage_limit" | "quota">;
   /** Session für ein späteres --resume */
   sessionId?: string;
   /**
@@ -128,6 +130,10 @@ export interface ClaudeResult {
    * Lesefehler (was bis dahin gemeldet war).
    */
   costUsd?: number;
+  /** Limit-Meldung und gemessene Fenster, auch bei Abbruch oder Fehler */
+  rateLimit?: EngineRateLimit;
+  /** Letzter strukturierter Verbrauchsbericht aus einem assistant-Ereignis. */
+  usageReport?: Record<string, unknown>;
   /**
    * Über das Abbruch-Register beendet (/stop): kein Fehler im üblichen Sinn,
    * also kein Rückfall-Modell und kein Neuversuch mit frischer Session.
@@ -290,20 +296,49 @@ function startFailureOf(run: ClaudeProcessOutcome, cwd: string): ClaudeStartFail
 }
 
 /** Fehlerergebnis eines gescheiterten Starts; Text und Log nur aus kontrollierten Feldern */
-function startFailedResult(failure: ClaudeStartFailure, where: string): ClaudeResult {
+function startFailedResult(failure: ClaudeStartFailure, where: string, quiet = false): ClaudeResult {
   const detail = startFailureLogText(failure);
-  console.error(`[${where}] Start fehlgeschlagen: ${detail}`);
+  if (!quiet) console.error(`[${where}] Start fehlgeschlagen: ${detail}`);
   return { text: `Claude Code konnte nicht gestartet werden (${detail}).`, isError: true, errorKind: failure.kind };
 }
 
 /** Lauf ohne verwertbare Ausgabe (Lese- oder Schreibfehler) */
 const failedCall = (): ClaudeResult => ({ text: "", isError: true });
 
+/** Gemeinsames Urteil für Text, JSON und Strom; ohne Fehler nie eine Fehlerart. */
+function resultStatus(text: string, signal?: CliErrorSignal, rateLimit?: EngineRateLimit, quiet = false): Pick<ClaudeResult, "isError" | "errorKind"> {
+  const isError = judgeClaudeResult(signal, text, rateLimit);
+  return { isError, ...limitErrorDetails(isError, text, rateLimit, signal, quiet) };
+}
+
+/** Diagnose nur beim Limit-Fehler; beliebiger Antwortinhalt bleibt vollständig aus dem Log. */
+function limitErrorDetails(
+  isError: boolean,
+  text: string,
+  rateLimit?: EngineRateLimit,
+  signal?: CliErrorSignal,
+  quiet = false
+): Pick<ClaudeResult, "errorKind"> {
+  const errorKind = isError ? claudeLimitError(text, rateLimit) : undefined;
+  if (!errorKind) return {};
+  if (!quiet) console.error(`[ClaudeLimit] ${JSON.stringify({
+    errorKind,
+    rateLimit: rateLimit ?? null,
+    result: {
+      is_error: signal?.is_error ?? null,
+      subtype: signal?.subtype ?? null,
+      api_error_status: signal?.api_error_status ?? null,
+    },
+    ...(claudeLimitText(text) ? { message: text.trimStart().slice(0, 120) } : { textLength: text.length }),
+  })}`);
+  return { errorKind };
+}
+
 /** CLAUDE_AUTH=apiKey ohne Schlüssel: kein Prozess, ein Fehlerergebnis mit der Meldung; sonst null */
-function blockedByAuth(): ClaudeResult | null {
+function blockedByAuth(quiet = false): ClaudeResult | null {
   const problem = claudeAuthProblem();
   if (!problem) return null;
-  console.error(`[Claude] Nicht gestartet: ${problem}`);
+  if (!quiet) console.error(`[Claude] Nicht gestartet: ${problem}`);
   return { text: problem, isError: true };
 }
 
@@ -330,6 +365,7 @@ export async function callClaude(request: ClaudeOptions): Promise<ClaudeResult> 
       input: request.prompt,
       timeoutMs: limitMs,
       abortKey: request.abortKey,
+      signal: request.signal,
     },
     runtime()
   );
@@ -343,7 +379,7 @@ export async function callClaude(request: ClaudeOptions): Promise<ClaudeResult> 
   if (run.readError !== undefined || run.inputError !== undefined) return failedCall();
   if (format === "json") return jsonResult(run.stdout, workDir);
   // Textformat: kein CLI-Signal, nur das Textmuster
-  return { text: run.stdout.trim(), isError: isClaudeErrorResponse(run.stdout) };
+  return { text: run.stdout.trim(), ...resultStatus(run.stdout) };
 }
 
 /** JSON aus der Ausgabe; undefined, wenn sie keins ist */
@@ -362,17 +398,23 @@ function parseJsonOutput(output: string): unknown {
  */
 function jsonResult(output: string, cwd: string): ClaudeResult {
   const parsed: any = parseJsonOutput(output);
-  if (parsed === undefined) return { text: output, isError: isClaudeErrorResponse(output) };
+  if (parsed === undefined) return { text: output, ...resultStatus(output) };
   const events: any[] | null = Array.isArray(parsed) ? parsed : null;
   const tools: TurnTools | undefined = events ? { uses: events.flatMap(toolUsesFromEvent), cwd } : undefined;
   const withTools = tools ? { tools } : {};
+  // Nur für das Urteil: falls --verbose Limit-Ereignisse enthält, dieselben
+  // Regeln wie beim Strom. JSON gibt weiterhin keine Messwerte zurück (M14-01).
+  let reading = startStreamReading();
+  for (const event of events ?? []) {
+    if (event?.type === "rate_limit_event") reading = readStreamEvent(reading, event, clock.now()).reading;
+  }
+  const rateLimit = reading.rateLimit;
   const final = events ? events.find((e) => e?.type === "result") : parsed;
-  if (!final) return { text: "", isError: true, ...withTools };
+  if (!final) return { text: "", isError: true, ...limitErrorDetails(true, "", rateLimit), ...withTools };
   const cost = typeof final.total_cost_usd === "number" ? final.total_cost_usd : undefined;
   // Im Listenformat nie die ganze Ereignisliste als Antworttext
   const text = final.result || (events ? "" : output);
-  const isError = judgeClaudeResult(final, String(text));
-  return { text, sessionId: final.session_id, isError, costUsd: cost, ...withTools };
+  return { text, sessionId: final.session_id, ...resultStatus(String(text), final, rateLimit), costUsd: cost, ...withTools };
 }
 
 // ---------------------------------------------------------------------------
@@ -420,7 +462,7 @@ export async function runClaudeWithTimeout(prompt: string, timeoutMs: number, ex
 export async function callClaudeStreaming(request: ClaudeStreamOptions): Promise<ClaudeResult> {
   const model = request.model ?? DEFAULT_CLAUDE_MODEL;
   const workDir = request.cwd || process.cwd();
-  const blocked = blockedByAuth();
+  const blocked = blockedByAuth(request.quiet);
   if (blocked) return blocked;
   let reading = startStreamReading();
   // Die CLI schickt auch während langer Werkzeuge alle 30 s tool_progress,
@@ -450,38 +492,54 @@ export async function callClaudeStreaming(request: ClaudeStreamOptions): Promise
       timeoutMs: request.timeoutMs ?? DEFAULT_CALL_TIMEOUT_MS,
       idleTimeoutMs: request.idleTimeoutMs,
       abortKey: request.abortKey,
+      signal: request.signal,
+      quiet: request.quiet,
       onLine,
     },
     runtime()
   );
 
   const outcome = finishStreamReading(reading);
-  // Bis hierher gemeldete Kosten gehen auch bei Abbruch, Zeitlimit und Lesefehler mit
-  const spent = outcome.costUsd !== undefined ? { costUsd: outcome.costUsd } : {};
-  if (run.aborted) return { text: "", isError: true, aborted: true, ...spent };
+  // Bis hierher gemeldete Kosten und Limits gehen bei jedem Ausgang mit.
+  const measured = {
+    ...(outcome.costUsd !== undefined ? { costUsd: outcome.costUsd } : {}),
+    ...(outcome.rateLimit ? { rateLimit: outcome.rateLimit } : {}),
+    ...(outcome.usageReport ? { usageReport: outcome.usageReport } : {}),
+  };
+  if (run.aborted) return { text: "", isError: true, aborted: true, ...measured };
   const tools: TurnTools = { uses: outcome.uses, cwd: workDir };
   // Auch ein Lesefehler nach dem Zeitlimit bleibt ein Zeitlimit: sonst
   // startete chat-turn einen frischen Resume-Versuch mit neuem Zeitfenster
-  if (run.limit) return { ...timeoutResult(run, outcome, tools, phase, model), ...spent };
+  if (run.limit) return { ...timeoutResult(run, outcome, tools, phase, model, request.quiet), ...measured };
   // Ohne Lauf keine Ausgabe, kein Leser-Ergebnis: nur die Diagnose (Issue #565)
   const startFailure = outcome.text || outcome.sessionId ? undefined : startFailureOf(run, workDir);
-  if (startFailure) return { ...startFailedResult(startFailure, "Claude streaming"), ...spent };
+  if (startFailure) return { ...startFailedResult(startFailure, "Claude streaming", request.quiet), ...measured };
   if (run.readError !== undefined || run.inputError !== undefined) {
-    console.error("[Claude streaming] Fehler:", run.readError ?? run.inputError);
-    if (run.stderr) console.error("[Claude streaming] stderr:", run.stderr.substring(0, 500));
-    return { ...failedCall(), ...spent };
+    if (!request.quiet) {
+      console.error("[Claude streaming] Fehler:", run.readError ?? run.inputError);
+      if (run.stderr) console.error("[Claude streaming] stderr:", run.stderr.substring(0, 500));
+    }
+    return { ...failedCall(), ...measured };
   }
 
-  if (outcome.joinedTurns) {
+  if (!request.quiet && outcome.joinedTurns) {
     console.error(`[Claude streaming] ${outcome.joinedTurns} fertige Turns in einem Aufruf (Hook?), alle weitergegeben`);
   }
   const length = outcome.text ? `${outcome.text.length} Zeichen` : "LEER";
-  console.error(`[Claude streaming] Ergebnis: text=${length}, sessionId=${outcome.sessionId || "keine"}`);
-  if (run.stderr) console.error("[Claude streaming] stderr:", run.stderr.substring(0, 500));
+  if (!request.quiet) {
+    console.error(`[Claude streaming] Ergebnis: text=${length}, sessionId=${outcome.sessionId || "keine"}`);
+    if (run.stderr) console.error("[Claude streaming] stderr:", run.stderr.substring(0, 500));
+  }
 
-  // CLI-Signal zuerst, das Textmuster nur ohne Signal (src/lib/claude/result.ts)
-  const isError = judgeClaudeResult(outcome.signal, outcome.text);
-  return { text: outcome.text, sessionId: outcome.sessionId, isError, costUsd: outcome.costUsd, tools };
+  // Ein Hook kann mehrere fertige Turns verbinden: eine abschließende Limit-
+  // Meldung bleibt für das Urteil sichtbar, der Antworttext bleibt vollständig.
+  const lastText = reading.result?.text || outcome.lastText;
+  const judgmentText = outcome.joinedTurns && claudeLimitText(lastText) ? lastText : outcome.text;
+  return {
+    text: outcome.text, sessionId: outcome.sessionId,
+    ...resultStatus(judgmentText, outcome.signal, outcome.rateLimit, request.quiet),
+    costUsd: outcome.costUsd, tools, ...measured,
+  };
 }
 
 /** Ergebnis beim Zeitlimit: Stand des Laufs für den Bericht (Issue #179) */
@@ -490,18 +548,19 @@ function timeoutResult(
   outcome: StreamOutcome,
   tools: TurnTools,
   phase: StreamPhaseTracker,
-  model: string
+  model: string,
+  quiet = false
 ): ClaudeResult {
   const at = run.limitAt ?? clock.now();
   const stoppedAfterMs = at - run.startedAt;
   const idleForMs = at - run.lastActivityAt;
   const stallPhase = phase.snapshot(at);
-  console.error(
+  if (!quiet) console.error(
     `[Claude streaming] Zeitlimit (${run.limit}) nach ${Math.round(stoppedAfterMs / 1000)}s, ` +
       `letztes Lebenszeichen vor ${Math.round(idleForMs / 1000)}s, Phase: ${stallPhaseLogText(stallPhase)} ` +
       `(Modell ${model}), sessionId=${outcome.sessionId || "keine"}, Prozessbaum beendet`
   );
-  if (run.stderr) console.error("[Claude streaming] stderr (Zeitlimit):", run.stderr.substring(0, 500));
+  if (!quiet && run.stderr) console.error("[Claude streaming] stderr (Zeitlimit):", run.stderr.substring(0, 500));
   return {
     text: "",
     sessionId: outcome.sessionId,

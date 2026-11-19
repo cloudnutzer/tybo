@@ -9,6 +9,7 @@
  */
 
 import { join } from "node:path";
+import { JOB_REPORT_HINT, JobReportDeferredError, jobReportMetadata } from "../lib/jobs/report-input";
 import {
   ABORT_REPLY,
   SHUTDOWN_ABORT_REPLY,
@@ -429,7 +430,7 @@ export function createBotChat(deps: BotChatDeps): BotChat {
     }
   }
 
-  async function runTurn({ conversationId, agent, text, sink, ask, endAsk, title, attachments = [], speech = false, reservation, noTelegram = false }: RunTurnOptions): Promise<TurnResult> {
+  async function runTurn({ conversationId, agent, text, sink, ask, endAsk, title, attachments = [], speech = false, reservation, noTelegram = false, jobReport }: RunTurnOptions): Promise<TurnResult> {
     const turnStartedAt = Date.now();
     const chatId = webChatId(conversationId);
     // Sprech-Turn (Issue #249): im Speicher markiert, nie im Text der Nachricht
@@ -498,7 +499,8 @@ export function createBotChat(deps: BotChatDeps): BotChat {
               })),
             }
           : {};
-        await save({ chat_id: chatId, role: "user", content, metadata: { channel: WEB_CHANNEL, ...speechMeta, ...mediaMeta } }, conversationId);
+        const saveUser = () => save({ chat_id: chatId, role: "user", content, metadata: { channel: WEB_CHANNEL, ...speechMeta, ...mediaMeta, ...(jobReport ? jobReportMetadata(jobReport) : {}) } }, conversationId);
+        if (!jobReport) await saveUser();
         if (wasAborted()) return aborted();
 
         let response: string;
@@ -507,13 +509,17 @@ export function createBotChat(deps: BotChatDeps): BotChat {
         // Rückfrage des Modells (Issue #336), nicht bei Denkaufträgen aus dem Telefonhörer
         const asked: { question?: TurnQuestion } = {};
         // Erinnerung an einen offenen Faden (Issue #292): einmal abholen, nur für diesen Turn
-        const threadHint = await threadTurnHint(deps, chatId, undefined, noTelegram);
+        const threadHint = await threadTurnHint(deps, chatId, undefined, noTelegram || !!jobReport);
         try {
           response = await runExecution(
             sessionKey,
             agent,
-            () =>
-              deps.runStreamingTurn({
+            async () => {
+              if (jobReport) {
+                if (!(await jobReport.claim())) throw new JobReportDeferredError();
+                await saveUser();
+              }
+              return deps.runStreamingTurn({
                 userMessage: prepared.length ? buildMediaPrompt(prepared, text) : text,
                 chatId,
                 agentName: agent,
@@ -524,6 +530,7 @@ export function createBotChat(deps: BotChatDeps): BotChat {
                 // und antwortet mit dem Modell für gesprochene Fragen, wenn eins eingestellt ist;
                 // dazu der Hinweis auf einen offenen Faden (Issue #292)
                 ...hintOptions(speech, threadHint),
+                ...(jobReport ? { jobChain: jobReport.chain, turnHint: JOB_REPORT_HINT } : {}),
                 // Denkauftrag aus dem Telefonhörer (Issue #260): der Hinweis aufs Gespräch bleibt für den nächsten getippten Turn
                 // und Erinnerungen der Planungswerkzeuge (Motor api) kommen nur in der WebUI an (Issue #348)
                 ...(noTelegram ? { skipCallRecap: true, noTelegram: { conversationId } } : {}),
@@ -540,7 +547,8 @@ export function createBotChat(deps: BotChatDeps): BotChat {
                         asked.question = q;
                       },
                     }),
-              }),
+              });
+            },
             deps.allowedTools?.(agent)
           );
         } catch (e) {
@@ -565,8 +573,8 @@ export function createBotChat(deps: BotChatDeps): BotChat {
         const commit = (deps.finishStages ?? createTurnStages)(
           webFinishDeps(deps, log, { where, save: message => save(message, conversationId), invokeBudget: 0 })
         );
-        const foreignInput = foreignInputOf(prepared);
-        const threads = threadsFor(deps, { chatId, userText: threadsUserText(text, prepared), turnStartedAt, noTelegram });
+        const foreignInput = jobReport ? "Job-Bericht" : foreignInputOf(prepared);
+        const threads = threadsFor(deps, { chatId, userText: threadsUserText(text, prepared), turnStartedAt, noTelegram: noTelegram || !!jobReport });
         const stages = await commit({
           chatId,
           agentName: agent,
@@ -586,6 +594,7 @@ export function createBotChat(deps: BotChatDeps): BotChat {
       }, { ...queueWaitOptions(deps, webSink), reservation });
     } catch (e) {
       if (isAbortError(e)) return aborted();
+      if (jobReport && (isRestartPendingError(e) || e instanceof JobReportDeferredError)) return { text: "", deferred: true };
       // Neustart läuft (Issue #190): nicht angenommen, klare Meldung
       if (isRestartPendingError(e)) return { text: RESTART_PENDING_REPLY, failed: true };
       throw e;
@@ -1113,7 +1122,7 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
     }
   }
 
-  async function runTurn({ conversationId, text, messageId, receivedAt, source = "web", sink, ask, endAsk, attachments = [], speech = false, reservation, noTelegram = false }: RunTurnOptions): Promise<TurnResult> {
+  async function runTurn({ conversationId, text, messageId, receivedAt, source = "web", sink, ask, endAsk, attachments = [], speech = false, reservation, noTelegram = false, jobReport }: RunTurnOptions): Promise<TurnResult> {
     const turnStartedAt = Date.now();
     // Sprech-Turn (Issue #249): Nutzernachricht und Antwort im Speicher markiert, [INVOKE:]-Antworten nicht
     const speechMeta = speech ? { speech: true } : {};
@@ -1209,7 +1218,7 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
 
         // Anhänge zuerst (der erste trägt den Text, wenn er passt), dann Text in Teilen;
         // ohne Telegram gibt es nichts zu spiegeln
-        const plan: MirrorPlan = !mirror
+        const plan: MirrorPlan = !mirror || !!jobReport
           ? { files: [], textChunks: [] }
           : files.length
             ? attachmentMirrorPlan(text, source, files.map(f => f.attachment))
@@ -1274,13 +1283,14 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
             }
           : {};
         const saveUser = () => {
+          if (userSaved) return Promise.resolve();
           userSaved = true;
           return save(
             {
               chat_id: chatId,
               role: "user",
               content,
-              metadata: { ...metaBase, msgId: messageId ?? newWebMessageId(), ...speechMeta, ...mediaMeta },
+              metadata: { ...metaBase, msgId: messageId ?? newWebMessageId(), ...speechMeta, ...mediaMeta, ...(jobReport ? jobReportMetadata(jobReport) : {}) },
               created_at: createdAt,
             },
             conversationId
@@ -1293,13 +1303,17 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
         // Erinnerung an einen offenen Faden (Issue #292): einmal abholen, nur für diesen Turn
         // Rückfrage des Modells (Issue #336), nicht bei Denkaufträgen aus dem Telefonhörer
         const asked: { question?: TurnQuestion } = {};
-        const threadHint = await threadTurnHint(deps, chatId, topicId, noTelegram);
+        const threadHint = await threadTurnHint(deps, chatId, topicId, noTelegram || !!jobReport);
         try {
           response = await runExecution(
             sessionKey,
             agent,
-            () =>
-              deps.runStreamingTurn({
+            async () => {
+              if (jobReport) {
+                if (!(await jobReport.claim())) throw new JobReportDeferredError();
+                await saveUser();
+              }
+              return deps.runStreamingTurn({
                 userMessage: prepared.length ? buildMediaPrompt(prepared, text) : text,
                 chatId,
                 agentName: agent,
@@ -1311,6 +1325,7 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
                 // und antwortet mit dem Modell für gesprochene Fragen, wenn eins eingestellt ist;
                 // dazu der Hinweis auf einen offenen Faden (Issue #292)
                 ...hintOptions(speech, threadHint),
+                ...(jobReport ? { jobChain: jobReport.chain, turnHint: JOB_REPORT_HINT } : {}),
                 // Denkauftrag aus dem Telefonhörer (Issue #260): der Hinweis aufs Gespräch bleibt für den nächsten getippten Turn
                 // und Erinnerungen der Planungswerkzeuge (Motor api) kommen nur in der WebUI an (Issue #348)
                 ...(noTelegram ? { skipCallRecap: true } : {}),
@@ -1329,11 +1344,13 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
                         asked.question = q;
                       },
                     }),
-              }),
+              });
+            },
             deps.allowedTools?.(agent)
           );
         } catch (e) {
           if (isAbortError(e) || wasAborted()) return aborted();
+          if (jobReport && (isRestartPendingError(e) || e instanceof JobReportDeferredError)) throw e;
           // Gescheitert, nicht abgebrochen: die Nutzernachricht bleibt wie bisher.
           // Ab hier verbindlich, damit stop() während des Speicherns ablehnt
           entry.committed = true;
@@ -1361,8 +1378,8 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
             ...(deps.onAgentTurn ? { onGoal: deps.onAgentTurn } : {}),
           })
         );
-        const foreignInput = foreignInputOf(prepared);
-        const threads = threadsFor(deps, { chatId, topicId, userText: threadsUserText(text, prepared), turnStartedAt, noTelegram });
+        const foreignInput = jobReport ? "Job-Bericht" : foreignInputOf(prepared);
+        const threads = threadsFor(deps, { chatId, topicId, userText: threadsUserText(text, prepared), turnStartedAt, noTelegram: noTelegram || !!jobReport });
         const stages = await commit({
           chatId,
           ...(topicId !== undefined ? { topicId } : {}),
@@ -1425,6 +1442,7 @@ export function createTelegramChat(deps: TelegramChatDeps): WebChat {
       }, { ...queueWaitOptions(deps, webSink), reservation });
     } catch (e) {
       if (isAbortError(e)) return aborted();
+      if (jobReport && (isRestartPendingError(e) || e instanceof JobReportDeferredError)) return { text: "", deferred: true };
       // Neustart läuft (Issue #190): nicht angenommen, klare Meldung
       if (isRestartPendingError(e)) return { text: RESTART_PENDING_REPLY, failed: true };
       throw e;

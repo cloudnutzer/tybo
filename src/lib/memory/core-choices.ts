@@ -100,6 +100,8 @@ export type OfferDraftOutcome =
   | "core_unreadable"
   /** Modell gescheitert oder leere Antwort */
   | "model_failed"
+  /** Claude am Limit ohne nutzbaren Ersatz; keine Wiederholung und kein Entwurf */
+  | { blockedUntil: string }
   /** Nirgends angekommen: Frage abgelaufen, Entwurf wieder weg */
   | "not_delivered";
 
@@ -164,6 +166,7 @@ export function createCoreChoices(deps: CoreChoicesDeps): CoreChoices {
     const result = await callAux("distill", buildCoreDraftPrompt(facts), { timeoutMs: DRAFT_TIMEOUT_MS, quiet: true });
     // Nach /stop oder Stopp-Knopf nichts mehr vorlegen
     checkAborted();
+    if (result.disabled && result.blockedUntil) return { blockedUntil: result.blockedUntil };
     if (result.isError) return "model_failed";
     // Das Verbot im Auftrag ist nur eine Bitte ans Modell: Vorgelegt und gespeichert wird die maskierte Fassung
     const text = fitCore(normalizeCore(maskSecrets(sanitizeModelOutput(result.text))), CORE_MAX_CHARS);

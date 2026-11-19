@@ -33,16 +33,27 @@ import {
 import { formatChannelRules } from "../src/agents/prompt-parts";
 import type { EngineId, EngineRequest, EngineResult } from "../src/lib/engines";
 import { isWebChatId, WEB_DM_CHAT_ID } from "../src/lib/channels";
-import { runExecution } from "../src/lib/execution-context";
+import { abortExecutions, currentExecution, runExecution } from "../src/lib/execution-context";
 import type { SendAndRecordInput } from "../src/lib/outbox";
 import type { WebPost } from "../src/lib/review-choices";
 import { getStore } from "../src/lib/store";
 import type { TaskStore } from "../src/lib/store/ports";
 import type { AsyncTask, TaskChanges } from "../src/lib/store/types";
-import { resumeMacTask, type TaskResumeDeps, taskResumePrompt } from "../src/lib/task-resume";
+import { resumeMacTask, type TaskResumeDeps, type MacResumeOutcome, taskResumePrompt, taskHandoverPrompt } from "../src/lib/task-resume";
+import { ABORT_REPLY, runJsonTurn, type ChatTurnDeps, type TurnOptions } from "../src/lib/chat-turn";
+import { resolveEngine, resetEngineChoiceForTests } from "../src/lib/engine-choice";
+import { readSwitchState, setSwitchStateFileForTests, updateSwitchState } from "../src/lib/engine-switch-state";
+import { resetSwitchNotifyForTests, settleSwitchNoticesForTests } from "../src/lib/engine-switch-notify";
+import { noteStageRun } from "../src/lib/engine-switch-run";
+import { applyFailure, stageBlock } from "../src/lib/engine-switch";
+import { recordSessionTurn, setSessionsFileForTests } from "../src/lib/session-manager";
+import type { Settings } from "../src/lib/settings";
+import { sessionKeyFor } from "../src/lib/store/message-rules";
+import { buildPromptContext, buildResumePrompt } from "../src/lib/prompt-builder";
+import { handoverSources } from "./handover-fixture";
 import { createTaskReminders } from "../src/lib/task-reminders";
 import { TELEGRAM_FORMAT_RULES } from "../src/lib/telegram";
-import { claimLegacyTaskButton, LEGACY_TASK_TEXT } from "../src/lib/legacy-task-buttons";
+import { claimLegacyTaskButton, resumeLegacyMacTask, LEGACY_TASK_TEXT } from "../src/lib/legacy-task-buttons";
 import { createTelegramChoices, installTelegramChoices } from "../src/lib/telegram-choices";
 import { createTelegramRuntime, type AgentBots } from "../src/lib/telegram-runtime";
 import { testChoices, type TestChoices } from "./choices-fixture";
@@ -118,6 +129,8 @@ let offer: (o: AskOffer) => Promise<AskOfferOutcome>;
 let cleanup: (() => void)[] = [];
 let logSpy: ReturnType<typeof spyOn>;
 let n = 0;
+let switchDeps: Partial<TaskResumeDeps>;
+let resumeOutcomes: MacResumeOutcome[];
 
 const fakeApi = {
   answerCallbackQuery: async (...args: unknown[]) => void calls.push({ method: "answerCallbackQuery", args }),
@@ -145,9 +158,12 @@ const resumeDeps: Partial<TaskResumeDeps> = {
   resolveEffort: () => undefined,
   allowedTools: () => undefined,
   cwd: dir,
+  getSettings: () => ({}),
 };
 
 beforeEach(() => {
+  switchDeps = {};
+  resumeOutcomes = [];
   port = testChoices(join(dir, `choices-${++n}.json`), { userId: OWNER, groupId: GROUP });
   logSpy = spyOn(console, "log").mockImplementation(() => {});
   tasks = memoryTasks();
@@ -212,7 +228,11 @@ beforeEach(() => {
     },
     processIntents: async (text, _tools, target) => void intents.push({ text, target }),
     tasks: () => tasks.store,
-    resume: (task, chatId, answer, channel) => resumeMacTask(task, chatId, answer, resumeDeps, channel),
+    resume: async (task, chatId, answer, channel, handover) => {
+      const outcome = await resumeMacTask(task, chatId, answer, { ...resumeDeps, ...switchDeps }, channel, handover);
+      resumeOutcomes.push(outcome);
+      return outcome;
+    },
     log: () => {},
   });
   cleanup.push(onChoiceDecided("ask", ask.handler));
@@ -1342,5 +1362,387 @@ describe("Rückfrage in der fortgesetzten Antwort (Issue #336)", () => {
     const { choice } = await offered();
     await click(`ch|${choice.id}|o0`);
     expect((await listChoices()).filter(c => c.kind === "ask" && c.state === "open")).toHaveLength(0);
+  });
+});
+
+describe("Motorwechsel über den echten Knopfweg (Issue #659)", () => {
+  const FABLE = "claude-fable-5-2";
+  const OPUS = "claude-opus-5-5";
+  const KEY = sessionKeyFor(GROUP, 443);
+  const emptyUsage = async () => ({ claude: [], codex: [], opencode: [], api: [] });
+  let settings: Settings;
+  let transfers: TurnOptions[];
+  let notes: Parameters<typeof noteStageRun>[];
+  let writes: Promise<void>[];
+  let handoverReply: (opts: TurnOptions) => Promise<string>;
+  const used = { uses: [{ name: "Bash", command: "notify --file /tmp/bericht.txt" }] };
+
+  beforeEach(() => {
+    setSwitchStateFileForTests(join(dir, `switch-${n}.json`));
+    resetSwitchNotifyForTests();
+    setSessionsFileForTests(join(dir, `sessions-${n}.json`));
+    resetEngineChoiceForTests();
+    transfers = [];
+    notes = [];
+    writes = [];
+    settings = { defaults: { model: FABLE }, engine: { backups: [{ engine: "codex" }], codex: { model: "codex-test" } } };
+    handoverReply = async opts => {
+      opts.onInfo?.({ agent: "research", engine: "codex", model: "codex-test", durationMs: 1 });
+      opts.onSessionId?.("codex-neu", { engine: "codex", model: "codex-test" });
+      opts.onTools?.({ uses: [{ name: "Write", path: "/tmp/notiz.txt" }] });
+      await opts.sink.notice("Codex übernimmt.");
+      return "Bericht mit deiner Antwort fertig.";
+    };
+    switchDeps = {
+      getSettings: () => settings,
+      readSwitchState,
+      now: Date.now,
+      checkEngine: async engine => ({ engine, installed: true, loggedIn: true, checked: true }),
+      noteStageRun: (...args) => {
+        notes.push(args);
+        const [stage, model, result, auto, now, update, options] = args;
+        const write = noteStageRun(stage, model, result, auto, now, update, { ...options, readUsage: emptyUsage });
+        writes.push(write);
+        return write;
+      },
+      handoverTurn: async opts => {
+        expect(currentExecution()).toMatchObject({ key: KEY, agent: "research", sessionLock: true });
+        transfers.push(opts);
+        return handoverReply(opts);
+      },
+    };
+  });
+  afterEach(async () => {
+    await Promise.all(writes);
+    await settleSwitchNoticesForTests();
+    resetSwitchNotifyForTests();
+    resetEngineChoiceForTests();
+    setSwitchStateFileForTests(null);
+    setSessionsFileForTests(null);
+  });
+
+  async function press(patch: Partial<AskOffer> = {}) {
+    const o = await offered({ model: FABLE, ...patch });
+    await port.port.decide("topic-443", o.choice.id, "o0", "web");
+    return o;
+  }
+  async function block() {
+    await updateSwitchState(state => applyFailure(state, { stage: { engine: "claude" }, model: FABLE, kind: "limit" }, Date.now()));
+  }
+  function failure(errorKind: EngineResult["errorKind"]) {
+    const result: EngineResult = { engine: "claude", text: "Fehler", isError: true, errorKind, tools: used };
+    engineReply = async () => result;
+    return result;
+  }
+  function realHandover() {
+    const sources = handoverSources(GROUP, Date.now());
+    const turnDeps: Partial<ChatTurnDeps> = {
+      getEngine: resumeDeps.getEngine,
+      getSettings: () => settings,
+      getAgentConfig: () => ({ name: "Research", model: FABLE, systemPrompt: "System" }),
+      resolveEngine: (key, deps, turn) => resolveEngine(key, { ...deps, env: () => ({}),
+        checkEngine: switchDeps.checkEngine, readUsage: emptyUsage, log: () => {},
+      }, turn),
+      readSwitchState,
+      noteStageRun: switchDeps.noteStageRun,
+      isSessionModeEnabled: () => true,
+      shouldDistill: () => false,
+      buildPromptContext: opts => buildPromptContext(opts, sources),
+      buildResumePrompt: opts => buildResumePrompt(opts, sources),
+      runFallbackChain: async req => {
+        expect(req.allowClaudeCli?.(OPUS)).toBe(false);
+        return { text: "Antwort der Kette.", source: "openrouter", model: "ersatzmodell" };
+      },
+      log: async () => {}, reportSecrets: () => [],
+      setTimer: () => { throw new Error("Kein gesammelter Laufzeit-Hinweis"); }, clearTimer: () => {},
+    };
+    handoverReply = opts => runJsonTurn({ ...opts, deps: turnDeps });
+    return turnDeps;
+  }
+
+  test("frei und erfolgreich: ursprüngliche Session, via resume, noteStageRun", async () => {
+    const { taskId } = await press();
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({ engine: "claude", model: FABLE, resumeSessionId: "sess-frage", answersQuestion: true });
+    expect(transfers).toHaveLength(0);
+    expect(resumeOutcomes[0]).toMatchObject({ status: "done", via: "resume" });
+    expect(notes).toHaveLength(1);
+    expect(notes[0].slice(0, 2)).toEqual([{ engine: "claude" }, FABLE]);
+    expect(task(taskId).status).toBe("completed");
+  });
+
+  test("Erfolg setzt Fehlerzähler zurück und wertet neue Messwerte aus", async () => {
+    const now = Date.now();
+    await updateSwitchState(state => applyFailure(state, { stage: { engine: "claude" }, model: FABLE, kind: "limit" }, now - 3_600_001));
+    engineReply = async (_req, engine) => ({ engine, text: "Erledigt", isError: false, rateLimit: { windows: [{
+      id: "weekly_all", percent: 96, resetsAt: new Date(now + 600_000).toISOString(), measuredAt: new Date(now).toISOString(), source: "stream",
+    }] } });
+    await press();
+    await Promise.all(writes);
+    expect(readSwitchState().counters).toEqual([]);
+    expect(stageBlock({ engine: "claude" }, FABLE, readSwitchState(), now)).toMatchObject({ cause: "threshold", window: "weekly_all" });
+    expect(transfers).toHaveLength(0);
+  });
+
+  test("gespeichertes leeres Modell geht als undefined an die Auswertung und in priorAttempts", async () => {
+    engineReply = async (_req, engine) => ({ engine, text: "Limit", isError: true, errorKind: "usage_limit" });
+    await press({ engine: "codex", model: "" });
+    expect(runs[0].model).toBeUndefined();
+    expect(notes[0].slice(0, 2)).toEqual([{ engine: "codex" }, undefined]);
+    expect(transfers[0].priorAttempts![0].stage).toEqual({ engine: "codex" });
+  });
+
+  for (const kind of ["usage_limit", "capacity", "auth", "not_installed", "other", undefined] as const) {
+    test(`${kind ?? "ohne Fehlerart"}: genau eine Übergabe, korrekte Sperre und unveränderter Vorversuch`, async () => {
+      const result = failure(kind);
+      handoverReply = async opts => {
+        expect(notes).toHaveLength(1);
+        expect(readSwitchState().blocks.map(b => b.cause)).toEqual(kind === "other" || !kind ? [] : [kind === "usage_limit" ? "limit" : "outage"]);
+        opts.onInfo?.({ agent: "research", engine: "codex", model: "codex-test", durationMs: 1 });
+        opts.onSessionId?.("codex-neu", { engine: "codex", model: "codex-test" });
+        await opts.sink.notice("Codex übernimmt.");
+        return "Bericht fertig.";
+      };
+      realDeliver = async (_conversation, text) => {
+        expect(notices.map(n => n.text)).toEqual(["Codex übernimmt."]);
+        delivered.push({ conversation: topicConv(), text });
+        return true;
+      };
+      const { taskId } = await press();
+      expect(runs).toHaveLength(1);
+      expect(transfers).toHaveLength(1);
+      expect(transfers[0]).toMatchObject({ chatId: GROUP, topicId: 443, agentName: "research", channel: "web" });
+      expect(transfers[0].userMessage).toBe(taskHandoverPrompt({ originalPrompt: input().originalPrompt,
+        question: input().question, options: input().options }, "Ja, verschicken"));
+      expect(transfers[0].priorAttempts).toEqual([{ stage: { engine: "claude", model: FABLE }, result }]);
+      expect(transfers[0].priorAttempts![0].result).toBe(result);
+      expect(saved[0]).toMatchObject({ content: "Bericht fertig.", metadata: { topicId: 443 } });
+      expect(delivered[0].text).toBe("Bericht fertig.");
+      expect(task(taskId)).toMatchObject({ status: "completed", session_id: "codex-neu", metadata: { engine: "codex", model: "codex-test" } });
+    });
+  }
+
+  for (const unavailable of ["blocked", "not-installed", "logged-out", "throws", "factory"] as const) {
+    test(`${unavailable}: kein Resume-Lauf und keine priorAttempts`, async () => {
+      if (unavailable === "blocked") await block();
+      if (unavailable === "factory") switchDeps.getEngine = () => { throw new Error("nicht verfügbar"); };
+      if (unavailable === "throws") switchDeps.checkEngine = async () => { throw new Error("Prüfung fehlgeschlagen"); };
+      if (unavailable === "not-installed" || unavailable === "logged-out") switchDeps.checkEngine = async engine =>
+        ({ engine, checked: true, installed: unavailable !== "not-installed", loggedIn: false });
+      const { taskId } = await press();
+      expect(runs).toHaveLength(0);
+      expect(transfers).toHaveLength(1);
+      expect(transfers[0].priorAttempts).toBeUndefined();
+      expect(notes).toHaveLength(0);
+      expect(task(taskId).status).toBe("completed");
+    });
+  }
+
+  test("Claude loginUnknown setzt die alte Session mit answersQuestion fort", async () => {
+    switchDeps.checkEngine = async engine => ({ engine, checked: true, installed: true, loggedIn: false, loginUnknown: true });
+    await press();
+    expect(runs[0]).toMatchObject({ resumeSessionId: "sess-frage", answersQuestion: true });
+    expect(transfers).toHaveLength(0);
+  });
+
+  test("echter runJsonTurn: Resume, Opus, Codex; kein OpenCode und keine fremde Session-ID", async () => {
+    settings.engine!.backups = [{ engine: "claude", model: OPUS }, { engine: "codex" }, { engine: "opencode" }];
+    await recordSessionTurn(KEY, "research", FABLE, "claude", "sess-frage");
+    engineReply = async (_req, engine) => ({ engine, text: "Limit", isError: true, errorKind: "usage_limit", tools: used, sessionId: `${engine}-fehlgeschlagen` });
+    realHandover();
+    const { taskId } = await press();
+    expect(runs.map(r => [r.engine, r.model])).toEqual([["claude", FABLE], ["claude", OPUS], ["codex", "codex-test"]]);
+    expect(runs.map(r => r.resumeSessionId)).toEqual(["sess-frage", undefined, undefined]);
+    expect(runs[1].prompt).toContain("notify --file /tmp/bericht.txt");
+    expect(runs[1].prompt).toContain("Limit erreicht");
+    expect(runs[1].prompt).toContain("7319");
+    expect(transfers).toHaveLength(1);
+    expect(task(taskId)).toMatchObject({ status: "completed", session_id: "sess-frage", metadata: { engine: "claude", model: FABLE } });
+    expect(delivered[0].text).toContain("Antwort der Kette.");
+    expect((await listChoices()).filter(c => c.state === "open")).toEqual([]);
+  });
+
+  test("Folgefrage kommt vom Turn, behält den Auftrag und setzt anschließend Codex fort", async () => {
+    await block();
+    handoverReply = async opts => {
+      opts.onInfo?.({ agent: "research", engine: "codex", model: "codex-test", durationMs: 1 });
+      opts.onSessionId?.("codex-folgefrage", { engine: "codex", model: "codex-test" });
+      opts.onQuestion?.({ question: "Auch ablegen?", options: ["Ja", "Nein"], via: "tag",
+        offer: async () => { throw new Error("Der Turn darf die Übergabe-Nachricht nicht als Auftrag speichern"); } });
+      return "Bericht fertig, auch ablegen?\n- Ja\n- Nein";
+    };
+    const { taskId } = await press();
+    const open = (await listChoices()).filter(c => c.state === "open");
+    expect(open).toHaveLength(1);
+    const next = parseAskRef(open[0].ref)!;
+    expect(next.taskId).not.toBe(taskId);
+    expect(task(next.taskId)).toMatchObject({ original_prompt: "Schreib den Wochenbericht", session_id: "codex-folgefrage",
+      metadata: { engine: "codex", model: "codex-test", agent_name: "research" } });
+    await port.port.decide("topic-443", open[0].id, "o0", "web");
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({ engine: "codex", model: "codex-test", resumeSessionId: "codex-folgefrage", answersQuestion: true });
+    expect(transfers).toHaveLength(1);
+  });
+
+  test("Ersatzmodell antwortet: keine Folgefrage, Motor, Modell und Session bleiben zusammen", async () => {
+    await block();
+    handoverReply = async opts => {
+      opts.onSessionId?.("fremde-session", { engine: "codex", model: "codex-test" });
+      opts.onInfo?.({ agent: "research", model: "ersatz", durationMs: 1 });
+      opts.onQuestion?.({ question: "Unzulässige Folgefrage?", options: ["Ja", "Nein"], via: "tag", offer: async () => ({ status: "invalid" }) });
+      return "Soll ich noch etwas ablegen?";
+    };
+    const { taskId } = await press();
+    expect(delivered[0].text).toBe("Soll ich noch etwas ablegen?");
+    expect(task(taskId)).toMatchObject({ status: "completed", session_id: "sess-frage", metadata: { engine: "claude", model: FABLE } });
+    expect((await listChoices()).filter(c => c.state === "open")).toEqual([]);
+  });
+
+  test("Übergabe-Text wird nicht ein zweites Mal als Frage erkannt", async () => {
+    await block();
+    handoverReply = async opts => {
+      opts.onInfo?.({ agent: "research", engine: "codex", durationMs: 1 });
+      return "Soll ich die Datei ablegen?";
+    };
+    const { taskId } = await press();
+    expect((await listChoices()).filter(c => c.state === "open")).toEqual([]);
+    // Ohne neue ID wird die alte entfernt, bevor der Auftrag einen anderen Motor trägt.
+    expect(task(taskId)).toMatchObject({ session_id: "", metadata: { engine: "codex", model: "" } });
+  });
+
+  test("niemand antwortet: Hinweise bleiben sichtbar, genau ein Übergabe-Turn", async () => {
+    await block();
+    handoverReply = async opts => {
+      await opts.sink.notice("Kein Motor frei.");
+      opts.onInfo?.({ agent: "research", durationMs: 1 });
+      return "Feste Fehlerantwort";
+    };
+    const { taskId } = await press();
+    expect(task(taskId).status).toBe("failed");
+    expect(notices.map(n => n.text)).toEqual(["Kein Motor frei.", ASK_TEXT.failed]);
+    expect(saved).toEqual([]);
+    expect(intents).toEqual([]);
+    expect(transfers).toHaveLength(1);
+  });
+
+  test.each(["resume", "handover", "state-write"] as const)("/stop während %s: abgebrochen, kein weiterer Versuch", async where => {
+    if (where === "resume") engineReply = async (_req, engine) => {
+      abortExecutions(KEY);
+      return { engine, text: "Limit", isError: true, errorKind: "usage_limit" };
+    };
+    if (where === "handover") {
+      await block();
+      handoverReply = async () => { abortExecutions(KEY); return "zu spät"; };
+    }
+    if (where === "state-write") {
+      failure("usage_limit");
+      const note = switchDeps.noteStageRun!;
+      switchDeps.noteStageRun = async (...args) => { await note(...args); abortExecutions(KEY); };
+    }
+    const { taskId } = await press();
+    expect(task(taskId)).toMatchObject({ status: "failed", result: "Abgebrochen" });
+    expect(notices.map(n => n.text)).toEqual([ASK_TEXT.aborted]);
+    expect(saved).toEqual([]);
+    expect(transfers).toHaveLength(where === "handover" ? 1 : 0);
+    expect(runs).toHaveLength(where === "handover" ? 0 : 1);
+  });
+
+  test("ABORT_REPLY aus dem Turn wird als Abbruch übersetzt", async () => {
+    await block();
+    handoverReply = async () => ABORT_REPLY;
+    await press();
+    expect(notices.map(n => n.text)).toEqual([ASK_TEXT.aborted]);
+    expect(transfers).toHaveLength(1);
+  });
+
+  for (const error of ["timeout", "rate_limit", "context"] as const) {
+    test(`${error} im Resume: bisherige Fehlermeldung ohne Übergabe`, async () => {
+      engineReply = async (_req, engine) => ({ engine, text: "Fehler", isError: true,
+        ...(error === "timeout" ? { timedOut: true } : { errorKind: error }) });
+      const { taskId } = await press();
+      expect(task(taskId).status).toBe("failed");
+      expect(notices.map(n => n.text)).toEqual([error === "timeout" ? ASK_TEXT.timedOut : ASK_TEXT.failed]);
+      expect(transfers).toHaveLength(0);
+      expect(runs).toHaveLength(1);
+      expect(readSwitchState().blocks).toEqual([]);
+    });
+  }
+
+  test("Zeitlimit im echten Übergabe-Turn: Zeitlimit-Meldung, keine Merk-Tags oder Ersatzstufe", async () => {
+    await block();
+    engineReply = async (_req, engine) => ({ engine, text: "[REMEMBER: Nicht speichern]", timedOut: true, isError: false, sessionId: "codex-zeitlimit" });
+    const d = realHandover();
+    d.runFallbackChain = async () => { throw new Error("Zeitlimit darf keine Kette starten"); };
+    const { taskId } = await press();
+    expect(task(taskId)).toMatchObject({ status: "failed", result: "Fortsetzen gescheitert (Zeitlimit)" });
+    expect(notices.map(n => n.text)).toEqual([
+      "Hier antwortet jetzt Codex statt Claude Code (Limit erreicht). Der Verlauf ist übergeben.", ASK_TEXT.timedOut,
+    ]);
+    expect(intents).toEqual([]);
+    expect(saved).toEqual([]);
+    expect(runs.map(r => r.engine)).toEqual(["codex"]);
+    expect(transfers).toHaveLength(1);
+  });
+
+  test("ohne Ersatzstufen: Limit scheitert wie bisher, keine Vorprüfung oder Auswertung", async () => {
+    settings = {};
+    failure("usage_limit");
+    switchDeps.checkEngine = async () => { throw new Error("Keine Vorprüfung erwartet"); };
+    const { taskId } = await press();
+    expect(task(taskId).status).toBe("failed");
+    expect(notices.map(n => n.text)).toEqual([ASK_TEXT.failed]);
+    expect(runs).toHaveLength(1);
+    expect(notes).toHaveLength(0);
+    expect(transfers).toHaveLength(0);
+  });
+
+  test("alter Agent-SDK-Auftrag: trotz Ersatzstufen weiter ohne Übergabe", async () => {
+    const old = await tasks.store.create(GROUP, "Alter Auftrag", 443);
+    if (!old) throw new Error("Auftrag fehlt");
+    Object.assign(old, { session_id: "alte-sdk-session", metadata: { agent_name: "research", engine: "claude", model: FABLE } });
+    tasks.rows.set(old.id, old);
+    failure("usage_limit");
+    const outcome = await resumeLegacyMacTask(old, "Ja", { chatId: GROUP, topicId: 443 }, {
+      conversation: topicConv(), tasks: () => tasks.store,
+      resume: (t, chatId, answer) => resumeMacTask(t, chatId, answer, { ...resumeDeps, ...switchDeps }),
+      reply: async () => { throw new Error("Keine Antwort erwartet"); },
+      notice: async text => { notices.push({ conversation: topicConv(), text }); },
+      saveMessage: async () => { throw new Error("Nichts zu speichern"); },
+      abortedText: () => ASK_TEXT.aborted,
+    });
+    expect(outcome).toEqual({ status: "ended" });
+    expect(task(old.id).status).toBe("failed");
+    expect(notices.map(n => n.text)).toEqual([ASK_TEXT.failed]);
+    expect(runs[0]).toMatchObject({ engine: "claude", resumeSessionId: "alte-sdk-session" });
+    expect(notes).toEqual([]);
+    expect(transfers).toEqual([]);
+  });
+
+  test("unbekannter Motor bleibt Fehler; fehlende Session wird vorher behandelt", async () => {
+    const first = await press({ engine: "unbekannt" as EngineId });
+    expect(task(first.taskId).status).toBe("failed");
+    expect(notices.map(n => n.text)).toEqual([ASK_TEXT.failed]);
+    const second = await press({ engine: "unbekannt" as EngineId, sessionId: undefined });
+    expect(task(second.taskId).status).toBe("completed");
+    expect(notices.at(-1)?.text).toBe(ASK_TEXT.noted("Ja, verschicken"));
+    expect(runs).toEqual([]);
+    expect(transfers).toEqual([]);
+  });
+
+  test.each(["empty", "throw", "timeout", "abort"] as const)("inzwischen getippt beantwortet vor Übergabe-Fehler %s", async kind => {
+    await block();
+    handoverReply = async opts => {
+      const current = [...tasks.rows.values()][0];
+      current.status = "completed";
+      current.metadata = { ...current.metadata, answered_by: "text" };
+      if (kind === "throw") throw new Error("Übergabe fehlgeschlagen");
+      await opts.sink.notice("Keine Stufe frei.");
+      opts.onInfo?.({ agent: "research", durationMs: 1, ...(kind === "timeout" ? { timedOut: true } : {}) });
+      return kind === "abort" ? ABORT_REPLY : "Fehler";
+    };
+    const { taskId } = await press();
+    expect(task(taskId).status).toBe("completed");
+    expect(notices.map(n => n.text)).toEqual([ASK_TEXT.answeredByText]);
+    expect(transfers).toHaveLength(1);
   });
 });

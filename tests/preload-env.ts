@@ -52,7 +52,11 @@ import { GIB } from "../src/lib/agent-capacity";
 import { resetCallRecapsForTests } from "../src/lib/call-recap";
 import { resetClaudeAvailabilityForTests } from "../src/lib/claude-availability";
 import { resetEngineShutdownForTests } from "../src/lib/engines/calls";
+import { resetCodexMcpLogForTests } from "../src/lib/engines/codex";
+import { setCodexMcpInputsForTests, setCodexMcpReaderForTests } from "../src/lib/engines/codex-mcp";
+import { setToolParityReadersForTests } from "../src/lib/engines/tool-parity";
 import { resetAgentCapacity } from "../src/lib/execution-context";
+import { setClaudeNotesSourceForTests } from "../src/lib/prompt-builder";
 import { resetStore } from "../src/lib/store";
 import { resetSupabaseClient } from "../src/lib/supabase";
 import { resetCallTurnsForTests } from "../src/web/call-turns";
@@ -89,6 +93,12 @@ if (!process.env.MEMORY_FILE_PATH) {
 if (!process.env.BUDGET_DB_PATH) {
   process.env.BUDGET_DB_PATH = join(mkdtempSync(join(tmpdir(), "tybo-test-spend-")), "api-budget.sqlite");
 }
+// Limit-Messwerte (Issue #651) auch bei einem geerbten Pfad nie im Arbeitsordner.
+process.env.ENGINE_USAGE_FILE_PATH = join(mkdtempSync(join(tmpdir(), "tybo-test-usage-")), "engine-usage.json");
+// Sperren (Issue #669): auch nach setSwitchStateFileForTests(null) nie den echten Zustand lesen.
+const switchStateDir = mkdtempSync(join(tmpdir(), "tybo-test-switch-"));
+let switchTestNo = 0;
+process.env.ENGINE_SWITCH_FILE_PATH = join(switchStateDir, "engine-switch-0.json");
 // Zeitzone immer gesetzt, nie gelöscht: Unter bun 1.3 (CI) bleibt die
 // Zeitzone nach einem `delete process.env.TZ` für den Rest des Prozesses
 // stehen, ein späteres Setzen wirkt nicht mehr. Tests, die TZ sichern und
@@ -98,6 +108,20 @@ if (!process.env.BUDGET_DB_PATH) {
 if (!process.env.TZ) process.env.TZ = "UTC";
 resetAgentCapacity({ totalmem: TEST_TOTALMEM });
 beforeEach(() => {
+  // Ein frischer Standard je Test; ausdrückliche setSwitchStateFileForTests-Pfade gehen weiter vor.
+  process.env.ENGINE_SWITCH_FILE_PATH = join(switchStateDir, `engine-switch-${++switchTestNo}.json`);
+  // Auch Codex-Turns mit nur teilweise ersetzten Prompt-Quellen bleiben vom echten ~/.claude fern.
+  setClaudeNotesSourceForTests(() => "");
+  // MCP-Anbindung: weder private MCP-Dateien noch Credentials oder .env lesen.
+  // Jeder Test beginnt leer; nur gezielte MCP-Tests setzen eigene Quellen ein.
+  const missingFile = () => { throw Object.assign(new Error("Testdatei fehlt"), { code: "ENOENT" }); };
+  setCodexMcpReaderForTests(missingFile);
+  // Der Werkzeugbestand ersetzt auch seine Plan-Umgebung, ohne den globalen MCP-Leser zu ändern (Issue #665).
+  setToolParityReadersForTests({ text: missingFile, children: missingFile, stat: missingFile,
+    inspectSkills: missingFile, planEnv: () => ({}) });
+  setCodexMcpInputsForTests({ parentEnv: () => ({}), projectRoot: () => "/test-projekt",
+    settings: () => ({}), lookup: () => undefined, secrets: () => [] });
+  resetCodexMcpLogForTests();
   resetEngineShutdownForTests();
   // Issue #566: „Claude fehlt“ aus einem Test schaltet sonst in späteren Dateien Nebenaufgaben ab
   resetClaudeAvailabilityForTests();

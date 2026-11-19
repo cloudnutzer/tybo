@@ -1,6 +1,6 @@
 {
   "name": "tybo",
-  "version": "2.17.0",
+  "version": "2.18.0",
   "description": "Always-on AI assistant on Telegram and in the browser, powered by Claude Code, with agents, persistent memory and background jobs",
   "homepage": "https://tybo.ai",
   "repository": {
@@ -22,6 +22,7 @@
     "notify": "bun run scripts/notify.ts",
     "nachschlagen": "bun run scripts/nachschlagen.ts",
     "job": "bun --no-env-file scripts/job.ts",
+    "limits": "bun --no-env-file scripts/engine-usage.ts",
     "checkin": "bun run src/routines/checkin.ts",
     "briefing": "bun run src/routines/briefing.ts",
     "health": "bun run src/health-check.ts",

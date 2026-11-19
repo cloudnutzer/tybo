@@ -12,6 +12,7 @@ import {
   type StoredSession,
 } from "../src/web/status";
 import { createBotStatus, processStartedAt, readGitCommit, readPackageVersion } from "../src/web/bot-status";
+import { setSettingsPath } from "../src/lib/settings";
 import { writeRecord } from "../src/setup/search-record";
 import { selectBackend } from "../src/lib/store";
 
@@ -170,6 +171,7 @@ describe("echte Quellen mit Attrappen", () => {
     restartMarker: join(dir, "kein-marker"),
     requestRestart: async () => {},
     // Nie ein echtes claude oder codex (Issue #126)
+    toolParity: () => { throw new Error("Test ohne Werkzeug-Quelle"); },
     inspectEngine: async (id: "claude" | "codex" | "opencode") => ({ engine: id, checked: true, installed: true, loggedIn: true }),
     now: () => NOW,
   };
@@ -207,6 +209,23 @@ describe("echte Quellen mit Attrappen", () => {
     expect(await port.commit()).toBe("abcdef1");
     expect(await port.commit()).toBe("abcdef1");
     expect(calls).toBe(1);
+  });
+
+  test("fortsetzbare Sessions folgen Gespräch, Agent, Standard", async () => {
+    const file = join(dir, "agentenmotor-settings.json");
+    setSettingsPath(file);
+    try {
+      await writeFile(file, JSON.stringify({ engine: { default: "claude", topics: { "dm:2": "opencode" } }, agents: { research: { engine: "codex" } } }));
+      const list: StoredSession[] = [
+        { key: "dm:1:research", agentName: "research", engine: "codex", engineSessionId: "a", model: "claude-opus-5-5", lastActivity: NOW },
+        { key: "dm:2:research", agentName: "research", engine: "opencode", engineSessionId: "b", model: "claude-opus-5-5", lastActivity: NOW },
+        { key: "dm:3:general", agentName: "general", engine: "claude", engineSessionId: "c", model: "claude-opus-5-5", lastActivity: NOW },
+        { key: "dm:1:research", agentName: "research", engine: "claude", engineSessionId: "alt", model: "claude-opus-5-5", lastActivity: NOW },
+      ];
+      const { engineFor, ...withoutEngineOverride } = quiet;
+      const port = createBotStatus({}, { ...withoutEngineOverride, listSessions: async () => list });
+      expect(await port.sessions()).toEqual({ mode: "resume", stored: 4, resumable: 3 });
+    } finally { setSettingsPath(); }
   });
 
   test("Sessions: gespeichert und fortsetzbar, Modus aus SESSION_MODE", async () => {
@@ -295,6 +314,7 @@ describe("Semantische Suche im Status (Issue #166)", () => {
     restartMarker: join(dir, "kein-marker"),
     requestRestart: async () => {},
     // Nie ein echtes claude oder codex (Issue #126)
+    toolParity: () => { throw new Error("Test ohne Werkzeug-Quelle"); },
     inspectEngine: async (id: "claude" | "codex" | "opencode") => ({ engine: id, checked: true, installed: true, loggedIn: true }),
     now: () => NOW,
   };

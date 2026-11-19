@@ -39,7 +39,9 @@ import {
   type ApiMessage,
   type ChatShutdownOptions,
   type HubConversation,
+  type JobReportTurn,
   type MessageSource,
+  type ReturnResult,
   type WebChat,
 } from "./chat";
 import { AGENT_NAME_PATTERN, agentList, DEFAULT_AGENT, FALLBACK_AGENT_NAMES, type AgentInfo } from "./agents";
@@ -57,8 +59,11 @@ import {
 import { normalizeTopicTitle, TEXT as TOPIC_TEXT, TOPIC_TITLE_MAX_CHARS, type TopicManager } from "./topics";
 import { createSettingsApi, SETTINGS_TEXT, type SettingsPort } from "./settings";
 import { createModelCatalog, type ModelCatalog, type OpenCodeModelsPort } from "./models";
+import { OPENROUTER_KEY_TEXT, type OpenRouterKeyPort } from "./openrouter-key";
 import { createInstructionsApi, INSTRUCTIONS_PATH, INSTRUCTIONS_TEXT, type InstructionsPort } from "./instructions";
 import { createStatusApi, STATUS_TEXT, type StatusPort } from "./status";
+import { createJobsApi, JOBS_API_TEXT, type JobsPort } from "./jobs";
+import { createPipelinesApi, type PipelinesPort } from "./pipelines";
 import { createRoutinesApi, ROUTINES_API_TEXT, type RoutinesPort } from "./routines";
 import { createThreadsApi, THREADS_API_TEXT, type ThreadsPort } from "./threads";
 import { createRemindersApi, REMINDERS_API_TEXT, type RemindersPort } from "./reminders";
@@ -115,7 +120,7 @@ import {
   VOICES_PATH,
   type VoiceClonePort,
 } from "./voice-clone";
-import { conversationEngines, createEnginesApi, ENGINE_TEXT, type EngineConversation, type EnginePort } from "./engines";
+import { conversationEngines, createEnginesApi, ENGINE_TEXT, ENGINE_PREVIEW_WAIT_MS, type ConversationEngineChoice, type ConversationEngineStage, type EngineConversation, type EnginePort } from "./engines";
 import { createKeysApi, KEYS_TEXT, type KeysPort } from "./keys";
 import { FILES_PATH, serveOutboxFile, type FilesDeps } from "./files";
 import { FILE_NAME_HEADER, MAX_ATTACHMENT_BYTES, parseAttachmentName, toApiAttachment, type ApiAttachment } from "./attachments";
@@ -359,6 +364,8 @@ export interface WebServerDeps {
    * ./bot-settings. Ohne sie antwortet /api/settings mit 503.
    */
   settings?: SettingsPort;
+  /** Nach gelungenem PATCH und außerhalb der Einstellungssperre (M14-05). */
+  onSettingsSaved?: () => Promise<unknown>;
   /**
    * Status der Sprechmodi für GET /api/voice (Issue #248): modes.local aus
    * der Sprach-Schnittstelle. In bot.ts botVoice aus ./bot-settings, in Demo
@@ -459,6 +466,8 @@ export interface WebServerDeps {
    * launchctl oder pm2). Ohne ihn antwortet die Route mit 503.
    */
   routines?: RoutinesPort;
+  jobs?: JobsPort;
+  pipelines?: PipelinesPort;
   /**
    * Offene Fäden (Issue #293): GET /api/threads und POST
    * /api/threads/<id>/close. In bot.ts createBotThreads aus ./bot-threads,
@@ -482,6 +491,8 @@ export interface WebServerDeps {
    * Tests eine Attrappe. Ohne ihn antworten die Routen mit 503.
    */
   engines?: EnginePort;
+  /** Limit des Ersatzmodell-Schlüssels (Issue #674), nur Anzeige. Ohne Port kein Netzabruf. */
+  openrouterKey?: OpenRouterKeyPort;
   /**
    * Slash-Befehle (Issue #74): Beginnt eine Nachricht mit einem registrierten
    * Befehl, läuft er statt eines Turns; GET /api/commands liefert die Liste.
@@ -570,6 +581,8 @@ export interface ConversationPost {
 }
 
 export interface WebServer {
+  /** Nur im Bot, keine HTTP-Route: Bericht durch den ChatHub des Zielgesprächs. */
+  runJobReport(conversationId: string, input: JobReportTurn): Promise<ReturnResult>;
   url: string;
   /** Offene SSE-Verbindungen (für Tests) */
   eventStreamCount(): number;
@@ -808,11 +821,13 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
   const currentAgents = (): AgentInfo[] => agentList(typeof agentSource === "function" ? agentSource() : agentSource);
   // Wie ein Set, aber bei jeder Abfrage aktuell
   const agentNames = { has: (name: string) => currentAgents().some(a => a.name === name) };
-  const settingsApi = deps.settings ? createSettingsApi(deps.settings, log) : null;
+  const settingsApi = deps.settings ? createSettingsApi(deps.settings, log, undefined, deps.onSettingsSaved) : null;
   const models = deps.models ?? createModelCatalog({ log, ...(deps.opencodeModels ? { opencode: deps.opencodeModels } : {}) });
   const agentsApi = catalog ? createAgentsApi({ port: catalog, settingsApi, settingsPort: deps.settings, log }) : null;
   const instructionsApi = deps.instructions ? createInstructionsApi(deps.instructions, agentNames, log) : null;
   const statusApi = deps.status ? createStatusApi(deps.status, log) : null;
+  const jobsApi = deps.jobs ? createJobsApi(deps.jobs, id => conversationTitleFor(id)) : null;
+  const pipelinesApi = createPipelinesApi(deps.pipelines, id => conversationTitleFor(id));
   const routinesApi = deps.routines ? createRoutinesApi(deps.routines, log) : null;
   // Fäden (Issue #293): Anzeigename des Gesprächs wie bei Benachrichtigungen
   const threadsApi = deps.threads ? createThreadsApi(deps.threads, log, id => conversationTitleFor(id)) : null;
@@ -824,9 +839,9 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
         {
           conversations: () => engineConversations(),
           resetConversation: deps.resetConversation
-            ? async (id, write) => {
+            ? async (id, options) => {
                 const reset = deps.resetConversation!;
-                const result = await hubFor(id).exclusive(id, () => reset(id, write));
+                const result = await hubFor(id).exclusive(id, () => reset(id, options));
                 if (result.status !== "done") return result.status;
                 if (result.value.status === "busy") return "busy";
                 // Kein Session-Schlüssel ermittelbar: beweist nicht, dass keine Antwort läuft, nichts schreiben
@@ -1006,7 +1021,7 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
   }
   // Meldungen für reine Web-Gespräche (Issue #227): aus dem Nachrichtenspeicher übernehmen,
   // entdoppelt über die msgId, mit Push wie jede Meldung
-  let stopWebNotices: (() => void) | null = null;
+  let stopWebNotices: ReturnType<typeof startWebNoticeImport> | null = null;
   if (deps.webNotices) {
     const importDeps = deps.webNotices;
     const cursorFile = importDeps.cursorFile ?? join(store.dir, "notice-cursor.json");
@@ -1128,24 +1143,52 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     return out;
   }
 
-  /** Motor je Gespräch und Standard für GET /api/conversations (Issue #126); ohne Port nichts */
-  function withEngines<T extends { id: string }>(list: T[]): (T & { engine?: string })[] {
-    if (!deps.engines) return list;
+  /** Ein Snapshot für Direktchat, Topics und Web-Gespräche; kalte Prüfungen halten die Liste nicht auf. */
+  async function conversationEngineData(list: { id: string; agent: string }[]) {
+    const port = deps.engines;
+    const entries: Record<string, { engine?: string; engineStage?: ConversationEngineStage; engineChoices?: ConversationEngineChoice[] }> = {};
+    if (!port) return { entries };
     try {
-      const engines = conversationEngines(deps.engines, list.map(c => c.id));
-      return list.map(c => ({ ...c, engine: engines[c.id] }));
+      const snapshot = port.conversationSnapshot?.(list);
+      const engines = snapshot?.engines ?? conversationEngines(port, list);
+      for (const c of list) entries[c.id] = { engine: engines[c.id] };
+      const engine = { default: snapshot?.default ?? port.standard().engine, timeZone: snapshot?.timeZone ?? port.timeZone() };
+      if (snapshot) {
+        let timedOut = false;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const stages = snapshot.stages.catch(e => {
+          log(`Motor-Vorschau nicht ermittelbar (${errorName(e)})`);
+          return undefined;
+        });
+        try {
+          const choices = snapshot.choices?.catch(e => {
+            log(`Motor-Auswahl nicht ermittelbar (${errorName(e)})`);
+            return undefined;
+          });
+          const complete = Promise.all([stages, choices]).then(result => {
+            // Nach einer kalten Prüfung holt der Browser beide Teile gemeinsam neu.
+            if (timedOut) telegramHub.publishEngineChange(ACTIVITY_STREAM);
+            return result;
+          });
+          const result = await Promise.race([complete, new Promise<undefined>(resolve => {
+            timer = setTimeout(() => { timedOut = true; resolve(undefined); }, ENGINE_PREVIEW_WAIT_MS);
+          })]);
+          if (result) for (const c of list) {
+            if (result[0]?.[c.id]) entries[c.id].engineStage = result[0][c.id];
+            if (result[1]?.[c.id]) entries[c.id].engineChoices = result[1][c.id];
+          }
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      return { entries, engine };
     } catch (e) {
       log(`Motor je Gespräch nicht ermittelbar (${errorName(e)})`);
-      return list;
-    }
-  }
-
-  function engineSummary(): { default: string } | undefined {
-    if (!deps.engines) return undefined;
-    try {
-      return { default: deps.engines.standard().engine };
-    } catch {
-      return undefined;
+      try {
+        const engines = conversationEngines(port, list);
+        for (const c of list) entries[c.id] = { engine: engines[c.id] };
+        return { entries, engine: { default: port.standard().engine, timeZone: port.timeZone() } };
+      } catch { return { entries }; }
     }
   }
 
@@ -1493,9 +1536,9 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
       case "decided":
         return json({ choice: result.choice });
       case "already":
-        return json({ error: CHOICE_TEXT.already, choice: result.choice, already: true }, 409);
+        return json({ error: result.message ?? CHOICE_TEXT.already, ...(result.message ? { message: result.message } : {}), choice: result.choice, already: true }, 409);
       case "expired":
-        return json({ error: CHOICE_TEXT.expired, choice: result.choice, expired: true }, 409);
+        return json({ error: result.message ?? CHOICE_TEXT.expired, ...(result.message ? { message: result.message } : {}), choice: result.choice, expired: true }, 409);
       case "invalid_option":
         return json({ error: CHOICE_TEXT.invalid }, 400);
       default:
@@ -2187,16 +2230,57 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
       const result = await enginesApi.get();
       return json(result.body, result.status);
     }
+    if (path === "/api/engines/openrouter") {
+      if (method !== "GET") return methodNotAllowed("GET");
+      if (!deps.openrouterKey) return json({ configured: false });
+      try {
+        return json(await deps.openrouterKey.read());
+      } catch {
+        // Auch ein unerwarteter Portfehler verrät weder Schlüssel noch rohe Netzfehler.
+        return json({ configured: true, error: OPENROUTER_KEY_TEXT.unavailable });
+      }
+    }
     if (path === "/api/engines/reset") {
       if (method !== "POST") return methodNotAllowed("POST");
       if (!enginesApi) return json({ error: ENGINE_TEXT.notConfigured }, 503);
       const result = await enginesApi.reset(body);
       return json(result.body, result.status);
     }
+    if (path === "/api/engines/check") {
+      if (method !== "POST") return methodNotAllowed("POST");
+      if (!enginesApi) return json({ error: ENGINE_TEXT.notConfigured }, 503);
+      keepOpen();
+      const result = await enginesApi.check();
+      return json(result.body, result.status);
+    }
     if (path === "/api/status") {
       if (method !== "GET") return methodNotAllowed("GET");
       if (!statusApi) return json({ error: STATUS_TEXT.notConfigured }, 503);
       const result = await statusApi.get();
+      return json(result.body, result.status);
+    }
+    if (path === "/api/pipelines") {
+      if (method !== "GET") return methodNotAllowed("GET");
+      const result = await pipelinesApi.get();
+      return json(result.body, result.status);
+    }
+    if (path === "/api/jobs") {
+      if (method !== "GET") return methodNotAllowed("GET");
+      if (!jobsApi) return json({ error: JOBS_API_TEXT.notConfigured }, 503);
+      const result = await jobsApi.get();
+      return json(result.body, result.status);
+    }
+    const jobRoute = /^\/api\/jobs\/([^/]+)\/([^/]+)$/.exec(path);
+    if (jobRoute) {
+      const action = jobRoute[2];
+      const reading = action === "log" || action === "report";
+      if (method !== (reading ? "GET" : "POST")) return methodNotAllowed(reading ? "GET" : "POST");
+      if (!jobsApi) return json({ error: JOBS_API_TEXT.notConfigured }, 503);
+      let id: string;
+      try { id = decodeURIComponent(jobRoute[1]); }
+      catch { return json({ error: JOBS_API_TEXT.invalid }, 400); }
+      if (!reading) keepOpen();
+      const result = reading ? await jobsApi.content(id, action, new URL(req.url).searchParams.get("run")) : await jobsApi.act(id, action, body);
       return json(result.body, result.status);
     }
     if (path === "/api/routines") {
@@ -2346,16 +2430,19 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
     if (path === "/api/conversations") {
       if (method === "GET") {
         const listed = await listTelegram();
-        // Motor je Gespräch (Issue #126): eingestellt, nicht der tatsächliche der letzten Antwort
+        const conversations = await store.listConversations();
+        const { entries, engine } = await conversationEngineData([
+          ...(listed.dm ? [listed.dm] : []), ...listed.topics, ...conversations,
+        ]);
+        const withEngine = <T extends { id: string }>(c: T) => ({ ...c, ...entries[c.id] });
         const telegram: TelegramConversationList & { chatId?: string } = {
-          dm: listed.dm ? withEngines([listed.dm])[0] : null,
-          topics: withEngines(listed.topics),
+          dm: listed.dm ? withEngine(listed.dm) : null,
+          topics: listed.topics.map(withEngine),
         };
         // Chat-ID der Forum-Gruppe, nur wenn bekannt: Topic-Namen in der Löschvorschau (Issue #51)
         const chatId = groupChatId();
-        const engine = engineSummary();
         return json({
-          conversations: withEngines(await store.listConversations()),
+          conversations: conversations.map(withEngine),
           telegram: chatId ? { ...telegram, chatId } : telegram,
           ...(engine ? { engine } : {}),
         });
@@ -2901,8 +2988,9 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
 
   function finalize(res: Response, path: string): Response {
     for (const [k, v] of Object.entries(securityHeadersFor(path, res.status))) {
-      // HTML aus Meldungen bringt seine eigene, strengere Regel mit (./files)
-      if (k === "Content-Security-Policy" && res.headers.has(k)) continue;
+      // HTML aus Meldungen bringt seine eigene, strengere Regel mit (./files),
+      // dazu X-Frame-Options SAMEORIGIN für den Betrachter der eigenen Seite (Issue #708)
+      if ((k === "Content-Security-Policy" || k === "X-Frame-Options") && res.headers.has(k)) continue;
       res.headers.set(k, v);
     }
     const api = path === "/api" || path.startsWith("/api/");
@@ -2995,6 +3083,17 @@ export async function createWebServer(config: WebConfig, deps: WebServerDeps = {
   };
   return {
     url: `http://${displayHost}:${server.port}`,
+    async runJobReport(id, input) {
+      if (stopped) return "retry";
+      const telegram = !!parseTelegramConversationId(id);
+      const conversation = telegram ? await deps.telegram?.getConversation(id, { activity: false }) : await store.getConversation(id);
+      if (!conversation) return "gone";
+      // Ein Wächter schreibt außerhalb des Bots. Vor der Antwort muss seine
+      // Meldung auch den offenen Browser erreicht haben.
+      const visible = telegram ? await deps.telegramLive?.flush?.() : await stopWebNotices?.flush();
+      if (visible === false) return "retry";
+      return hubFor(id).sendJobReport(conversation, input);
+    },
     eventStreamCount: () => hub.subscriberCount() + telegramHub.subscriberCount(),
     isConversationVisible: id => presence.isVisible(id),
     async postToConversation(conversationId, post) {

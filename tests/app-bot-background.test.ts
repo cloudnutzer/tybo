@@ -9,12 +9,16 @@ import type { SendAndRecordInput, SendAndRecordResult } from "../src/lib/outbox"
 import type { SchemaProbeResult } from "../src/lib/schema-probe";
 import { DRAIN_INTERVAL_MS } from "../src/lib/embedding";
 import type { AlertMeta } from "../src/lib/routines/alerts";
+import { PROJECT_ROOT } from "../src/lib/env";
+import type { CodexSkillLinksInput } from "../src/lib/engines/codex-skills";
+import { readCodexUsage } from "../src/lib/engines/codex-usage";
+import { recordUsage } from "../src/lib/engines/usage";
 
 interface RoutineMenu {
   offerStatus?: "sent" | "none" | "unknown";
 }
 
-function setup(overrides: Partial<BackgroundServices> = {}, env: Record<string, string | undefined> = {}, menu: RoutineMenu = {}, notices?: BotNotices) {
+function setup(overrides: Partial<BackgroundServices> = {}, env: Record<string, string | undefined> = {}, menu: RoutineMenu = {}, notices?: BotNotices, pollJobReports?: () => Promise<void>) {
   const events: string[] = [];
   const plainAlerts: { text: string; meta: unknown }[] = [];
   const offers: { conversation: unknown; id: string; text: string }[] = [];
@@ -25,6 +29,10 @@ function setup(overrides: Partial<BackgroundServices> = {}, env: Record<string, 
   const services: Partial<BackgroundServices> = {
     // Nie die echte Claude CLI (Issue #566)
     inspectClaude: async () => ({ engine: "claude", checked: true, installed: true, loggedIn: true }),
+    checkCodex: async () => ({ engine: "codex", checked: true, installed: false, loggedIn: false }),
+    installCodexSkillSync: () => {},
+    installCodexUsageReader: () => {},
+    syncCodexSkills: () => ({ linked: [], foreign: [], skipped: [] }),
     getSettings: () => ({}),
     checkEmbedding: async () => (events.push("checkEmbedding"), { ok: false, message: "Anbieter weicht ab" }) as never,
     drainEmbeddings: async () => (events.push("drain"), { state: "fertig", written: 2, rejected: 0 }) as never,
@@ -35,6 +43,10 @@ function setup(overrides: Partial<BackgroundServices> = {}, env: Record<string, 
     startRoutineWatch: (deps => ((watchArgs = deps), events.push("routineWatch"), { id: "watch" })) as never,
     startThreadReminders: (deps => ((threadDeps = deps), events.push("threadReminders"), { id: "threads" })) as never,
     startReminderPlanner: (() => (events.push("planner"), { id: "planner" })) as never,
+    setSwitchNotifier: () => {},
+    startSwitchWatch: () => () => {},
+    installClaudeUsageMeasurement: () => () => {},
+    startClaudeUsageWatch: () => () => {},
     webConversationExists: async id => (events.push(`exists ${id}`), false),
     topicDeleted: async () => false,
     every: (ms, run) => void timers.push({ ms, run }),
@@ -52,6 +64,7 @@ function setup(overrides: Partial<BackgroundServices> = {}, env: Record<string, 
     routineChoices: { offerMenu: async (conversation: unknown, id: string, text: string) => (offers.push({ conversation, id, text }), { status: menu.offerStatus ?? "none" }) } as never,
     postWeb: async () => false,
     refresh: async () => [],
+    pollJobReports,
     services,
   });
   return { background, events, timers, lines, thread: () => threadDeps!, sweeps: () => sweeps, watch: () => watchArgs!, plainAlerts, offers };
@@ -60,6 +73,88 @@ function setup(overrides: Partial<BackgroundServices> = {}, env: Record<string, 
 const tick = () => new Promise(r => setTimeout(r, 5));
 
 describe("startBackground", () => {
+  test.each(["local", "server"])("Job-Rückgaben im Profil %s beim Start und im Minutenlauf", async profile => {
+    let calls = 0;
+    const s = setup({}, { TYBO_PROFILE: profile }, {}, undefined, async () => { calls++; });
+    await s.background.firstSweep;
+    expect(calls).toBe(1);
+    s.timers[2].run();
+    await tick();
+    expect(calls).toBe(2);
+  });
+  test("Claude-Messung registrieren, Zeitgeber starten und beim Beenden beide entfernen", async () => {
+    const events: string[] = [];
+    const s = setup({
+      installClaudeUsageMeasurement: () => { events.push("Quelle"); return () => { events.push("Quelle entfernt"); }; },
+      startClaudeUsageWatch: () => { events.push("Zeitgeber"); return () => { events.push("Zeitgeber beendet"); }; },
+    });
+    await s.background.firstSweep;
+    expect(events).toEqual(["Quelle", "Zeitgeber"]);
+    s.background.stopSwitchNotices();
+    expect(events).toEqual(["Quelle", "Zeitgeber", "Zeitgeber beendet", "Quelle entfernt"]);
+  });
+  test("Codex-Messung verdrahtet Sitzungsleser und gemeinsame Ablage beim Start", async () => {
+    const installed: unknown[] = [];
+    const s = setup({ installCodexUsageReader: (read, record) => { installed.push(read, record); } });
+    await s.background.firstSweep;
+    expect(installed).toEqual([readCodexUsage, recordUsage]);
+  });
+
+  test("Skill-Abgleich: installiert genügt, PROJECT_ROOT statt Dienstordner, Einstellung und Verdrahtung", async () => {
+    for (const skills of [undefined, false, true]) {
+      const inputs: CodexSkillLinksInput[] = [];
+      const syncSkills: BackgroundServices["syncCodexSkills"] = input => (inputs.push(input), { linked: [], foreign: [], skipped: [] });
+      let installed: unknown;
+      setup({
+        checkCodex: async () => ({ engine: "codex", checked: true, installed: true, loggedIn: false }),
+        getSettings: () => ({ engine: { codex: { skills } } }),
+        syncCodexSkills: syncSkills,
+        installCodexSkillSync: sync => { installed = sync; },
+      });
+      await tick();
+      expect(installed).toBe(syncSkills);
+      expect(inputs).toHaveLength(1);
+      expect(inputs[0]).toMatchObject({ root: PROJECT_ROOT, enabled: skills !== false });
+      expect(inputs[0].root).not.toBe("/srv/tybo");
+    }
+  });
+
+  test("Ohne Codex kein Skill-Abgleich; eine langsame Prüfung hält den Start nicht auf", async () => {
+    let finish!: (value: Awaited<ReturnType<BackgroundServices["checkCodex"]>>) => void;
+    let calls = 0;
+    const s = setup({ checkCodex: () => new Promise(resolve => { finish = resolve; }),
+      syncCodexSkills: () => (calls++, { linked: [], foreign: [], skipped: [] }),
+    });
+    await s.background.firstSweep;
+    expect(s.events).toContain("sweep");
+    expect(calls).toBe(0);
+    finish({ engine: "codex", checked: true, installed: false, loggedIn: false });
+    await tick();
+    expect(calls).toBe(0);
+  });
+
+  test("Fehler der Codex-Prüfung oder des Abgleichs lassen den Start weiterlaufen, ohne Quellpfade im Log", async () => {
+    for (const failCheck of [true, false]) {
+      const s = setup({ checkCodex: async () => {
+        if (failCheck) throw new Error("/privater/quellpfad");
+        return { engine: "codex", checked: true, installed: true, loggedIn: true };
+      }, syncCodexSkills: () => { throw new Error("/privater/quellpfad"); } });
+      await s.background.firstSweep; await tick();
+      expect(s.lines.filter(l => l.includes("[Codex]"))).toEqual(["ERROR [Codex] Skill-Abgleich beim Start fehlgeschlagen; Start läuft weiter."]);
+    }
+  });
+
+  test("Motorwechsel verbindet den gemeinsamen Meldeweg auch ohne WebUI und trennt ihn beim Stoppen", async () => {
+    const notices = createBotNotices({ telegram: () => false, send: async () => ({ ok: true }) as never, sendStatusMessage: async () => {}, dmChatId: () => "" });
+    const connections: unknown[] = [];
+    const s = setup({ setSwitchNotifier: deliver => { connections.push(deliver); },
+      startSwitchWatch: () => { connections.push("watch"); return () => { connections.push("stop"); }; },
+    }, { WEB_ENABLED: "false" }, {}, notices);
+    await s.background.firstSweep;
+    expect(connections).toEqual([notices.deliverToUser, "watch"]);
+    s.background.stopSwitchNotices();
+    expect(connections).toEqual([notices.deliverToUser, "watch", "stop", null]);
+  });
   test("Reihenfolge: Embedding, Logs, Jobs, Routinen-Wache, Fäden, Erinnerungen, dann die erste Ablauf-Prüfung", async () => {
     const s = setup();
     await s.background.firstSweep;
@@ -118,8 +213,8 @@ describe("startBackground", () => {
 
   test("regelmäßig: Embedding-Nachzug, Log-Rotation stündlich, Rückfragen jede Minute", async () => {
     const s = setup();
-    expect(s.timers.map(t => t.ms)).toEqual([DRAIN_INTERVAL_MS, 3_600_000, 60_000]);
-    s.timers[2].run();
+    expect(s.timers.map(t => t.ms)).toEqual([DRAIN_INTERVAL_MS, 3_600_000, 60_000, 60_000]);
+    s.timers[3].run();
     await tick();
     expect(s.sweeps()).toBe(2);
   });
@@ -137,7 +232,23 @@ describe("startBackground", () => {
   test("Fehler beim Aufräumen der Jobs landen nur im Log", async () => {
     const s = setup({ recoverJobs: async () => { throw new TypeError("weg"); } });
     await tick();
-    expect(s.lines).toContain("ERROR [job] Aufräumen beim Start gescheitert (TypeError)");
+    expect(s.lines).toContain("ERROR [job] Wiederherstellung gescheitert (TypeError)");
+  });
+
+  test("Job-Fristen werden jede Minute geprüft, auch wenn ein Versandversuch noch wartet", async () => {
+    let runs = 0;
+    const finishes: (() => void)[] = [];
+    const s = setup({ recoverJobs: async () => {
+      runs++;
+      await new Promise<void>(resolve => { finishes.push(resolve); });
+      return { aborted: [], resent: [] };
+    } });
+    const timer = s.timers[2];
+    expect(timer.ms).toBe(60_000);
+    timer.run(); timer.run();
+    expect(runs).toBe(3);
+    finishes.forEach(finish => finish());
+    await tick();
   });
 });
 

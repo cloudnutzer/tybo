@@ -90,18 +90,22 @@ function discoveredSpec(raw: Entry): ServerSpec | undefined {
 }
 
 /** Liest eine JSON-Datei; fehlt sie, undefined, ist sie kaputt, eine Logzeile */
-function readJson(path: string | undefined): Entry | undefined {
+function readJson(path: string | undefined, quiet = false): Entry | undefined {
   if (!path || !existsSync(path)) return undefined;
   try {
     return asRecord(JSON.parse(readFileSync(path, "utf-8")));
   } catch (err) {
-    console.error(`[MCP] Konfiguration ${path} nicht lesbar: ${err instanceof Error ? err.message : String(err)}`);
+    if (!quiet) console.error(`[MCP] Konfiguration ${path} nicht lesbar: ${err instanceof Error ? err.message : String(err)}`);
     return undefined;
   }
 }
 
 /** Alle Server aus den drei Quellen, frühere Quelle gewinnt */
-export function loadServerSpecs(sources: SpecSources = defaultSpecSources()): ServerSpecs {
+export function loadServerSpecs(sources: SpecSources = defaultSpecSources(), options: {
+  quiet?: boolean;
+  readJson?: (path: string | undefined) => Entry | undefined;
+} = {}): ServerSpecs {
+  const read = options.readJson ?? (path => readJson(path, options.quiet));
   const specs: ServerSpecs = new Map();
   const take = (path: string, entries: Entry | undefined, pick: (raw: Entry) => ServerSpec | undefined) => {
     let added = 0;
@@ -112,16 +116,16 @@ export function loadServerSpecs(sources: SpecSources = defaultSpecSources()): Se
       specs.set(name, spec);
       added++;
     }
-    if (added > 0) console.log(`[MCP] ${path}: ${added} Server`);
+    if (added > 0 && !options.quiet) console.log(`[MCP] ${path}: ${added} Server`);
   };
 
-  const project = readJson(sources.projectFile);
+  const project = read(sources.projectFile);
   take(sources.projectFile, asRecord(project?.servers), explicitSpec);
   if (sources.extraFile) {
-    const extra = readJson(sources.extraFile);
+    const extra = read(sources.extraFile);
     take(sources.extraFile, asRecord(extra?.servers) ?? asRecord(extra?.mcpServers), explicitSpec);
   }
-  const claude = readJson(sources.claudeFile);
+  const claude = read(sources.claudeFile);
   take(sources.claudeFile, asRecord(claude?.mcpServers), discoveredSpec);
   return specs;
 }

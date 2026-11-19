@@ -36,6 +36,7 @@ import { dirname, isAbsolute, join, resolve } from "path";
 import { CLAUDE_KEY_VAR, resolveClaudeAuth } from "./engines/claude-auth";
 import { MODELS_DEV_PROVIDER_ENV } from "./engines/opencode-provider-env";
 import type { EngineId } from "./engines/types";
+import { currentJobChain } from "./jobs/chain-context";
 
 type Env = Record<string, string | undefined>;
 
@@ -166,7 +167,29 @@ export function isOpenCodeProviderCredential(
  * Immer entfernt, auch bei Freigabe oder MCP-Referenz. WEB_PUSH_PRIVATE_KEY
  * (Issue #225): mit ihm könnte jeder im Namen von tybo an die Geräte pushen.
  */
-const ALWAYS_REMOVED = new Set(["CLAUDECODE", ...CONVERSATION_VARS, "WEB_PASSWORD", "WEB_PUSH_PRIVATE_KEY"]);
+const ALWAYS_REMOVED_SECRETS = new Set(["WEB_PASSWORD", "WEB_PUSH_PRIVATE_KEY"]);
+const ALWAYS_REMOVED = new Set(["CLAUDECODE", "TYBO_JOB_CHAIN", ...CONVERSATION_VARS, ...ALWAYS_REMOVED_SECRETS]);
+
+/** MCP darf weder die Laufumgebung ändern noch das Laden fremden Codes steuern. */
+const PROTECTED_SUBPROCESS_VARS = new Set([
+  "TYBO_SUBPROCESS", "TYBO_SUBPROCESS_ENV_ALLOW", "TYBO_JOB_ID", "TYBO_JOB_CHAIN", "HOME", "PATH", "CODEX_HOME",
+  "NODE_OPTIONS", "BUN_OPTIONS", "LD_PRELOAD", "LD_LIBRARY_PATH", "BASH_ENV", "ENV", "OPENAI_BASE_URL",
+]);
+
+/** Geschützte Werte auch unter anderem Namen nicht durch MCP wieder einführen. */
+export function isProtectedSubprocessSecret(name: string, engine: EngineId): boolean {
+  return ALWAYS_REMOVED_SECRETS.has(name) || (engine === "codex" && codexAllowOnly(name));
+}
+
+/** Verweise dürfen keine grundsätzlich entfernte Variable anfordern. */
+export function isProtectedSubprocessReference(name: string, engine: EngineId): boolean {
+  return ALWAYS_REMOVED.has(name) || (engine === "codex" && codexAllowOnly(name));
+}
+
+/** Schutz für ergänzte MCP-Umgebungen; der bestehende Filter bleibt unverändert. */
+export function isProtectedSubprocessVar(name: string, engine: EngineId): boolean {
+  return isProtectedSubprocessReference(name, engine) || PROTECTED_SUBPROCESS_VARS.has(name) || name.startsWith("DYLD_");
+}
 
 export function isSecretName(name: string): boolean {
   return SECRET_PATTERNS.some(p => p.test(name));
@@ -558,6 +581,8 @@ export interface SubprocessEnvOptions {
   home?: string;
   /** Schlüssel der laufenden Ausführung (sessionKeyFor) für TYBO_CHAT_ID/TYBO_TOPIC_ID */
   conversationKey?: string;
+  /** Zähler dieses Turns; ohne Angabe aus seinem asynchronen Kontext. */
+  jobChain?: number;
   /** Motor des Subprozesses, Standard claude */
   engine?: EngineId;
 }
@@ -639,6 +664,8 @@ export function filterSubprocessEnv(opts: SubprocessEnvOptions = {}): EnvFilterR
   Object.assign(env, SUBPROCESS_MARKER);
   if (engine === "claude" && env[NO_BACKGROUND_TASKS] === undefined) env[NO_BACKGROUND_TASKS] = "1";
   Object.assign(env, conversationEnv(opts.conversationKey));
+  const jobChain = opts.jobChain ?? currentJobChain();
+  if (jobChain !== undefined) env.TYBO_JOB_CHAIN = String(jobChain);
   return { env, removed: removed.sort(), ...(keyWithheld ? { keyWithheld: true as const } : {}) };
 }
 

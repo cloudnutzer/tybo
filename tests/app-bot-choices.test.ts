@@ -81,7 +81,7 @@ function setup(env: Record<string, string> = {}, parts: BotChoicesDeps["parts"] 
 describe("wireBotChoices", () => {
   test("jede Art des Registers außer tool bekommt genau einen Handler", () => {
     const { kinds } = setup();
-    expect([...kinds].sort()).toEqual(["ask", "call", "cleanup", "core", "goal", "memory", "proactive", "reminder", "review", "routine", "secret", "sprachagent", "thread", "topicmap"]);
+    expect([...kinds].sort()).toEqual(["ask", "call", "cleanup", "core", "goal", "job", "memory", "proactive", "reminder", "review", "routine", "secret", "sprachagent", "thread", "topicmap"]);
   });
 
   test("Ablauf der Faden-Rückfragen, Ziel- und Topic-Änderungen, Freigaben und Anrufe angemeldet", () => {

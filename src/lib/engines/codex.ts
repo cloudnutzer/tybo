@@ -18,10 +18,13 @@
  */
 
 import { spawn } from "bun";
+import { createHash } from "node:crypto";
 import { checkAborted, currentExecution } from "../execution-context";
 import { firstTextSnippet, IDLE_CHECK_INTERVAL_MS, MAX_RUN_STEPS, type RunStep } from "../claude";
 import { toolLabel } from "./tool-labels";
-import { subprocessEnv } from "../subprocess-env";
+import { codexHomeDir, filterSubprocessEnv, subprocessEnv } from "../subprocess-env";
+import { PROJECT_ROOT } from "../env";
+import type { CodexSkillLinksInput, CodexSkillLinksResult } from "./codex-skills";
 import {
   CLAUDE_STOP_PLAN,
   homeDirectory,
@@ -34,11 +37,14 @@ import {
 } from "./platform";
 import { createLineReader } from "./lines";
 import { bashToolUse, type ToolUse, type TurnTools } from "../turn-tools";
-import { MASK, maskSecrets, projectSecrets } from "../jobs/mask";
+import { MASK, maskSecrets, mergeSecretValues, projectSecrets } from "../jobs/mask";
 import { registerEngineCall, trackEngineTermination, unregisterEngineCall, type EngineProc } from "./calls";
 import { superviseRun, type RunControl } from "./lifecycle";
 import type { Engine, EngineErrorKind, EngineRequest, EngineResult, EngineUsage } from "./types";
-import { DEFAULT_CODEX_SANDBOX, getSettings, type CodexSandbox } from "../settings";
+import { DEFAULT_CODEX_SANDBOX, getSettings, type CodexSandbox, type Settings } from "../settings";
+import { applyCodexMcpEnv, currentCodexMcpPlan, type CodexMcpPlan } from "./codex-mcp";
+import { logCodexUsageMissing, type readCodexUsage } from "./codex-usage";
+import type { recordUsage, UsageWindow } from "./usage";
 
 /** Heimatverzeichnis für die Prozess-Umgebung (engines/platform.ts) */
 const HOME_DIR = homeDirectory();
@@ -53,11 +59,14 @@ export function codexPath(): string {
  * Codex-Regeln (MCP-Verweise aus der config.toml von Codex), CODEX_HOME
  * bleibt, dazu HOME und PATH.
  */
-export function codexEnv(cwd: string, conversationKey?: string): Record<string, string> {
+export function codexEnv(cwd: string, conversationKey?: string, options: { quiet?: boolean; home?: string; env?: Record<string, string | undefined> } = {}): Record<string, string> {
+  const home = options.home ?? HOME_DIR;
+  const env = options.env ?? process.env;
+  const input = { cwd, home, env, conversationKey, engine: "codex" as const };
   return {
-    ...subprocessEnv({ cwd, home: HOME_DIR, conversationKey, engine: "codex" }),
-    HOME: HOME_DIR,
-    PATH: process.env.PATH || "",
+    ...(options.quiet ? filterSubprocessEnv(input).env : subprocessEnv(input)),
+    HOME: home,
+    PATH: env.PATH || "",
   };
 }
 
@@ -240,15 +249,20 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   [/\b(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{32,}\b/g, MASK],
 ];
 
+/** Reine Formprüfung ohne den lastIndex der Maskierungsmuster zu verändern. */
+export function secretShaped(text: string): boolean {
+  return SECRET_PATTERNS.some(([pattern]) => new RegExp(pattern.source, pattern.flags.replace("g", "")).test(text));
+}
+
 /**
  * Text aus stderr, Startfehlern und Fehler-Ereignissen von Codex, bevor er
  * ins Log oder in eine Fehlermeldung geht: bekannte Werte (.env des
  * Projekts, geheim benannte Variablen der Umgebung) und typische Formen von
  * Zugangsdaten werden ersetzt.
  */
-export function redactCodexDiagnostic(text: string): string {
+export function redactCodexDiagnostic(text: string, extra: readonly string[] = []): string {
   const root = process.env.GO_PROJECT_ROOT || process.cwd();
-  let out = maskSecrets(text, projectSecrets(root));
+  let out = maskSecrets(text, mergeSecretValues(projectSecrets(root), extra));
   for (const [pattern, replacement] of SECRET_PATTERNS) out = out.replace(pattern, replacement);
   return out;
 }
@@ -375,7 +389,7 @@ export class CodexTurn {
    * Fehlermeldung ist bereinigt (redactCodexDiagnostic), die Fehlerart kommt
    * aus dem ungekürzten Text.
    */
-  result(o: { exitCode: number | null; stderr?: string; cwd: string }): CodexTurnResult {
+  result(o: { exitCode: number | null; stderr?: string; cwd: string; secretValues?: readonly string[] }): CodexTurnResult {
     const tools: TurnTools = { uses: this.toolUses(), cwd: o.cwd };
     const base = {
       ...(this.sessionId ? { sessionId: this.sessionId } : {}),
@@ -390,10 +404,14 @@ export class CodexTurn {
     const message =
       this.failedMessage ??
       this.errorMessage ??
-      (stderr ? lastLines(redactCodexDiagnostic(stderr), 5) : undefined) ??
+      (stderr || undefined) ??
       (this.completed ? `Codex endete mit Exit-Code ${o.exitCode}` : `Codex endete ohne Abschluss (Exit-Code ${o.exitCode})`);
     const errorKind = !this.sawEvent && NOT_INSTALLED.test(stderr) ? "not_installed" : codexErrorKind(message);
-    return { ...base, text: redactCodexDiagnostic(message), isError: true, errorKind };
+    // Erst klassifizieren, dann maskieren und kürzen: auch kurze Werte dürfen
+    // die Erkennung eines Limits nicht verändern oder als Fragment stehen bleiben.
+    const masked = redactCodexDiagnostic(message, o.secretValues);
+    const text = this.failedMessage || this.errorMessage ? masked : lastLines(masked, 5);
+    return { ...base, text, isError: true, errorKind };
   }
 }
 
@@ -466,8 +484,8 @@ export function codexSandboxArgs(sandbox: CodexSandbox, resume: boolean): string
 }
 
 /** Rechte-Stufe aus den Einstellungen (engine.codex.sandbox), sonst full; bei jedem Lauf neu gelesen */
-export function codexSandbox(): CodexSandbox {
-  return getSettings().engine?.codex?.sandbox ?? DEFAULT_CODEX_SANDBOX;
+export function codexSandbox(settings: Settings = getSettings()): CodexSandbox {
+  return settings.engine?.codex?.sandbox ?? DEFAULT_CODEX_SANDBOX;
 }
 
 const SANDBOX_TEXT: Record<CodexSandbox, string> = {
@@ -490,6 +508,23 @@ export function resetCodexSandboxLogForTests(): void {
   loggedSandbox = undefined;
 }
 
+let loggedMcp: string | undefined;
+
+/** Nur Kategorien und Namen ausgeben; auch eine Änderung der Werte zählt als neuer Plan. */
+function logMcp(plan: CodexMcpPlan): void {
+  const signature = createHash("sha256").update(JSON.stringify(plan)).digest("hex");
+  if (loggedMcp === signature) return;
+  loggedMcp = signature;
+  const names = (values: string[]) => values.join(", ") || "keine";
+  console.log(`[Codex] MCP-Server: mitgegeben ${names(plan.passed.map(s => s.name))}; ` +
+    `in Codex selbst: ${names(plan.own)}; übersprungen ${names(plan.skipped.map(s => `${s.name} (${s.reason})`))}`);
+}
+
+/** Nur für Tests: der nächste Lauf schreibt seine MCP-Übersicht wieder. */
+export function resetCodexMcpLogForTests(): void {
+  loggedMcp = undefined;
+}
+
 /**
  * Argumente nach `codex`: neuer Lauf mit -C <cwd>, Fortsetzen mit
  * `exec resume` (kennt kein -C, das Arbeitsverzeichnis kommt aus dem cwd des
@@ -498,7 +533,7 @@ export function resetCodexSandboxLogForTests(): void {
  * Option durchzureichen.
  */
 export function codexArgs(
-  req: Pick<EngineRequest, "model" | "effort" | "resumeSessionId" | "cwd"> & { sandbox?: CodexSandbox }
+  req: Pick<EngineRequest, "model" | "effort" | "resumeSessionId" | "cwd"> & { sandbox?: CodexSandbox; mcpArgs?: readonly string[] }
 ): string[] {
   // Fehlermeldungen ohne den Wert: er kann Zugangsdaten enthalten
   if (req.model !== undefined && req.model !== "" && !MODEL.test(req.model)) throw new Error("Ungültiges Codex-Modell");
@@ -510,6 +545,7 @@ export function codexArgs(
     ...(req.effort ? ["-c", `model_reasoning_effort="${req.effort}"`] : []),
     ...CODEX_PROJECT_DOC_ARGS,
     ...codexSandboxArgs(req.sandbox ?? DEFAULT_CODEX_SANDBOX, resume),
+    ...(req.mcpArgs ?? []),
   ];
   if (req.resumeSessionId) {
     if (!SESSION_ID.test(req.resumeSessionId)) throw new Error("Ungültige Codex-Session");
@@ -530,6 +566,8 @@ export const CODEX_KILL_GRACE_MS = 3_000;
  * SIGKILL-Nachlauf
  */
 export const CODEX_STOP_WAIT_MS = CODEX_KILL_GRACE_MS + 3_000;
+/** Nach regulärem Prozessende höchstens so lange auf die Limit-Messung warten. */
+export const CODEX_USAGE_WAIT_MS = 2_000;
 /** Höchstens ein Werkzeug-Rückruf so oft (wie bei Claude) */
 const TOOL_THROTTLE_MS = 5_000;
 
@@ -541,6 +579,13 @@ type CodexSignal = "SIGINT" | "SIGKILL";
  */
 export interface CodexRuntime {
   spawn: typeof spawn;
+  /** Plan je Lauf; ersetzbar auch für Planungsfehler und ungültige Umgebungen. */
+  mcpPlan?: typeof currentCodexMcpPlan;
+  /** Im Modul ohne Dateizugriff; erst src/app/ setzt den echten Abgleich ein. */
+  syncSkills?: (input: CodexSkillLinksInput) => CodexSkillLinksResult | void;
+  /** Erst beim Bot-Start verdrahtet; Teil-Attrappen lesen und speichern nichts. */
+  readUsage?: typeof readCodexUsage;
+  recordUsage?: typeof recordUsage;
   now: () => number;
   setTimeout: (fn: () => void, ms: number) => unknown;
   clearTimeout: (handle: unknown) => void;
@@ -566,6 +611,8 @@ export function signalProcessGroup(proc: EngineProc, signal: CodexSignal, platfo
 
 const defaultRuntime: CodexRuntime = {
   spawn,
+  mcpPlan: currentCodexMcpPlan,
+  syncSkills: () => {},
   now: () => Date.now(),
   setTimeout: (fn, ms) => setTimeout(fn, ms),
   clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
@@ -575,6 +622,22 @@ const defaultRuntime: CodexRuntime = {
 };
 
 let runtime: CodexRuntime = defaultRuntime;
+
+/** Verdrahtung beim Bot-Start; Teil-Attrappen der Motor-Tests bleiben ohne Abgleich. */
+export function setCodexSkillSync(syncSkills: CodexRuntime["syncSkills"]): void {
+  runtime = { ...runtime, syncSkills: syncSkills ?? defaultRuntime.syncSkills };
+}
+
+/** Echte Messquelle und Ablage kommen aus src/app/, nie aus dem Standard-Runtime. */
+export function setCodexUsageReader(readUsage: CodexRuntime["readUsage"], recordUsage: CodexRuntime["recordUsage"]): void {
+  runtime = { ...runtime, readUsage, recordUsage };
+}
+
+/** Immer tybos Projekt, auch wenn ein Motorlauf einen anderen Arbeitsordner hat. */
+export function codexSkillLinksInput(enabled: boolean): CodexSkillLinksInput {
+  const home = homeDirectory();
+  return { root: PROJECT_ROOT, home, enabled, codexHome: codexHomeDir(process.env, home) };
+}
 
 /** Laufzeit für andere Codex-Aufrufe (Anmeldeprüfung in check.ts) */
 export function codexRuntime(): CodexRuntime {
@@ -618,16 +681,68 @@ export function createCodexEngine(): Engine {
   };
 }
 
+async function measureCodexUsage(sessionId: string | undefined, rt: CodexRuntime): Promise<UsageWindow[]> {
+  if (!sessionId || !rt.readUsage) return [];
+  const controller = new AbortController();
+  let timer: unknown;
+  try {
+    const windows = await Promise.race([
+      Promise.resolve().then(() => rt.readUsage!(sessionId, controller.signal)),
+      new Promise<UsageWindow[]>(resolve => {
+        timer = rt.setTimeout(() => { controller.abort(); resolve([]); }, CODEX_USAGE_WAIT_MS);
+      }),
+    ]);
+    if (controller.signal.aborted || !windows.length) {
+      logCodexUsageMissing();
+      return [];
+    }
+    // Nur das rechtzeitige Ergebnis speichern. Eine späte Messung hat keinen
+    // Schreib-Rückruf; die Dateisperre der Ablage hält die Antwort nicht auf.
+    void Promise.resolve().then(() => rt.recordUsage?.("codex", windows)).catch(() => {});
+    return windows;
+  } catch {
+    logCodexUsageMissing();
+    return [];
+  } finally {
+    controller.abort();
+    if (timer !== undefined) rt.clearTimeout(timer);
+  }
+}
+
 async function runCodex(req: EngineRequest): Promise<EngineResult> {
   const rt = runtime;
   const cwd = req.cwd || process.cwd();
+  if (!req.resumeSessionId) {
+    try {
+      rt.syncSkills?.(codexSkillLinksInput(getSettings().engine?.codex?.skills !== false));
+    } catch {
+      console.error("[Codex] Skill-Abgleich fehlgeschlagen; Antwort läuft weiter.");
+    }
+  }
   let args: string[];
+  let env: Record<string, string>;
+  let plan: CodexMcpPlan | undefined;
   try {
     const sandbox = codexSandbox();
-    args = codexArgs({ ...req, cwd, sandbox });
+    // Einmal bilden: Konfliktprüfung und Prozessstart brauchen dieselbe Basis.
+    const baseEnv = codexEnv(cwd, currentExecution()?.key);
+    env = baseEnv;
+    let mcpArgs: readonly string[] | undefined;
+    try {
+      plan = (rt.mcpPlan ?? currentCodexMcpPlan)({ cwd, baseEnv, sandbox });
+      env = applyCodexMcpEnv(baseEnv, plan);
+      mcpArgs = plan.args;
+      logMcp(plan);
+    } catch {
+      env = baseEnv;
+      mcpArgs = undefined;
+      // Keine Quelldaten oder Fehlertexte: eine Antwort darf daran nie scheitern.
+      console.error("[Codex] MCP-Plan fehlgeschlagen; Lauf ohne MCP-Server von tybo.");
+    }
+    args = codexArgs({ ...req, cwd, sandbox, mcpArgs });
     logSandbox(sandbox);
   } catch (err) {
-    return { engine: "codex", text: redactCodexDiagnostic(errorText(err)), isError: true, errorKind: "other" };
+    return { engine: "codex", text: redactCodexDiagnostic(errorText(err), plan?.secretValues), isError: true, errorKind: "other" };
   }
   const cmd = keepAwakeCommand([codexPath(), ...args]);
 
@@ -637,7 +752,7 @@ async function runCodex(req: EngineRequest): Promise<EngineResult> {
       detached: startsOwnGroup(),
       cmd,
       cwd,
-      env: codexEnv(cwd, currentExecution()?.key),
+      env,
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
@@ -646,7 +761,7 @@ async function runCodex(req: EngineRequest): Promise<EngineResult> {
   try {
     proc = start();
   } catch (err) {
-    const reason = redactCodexDiagnostic(errorText(err));
+    const reason = redactCodexDiagnostic(errorText(err), plan?.secretValues);
     console.error("[Codex] Start fehlgeschlagen:", reason);
     return { engine: "codex", text: `Codex konnte nicht gestartet werden: ${reason}`, isError: true, errorKind: "not_installed" };
   }
@@ -740,7 +855,7 @@ async function runCodex(req: EngineRequest): Promise<EngineResult> {
     await proc.stdin.end();
   })().catch((err) => {
     if (control.exited || control.phase !== "running") return;
-    promptError = redactCodexDiagnostic(errorText(err));
+    promptError = redactCodexDiagnostic(errorText(err), plan?.secretValues);
     console.error("[Codex] Prompt konnte nicht übergeben werden:", promptError);
     control.stop("input");
   });
@@ -759,7 +874,7 @@ async function runCodex(req: EngineRequest): Promise<EngineResult> {
     return { engine: "codex", text: `Codex hat den Auftrag nicht angenommen: ${promptError}`, isError: true, errorKind: "other" };
   }
 
-  const r = turn.result({ exitCode: streamFailed ? null : exitCode, stderr, cwd });
+  const r = turn.result({ exitCode: streamFailed ? null : exitCode, stderr, cwd, secretValues: plan?.secretValues });
 
   if (limitHit) {
     console.error(
@@ -782,11 +897,14 @@ async function runCodex(req: EngineRequest): Promise<EngineResult> {
     };
   }
 
+  // Bei /stop, nicht übergebenem Prompt und Prozess-Zeitlimit keine weitere
+  // Wartezeit. Normale Abschlüsse messen auch bei usage_limit und quota.
+  const windows = await measureCodexUsage(r.sessionId || req.resumeSessionId, rt);
   console.error(
     `[Codex] Ergebnis: text=${r.text ? r.text.length + " Zeichen" : "LEER"}, sessionId=${r.sessionId || "keine"}, ` +
       `exit=${exitCode}, isError=${r.isError}${r.errorKind ? ` (${r.errorKind})` : ""}`
   );
-  if (r.isError && stderr) console.error("[Codex] stderr:", redactCodexDiagnostic(stderr).substring(0, 500));
+  if (r.isError && stderr) console.error("[Codex] stderr:", redactCodexDiagnostic(stderr, plan?.secretValues).substring(0, 500));
   return {
     engine: "codex",
     text: r.text,
@@ -794,6 +912,7 @@ async function runCodex(req: EngineRequest): Promise<EngineResult> {
     isError: r.isError,
     ...(r.errorKind ? { errorKind: r.errorKind } : {}),
     ...(r.usage ? { usage: r.usage } : {}),
+    ...(windows.length ? { rateLimit: { windows } } : {}),
     tools: r.tools,
   };
 }

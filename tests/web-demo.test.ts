@@ -184,7 +184,7 @@ test("Demo mit Telegram-Attrappe (web:dev): Schreiben in ein Topic antwortet die
 
 test("web:dev gibt der Demo eine Telegram-Attrappe, nie einen echten Turn", async () => {
   const script = await readFile(join(root, "scripts", "web-dev.ts"), "utf8");
-  expect(script).toContain("startDemoServer(result.config, { chat: createFakeChat(), telegramChat: createFakeChat(), push: await devPush() })");
+  expect(script).toContain("startDemoServer(result.config, { chat: createFakeChat(engineExample), telegramChat: createFakeChat(engineExample), pipelines, push: await devPush() })");
   expect(script).not.toContain("createTelegramChat");
 });
 

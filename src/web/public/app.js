@@ -395,7 +395,7 @@ function draftEntry(requestUrl) {
   return match ? { tab: match[1], gen: Number(match[2]), n: match[3] === undefined ? null : Number(match[3]) } : null;
 }
 
-/** Zufällige Kennung dieses Tabs, nur für die Anwesenheit; neu bei jedem Laden */
+/** Zufällige Kennung für Anwesenheit oder einen einmaligen Auftrag */
 function randomTabId(win) {
   const bytes = new Uint8Array(16);
   try {
@@ -765,10 +765,12 @@ const NOTICE_SOURCES = {
  * Steuerbefehle, die auch während einer Antwort und während Rückfragen
  * ([INVOKE:]) rausgehen: /stop bzw. /abbruch allein (Issue #74), dazu
  * /goal pause und /goal stop samt Aliasen (Issue #76, wie goalUnscoped im Register)
+ * sowie Anzeige, Automatik und Prüfen von /motor (Issues #666, #668).
  */
 function isUrgentCommand(text) {
-  const value = String(text || "").trim();
-  return /^\/(stop|abbruch)(@\S+)?$/i.test(value) || /^\/goal(@\S+)?\s+(pause|stop|cancel|done|abbrechen)$/i.test(value);
+  const value = String(text || "").trim().normalize("NFC");
+  return /^\/(stop|abbruch)(@\S+)?$/i.test(value) || /^\/goal(@\S+)?\s+(pause|stop|cancel|done|abbrechen)$/i.test(value)
+    || /^\/(motor|engine)(@\S+)?(?:\s+(?:werkzeuge|pruefen|prüfen|auto(?:\s+\S+(?:\s+\S+)*)?))?$/i.test(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -971,6 +973,221 @@ function fileIcon() {
 }
 
 /**
+ * Installierte App auf iPhone oder iPad (Home-Bildschirm), erkannt wie am
+ * Telefonhörer (callIosApp in call.js). Dort gibt es weder Browserleiste noch
+ * Download-Verwaltung: Ein Link auf eine Datei oder in einen eigenen Tab
+ * ersetzt die einzige Ansicht, und nichts führt zurück (Issue #708, im
+ * Simulator mit iOS 26.4 nachgestellt). Überall sonst bleiben die Links.
+ */
+function isIosApp() {
+  return typeof callIosApp === "function" && typeof window !== "undefined" && callIosApp(window);
+}
+
+// ---------------------------------------------------------------------------
+// Betrachter (Issue #708): Bild oder HTML-Datei groß, als Überlagerung der Seite
+// ---------------------------------------------------------------------------
+
+/** Der eine Betrachter der Seite, angelegt beim ersten Öffnen */
+let fileViewer = null;
+
+function createFileViewer() {
+  const dialog = document.createElement("dialog");
+  dialog.className = "viewer";
+  const bar = document.createElement("div");
+  bar.className = "viewer-bar";
+  const title = document.createElement("span");
+  title.className = "viewer-title";
+  // Schließen steht vor dem Inhalt: showModal gibt ihm den Fokus
+  const close = document.createElement("button");
+  close.setAttribute("type", "button");
+  close.className = "viewer-close";
+  close.setAttribute("aria-label", "Schließen");
+  const icon = pathIcon(["M6 6l12 12M18 6L6 18"]);
+  if (icon) close.appendChild(icon);
+  bar.appendChild(title);
+  bar.appendChild(close);
+  const stage = document.createElement("div");
+  stage.className = "viewer-stage";
+  dialog.appendChild(bar);
+  dialog.appendChild(stage);
+  const viewer = { dialog, title, stage, opener: null };
+  close.addEventListener("click", () => dialog.close());
+  // Tipp neben das Bild; Escape schließt ein <dialog> von selbst
+  dialog.addEventListener("click", event => {
+    if (event.target === dialog || event.target === stage) dialog.close();
+  });
+  dialog.addEventListener("close", () => {
+    // Das Ereignis kommt nach Escape verspätet: Ist schon wieder geöffnet, gehört der Inhalt dem neuen Bild
+    if (dialog.open) return;
+    // Inhalt weg: eine HTML-Datei läuft im Hintergrund nicht weiter
+    stage.replaceChildren();
+    const opener = viewer.opener;
+    viewer.opener = null;
+    // iOS gibt einem angetippten Knopf keinen Fokus, also ausdrücklich zurück
+    if (opener && opener.isConnected !== false && typeof opener.focus === "function") opener.focus();
+  });
+  document.body.appendChild(dialog);
+  return viewer;
+}
+
+/**
+ * Öffnet den Betrachter. kind "image": ein Bild der erlaubten Typen (Adresse
+ * mit ?inline=1; die CSP erlaubt für Bilder kein blob:). kind "page": eine
+ * HTML-Datei aus einer Meldung im iframe; der Server liefert sie mit eigener
+ * Sandbox ohne Ursprung (SANDBOXED_HTML_CSP in src/web/files.ts), das Attribut
+ * sandbox hier erlaubt dazu weder Downloads noch den Wechsel der äußeren Seite.
+ */
+function openViewer(kind, src, name, opener) {
+  if (!fileViewer) fileViewer = createFileViewer();
+  const { dialog, title, stage } = fileViewer;
+  if (typeof dialog.showModal !== "function" || dialog.open) return;
+  const content = document.createElement(kind === "page" ? "iframe" : "img");
+  if (kind === "page") {
+    content.className = "viewer-page";
+    content.setAttribute("sandbox", "allow-scripts allow-popups allow-popups-to-escape-sandbox");
+    content.setAttribute("referrerpolicy", "no-referrer");
+    content.setAttribute("title", name);
+  } else {
+    content.className = "viewer-image";
+    content.setAttribute("alt", name);
+  }
+  content.setAttribute("src", src);
+  stage.replaceChildren(content);
+  title.textContent = name;
+  dialog.setAttribute("aria-label", name);
+  fileViewer.opener = opener;
+  dialog.showModal();
+}
+
+const FILE_SAVE_TEXT = {
+  idle: "Herunterladen",
+  loading: "Lädt …",
+  ready: "Sichern oder teilen",
+  readyNote: "Geladen. Noch einmal tippen, dann öffnet sich der Dialog zum Sichern.",
+  offline: "Server nicht erreichbar. Bitte noch einmal versuchen.",
+  session: "Nicht mehr angemeldet. Die App neu öffnen und anmelden.",
+  missing: "Die Datei gibt es nicht mehr.",
+  failed: "Die Datei ließ sich nicht laden. Bitte noch einmal versuchen.",
+  shareFailed: "Sichern hat nicht geklappt. Bitte noch einmal versuchen.",
+  noShare: "Sichern geht in der installierten App nicht. Die Seite in Safari öffnen und die Datei dort herunterladen.",
+};
+
+/** Typ für das Teilen: der festgehaltene, wenn er wie ein MIME-Typ aussieht (der Download selbst kommt immer als octet-stream) */
+function shareType(mime) {
+  return typeof mime === "string" && /^[a-z0-9][a-z0-9.+-]*\/[a-z0-9][a-z0-9.+-]*$/i.test(mime) ? mime : "application/octet-stream";
+}
+
+/** Nimmt der Teilen-Dialog des Systems eine Datei mit diesem Namen und Typ? Wirft nie. */
+function canShareFile(name, type) {
+  try {
+    const nav = window.navigator;
+    if (!nav || typeof nav.share !== "function" || typeof nav.canShare !== "function") return false;
+    return nav.canShare({ files: [new File([], name, { type })] }) === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * „Herunterladen" in der installierten App auf dem iPhone (Issue #708): kein
+ * Link, sondern ein Knopf. Er lädt die Datei über dieselbe Route (dort bleiben
+ * alle Zugriffsprüfungen) und gibt sie an den Teilen-Dialog des Systems („In
+ * Dateien sichern", „Bild sichern"), der sich von selbst wieder schließt.
+ * Verfällt die Nutzergeste während des Ladens (NotAllowedError), bleibt die
+ * Datei geladen und der nächste Tipp öffnet den Dialog. note: Zeile unter der
+ * Karte für Hinweise und Fehler.
+ */
+function fileSaveButton(href, name, mime, note) {
+  const type = shareType(mime);
+  const button = document.createElement("button");
+  button.setAttribute("type", "button");
+  button.className = "quiet-button file-download";
+  /** Geladene Datei; bleibt für den nächsten Tipp */
+  let loaded = null;
+  /** Ein Tipp wird gerade bearbeitet (Laden oder offener Dialog): kein zweiter daneben */
+  let running = false;
+  /** Die Datei lädt gerade */
+  let busy = false;
+  /** Datei geladen, Geste verfallen: Der nächste Tipp öffnet den Dialog */
+  let waiting = false;
+  function paint() {
+    button.textContent = busy ? FILE_SAVE_TEXT.loading : waiting ? FILE_SAVE_TEXT.ready : FILE_SAVE_TEXT.idle;
+    button.setAttribute("aria-label", name + (busy ? " wird geladen" : waiting ? " sichern oder teilen" : " herunterladen"));
+    if (busy) {
+      button.setAttribute("aria-busy", "true");
+      button.setAttribute("aria-disabled", "true");
+    } else {
+      button.removeAttribute("aria-busy");
+      button.removeAttribute("aria-disabled");
+    }
+  }
+  function say(text, error) {
+    note.textContent = text;
+    note.className = error ? "file-note file-note-error" : "file-note";
+    note.hidden = !text;
+  }
+  /** Lädt die Datei; wirft mit dem Text für die Zeile unter der Karte */
+  async function load() {
+    let res;
+    try {
+      res = await fetch(href, { credentials: "same-origin" });
+    } catch {
+      throw new Error(FILE_SAVE_TEXT.offline);
+    }
+    if (res.status === 401) throw new Error(FILE_SAVE_TEXT.session);
+    if (res.status === 404) throw new Error(FILE_SAVE_TEXT.missing);
+    if (!res.ok) throw new Error(FILE_SAVE_TEXT.failed);
+    try {
+      return new File([await res.blob()], name, { type });
+    } catch {
+      throw new Error(FILE_SAVE_TEXT.offline);
+    }
+  }
+  async function save() {
+    if (!canShareFile(name, type)) {
+      say(FILE_SAVE_TEXT.noShare, true);
+      return;
+    }
+    // Schon geladen: Der Tipp selbst ist die Geste, ein zweites Verfallen gibt es nicht
+    const direct = !!loaded;
+    running = true;
+    waiting = false;
+    busy = !direct;
+    paint();
+    try {
+      if (!loaded) loaded = await load();
+    } catch (e) {
+      say(e.message, true);
+    }
+    busy = false;
+    paint();
+    if (loaded) {
+      try {
+        await window.navigator.share({ files: [loaded] });
+      } catch (e) {
+        const kind = e && e.name;
+        if (kind === "NotAllowedError" && !direct) {
+          waiting = true;
+          say(FILE_SAVE_TEXT.readyNote, false);
+        } else if (kind !== "AbortError") {
+          // Abbruch im Dialog ist keine Meldung wert
+          say(FILE_SAVE_TEXT.shareFailed, true);
+        }
+      }
+    }
+    running = false;
+    paint();
+  }
+  button.addEventListener("click", () => {
+    if (running) return;
+    say("", false);
+    save();
+  });
+  paint();
+  return button;
+}
+
+/**
  * Karte einer Datei: Name, Größe und „Herunterladen" (Link auf
  * /api/files/<id>, der Server liefert immer als Anhang). Bilder der
  * erlaubten Typen zusätzlich als Vorschau darüber. null bei ungültiger id.
@@ -990,11 +1207,18 @@ function fileCard(file) {
     return fileCardElement(file, href, null, [], player);
   }
   if (isHtmlFile(file)) {
-    const open = document.createElement("a");
+    // Ein eigener Tab ersetzt in der installierten App auf dem iPhone die ganze Ansicht (Issue #708)
+    const trapped = isIosApp();
+    const open = document.createElement(trapped ? "button" : "a");
     open.className = "quiet-button file-open";
-    open.setAttribute("href", inlineHref);
-    open.setAttribute("target", "_blank");
-    open.setAttribute("rel", "noopener");
+    if (trapped) {
+      open.setAttribute("type", "button");
+      open.addEventListener("click", () => openViewer("page", inlineHref, String(file.name), open));
+    } else {
+      open.setAttribute("href", inlineHref);
+      open.setAttribute("target", "_blank");
+      open.setAttribute("rel", "noopener");
+    }
     open.setAttribute("aria-label", String(file.name) + " öffnen");
     open.textContent = "Öffnen";
     return fileCardElement(file, href, null, [open]);
@@ -1004,8 +1228,10 @@ function fileCard(file) {
 
 /**
  * Karte mit Name, Größe, Herunterladen und, wenn previewHref gesetzt ist, der
- * Vorschau darüber; extra: weitere Elemente vor „Herunterladen"; player:
- * Audio oder Video über der Karte
+ * Vorschau darüber (ein Knopf, der das Bild im Betrachter öffnet); extra:
+ * weitere Elemente vor „Herunterladen"; player: Audio oder Video über der
+ * Karte. In der installierten App auf dem iPhone ist „Herunterladen" ein
+ * Knopf zum Sichern (fileSaveButton), sonst ein gewöhnlicher Download-Link.
  */
 function fileCardElement(file, href, previewHref, extra, player) {
   const name = typeof file.name === "string" && file.name ? file.name : "Datei";
@@ -1017,7 +1243,13 @@ function fileCardElement(file, href, previewHref, extra, player) {
     img.setAttribute("src", previewHref);
     img.setAttribute("alt", name);
     img.setAttribute("loading", "lazy");
-    wrap.appendChild(img);
+    const zoom = document.createElement("button");
+    zoom.setAttribute("type", "button");
+    zoom.className = "file-zoom";
+    zoom.setAttribute("aria-label", name + " groß ansehen");
+    zoom.addEventListener("click", () => openViewer("image", previewHref, name, zoom));
+    zoom.appendChild(img);
+    wrap.appendChild(zoom);
   }
   if (player) wrap.appendChild(player);
   const card = document.createElement("div");
@@ -1038,13 +1270,23 @@ function fileCardElement(file, href, previewHref, extra, player) {
     info.appendChild(meta);
   }
   card.appendChild(info);
+  for (const node of extra || []) card.appendChild(node);
+  if (isIosApp()) {
+    const note = document.createElement("p");
+    note.className = "file-note";
+    note.setAttribute("role", "status");
+    note.hidden = true;
+    card.appendChild(fileSaveButton(href, name, file.mime, note));
+    wrap.appendChild(card);
+    wrap.appendChild(note);
+    return wrap;
+  }
   const link = document.createElement("a");
   link.className = "quiet-button file-download";
   link.setAttribute("href", href);
   link.setAttribute("download", name);
   link.setAttribute("aria-label", name + " herunterladen");
   link.textContent = "Herunterladen";
-  for (const node of extra || []) card.appendChild(node);
   card.appendChild(link);
   wrap.appendChild(card);
   return wrap;
@@ -1547,7 +1789,7 @@ function choiceElement(choice, ui) {
   if (status) {
     const line = document.createElement("p");
     line.className = "choice-status";
-    line.textContent = status;
+    line.textContent = (ui && ui.notices && ui.notices.get(choice.id)) || status;
     box.appendChild(line);
     return box;
   }
@@ -1698,17 +1940,84 @@ function formatDuration(ms) {
  */
 const ENGINE_NAMES = { claude: "Claude Code", codex: "Codex", opencode: "OpenCode", api: "Anthropic API" };
 
-/**
- * Pille der Kopfzeile (Issue #126): Motor des Gesprächs, wenn er vom
- * Standard abweicht oder der Standard nicht Claude Code ist; sonst null.
- * engine: eingestellter Motor des Gesprächs (nicht der der letzten Antwort),
- * standard: Standard-Motor oder null, wenn der Server keinen nennt.
- */
-function enginePillText(engine, standard) {
-  if (typeof engine !== "string" || !Object.hasOwn(ENGINE_NAMES, engine)) return null;
-  const base = typeof standard === "string" && standard ? standard : "claude";
-  if (engine === "claude" && base === "claude") return null;
-  return ENGINE_NAMES[engine];
+/** Nächste Stufe; ohne Vorschau bleibt der eingestellte Motor immer sichtbar. */
+function enginePillText(engine, standard, stage, compact = false) {
+  if (stage && stage.role === "none") return "Kein Motor frei";
+  if (stage && typeof stage.label === "string" && stage.label) {
+    const label = compact && Object.hasOwn(ENGINE_NAMES, stage.engine) ? ENGINE_NAMES[stage.engine] : stage.label;
+    return label + (stage.role === "backup" ? " · springt ein" : "");
+  }
+  return Object.hasOwn(ENGINE_NAMES, engine) ? ENGINE_NAMES[engine]
+    : Object.hasOwn(ENGINE_NAMES, standard) ? ENGINE_NAMES[standard] : ENGINE_NAMES.claude;
+}
+
+/** Reiner Zustandssatz für Pille und späteres Menü, immer in der Bot-Zeitzone. */
+function engineStageText(stage, timeZone = "UTC") {
+  if (!stage) return "";
+  if (stage.role === "first") return stage.label + " antwortet.";
+  if (stage.role === "manual") return stage.label + " ist für dieses Gespräch gewählt.";
+  const reason = stage.reason;
+  let explanation = "";
+  // Zeit und Fensternamen kommen aus settings.js, wie im Reiter Modelle.
+  const time = (iso, day) => {
+    const value = engineTime(iso, timeZone, day);
+    return day ? value.replace(" ", ", ") + " Uhr" : value;
+  };
+  if (reason) {
+    if (reason.kind === "not_ready") {
+      explanation = reason.label + " ist nicht bereit" + (reason.message ? " (" + reason.message + ")" : "") + ". ";
+    } else {
+      const reset = reason.resetKnown !== false && reason.kind !== "outage";
+      const window = reason.window ? engineWindowLabel(reason.window) : "";
+      const percent = typeof reason.percent === "number" ? Math.round(reason.percent) + " %" : "";
+      const measurement = window && percent ? window + ": " + percent : "";
+      const detail = reason.kind === "outage" ? "Ausfall" : reason.kind === "limit" ? "Limit erreicht" : measurement;
+      const bracket = reset ? detail : (detail ? detail + (reason.kind === "outage" ? "" : ", Reset unbekannt") : "Reset unbekannt");
+      explanation = reason.label + (reset ? " ist" : " ist pausiert")
+        + (reason.until ? " bis " + time(reason.until, reset) : "") + (reset ? " gesperrt" : "")
+        + (bracket ? " (" + bracket + ")" : "") + ". ";
+    }
+  }
+  if (stage.role === "none") return explanation + "Kein Motor ist frei. "
+    + (stage.until ? "Bis " + time(stage.until, true) + " antworten" : "Es antworten")
+    + " Ersatzmodelle mit eingeschränktem Werkzeugumfang.";
+  return explanation + stage.label + " springt ein.";
+}
+
+/** Nur Anzeige: keine allgemeine Reihenfolge, Sperrliste oder Modellzuordnung im Browser. */
+function engineMenuView({ conversationId, engineStage, engineChoices, overrides, engines, timeZone = "UTC" }) {
+  const knownChoice = Array.isArray(overrides);
+  const override = knownChoice && overrides.find(entry => entry.conversationId === conversationId);
+  const selected = knownChoice ? (override ? override.engine : "standard") : null;
+  const choices = Array.isArray(engineChoices) ? engineChoices : (Array.isArray(engines) ? engines
+    : Object.entries(ENGINE_NAMES).map(([id, label]) => ({ id, label }))).map(e => ({ engine: e.id, label: e.label }));
+  const rows = [{ engine: "standard", label: "Standard (Automatik)", status: "", note: "", paid: false, disabled: false, checked: selected === "standard" }];
+  for (const choice of choices) {
+    let status = "";
+    let note = "";
+    if (choice.state === "free" || choice.state === "answering") status = "frei";
+    else if (choice.state === "blocked") {
+      const reset = choice.resetKnown === true && choice.cause !== "outage";
+      status = (reset ? "gesperrt bis " : "pausiert bis ") + engineTime(choice.blockedUntil, timeZone, reset);
+      note = "bis dahin springt die nächste Stufe ein";
+    } else if (choice.state === "not_ready") {
+      status = choice.installed ? "nicht angemeldet" : "nicht installiert";
+      note = choice.message || "";
+    }
+    rows.push({ engine: choice.engine, label: choice.label, status, note,
+      paid: choice.engine === "api" || (choice.engine === "opencode" && typeof choice.model === "string" && choice.model.startsWith("openrouter/")),
+      disabled: choice.state === "not_ready", checked: selected === choice.engine });
+  }
+  return { sentence: engineStageText(engineStage, timeZone), rows };
+}
+
+function engineMenuLock({ running, closed, sending, recording, talking, calling, busy }) {
+  if (closed) return "Das Topic ist geschlossen. Erst wieder öffnen.";
+  if (running) return "Erst die laufende Antwort abwarten oder stoppen.";
+  if (sending || busy) return "Erst das laufende Senden abwarten.";
+  if (recording) return "Erst die Aufnahme beenden oder verwerfen.";
+  if (talking || calling) return "Erst das Gespräch am Mikrofon beenden.";
+  return "";
 }
 
 /**
@@ -1987,6 +2296,8 @@ function init() {
     send: document.getElementById("send"),
     agent: document.getElementById("agent-name"),
     engine: document.getElementById("engine-name"),
+    engineStatus: document.getElementById("engine-status"),
+    engineMenu: document.getElementById("engine-menu"),
     newChat: document.getElementById("new-chat"),
     logout: document.getElementById("logout"),
     connection: document.getElementById("connection"),
@@ -2021,7 +2332,11 @@ function init() {
     closedNote: document.getElementById("closed-note"),
     main: document.getElementById("main"),
     openSettings: document.getElementById("open-settings"),
-    /** Offene Fäden (Issue #293): Eintrag mit Anzahl und Ansicht #/faeden; fehlen in alten Seiten */
+    /** Jobs (Issue #626) und Offene Fäden (Issue #293) mit eigener Ansicht. */
+    openJobs: document.getElementById("open-jobs"),
+    jobsBack: document.getElementById("jobs-back"),
+    openPipelines: document.getElementById("open-pipelines"),
+    pipelinesBack: document.getElementById("pipelines-back"),
     openThreads: document.getElementById("open-threads"),
     threadsCount: document.getElementById("threads-count"),
     threadsView: document.getElementById("threads-view"),
@@ -2129,6 +2444,7 @@ function init() {
     callChoiceErrors: new Map(),
     /** Meldung unter den Knöpfen einer Rückfrage (ID → Text) */
     choiceErrors: new Map(),
+    choiceNotices: new Map(),
     /**
      * Endzustand je Rückfrage (ID → { state, result }), sobald einer bekannt
      * ist. Eine verspätete Antwort (GET, POST, SSE) mit „offen" öffnet die
@@ -2141,6 +2457,11 @@ function init() {
     telegram: { dm: null, topics: [] },
     /** Standard-Motor aus GET /api/conversations (Issue #126), null ohne Angabe */
     engineDefault: null,
+    engineTimeZone: "UTC",
+    engineMenuData: null,
+    engineMenuRequest: 0,
+    engineMenuNotice: null,
+    engineSettingsTarget: false,
     /** „Ältere Topics" aufgeklappt (gilt nur ohne Filter) */
     olderOpen: false,
     /** Telegram-Gespräche mit neuer Nachricht seit dem letzten Öffnen (Neu-Punkt), gespeichert bis zum Öffnen */
@@ -2440,6 +2761,7 @@ function init() {
   const choiceUi = {
     pending: state.choicePending,
     errors: state.choiceErrors,
+    notices: state.choiceNotices,
     pick: (id, key) => void pickChoice(id, key),
     open: id => openById(id),
   };
@@ -2534,11 +2856,15 @@ function init() {
     if (!message || message.choice.state !== "open" || !message.choice.options.some(o => o.key === key)) return;
     state.choicePending.add(id);
     state.choiceErrors.delete(id);
+    state.choiceNotices.delete(id);
     renderMessages();
     let error = "";
     try {
       const { status, data } = await api("POST", "/api/conversations/" + conversation.id + "/choices/" + encodeURIComponent(id), { option: key });
-      if (data && data.choice) settledChoice(data.choice);
+      if (data && data.choice) {
+        settledChoice(data.choice);
+        if (typeof data.message === "string" && data.message) state.choiceNotices.set(id, data.message);
+      }
       else if (status === 404 || (data && data.expired)) settledChoice({ id, state: "expired", options: [] });
       else error = data && typeof data.error === "string" && data.error ? data.error : "Die Auswahl ist fehlgeschlagen.";
     } catch {
@@ -2667,7 +2993,7 @@ function init() {
   function updateControls() {
     const answerable = state.awaiting && approvalShown();
     const closed = isClosed();
-    // /stop und /goal pause|stop dürfen auch während einer Antwort raus (Issue #74, #76)
+    // Lesende Motorabfragen und Steuerbefehle dürfen auch während einer Antwort raus.
     const urgentTyped = state.running && isUrgentCommand(el.input.value);
     const locked = (state.running && !answerable && !urgentTyped) || state.sending || state.busy || !state.conversation || closed;
     // Anhänge allein reichen zum Senden (Issue #73)
@@ -2713,6 +3039,7 @@ function init() {
     } else {
       el.input.hidden = false;
     }
+    renderEngineMenu();
   }
 
   function setRunning(running, awaiting, approvalId) {
@@ -3098,6 +3425,7 @@ function init() {
       chatId: typeof telegram.chatId === "string" && telegram.chatId ? telegram.chatId : null,
     };
     state.engineDefault = data.engine && typeof data.engine.default === "string" ? data.engine.default : null;
+    state.engineTimeZone = data.engine && typeof data.engine.timeZone === "string" ? data.engine.timeZone : "UTC";
   }
 
   /** Eintrag mit dieser ID aus allen drei Gruppen, sonst null */
@@ -3162,23 +3490,28 @@ function init() {
   }
 
   /** Holt die Liste neu (z.B. für den Titel nach der ersten Nachricht). */
-  async function refreshConversations() {
+  async function refreshConversations(createdConversation) {
     try {
       const changes = state.entryChanges;
       const { ok, data } = await api("GET", "/api/conversations");
       if (!ok || !data || !Array.isArray(data.conversations)) return;
       // Inzwischen bestätigte Änderung: diese Liste ist älter, eine neue enthält sie
       if (changes !== state.entryChanges) {
-        void refreshConversations();
+        void refreshConversations(createdConversation);
         return;
       }
       const before = state.telegram;
       applyConversationList(data);
+      // Ein gerade angelegtes Gespräch kann in der Liste noch fehlen.
+      if (createdConversation && !findConversation(createdConversation.id)) addConversation(createdConversation);
       markNewerActivity(before);
       const current = state.conversation && findConversation(state.conversation.id);
       if (current) {
         // Agent in einem anderen Browser geändert: Sprecher älterer Antworten festhalten
         keepSpeakers(current.agent);
+        // Nur die vollständige Liste ersetzt die Vorschau, auch wenn die neue fehlt.
+        delete state.conversation.engineStage;
+        delete state.conversation.engineChoices;
         state.conversation = mergeEntry(state.conversation, current);
         if (!state.editingTitle) el.title.textContent = conversationTitle(state.conversation);
         renderAgentChip();
@@ -3200,22 +3533,181 @@ function init() {
     renderEnginePill();
   }
 
-  /**
-   * Motor-Pille: eingestellter Motor des offenen Gesprächs aus der
-   * Gesprächsliste. /motor, Standard und „Auf Standard" kommen als
-   * SSE-Ereignis engine, danach ein Abgleich der Liste; ohne Angabe keine Pille.
-   */
+  /** Vorschau nur aus dem frischen Listeneintrag; engine-Ereignisse gleichen die Liste ab. */
   function renderEnginePill() {
     if (!el.engine) return;
     const conversation = state.conversation;
     const listed = conversation ? findConversation(conversation.id) : null;
     const engine = listed && typeof listed.engine === "string" ? listed.engine : conversation && conversation.engine;
-    const text = conversation ? enginePillText(engine, state.engineDefault) : null;
-    el.engine.textContent = text || "";
-    el.engine.hidden = !text;
-    // Leeren statt entfernen: die Pille ist dann ohnehin ausgeblendet
-    el.engine.setAttribute("data-engine", text ? engine : "");
-    el.engine.setAttribute("title", text ? "Motor dieses Gesprächs: " + text + ". Wechseln mit /motor." : "");
+    const stage = listed && listed.engineStage;
+    const text = conversation ? enginePillText(engine, state.engineDefault, stage) : "";
+    const compact = conversation ? enginePillText(engine, state.engineDefault, stage, true) : "";
+    el.engine.textContent = text;
+    if (text !== compact) {
+      el.engine.textContent = "";
+      const full = document.createElement("span");
+      full.className = "engine-pill-full";
+      full.textContent = text;
+      const short = document.createElement("span");
+      short.className = "engine-pill-compact";
+      short.textContent = compact;
+      el.engine.appendChild(full);
+      el.engine.appendChild(short);
+    }
+    el.engine.hidden = !conversation;
+    // data-engine nennt wie die Pille den antwortenden Motor, bei none ist es leer.
+    el.engine.setAttribute("data-engine", conversation ? (stage ? stage.engine || "" : engine || state.engineDefault || "claude") : "");
+    const sentence = stage ? engineStageText(stage, state.engineTimeZone) : text + " antwortet.";
+    const description = conversation ? sentence : "";
+    el.engine.setAttribute("title", description);
+    if (el.engineStatus && el.engineStatus.textContent !== description) el.engineStatus.textContent = description;
+    renderEngineMenu();
+  }
+
+  /** Ein Menü teilt den Zustand und den Fokus mit den Gesprächsmenüs. */
+  function renderEngineMenu() {
+    if (!el.engineMenu) return;
+    const open = !!state.menu && state.menu.place === "engine" && !!state.conversation && state.menu.id === state.conversation.id;
+    el.engine.setAttribute("aria-expanded", String(open));
+    el.engineMenu.hidden = !open;
+    if (!open) { el.engineMenu.replaceChildren(); return; }
+    const focused = focusedKey();
+    const conversation = findConversation(state.conversation.id);
+    const data = state.engineMenuData;
+    const view = engineMenuView({ conversationId: state.conversation.id,
+      engineStage: conversation && conversation.engineStage,
+      engineChoices: data && conversation && conversation.engineChoices,
+      engines: data && data.engines, overrides: data && data.overrides, timeZone: state.engineTimeZone });
+    const lock = engineChoiceLock();
+    const sentence = document.createElement("p");
+    sentence.className = "actions-hint engine-menu-summary";
+    sentence.textContent = view.sentence || el.engine.getAttribute("title");
+    const rows = view.rows.map(row => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "button-quiet engine-menu-choice";
+      button.setAttribute("role", "menuitemradio");
+      button.setAttribute("aria-checked", String(row.checked));
+      button.setAttribute("aria-disabled", String(row.disabled || !!lock));
+      button.setAttribute("tabindex", "-1");
+      button.setAttribute("data-focus-key", "engine:" + row.engine + ":" + state.conversation.id);
+      button.setAttribute("data-engine-choice", row.engine);
+      button.addEventListener("click", () => void chooseEngine(row));
+      const name = document.createElement("span");
+      name.className = "engine-menu-name";
+      name.textContent = row.label;
+      const status = document.createElement("span");
+      status.className = "engine-menu-state";
+      status.textContent = row.status;
+      button.appendChild(name);
+      button.appendChild(status);
+      if (row.note || row.paid) {
+        const note = document.createElement("span");
+        note.className = "engine-menu-note";
+        note.textContent = [row.note, row.paid ? "zahlt je Verbrauch" : ""].filter(Boolean).join(" · ");
+        button.appendChild(note);
+      }
+      return button;
+    });
+    const link = document.createElement("a");
+    link.className = "button-quiet engine-menu-link";
+    link.href = "#/einstellungen/modelle";
+    link.setAttribute("role", "menuitem");
+    link.setAttribute("data-focus-key", "engine:settings:" + state.conversation.id);
+    link.textContent = "Reihenfolge und Limits";
+    link.addEventListener("click", () => {
+      state.engineSettingsTarget = true;
+      closeMenu(true);
+    });
+    const hint = document.createElement("p");
+    hint.className = "actions-hint engine-menu-summary";
+    hint.setAttribute("role", "status");
+    hint.textContent = lock || (state.engineMenuNotice && state.engineMenuNotice.id === state.conversation.id ? state.engineMenuNotice.text : "");
+    hint.hidden = !hint.textContent;
+    el.engineMenu.replaceChildren(sentence, ...rows, hint, link);
+    positionEngineMenu();
+    if (focused && focused.startsWith("engine:") && !state.menuFocus) focusKey(focused);
+  }
+
+  /** Unter der Pille bleiben, ohne hinter die feste Seitenleiste zu ragen. */
+  function positionEngineMenu() {
+    if (!el.engineMenu || el.engineMenu.hidden || typeof el.engineMenu.getBoundingClientRect !== "function") return;
+    el.engineMenu.style.right = "0px";
+    const box = el.engineMenu.getBoundingClientRect();
+    const area = el.main.getBoundingClientRect();
+    const left = Math.max(area.left + 12, Math.min(box.left, area.right - box.width - 12));
+    el.engineMenu.style.right = (box.left - left) + "px";
+  }
+
+  function engineChoiceLock() {
+    return engineMenuLock({ running: state.running, closed: isClosed(), sending: state.sending,
+      recording: !!state.recording, talking: talkActive(), calling: callActive(), busy: state.busy });
+  }
+
+  /** Befehlsweg ohne Composer: Entwurf, Anhänge und offene Freigaben bleiben unberührt. */
+  async function chooseEngine(row) {
+    const conversation = state.conversation;
+    if (!conversation || row.disabled || engineChoiceLock()) { renderEngineMenu(); return; }
+    closeMenu(true);
+    if (row.checked) return;
+    const generation = state.generation;
+    const seq = state.statusSeq;
+    state.engineMenuNotice = null;
+    state.sending = true;
+    updateControls();
+    try {
+      const { status, data } = await api("POST", "/api/conversations/" + conversation.id + "/messages", { text: "/motor " + row.engine });
+      if (generation !== state.generation) return;
+      if (status === 202 && data && data.message) {
+        addMessages([data.message]);
+        if (seq === state.statusSeq) setRunning(data.running !== false);
+        void refreshConversations();
+      } else if (status === 409) {
+        const closed = data && data.closed === true;
+        if (closed) applyConversation({ id: conversation.id, closed: true });
+        state.engineMenuNotice = { id: conversation.id, text: closed
+          ? "Das Topic ist geschlossen. Erst wieder öffnen."
+          : "Erst die laufende Antwort abwarten oder stoppen." };
+        if (!state.menu) toggleMenu("engine", conversation.id);
+        renderEngineMenu();
+        await syncMessages();
+        if (closed) void refreshConversations();
+      } else addLocalError((data && data.error) || "Motorwechsel fehlgeschlagen (Fehler " + status + ").");
+    } catch {
+      if (generation === state.generation && !state.leaving) addLocalError("Server nicht erreichbar, Motorwechsel nicht bestätigt.");
+    } finally {
+      state.sending = false;
+      updateControls();
+    }
+  }
+
+  /** Auswahlmarkierung nur aus frischen Ausnahmen, nie aus der antwortenden Stufe. */
+  async function loadEngineMenu() {
+    const request = ++state.engineMenuRequest;
+    let next = null;
+    try {
+      const { ok, data } = await api("GET", "/api/engines");
+      if (ok && data && Array.isArray(data.engines) && Array.isArray(data.overrides)) next = data;
+    } catch { /* Ohne Übersicht bleiben die bekannten Namen wählbar, ohne Markierung. */ }
+    if (request !== state.engineMenuRequest) return;
+    state.engineMenuData = next;
+    renderEngineMenu();
+  }
+
+  function engineMenuKeydown(event) {
+    if (!state.menu || state.menu.place !== "engine") return;
+    const items = Array.from(el.engineMenu.querySelectorAll('[role="menuitemradio"], [role="menuitem"]'));
+    if (!items.length) return;
+    const index = items.indexOf(document.activeElement);
+    let next;
+    if (event.key === "ArrowDown") next = (index + 1) % items.length;
+    else if (event.key === "ArrowUp") next = (index - 1 + items.length) % items.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = items.length - 1;
+    else if (event.key === "Tab") { closeMenu(false); return; }
+    else return;
+    event.preventDefault();
+    items[next].focus();
   }
 
   /**
@@ -3239,6 +3731,8 @@ function init() {
   function showSidebar() {
     // Anzahl der offenen Fäden frisch (Issue #293)
     void loadThreads();
+    void loadJobs();
+    void loadPipelines();
     el.sidebar.setAttribute("data-open", "true");
     el.scrim.hidden = false;
     el.menu.setAttribute("aria-expanded", "true");
@@ -3352,6 +3846,7 @@ function init() {
       root.style.removeProperty("--app-height");
       root.style.removeProperty("--app-top");
     }
+    positionEngineMenu();
     if (stick) scrollToBottom();
   }
 
@@ -3362,6 +3857,7 @@ function init() {
   }
 
   function openAttachMenu() {
+    if (state.menu) closeMenu(false);
     state.attachMenu = true;
     el.attachMenu.hidden = false;
     el.attach.setAttribute("aria-expanded", "true");
@@ -3706,6 +4202,8 @@ function init() {
     void loadAgents();
     // Offene Fäden (Issue #293): Eintrag und Anzahl in der Seitenleiste
     void loadThreads();
+    void loadJobs();
+    void loadPipelines();
     try {
       const { ok, data } = await api("GET", "/api/conversations");
       if (!ok || !data) throw new Error("Liste nicht geladen");
@@ -4386,7 +4884,7 @@ function init() {
     if (state.leaving) return;
     if (id) state.linkTarget = id;
     try {
-      if ((settingsView && settingsView.isOpen()) || threadsViewOpen()) {
+      if ((settingsView && settingsView.isOpen()) || threadsViewOpen() || (jobsView && jobsView.isOpen()) || (pipelinesView && pipelinesView.isOpen())) {
         replaceHash(null);
         routeFromHash();
       }
@@ -4877,6 +5375,7 @@ function init() {
       const data = parse(event);
       if (!data || data.conversationId !== conversation.id) return;
       applyChoice(data.choice);
+      void loadJobs();
     });
     source.addEventListener("status", event => {
       if (!current()) return;
@@ -4904,6 +5403,7 @@ function init() {
       if (unresolvedChoiceId(data) && !state.syncTimer) void syncMessages();
       // Antwort da: Fäden erkennt und schließt der Server danach (Issue #293)
       if (data.role === "assistant") scheduleThreadsRefresh();
+      if (data.source === "job") void loadJobs();
     });
     // Gespräch wurde gelöscht (auch in einem anderen Browser)
     source.addEventListener("deleted", () => {
@@ -4962,6 +5462,7 @@ function init() {
     if (!isTelegramId(id) || !Number.isFinite(parseTime(lastActivity))) return;
     // Neue Nachricht in Telegram, auch eine Antwort: Fäden nachholen (Issue #293)
     scheduleThreadsRefresh();
+    void loadJobs();
     const open = !!state.conversation && state.conversation.id === id;
     if (!open) markUnread(id);
     if (id === "dm") {
@@ -5006,6 +5507,7 @@ function init() {
       // Was während der Lücke passiert ist, kam nie als Ereignis; auch eine neue Oberfläche
       if (state.activityWasOpen) {
         void refreshConversations();
+        if (state.menu && state.menu.place === "engine") void loadEngineMenu();
         void checkUiVersion();
       }
       state.activityWasOpen = true;
@@ -5020,6 +5522,7 @@ function init() {
     source.addEventListener("choice", event => {
       if (!current()) return;
       const data = parse(event);
+      if (data) void loadJobs();
       if (!data || typeof data.id !== "string" || data.state === "open" || !state.conversation) return;
       const shown = state.messages.some(m => (m.choice && m.choice.id === data.id && m.choice.state === "open") || unresolvedChoiceId(m) === data.id);
       if (shown && !state.choicePending.has(data.id)) void syncMessages();
@@ -5037,6 +5540,8 @@ function init() {
     source.addEventListener("engine", () => {
       if (!current()) return;
       void refreshConversations();
+      if (state.menu && state.menu.place === "engine") void loadEngineMenu();
+      if (settingsView && typeof settingsView.refreshEngines === "function") void settingsView.refreshEngines();
     });
     source.addEventListener("error", () => {
       if (!current()) return;
@@ -6216,6 +6721,8 @@ function init() {
         if (!state.activityEvents && !state.activityTimer) connectActivity();
         openConversation(conversation);
         el.input.focus();
+        // Die Antwort auf das Anlegen enthält noch keine Motor-Vorschau.
+        await refreshConversations(conversation);
       }
       // Abgelehnt oder nur teilweise gespeichert: die Meldung des Servers zeigen
       if (error) reportError(error);
@@ -6727,6 +7234,8 @@ function init() {
         if (typeof data.note === "string" && data.note) showConnection(data.note);
         if (menu && menu.place === "header") el.conversationMenu.focus();
         else if (menu) focusKey("menu:" + id);
+        // Der Agent bestimmt das Modell der nächsten Stufe.
+        void refreshConversations();
         return;
       }
       if (status === 404 && (await confirmGone(id))) {
@@ -6746,6 +7255,7 @@ function init() {
   }
 
   function renderHeaderMenu() {
+    renderEngineMenu();
     const open = !!state.menu && state.menu.place === "header" && canManage() && state.menu.id === state.conversation.id;
     const focused = focusedKey();
     el.conversationMenu.setAttribute("aria-expanded", open ? "true" : "false");
@@ -6881,10 +7391,13 @@ function init() {
   function toggleMenu(place, id) {
     if (state.menu && state.menu.place === place && state.menu.id === id) return closeMenu(true);
     if (state.pickerOpen) closePicker(false);
-    state.menu = { place, id, confirm: false, agentPick: false, focus: place + ":rename:" + id, typed: "", error: null };
+    closeAttachMenu(false);
+    state.menu = { place, id, confirm: false, agentPick: false, focus: place + (place === "engine" ? ":standard:" : ":rename:") + id, typed: "", error: null };
+    if (place === "engine") state.engineMenuData = null;
     renderMenus();
+    if (place === "engine") void loadEngineMenu();
     // Topic: ob Löschen erlaubt ist, weiß nur der Server
-    if (isManagedTopicId(id)) void loadRights(false);
+    if (place !== "engine" && isManagedTopicId(id)) void loadRights(false);
   }
 
   /** Schließt das offene Menü; mit focusToggle geht der Fokus zurück an seinen Knopf. */
@@ -6892,9 +7405,11 @@ function init() {
     const menu = state.menu;
     if (!menu) return;
     state.menu = null;
+    if (menu.place === "engine") state.engineMenuNotice = null;
     renderMenus();
     if (!focusToggle) return;
-    if (menu.place === "header") el.conversationMenu.focus();
+    if (menu.place === "engine") el.engine.focus();
+    else if (menu.place === "header") el.conversationMenu.focus();
     else focusKey("menu:" + menu.id);
   }
 
@@ -7001,6 +7516,18 @@ function init() {
 
   // --- Einstellungen (Issue #38) -----------------------------------------------
 
+  const jobsView = window.TyboJobs ? window.TyboJobs.create({
+    api, choiceElement, settledChoice, choicePending: state.choicePending, choiceErrors: state.choiceErrors, choiceNotices: state.choiceNotices,
+    openConversation: openThreadConversation, requestId: () => randomTabId(window),
+  }) : null;
+  let jobsPushed = false;
+  let jobsLeaving = false;
+  const loadJobs = () => jobsView ? jobsView.load() : Promise.resolve();
+  const pipelinesView = window.TyboPipelines ? window.TyboPipelines.create({ api, openConversation: openThreadConversation }) : null;
+  const loadPipelines = () => pipelinesView ? pipelinesView.load() : Promise.resolve();
+  let pipelinesPushed = false;
+  let pipelinesLeaving = false;
+
   const settingsView = typeof createSettingsView === "function"
     ? createSettingsView({
       api,
@@ -7056,6 +7583,47 @@ function init() {
       tab = null;
     }
     state.closingSettings = false;
+    let pipelines = !tab && hash === "#/pipelines" && !!pipelinesView;
+    if (pipelines && pipelinesLeaving) { replaceHash(null); pipelines = false; }
+    pipelinesLeaving = false;
+    if (pipelines) {
+      hideThreadsView();
+      if (jobsView && jobsView.isOpen()) { jobsView.hide(); jobsPushed = false; }
+      if (settingsView && settingsView.isOpen()) { settingsView.hide(); el.openSettings.removeAttribute("aria-current"); }
+      if (state.menu) closeMenu(false);
+      if (state.pickerOpen) closePicker(false);
+      cancelRename(false); closeSidebar(); discardRecording(); hangUpTalk(); hangUpCall();
+      el.main.setAttribute("data-view", "pipelines");
+      if (!pipelinesView.isOpen()) pipelinesView.show();
+      reportPresence();
+      return;
+    }
+    if (pipelinesView && pipelinesView.isOpen()) {
+      pipelinesView.hide(); pipelinesPushed = false;
+      el.main.setAttribute("data-view", "chat");
+      if (!tab && hash !== THREADS_VIEW_HASH && hash !== "#/jobs" && !el.input.disabled) el.input.focus();
+      reportPresence();
+    }
+    let jobs = !tab && hash === "#/jobs" && !!jobsView;
+    if (jobs && jobsLeaving) { replaceHash(null); jobs = false; }
+    jobsLeaving = false;
+    if (jobs) {
+      hideThreadsView();
+      if (settingsView && settingsView.isOpen()) { settingsView.hide(); el.openSettings.removeAttribute("aria-current"); }
+      if (state.menu) closeMenu(false);
+      if (state.pickerOpen) closePicker(false);
+      cancelRename(false); closeSidebar(); discardRecording(); hangUpTalk(); hangUpCall();
+      el.main.setAttribute("data-view", "jobs");
+      if (!jobsView.isOpen()) jobsView.show();
+      reportPresence();
+      return;
+    }
+    if (jobsView && jobsView.isOpen()) {
+      jobsView.hide(); jobsPushed = false;
+      el.main.setAttribute("data-view", "chat");
+      if (!tab && hash !== THREADS_VIEW_HASH && !el.input.disabled) el.input.focus();
+      reportPresence();
+    }
     // Offene Fäden (Issue #293): #/faeden; Zurück-Knopf wie bei den Einstellungen
     let threads = !tab && hash === THREADS_VIEW_HASH && !!el.threadsView;
     if (threads && state.threads.leaving) {
@@ -7091,6 +7659,11 @@ function init() {
       el.main.setAttribute("data-view", "settings");
       el.openSettings.setAttribute("aria-current", "page");
       settingsView.show(tab);
+      if (state.engineSettingsTarget && tab === "modelle") {
+        const scroll = typeof document.querySelector === "function" && document.querySelector("#settings .settings-scroll");
+        if (scroll) scroll.scrollTop = 0;
+        state.engineSettingsTarget = false;
+      }
       if (!wasOpen) el.settingsTitle.focus();
       if (!wasOpen) reportPresence();
       return;
@@ -7112,7 +7685,7 @@ function init() {
   /** Chat zu sehen, nicht Einstellungen oder Offene Fäden */
   function chatInView() {
     const view = el.main.getAttribute("data-view");
-    return view !== "settings" && view !== "threads";
+    return view !== "settings" && view !== "threads" && view !== "jobs" && view !== "pipelines";
   }
 
   function threadsViewOpen() {
@@ -7623,6 +8196,10 @@ function init() {
   el.conversationMenu.addEventListener("click", () => {
     if (state.conversation) toggleMenu("header", state.conversation.id);
   });
+  if (el.engine) el.engine.addEventListener("click", () => {
+    if (state.conversation) toggleMenu("engine", state.conversation.id);
+  });
+  if (el.engineMenu) el.engineMenu.addEventListener("keydown", engineMenuKeydown);
   el.titleInput.addEventListener("keydown", event => {
     if (event.isComposing || event.keyCode === 229) return;
     if (event.key === "Enter") {
@@ -7653,8 +8230,8 @@ function init() {
   window.addEventListener("click", event => {
     if (!state.menu) return;
     const target = event.target;
-    if (target && typeof target.closest === "function" && target.closest(".actions-panel, .actions-list, .entry-actions, .entry-menu, #conversation-menu")) return;
-    closeMenu(false);
+    if (target && typeof target.closest === "function" && target.closest(".actions-panel, .actions-list, .entry-actions, .entry-menu, #conversation-menu, #engine-name")) return;
+    closeMenu(state.menu.place === "engine");
   });
   // Filtert nur die schon geladene Liste, ohne Anfrage an den Server
   el.filter.addEventListener("input", () => renderConversationList());
@@ -7671,6 +8248,33 @@ function init() {
   } else {
     el.openSettings.hidden = true;
   }
+  // Jobs (Issue #626)
+  if (jobsView) {
+    el.openJobs.addEventListener("click", () => {
+      if (jobsView.isOpen()) { closeSidebar(); return; }
+      jobsPushed = true;
+      window.location.hash = "#/jobs";
+      routeFromHash();
+    });
+    el.jobsBack.addEventListener("click", () => {
+      if (jobsPushed && window.history && typeof window.history.back === "function") {
+        jobsPushed = false; jobsLeaving = true; window.history.back();
+      } else { replaceHash(null); routeFromHash(); }
+    });
+    if (!settingsView && !el.threadsView) window.addEventListener("hashchange", routeFromHash);
+  }
+  if (pipelinesView) {
+    el.openPipelines.addEventListener("click", () => {
+      if (pipelinesView.isOpen()) { closeSidebar(); return; }
+      pipelinesPushed = true; window.location.hash = "#/pipelines"; routeFromHash();
+    });
+    el.pipelinesBack.addEventListener("click", () => {
+      if (pipelinesPushed && window.history && typeof window.history.back === "function") {
+        pipelinesPushed = false; pipelinesLeaving = true; window.history.back();
+      } else { replaceHash(null); routeFromHash(); }
+    });
+    if (!settingsView && !el.threadsView && !jobsView) window.addEventListener("hashchange", routeFromHash);
+  }
   // Offene Fäden (Issue #293)
   if (el.openThreads && el.threadsView) {
     el.openThreads.addEventListener("click", () => openThreadsView());
@@ -7686,6 +8290,8 @@ function init() {
     reportPresence({ gone: true });
     closeEvents();
     closeActivity();
+    if (jobsView) jobsView.hide();
+    if (pipelinesView) pipelinesView.stop();
     // Seite verlassen (Issue #109): Aufnahme verwerfen, Mikrofon und Objekt-URLs frei
     discardRecording();
     // Sprechmodus (Issue #250): auflegen, Mikrofon, Ausgabe und Wake Lock frei
@@ -7708,6 +8314,7 @@ function init() {
       void dropDraftStash();
     }
     renderAttachments();
+    if (event && event.persisted) { routeFromHash(); void loadJobs(); void loadPipelines(); }
     // Aus dem Zurück-Cache: der Server hat den Tab beim Verlassen vergessen
     if (state.presence.gone && !state.leaving) {
       state.presence.gone = false;
@@ -7733,6 +8340,8 @@ function init() {
       onVisible();
       if (document.visibilityState !== "hidden") refreshDay();
       if (document.visibilityState === "visible") void loadThreads();
+      if (jobsView) jobsView.visibility();
+      if (pipelinesView) pipelinesView.visibility();
     });
   }
 

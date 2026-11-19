@@ -23,14 +23,19 @@
  * Offline-Emulation trennt eine schon offene SSE-Verbindung nicht.
  */
 
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createConnection, createServer, type Socket } from "node:net";
 import { BRAND } from "../src/brand";
 import { createFakeChat } from "../src/web/fake-chat";
 import { DEFAULT_PUSH_SUBJECT, generateVapidKeys, toBase64Url } from "../src/web/push";
-import { createDemoKeys, createDemoReminders, createDemoRoutines, createDemoSettings, createDemoStatus, createDemoThreads, DEMO_CHOICES, DEMO_GROUP_ID, DEMO_REPLY, startDemoServer } from "../src/web/demo";
-import { decideChoice, getChoiceChecked, listChoices, onChoiceChange, onChoiceDecided, setChoicesFileForTests } from "../src/lib/choices";
+import { createDemoJobs, createDemoChoices, DEMO_JOB_IDS, DEMO_JOB_CHOICE, createDemoKeys, createDemoEngines, DEMO_DM_SESSION_KEY, DEMO_ENGINE_HINT, createDemoOpenRouterKey, createDemoReminders, createDemoRoutines, createDemoSettings, createDemoStatus, createDemoThreads, DEMO_CHOICES, DEMO_GROUP_ID, DEMO_REPLY, DEMO_SETTINGS, startDemoServer } from "../src/web/demo";
+import type { OpenRouterKeyStatus } from "../src/web/openrouter-key";
+import { createDemoPipelines } from "../src/web/demo";
+import { createChoice, decideChoice, getChoiceChecked, listChoices, onChoiceChange, onChoiceDecided, setChoicesFileForTests } from "../src/lib/choices";
+import { jobChoiceStaleText } from "../src/lib/jobs/choices";
+import { writeStatus } from "../src/lib/jobs/store";
 import { abortExecutions } from "../src/lib/execution-context";
 import { createChoiceToolApproval } from "../src/lib/tool-approval";
 import { decideReview, processTurnIntents } from "../src/lib/intent-gate";
@@ -69,10 +74,15 @@ import { ConversationStore } from "../src/web/store";
  */
 const ONLY_SECTIONS: Record<string, () => Promise<void>> = {
   einstellungen: () => settingsChecks(),
+  status: () => modelsStatusChecks(),
+  motor: () => engineChecks(),
   schluessel: () => keysChecks(),
   routinen: () => routinesChecks(),
   erinnerungen: () => remindersChecks(),
   faeden: () => threadsChecks(),
+  rueckfragen: () => choiceChecks(),
+  jobs: async () => { await jobViewChecks(); await jobResumeChoiceChecks(); await jobQuestionChecks(); await jobReturnChecks(); },
+  pipelines: () => pipelineViewChecks(),
 };
 const onlyAt = process.argv.indexOf("--nur");
 const only = onlyAt >= 0 ? (process.argv[onlyAt + 1] ?? "").split(",").filter(Boolean) : [];
@@ -113,49 +123,33 @@ const demo = await startDemoServer(
 
 // --- Trennbarer Proxy [::1]:port -> 127.0.0.1:port ----------------------------
 const port = Number(new URL(server.url).port);
-type Pair = { client: any; upstream: any | null; buffered: Uint8Array[] };
+type Pair = { client: Socket; upstream: Socket };
 const pairs = new Set<Pair>();
 let proxyBlocked = false;
-const proxy = Bun.listen<Pair>({
-  hostname: "::1",
-  port,
-  socket: {
-    open(client) {
-      if (proxyBlocked) return void client.end();
-      const pair: Pair = { client, upstream: null, buffered: [] };
-      client.data = pair;
-      pairs.add(pair);
-      void Bun.connect<Pair>({
-        hostname: "127.0.0.1",
-        port,
-        socket: {
-          open(up) {
-            up.data = pair;
-            pair.upstream = up;
-            for (const b of pair.buffered) up.write(b);
-            pair.buffered = [];
-          },
-          data(up, chunk) { up.data.client.write(chunk); },
-          close(up) { up.data.client.end(); pairs.delete(up.data); },
-          error(up) { up.data.client.end(); },
-        },
-      }).catch(() => client.end());
-    },
-    data(client, chunk) {
-      const pair = client.data;
-      if (pair.upstream) pair.upstream.write(chunk);
-      else pair.buffered.push(new Uint8Array(chunk));
-    },
-    close(client) { client.data?.upstream?.end(); if (client.data) pairs.delete(client.data); },
-    error(client) { client.data?.upstream?.end(); },
-  },
+const proxy = createServer(client => {
+  if (proxyBlocked) return void client.destroy();
+  const upstream = createConnection({ host: "127.0.0.1", port });
+  const pair = { client, upstream };
+  pairs.add(pair);
+  // pipe berücksichtigt volle Schreibpuffer. Rohe socket.write-Aufrufe können
+  // nur einen Teil übernehmen und schnitten dann große Skripte wie app.js ab.
+  client.pipe(upstream);
+  upstream.pipe(client);
+  client.on("error", () => upstream.destroy());
+  upstream.on("error", () => client.destroy());
+  client.on("close", () => { upstream.destroy(); pairs.delete(pair); });
+  upstream.on("close", () => client.end());
+});
+await new Promise<void>((resolve, reject) => {
+  proxy.once("error", reject);
+  proxy.listen({ host: "::1", port, ipv6Only: true }, resolve);
 });
 function cutConnections(block: boolean) {
   proxyBlocked = block;
   if (!block) return;
   for (const p of [...pairs]) {
-    p.client.end();
-    p.upstream?.end();
+    p.client.destroy();
+    p.upstream.destroy();
   }
   pairs.clear();
 }
@@ -637,7 +631,7 @@ async function liveChecks() {
  * Meldungen und Dateien (Issue #47), je 1280 und 390 px, hell und (mit
  * --screenshots) dunkel: Topic „Pipeline" der Demo mit Meldung, Bild und
  * HTML-Report. Absender ohne Blase, Markdown, Dateikarte, Vorschau geladen,
- * Download als Anhang, HTML nie inline; eine Meldung „aus einem anderen
+ * Download als Anhang, HTML-Vorschau mit Sandbox; eine Meldung „aus einem anderen
  * Prozess" erscheint ohne Neuladen, ein anderes Topic bekommt den Neu-Punkt.
  */
 async function noticeChecks() {
@@ -684,8 +678,12 @@ async function noticeChecks() {
           (await count("img.file-preview")) === 1);
         const headers = await js<string[]>(`Promise.all([...document.querySelectorAll("a.file-download")].map(a =>
           fetch(a.href + "?inline=1").then(r => r.headers.get("content-disposition").split(";")[0] + " " + r.headers.get("content-type"))))`);
-        check(`${label}: HTML-Report auch mit ?inline=1 nur als Anhang, Bild inline`,
-          JSON.stringify(headers) === JSON.stringify(["inline image/png", "attachment application/octet-stream"]), headers.join(" | "));
+        const htmlSandbox = await js<boolean>(`fetch([...document.querySelectorAll("a.file-download")][1].href + "?inline=1").then(r => {
+          const policy = r.headers.get("content-security-policy") || "";
+          return policy.startsWith("sandbox ") && !policy.includes("allow-same-origin");
+        })`);
+        check(`${label}: HTML-Report als isolierte Vorschau, Bild inline`,
+          JSON.stringify(headers) === JSON.stringify(["inline image/png", "inline text/html; charset=utf-8"]) && htmlSandbox, headers.join(" | "));
         const plain = await js<string[]>(`Promise.all([...document.querySelectorAll("a.file-download")].map(a =>
           fetch(a.href).then(r => r.headers.get("content-disposition").split(";")[0])))`);
         check(`${label}: Herunterladen liefert immer einen Anhang`, plain.every(v => v === "attachment"), plain.join(", "));
@@ -1789,6 +1787,39 @@ async function settingsChecks() {
           check(`${label}: kein seitliches Scrollen`, await noHorizontalScroll(size.width));
           await shoot(`einstellungen-${size.width}-agent${suffix}`);
 
+          // M14-28: Auswahl aus dem Schema, deaktivierte Felder behalten ihre Werte.
+          check(`${label}: Agentenmotoren entsprechen der Serverauswahl plus Standard`, await js<boolean>(`fetch("/api/settings").then(r => r.json()).then(data =>
+            JSON.stringify([...document.getElementById("settings-engine-research").options].map(o => o.value)) === JSON.stringify([" standard", ...data.engineOptions.engines.map(e => e.id)]))`));
+          check(`${label}: OpenCode nicht installiert und trotzdem wählbar`, await js<boolean>(`(() => { const o = [...document.getElementById("settings-engine-research").options].find(o => o.value === "opencode");
+            return o.textContent === "OpenCode (nicht installiert)" && !o.disabled; })()`));
+          await setSelect("settings-engine-research", "codex");
+          await click('[data-focus-key="save:research"]');
+          await waitFor(`document.querySelector('[data-focus-key="save:research"]').disabled && document.querySelector('[data-focus-key="agent:research"] .settings-agent-meta').textContent.startsWith("Codex")`);
+          check(`${label}: Codex gespeichert, Modell und Effort ausgegraut und Modell erhalten`, await js<boolean>(`fetch("/api/settings").then(r => r.json()).then(data =>
+            data.settings.agents.research.engine === "codex" && data.settings.agents.research.model === "claude-sonnet-5" &&
+            document.getElementById("settings-model-research").disabled && document.getElementById("settings-effort-research").disabled &&
+            document.querySelector(".settings-agent-engine-note").textContent.includes("Modell und Effort kommen aus den Einstellungen des Motors") &&
+            document.querySelector(".settings-agent-engine-note a").getAttribute("href") === "#/einstellungen/modelle")`));
+          await js(`document.getElementById("settings-engine-research").closest(".settings-field").scrollIntoView({ block: "start" })`);
+          check(`${label}: Agentenmotor ohne seitliches Scrollen`, await noHorizontalScroll(size.width));
+          await shoot(`agenten-motor-codex-${size.width}${suffix}`);
+          await click(".settings-agent-engine-note a");
+          check(`${label}: Formularlink öffnet den sichtbaren Motorabschnitt`,
+            await waitFor(`location.hash === "#/einstellungen/modelle" && !!document.getElementById("settings-g-title-engine")`) &&
+            await js<boolean>(`(() => { const r = document.getElementById("settings-g-title-engine").getBoundingClientRect(); return r.top >= 0 && r.bottom < innerHeight; })()`));
+          await click("#settings-tab-agenten");
+          await waitFor(`!!document.getElementById("settings-engine-research")`);
+          await setSelect("settings-engine-research", "opencode");
+          check(`${label}: auch OpenCode graut Modell und Effort aus`, await js<boolean>(`document.getElementById("settings-model-research").disabled && document.getElementById("settings-effort-research").disabled`));
+          await setSelect("settings-engine-research", "api");
+          check(`${label}: API macht Felder bedienbar und erklärt Modellnamen und Verbrauch`, await js<boolean>(`!document.getElementById("settings-model-research").disabled && !document.getElementById("settings-effort-research").disabled &&
+            document.querySelector(".settings-agent-engine-note").textContent === "Die Anthropic API nimmt nur volle Modellnamen (claude-…) und zahlt je Verbrauch."`));
+          await js(`document.getElementById("settings-engine-research").closest(".settings-field").scrollIntoView({ block: "start" })`);
+          await shoot(`agenten-motor-api-${size.width}${suffix}`);
+          await setSelect("settings-engine-research", " standard");
+          await click('[data-focus-key="save:research"]');
+          await waitFor(`document.querySelector('[data-focus-key="save:research"]').disabled && !document.querySelector('[data-focus-key="agent:research"] .settings-agent-meta').textContent.startsWith("Codex")`);
+
           await setSelect("settings-model-research", " standard");
           await click('[data-focus-key="save:research"]');
           await waitFor(`document.querySelector(".settings-status") && document.querySelector(".settings-status").textContent === "Gespeichert."`);
@@ -1995,7 +2026,7 @@ async function agentsManageChecks() {
  * nie ein echter Neustart-Marker.
  */
 /**
- * Motor in der WebUI (Issue #126): Abschnitt „Motor" oben im Reiter Agenten
+ * Motor in der WebUI (Issue #126): Abschnitt „Motor" oben im Reiter Modelle
  * (Verfügbarkeit, Standard, Codex, abweichende Gespräche), Motor-Pille in der
  * Kopfzeile, Motor in der Antwort-Angabe, Live-Wechsel über das SSE-Ereignis
  * engine und die Motoren im Status. Seit Issue #129 auch OpenCode: Gruppe
@@ -2014,7 +2045,7 @@ async function engineChecks() {
     await Bun.write(join(out, `${name}.png`), Buffer.from(data, "base64"));
     console.log(`Bild ${name}.png`);
   }
-  const pillText = `(() => { const p = document.getElementById("engine-name"); return p && !p.hidden && p.getClientRects().length ? p.textContent : ""; })()`;
+  const pillText = `(() => { const p = document.getElementById("engine-name"); return p && !p.hidden && p.getClientRects().length ? p.innerText : ""; })()`;
   const patchSettings = (body: unknown) =>
     js<number>(`fetch("/api/settings", { method: "PATCH", headers: { "content-type": "application/json" }, body: ${JSON.stringify(JSON.stringify(body))} }).then(r => r.status)`);
   for (const scheme of schemes) {
@@ -2023,21 +2054,28 @@ async function engineChecks() {
     for (const size of [{ width: 1280, height: 900, mobile: false }, { width: 390, height: 844, mobile: true }]) {
       const label = `Motor ${size.width} px ${scheme === "dark" ? "dunkel" : "hell"}`;
       await cdp("Emulation.setDeviceMetricsOverride", { ...size, deviceScaleFactor: 2 });
+      const keyReading = await createDemoOpenRouterKey().read();
+      let keyStatus: OpenRouterKeyStatus = keyReading;
+      let demoEngineNow = Date.now();
+      const engineSettings = createDemoSettings(structuredClone(DEMO_SETTINGS));
+      const engineExample = { delayMs: 300, stepMs: 700, notice: DEMO_ENGINE_HINT, replyInfo: { engine: "codex" as const, model: "gpt-6-astra" } };
       const d = await startDemoServer(
         { host: "127.0.0.1", port: 0, password: PASSWORD, allowedHosts: [] },
-        { chat: createFakeChat({ delayMs: 300, stepMs: 100 }), telegramChat: createFakeChat({ delayMs: 300, stepMs: 100 }), log: () => {} }
+        { chat: createFakeChat(engineExample), telegramChat: createFakeChat(engineExample),
+          settings: engineSettings, engines: createDemoEngines(engineSettings, { now: () => demoEngineNow }),
+          openrouterKey: { read: async () => structuredClone(keyStatus) }, log: () => {} }
       );
       try {
         const url = `${d.server.url}/`;
         // --- Einstellungen: Abschnitt „Motor" ---
-        await goto(`${url}#/einstellungen/agenten`);
-        await waitFor(`!!document.getElementById("settings-g-engine-default") && document.querySelectorAll(".settings-engine-overrides li").length === 2 && document.querySelectorAll("#settings-panel .settings-engines li").length === 3 && !!document.getElementById("settings-g-engine-opencodeModel")`);
-        check(`${label}: Abschnitt „Motor" ganz oben, vor der Agentenliste`,
-          await js<boolean>(`(() => { const h = document.querySelector("#settings-panel h3"); const list = document.querySelector(".settings-agents");
+        await goto(`${url}#/einstellungen/modelle`);
+        await waitFor(`!!document.getElementById("settings-g-engine-default") && document.querySelectorAll(".settings-engine-overrides li").length === 2 && document.querySelectorAll("#settings-panel .settings-engines li").length === 4 && !!document.getElementById("settings-g-engine-opencodeModel")`);
+        check(`${label}: Abschnitt „Motor" ganz oben im Reiter Modelle`,
+          await js<boolean>(`(() => { const h = document.querySelector("#settings-panel h3"); const list = document.getElementById("settings-g-title-defaults");
             return h && h.textContent === "Motor" && !!list && (h.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING) > 0; })()`));
         check(`${label}: Verfügbarkeit je Motor aus der Attrappe`,
           JSON.stringify(await js<string[]>(`[...document.querySelectorAll("#settings-panel .settings-engines .settings-key-state")].map(e => e.textContent)`)) ===
-            JSON.stringify(["angemeldet, Version 2.1.281", "angemeldet, Version 0.155.1", "angemeldet, Version 1.18.33"]));
+            JSON.stringify(["angemeldet, Version 2.1.281", "angemeldet, Version 0.155.1", "nicht installiert", "angemeldet"]));
         check(`${label}: Standard-Motor, Codex-Modell mit Platzhalter, Rechte „Voller Zugriff (Standard)"`,
           (await js<string>(`document.getElementById("settings-g-engine-default").options[0].textContent`)) === "Standard (Claude Code, Voreinstellung)" &&
             (await js<string>(`document.getElementById("settings-g-engine-codexModel").placeholder`)) === "Standard aus der Codex-Konfiguration" &&
@@ -2052,24 +2090,113 @@ async function engineChecks() {
         // --- Gruppe „OpenCode" (Issue #129) ---
         check(`${label}: OpenCode im Standard-Motor wählbar`,
           JSON.stringify(await js<string[]>(`[...document.getElementById("settings-g-engine-default").options].slice(1).map(o => o.textContent)`)) ===
-            JSON.stringify(["Claude Code", "Codex", "OpenCode"]));
+            JSON.stringify(["Claude Code", "Codex", "OpenCode", "Anthropic API"]));
         check(`${label}: OpenCode-Modell aus der Attrappe, OpenRouter zuerst, Standard bleibt gewählt`,
           JSON.stringify(await js<string[]>(`[...document.getElementById("settings-g-engine-opencodeModel").options].map(o => o.textContent)`)) ===
             JSON.stringify(["Standard aus der OpenCode-Konfiguration", "openrouter/anthropic/claude-opus-5.5", "openrouter/moonshotai/kimi-k2", "openrouter/openai/gpt-5.5", "openai/gpt-5.5", "Eigenes Modell …"]) &&
             (await js<number>(`document.getElementById("settings-g-engine-opencodeModel").selectedIndex`)) === 0);
-        check(`${label}: OpenCode-Variante frei, Rechte „Automatisch freigeben (Standard)", Verfügbarkeit angemeldet`,
+        check(`${label}: OpenCode-Variante frei, Rechte „Automatisch freigeben (Standard)", Verfügbarkeit nicht installiert`,
           (await js<string>(`document.getElementById("settings-g-engine-opencodeVariant").placeholder`)) === "Standard von OpenCode" &&
             (await js<string>(`document.getElementById("settings-g-engine-opencodePermission").selectedOptions[0].textContent`)) === "Automatisch freigeben (Standard)" &&
-            (await js<string>(`document.querySelector('.settings-engine-state[data-engine="opencode"]').textContent`)) === "OpenCode: angemeldet, Version 1.18.33" &&
+            (await js<string>(`document.querySelector('.settings-engine-state[data-engine="opencode"]').textContent`)) === "OpenCode: OpenCode ist nicht installiert" &&
             (await noHorizontalScroll(size.width)));
-        check(`${label}: Agenten-Modell „gilt für Claude Code" nach dem Aufklappen, kein seitliches Scrollen`,
-          (await js(`document.querySelector('[data-focus-key="agent:research"]').click()`), await waitFor(`!!document.querySelector(".settings-engine-scope")`)) &&
-            (await js<string>(`document.querySelector(".settings-engine-scope").textContent`)) === "gilt für Claude Code" && (await noHorizontalScroll(size.width)));
-        await js(`document.querySelector('[data-focus-key="agent:research"]').click()`);
+        // M14-23: Stufen nach Kennung, neutraler Zustand und Umbruch auf dem Handy.
+        check(`${label}: nummerierte Reihenfolge, korrektes General-Modell und feste letzte Zeile`, await js<boolean>(`(() => {
+          const list = document.querySelector(".settings-motor-order");
+          return list.tagName === "OL" && list.children.length === 6 && list.children[0].querySelector(".settings-motor-model").textContent === "claude-fable-5-2 · Modell des Agenten"
+            && list.lastElementChild.textContent === "Ersatzmodelle mit eingeschränktem Werkzeugumfang";
+        })()`));
+        check(`${label}: gesperrt bis ist normaler Zustand, kein Rot und keine Bewegung`, await js<boolean>(`(() => {
+          const entry = document.querySelector('.settings-motor-state[data-state="blocked"]');
+          const style = getComputedStyle(entry); const section = document.querySelector('.settings-motor-order');
+          return entry.textContent.startsWith("gesperrt bis ") && style.color === getComputedStyle(section).color
+            && style.animationName === "none" && style.transitionDuration === "0s";
+        })()`));
+        check(`${label}: Zeilen ohne seitliches Scrollen, auf 390 px Zustand unter Name`, (await noHorizontalScroll(size.width)) && await js<boolean>(`(() => {
+          const rows = [...document.querySelectorAll(".settings-motor-row")];
+          return rows.every(row => { const name = row.children[0].getBoundingClientRect(); const state = row.children[1].getBoundingClientRect();
+            return ${size.width} > 390 || state.top >= name.bottom; });
+        })()`));
+        check(`${label}: Knöpfe für Ersatzstufen mindestens 44 mal 44 Pixel`, await js<boolean>(`[...document.querySelectorAll(".settings-motor-actions button")].every(b => { const r = b.getBoundingClientRect(); return r.width >= 44 && r.height >= 44 && !!b.getAttribute("aria-label"); })`));
+        // Enter aktiviert den fokussierten Knopf über den Browser, auch am Listenrand bleibt er fokussierbar.
+        await js(`document.querySelector('[data-focus-key="engine-stage:codex:up"]').focus()`);
+        await pressKey("Enter", "Enter", 13, "\r");
+        check(`${label}: Verschieben mit Tastatur hält Fokus, Zustand und Ansage an Codex`, await js<boolean>(`(() => {
+          const list = document.querySelector(".settings-motor-order"); const focus = document.activeElement;
+          return list.children[1].dataset.stageId === "codex" && list.children[1].querySelector(".settings-motor-state").textContent === "antwortet"
+            && focus.dataset.focusKey === "engine-stage:codex:up" && focus.getAttribute("aria-disabled") === "true" && !focus.disabled
+            && document.querySelector(".settings-engine-live").textContent === "Codex steht jetzt an Position 2.";
+        })()`));
+        await pressKey("Tab", "Tab", 9);
+        await pressKey("Enter", "Enter", 13, "\r");
+        check(`${label}: Tab zum Runter-Knopf und Enter stellt Reihenfolge wieder her`, await js<boolean>(`document.querySelector(".settings-motor-order").children[2].dataset.stageId === "codex" && document.activeElement.dataset.focusKey === "engine-stage:codex:down"`));
+        // Modellvorschau reagiert vor dem Speichern auf Motor und freie Eingabe.
+        await js(`(() => { const field = document.getElementById("settings-g-engine-default"); field.value = "codex"; field.dispatchEvent(new Event("change")); })()`);
+        check(`${label}: anderer Standard zeigt vor Speichern die Codex-Konfiguration`, await js<boolean>(`document.querySelector('[data-focus-key="engine-model:0"]').textContent === "Standard aus der Codex-Konfiguration"`));
+        await js(`(() => { const field = document.getElementById("settings-g-engine-codexModel"); field.value = "vorschau-modell"; field.dispatchEvent(new Event("input")); })()`);
+        check(`${label}: Modellvorschau folgt dem freien Feld sofort`, await js<boolean>(`document.querySelector('[data-focus-key="engine-model:0"]').textContent === "vorschau-modell"`));
+        await js(`(() => { const field = document.getElementById("settings-g-engine-codexModel"); field.value = ""; field.dispatchEvent(new Event("input")); const motor = document.getElementById("settings-g-engine-default"); motor.value = " standard"; motor.dispatchEvent(new Event("change")); })()`);
+        await js(`(() => { const original = window.fetch.bind(window); window.__engineChecks = 0; window.__openrouterChecks = 0;
+          window.fetch = async (...args) => {
+            if (args[0] === "/api/engines/check" && args[1]?.method === "POST") { window.__engineChecks++; await new Promise(r => setTimeout(r, 150)); }
+            if (args[0] === "/api/engines/openrouter") window.__openrouterChecks++;
+            return original(...args);
+          };
+          const button = document.querySelector('[data-focus-key="engine-check"]'); button.click(); button.click();
+        })()`);
+        check(`${label}: Jetzt messen während Anfrage deaktiviert`, await js<boolean>(`document.querySelector('[data-focus-key="engine-check"]').disabled`));
+        await waitFor(`!document.querySelector('[data-focus-key="engine-check"]').disabled`);
+        check(`${label}: Jetzt messen genau ein POST, Ergebnis sichtbar`, await js<boolean>(`window.__engineChecks === 1 && document.querySelectorAll(".settings-motor-measure-result").length > 0`));
+        await js(`document.getElementById("settings-engine-usage-title").scrollIntoView({ block: "start" })`);
+        await shoot(`einstellungen-motor-stand-${size.width}${suffix}`);
+        // M14-24: reine Anzeige des Ersatzmodell-Schlüssels, alle Werte aus der Demo.
+        await waitFor(`!!document.querySelector(".settings-openrouter-key") && window.__openrouterChecks === 1`);
+        check(`${label}: OpenRouter mit Rest, Limit, Erneuerung, Alter und Hinweis auf eigene OpenCode-Anmeldung`, await js<boolean>(`(() => {
+          const row = document.querySelector(".settings-openrouter-key");
+          return row.querySelector("h4").textContent === "OpenRouter (Schlüssel der Ersatzmodelle)"
+            && row.querySelector(".settings-motor-reading").textContent === "12,40 $ von 50,00 $ übrig · Limit erneuert sich monatlich · vor 3 Minuten"
+            && row.lastElementChild.textContent === "OpenCode nutzt seine eigene Anmeldung. Das kann ein anderer Schlüssel sein als dieser."
+            && (document.querySelector(".settings-motor-usage").compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING) > 0;
+        })()`));
+        await js(`document.querySelector(".settings-openrouter-key").scrollIntoView({ block: "center" })`);
+        check(`${label}: OpenRouter ohne seitliches Scrollen und mit tabellarischen Ziffern`, (await noHorizontalScroll(size.width)) &&
+          await js<boolean>(`getComputedStyle(document.querySelector(".settings-openrouter-key .settings-motor-reading")).fontVariantNumeric === "tabular-nums"`));
+        await shoot(`einstellungen-openrouter-${size.width}${suffix}`);
+        keyStatus = { configured: true, error: "OpenRouter ist gerade nicht erreichbar" };
+        await js(`document.querySelector('[data-focus-key="engine-check"]').click()`);
+        await waitFor(`document.querySelector(".settings-openrouter-key .settings-motor-reading").textContent === "OpenRouter ist gerade nicht erreichbar"`);
+        check(`${label}: OpenRouter-Fehler gedämpft, ohne Rot, Motorabschnitt weiter benutzbar`, await js<boolean>(`(() => {
+          const row = document.querySelector(".settings-openrouter-key");
+          return getComputedStyle(row.querySelector(".settings-motor-reading")).color === getComputedStyle(row.lastElementChild).color
+            && !row.querySelector(".actions-error") && !document.querySelector('[data-focus-key="engine-check"]').disabled
+            && !document.getElementById("settings-g-engine-default").disabled;
+        })()`));
+        keyStatus = { configured: true, limit: null, remaining: null, limitReset: null, usage: 37.6, usageMonthly: 3.2, fetchedAt: new Date().toISOString() };
+        await js(`document.querySelector('[data-focus-key="engine-check"]').click()`);
+        check(`${label}: ohne Limit nur Monatsverbrauch`, await waitFor(`document.querySelector(".settings-openrouter-key .settings-motor-reading").textContent.startsWith("kein Limit am Schlüssel, in diesem Monat 3,20 $ verbraucht")`));
+        keyStatus = { configured: false };
+        await js(`document.querySelector('[data-focus-key="engine-check"]').click()`);
+        check(`${label}: ohne konfigurierten Schlüssel keine Zeile`, await waitFor(`!document.querySelector(".settings-openrouter-key")`));
+        keyStatus = keyReading;
+        await js(`document.querySelector('[data-focus-key="engine-check"]').click()`);
+        await waitFor(`!!document.querySelector(".settings-openrouter-key")`);
+        await js(`document.getElementById("settings-engine-auto-title").scrollIntoView({ block: "start" })`);
+        await shoot(`einstellungen-motor-automatik-${size.width}${suffix}`);
+        await js(`document.querySelector('[data-focus-key="engine-fallback"]').click()`);
+        check(`${label}: Fallback-Knopf fokussiert den Abschnitt ohne Routerwechsel`, await js<boolean>(`location.hash === "#/einstellungen/modelle" && document.activeElement.id === "settings-g-title-fallback"`));
+
         await js(`window.scrollTo(0, 0); document.getElementById("settings-panel").scrollIntoView()`);
         await shoot(`einstellungen-motor-${size.width}${suffix}`);
         await js(`document.querySelector('[aria-labelledby="settings-g-engine-opencode"]').scrollIntoView({ block: "start" })`);
         await shoot(`einstellungen-opencode-${size.width}${suffix}`);
+
+        await goto(`${url}#/einstellungen/agenten`);
+        await waitFor(`!!document.querySelector('.settings-engine-link a') && !!document.querySelector('[data-focus-key="agent:research"]')`);
+        check(`${label}: Agenten verweisen auf Modelle, ohne Motorabschnitt`, await js<boolean>(`document.querySelector(".settings-engine-link").textContent === "Standard-Motor und Ersatzstufen stehen unter Modelle." && document.querySelector(".settings-engine-link a").getAttribute("href") === "#/einstellungen/modelle" && !document.getElementById("settings-g-title-engine")`));
+        check(`${label}: Agenten-Modell „gilt für Claude Code und Anthropic API" nach dem Aufklappen, kein seitliches Scrollen`,
+          (await js(`document.querySelector('[data-focus-key="agent:research"]').click()`), await waitFor(`!!document.querySelector(".settings-engine-scope")`)) &&
+            (await js<string>(`document.querySelector(".settings-engine-scope").textContent`)) === "gilt für Claude Code und Anthropic API" && (await noHorizontalScroll(size.width)));
+        await js(`document.querySelector('[data-focus-key="agent:research"]').click()`);
 
         // --- Gespräch mit Codex-Pille und Antwort-Angabe ---
         await goto(url);
@@ -2090,17 +2217,153 @@ async function engineChecks() {
         // --- Gespräch mit OpenCode-Pille und Antwort-Angabe (Issue #129) ---
         await clickEntry("topic-12");
         await waitFor(`document.getElementById("agent-name").textContent === "Finance" && document.querySelectorAll(".msg-assistant .msg-meta").length === 1`);
-        check(`${label}: Kopfzeile mit Pille „OpenCode" im Topic Finanzen`, await waitFor(`${pillText} === "OpenCode"`) &&
-          (await js<string>(`document.getElementById("engine-name").dataset.engine`)) === "opencode");
+        check(`${label}: Kopfzeile in Finanzen zeigt die bereite Ersatzstufe statt des fehlenden OpenCode`, await waitFor(`${pillText} === "Codex · springt ein"`) &&
+          (await js<string>(`document.getElementById("engine-name").dataset.engine`)) === "codex");
         check(`${label}: Antwort-Angabe nennt OpenCode und das OpenRouter-Modell`,
           (await js<string>(`document.querySelector(".msg-assistant .msg-meta").textContent`)) === "Finance · OpenCode · openrouter/anthropic/claude-opus-5.5 · 8 s" &&
             (await noHorizontalScroll(size.width)));
         await shoot(`gespraech-opencode-${size.width}${suffix}`);
+        await js(`document.getElementById("engine-name").click()`);
+        await waitFor(`document.querySelector('[data-engine-choice="opencode"]')?.getAttribute("aria-checked") === "true"`);
+        check(`${label}: gewählter, nicht bereiter Motor markiert und deaktiviert, Standard wählbar`, await js<boolean>(`document.querySelector('[data-engine-choice="opencode"]').getAttribute("aria-disabled") === "true" && document.querySelector('[data-engine-choice="standard"]').getAttribute("aria-disabled") === "false"`));
+        await shoot(`motor-menue-nicht-bereit-${size.width}${suffix}`);
+        await pressKey("Escape", "Escape", 27);
 
-        // Direktchat: Standard Claude Code, keine Pille
+        // Direktchat: Fable gesperrt, Opus pausiert, Codex antwortet als Ersatz.
         await clickEntry("dm");
         await waitFor(`document.getElementById("agent-name").textContent === "General"`);
-        check(`${label}: Direktchat mit Standard Claude Code ohne Pille`, (await js<string>(pillText)) === "");
+        check(`${label}: Direktchat mit „Codex · springt ein“`, await waitFor(`${pillText} === "Codex · springt ein"`));
+        const headerFits = `(() => {
+          const p = document.getElementById("engine-name"), r = p.getBoundingClientRect();
+          const h = document.querySelector(".topbar").getBoundingClientRect();
+          const t = document.querySelector(".chat-title").getBoundingClientRect();
+          return r.left >= h.left && r.right <= h.right && r.top >= h.top && r.bottom <= h.bottom
+            && p.scrollWidth <= p.clientWidth + 1 && t.width >= 64;
+        })()`;
+        check(`${label}: Pille passt vollständig, Titel hat mindestens 64 px`, await js<boolean>(headerFits));
+        check(`${label}: title und Live-Zeile nennen Sperrgrund und Bot-Zeit`, await js<boolean>(`(() => {
+          const p = document.getElementById("engine-name"); return p.title.includes("Woche, Fable: 96 %")
+            && p.title.includes("Codex springt ein.") && !p.title.includes("/motor") && !p.hasAttribute("aria-label") && document.getElementById("engine-status").textContent === p.title;
+        })()`));
+        await waitFor(`[...document.querySelectorAll(".msg-notice")].some(n => n.textContent.includes("Motorwechsel:"))`);
+        check(`${label}: Wechselmeldung als Dienst mit Uhrzeit und Haarlinie`, await js<boolean>(`(() => {
+          const n = [...document.querySelectorAll(".msg-notice")].find(n => n.textContent.includes("Motorwechsel:"));
+          return !!n && n.querySelector(".notice-source").textContent === "System" && !!n.querySelector(".notice-time")
+            && getComputedStyle(n.querySelector(".notice-body")).borderLeftWidth === "1px" && !n.querySelector(".msg-head");
+        })()`));
+        await shoot(`motor-chat-ersatz-${size.width}${suffix}`);
+        // Menü: echte Tastatur, gemeinsame Menüverwaltung und Gesprächsdaten.
+        const menuOpen = `document.getElementById("engine-name").getAttribute("aria-expanded") === "true"`;
+        await js(`document.getElementById("engine-name").focus()`);
+        await pressKey("Enter", "Enter", 13, "\r");
+        await waitFor(`document.querySelector('[data-engine-choice="standard"]')?.getAttribute("aria-checked") === "true"`);
+        check(`${label}: Enter öffnet das Menü, aria-expanded und Anfangsfokus stimmen`, await js<boolean>(`${menuOpen} && document.activeElement.dataset.engineChoice === "standard" && document.getElementById("engine-name").getAttribute("aria-haspopup") === "menu"`));
+        await pressKey("ArrowDown", "ArrowDown", 40);
+        check(`${label}: Pfeil ab fokussiert Claude Code`, await js<boolean>(`document.activeElement.dataset.engineChoice === "claude"`));
+        await pressKey("End", "End", 35);
+        check(`${label}: Ende erreicht den Einstellungslink`, await js<boolean>(`document.activeElement.textContent === "Reihenfolge und Limits"`));
+        await pressKey("Home", "Home", 36);
+        await pressKey("ArrowUp", "ArrowUp", 38);
+        check(`${label}: Pos1 und Pfeil auf gehen vom Anfang zum Ende`, await js<boolean>(`document.activeElement.textContent === "Reihenfolge und Limits"`));
+        await pressKey("Escape", "Escape", 27);
+        check(`${label}: Escape schließt, aria-expanded false und Fokus zurück auf Pille`, await js<boolean>(`!(${menuOpen}) && document.getElementById("engine-menu").hidden && document.activeElement.id === "engine-name"`));
+        await pressKey("Enter", "Enter", 13, "\r");
+        await js(`document.getElementById("input").click()`);
+        check(`${label}: Klick daneben schließt mit Fokus auf Pille`, await js<boolean>(`!(${menuOpen}) && document.activeElement.id === "engine-name"`));
+        await pressKey("Enter", "Enter", 13, "\r");
+        await waitFor(`document.querySelector('[data-engine-choice="claude"] .engine-menu-state')?.textContent.startsWith("gesperrt bis ")`);
+        check(`${label}: gesperrt wählbar, nicht bereit deaktiviert, API und Verbrauchshinweis vorhanden`, await js<boolean>(`(() => {
+          const row = e => document.querySelector('[data-engine-choice="' + e + '"]');
+          return row("claude").getAttribute("aria-disabled") === "false" && row("claude").textContent.includes("bis dahin springt die nächste Stufe ein")
+            && row("opencode").getAttribute("aria-disabled") === "true" && row("api").textContent.includes("zahlt je Verbrauch");
+        })()`));
+        check(`${label}: Menü bleibt im Gesprächsbereich, Zeilen und Trefferfläche mindestens 44 px, ohne Bewegung`, await js<boolean>(`(() => {
+          const menu = document.getElementById("engine-menu"), r = menu.getBoundingClientRect(), style = getComputedStyle(menu);
+          const area = document.getElementById("main").getBoundingClientRect();
+          const pill = document.getElementById("engine-name");
+          return r.left >= 0 && r.right <= innerWidth && r.top >= 0 && r.bottom <= innerHeight
+            && r.left >= area.left && r.right <= area.right
+            && [...menu.querySelectorAll('[role="menuitemradio"], [role="menuitem"]')].every(e => e.getBoundingClientRect().height >= 44)
+            && parseFloat(getComputedStyle(pill, "::after").height) >= 44 && style.boxShadow === "none" && style.animationName === "none" && style.transitionDuration === "0s";
+        })()`));
+        await shoot(`motor-menue-${size.width}${suffix}`);
+        // Eine Änderung von einem anderen Kanal lädt Liste UND Ausnahmen, ohne Fokusverlust.
+        await js(`document.querySelector('[data-engine-choice="claude"]').focus(); window.__engineMenuMarker = 1`);
+        const manual = await engineSettings.readForWrite();
+        manual.engine!.topics = { ...manual.engine!.topics, [DEMO_DM_SESSION_KEY]: "codex" };
+        await engineSettings.write(manual);
+        check(`${label}: engine aktualisiert Markierung und behält offenes Menü und Fokus`, await waitFor(`document.querySelector('[data-engine-choice="codex"]')?.getAttribute("aria-checked") === "true"`, 6000)
+          && await js<boolean>(`${menuOpen} && document.activeElement.dataset.engineChoice === "claude" && window.__engineMenuMarker === 1`));
+        delete manual.engine!.topics![DEMO_DM_SESSION_KEY];
+        await engineSettings.write(manual);
+        await waitFor(`document.querySelector('[data-engine-choice="standard"]')?.getAttribute("aria-checked") === "true"`, 6000);
+        // Mitschnitt: exakt eine Textnachricht, kein Upload, kein eigener Session-Reset.
+        await js(`(() => { const original = window.fetch.bind(window); window.__engineMenuRequests = []; window.__engineMenuBusyOnce = false;
+          window.fetch = async (...args) => {
+            const path = String(args[0]), init = args[1] || {};
+            if (init.method === "POST") window.__engineMenuRequests.push({ path, body: typeof init.body === "string" ? JSON.parse(init.body) : null });
+            if (path.endsWith("/messages") && init.method === "POST") {
+              if (window.__engineMenuBusyOnce) { window.__engineMenuBusyOnce = false; return Response.json({ error: "Antwort läuft" }, { status: 409 }); }
+              await new Promise(r => setTimeout(r, 250));
+            }
+            return original(...args);
+          };
+          const input = document.getElementById("input"); input.value = "Mein ungesendeter Entwurf"; input.dispatchEvent(new Event("input"));
+          const transfer = new DataTransfer(); transfer.items.add(new File(["%PDF-1.4"], "notiz.pdf", { type: "application/pdf" }));
+          const file = document.getElementById("file-input"); file.files = transfer.files; file.dispatchEvent(new Event("change"));
+        })()`);
+        await js(`document.querySelector('[data-engine-choice="standard"]').click()`);
+        check(`${label}: bereits gewählte Zeile schließt ohne Nachricht`, await js<boolean>(`!(${menuOpen}) && window.__engineMenuRequests.length === 0`));
+        await js(`document.getElementById("engine-name").click()`);
+        await waitFor(`document.querySelector('[data-engine-choice="standard"]')?.getAttribute("aria-checked") === "true"`);
+        await js(`document.querySelector('[data-engine-choice="codex"]').click(); document.getElementById("engine-name").click()`);
+        check(`${label}: laufendes Senden sperrt erneut geöffnetes Menü`, await js<boolean>(`[...document.querySelectorAll('#engine-menu [role="menuitemradio"]')].every(e => e.getAttribute("aria-disabled") === "true")`));
+        await pressKey("Escape", "Escape", 27);
+        await waitFor(`document.querySelectorAll(".msg-user").length > 0 && [...document.querySelectorAll(".msg-user")].some(e => e.textContent.includes("/motor codex"))`, 10000);
+        await turnDone();
+        check(`${label}: /motor codex nur als text, keine Reset-Route oder Anhänge, Entwurf und Datei erhalten`, await js<boolean>(`JSON.stringify(window.__engineMenuRequests) === JSON.stringify([{ path: "/api/conversations/dm/messages", body: { text: "/motor codex" } }])
+          && document.getElementById("input").value === "Mein ungesendeter Entwurf" && document.querySelectorAll("#attachments li").length === 1`));
+        await js(`window.__engineMenuBusyOnce = true; document.getElementById("engine-name").click()`);
+        await waitFor(`document.querySelector('[data-engine-choice="standard"]')?.getAttribute("aria-checked") === "true"`);
+        await js(`document.querySelector('[data-engine-choice="codex"]').click()`);
+        check(`${label}: Wettlauf 409 zeigt Hinweis im wieder geöffneten Menü`, await waitFor(`${menuOpen} && document.getElementById("engine-menu").textContent.includes("Erst die laufende Antwort abwarten oder stoppen.")`));
+        await pressKey("Escape", "Escape", 27);
+        await js(`document.querySelector("#attachments .attachment-remove").click(); const input = document.getElementById("input"); input.value = ""; input.dispatchEvent(new Event("input"))`);
+        // Der Link führt an den Anfang des Reiters Modelle, zum Abschnitt Motor.
+        await js(`document.getElementById("engine-name").click(); document.querySelector("#engine-menu a").click()`);
+        check(`${label}: Link öffnet Modelle beim Motorabschnitt`, await waitFor(`location.hash === "#/einstellungen/modelle" && document.querySelector("#settings-panel h3")?.textContent === "Motor"`));
+        check(`${label}: Motorabschnitt nach Link tatsächlich sichtbar`, await js<boolean>(`(() => { const title = document.getElementById("settings-g-title-engine").getBoundingClientRect(); const area = document.querySelector("#settings .settings-scroll").getBoundingClientRect(); return title.top >= area.top && title.bottom <= area.bottom; })()`));
+        await js(`document.getElementById("settings-back").click()`);
+        await waitFor(`document.getElementById("main").dataset.view === "chat"`);
+
+        // Jede Gruppe der Liste, einschließlich geschlossener Topics und älterer Web-Gespräche.
+        const ids = await js<string[]>(`fetch("/api/conversations").then(r => r.json()).then(b => [...b.telegram.topics, ...b.conversations].map(c => c.id))`);
+        for (const id of ids) {
+          await clickEntry(id);
+          check(`${label}: Pille sichtbar in ${id}`, !!(await js<string>(pillText)));
+        }
+        await clickEntry("dm");
+        await js(`window.__engineMarker = 1`);
+        await patchSettings({ engine: { auto: { enabled: false } } });
+        check(`${label}: Ende der Schwellensperre erscheint ohne Neuladen oder Nachricht`,
+          await waitFor(`${pillText} === "Claude Code"`, 6000) && await js<boolean>(`window.__engineMarker === 1`));
+        await shoot(`motor-chat-standard-${size.width}${suffix}`);
+        await patchSettings({ engine: { auto: { enabled: true } } });
+        await waitFor(`${pillText} === "Codex · springt ein"`, 6000);
+        await js(`(() => { const i = document.getElementById("input"); i.value = "Eine Probe mit Ersatzmotor"; i.dispatchEvent(new Event("input")); document.getElementById("send").click(); })()`);
+        await waitFor(`document.querySelector("#progress .step-notice")?.textContent === ${JSON.stringify(DEMO_ENGINE_HINT)}`, 10000);
+        await js(`document.getElementById("activity-toggle").click()`);
+        check(`${label}: Wechselhinweis in der vorhandenen Fortschrittsliste`, await js<boolean>(`(() => {
+          const n = document.querySelector("#progress .step-notice"); return !!n && n.getClientRects().length > 0
+            && getComputedStyle(n).color === getComputedStyle(document.body).color;
+        })()`));
+        await shoot(`motor-chat-hinweis-${size.width}${suffix}`);
+        await js(`document.getElementById("engine-name").click()`);
+        check(`${label}: während einer Antwort Wahl gesperrt, Hinweis und Link erreichbar`, await js<boolean>(`[...document.querySelectorAll('#engine-menu [role="menuitemradio"]')].every(e => e.getAttribute("aria-disabled") === "true") && document.getElementById("engine-menu").textContent.includes("Erst die laufende Antwort abwarten oder stoppen.") && !!document.querySelector('#engine-menu a[role="menuitem"]')`));
+        await pressKey("Escape", "Escape", 27);
+        await turnDone();
+        check(`${label}: Ersatzantwort nennt Motor und Modell`, await js<boolean>(`[...document.querySelectorAll(".msg-assistant .msg-meta")].at(-1).textContent.includes("General · Codex · gpt-6-astra")`));
+
 
         if (size.width === 1280 && scheme === "light") {
           // Live: Standard auf Codex (Einstellungsseite), SSE engine, Pille ohne Neuladen
@@ -2108,20 +2371,65 @@ async function engineChecks() {
           check(`${label}: PATCH Standard Codex`, (await patchSettings({ engine: { default: "codex" } })) === 200);
           check(`${label}: Standard Codex erscheint im offenen Direktchat ohne Neuladen`,
             (await waitFor(`${pillText} === "Codex"`, 6000)) && (await js<number>(`window.__engineMarker`)) === 1);
-          // „Auf Standard" für „Recherche" und Standard zurück: Pille verschwindet
+          // „Auf Standard" für „Recherche" und Standard zurück: Ersatzstufe bleibt sichtbar.
           const key = await js<string>(`fetch("/api/engines").then(r => r.json()).then(b => b.overrides[0].key)`);
           const reset = await js<number>(`fetch("/api/engines/reset", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: ${JSON.stringify(key)} }) }).then(r => r.status)`);
           check(`${label}: „Auf Standard" über die API`, reset === 200);
           await patchSettings({ engine: { default: null } });
-          check(`${label}: Standard zurück auf Claude Code: Pille weg, ohne Neuladen`,
-            (await waitFor(`${pillText} === ""`, 6000)) && (await js<number>(`window.__engineMarker`)) === 1);
+          check(`${label}: Standard zurück auf Claude Code: Ersatzstufe ohne Neuladen`,
+            (await waitFor(`${pillText} === "Codex · springt ein"`, 6000)) && (await js<number>(`window.__engineMarker`)) === 1);
           // Status: Motoren
           await goto(`${url}#/einstellungen/status`);
           await waitFor(`!!document.querySelector('#settings-panel [aria-labelledby="settings-g-title-engines"] li')`);
-          check(`${label}: Status zeigt die Motoren mit Version`,
+          check(`${label}: Status zeigt Versionen und OpenCode als nicht installiert`,
             JSON.stringify(await js<string[]>(`[...document.querySelectorAll('[aria-labelledby="settings-g-title-engines"] .settings-key-state')].map(e => e.textContent)`)) ===
-              JSON.stringify(["angemeldet, Version 2.1.281", "angemeldet, Version 0.155.1", "angemeldet, Version 1.18.33"]));
+              JSON.stringify(["angemeldet, Version 2.1.281", "angemeldet, Version 0.155.1", "nicht installiert", "angemeldet"]));
         }
+        // Dieselben Demo-Sperren: nach 61 Minuten endet die Opus-Pause, Fable bleibt gesperrt.
+        demoEngineNow += 61 * 60_000;
+        await patchSettings({ engine: { auto: { threshold: 94 } } });
+        await goto(url);
+        await clickEntry("dm");
+        const longText = size.width === 390 ? "Claude Code · springt ein" : "Claude Code (claude-opus-5-5) · springt ein";
+        check(`${label}: lange Claude-Ersatzstufe passt, Modell im vollständigen Zustand`,
+          await waitFor(`${pillText} === ${JSON.stringify(longText)}`, 6000) && await js<boolean>(headerFits)
+          && await js<boolean>(`document.getElementById("engine-name").title.includes("Claude Code (claude-opus-5-5) springt ein.")`));
+        await shoot(`motor-chat-langes-modell-${size.width}${suffix}`);
+        await js(`document.getElementById("engine-name").click()`);
+        await waitFor(`document.querySelector('[data-engine-choice="claude"] .engine-menu-state')?.textContent.startsWith("gesperrt bis ")`);
+        check(`${label}: Opus-Ersatz in der Pille, Fable-Wahl im Menü weiterhin gesperrt`, await js<boolean>(`document.querySelector('[data-engine-choice="claude"]').getAttribute("aria-disabled") === "false" && document.getElementById("engine-name").title.includes("claude-opus-5-5")`));
+        await shoot(`motor-menue-opus-ersatz-${size.width}${suffix}`);
+        await pressKey("Escape", "Escape", 27);
+        // Ohne Codex und Opus in der Reihenfolge sind beide verbleibenden Stufen nicht frei.
+        await patchSettings({ engine: { backups: [{ engine: "opencode" }] } });
+        check(`${label}: Kein Motor frei passt und trägt keine Motor-Kennung`,
+          await waitFor(`${pillText} === "Kein Motor frei"`, 6000) && await js<boolean>(headerFits)
+          && await js<boolean>(`document.getElementById("engine-name").dataset.engine === "" && document.getElementById("engine-name").title.includes("Ersatzmodelle mit eingeschränktem Werkzeugumfang")`));
+        await shoot(`motor-chat-keiner-${size.width}${suffix}`);
+        // M14-28: offenes Agentengespräch empfängt engine ohne Nachricht oder Neuladen.
+        const live = await engineSettings.readForWrite();
+        live.engine = { ...live.engine, default: "claude", topics: {}, backups: [] };
+        live.agents = { ...live.agents, research: { model: "claude-sonnet-5" } };
+        await engineSettings.write(live);
+        await goto(url);
+        if (size.mobile) await openDrawer();
+        await clickEntry("topic-443");
+        check(`${label}: Agentengespräch vollständig geladen vor der Live-Prüfung`,
+          await waitFor(`document.getElementById("chat-title").textContent === "Recherche" && ${pillText} === "Claude Code" && document.querySelectorAll(".msg").length === 4`));
+        await js(`window.__agentLive = { events: 0, messages: document.querySelectorAll(".msg").length };
+          window.__agentSource = new EventSource("/api/telegram/events");
+          window.__agentSource.addEventListener("engine", () => window.__agentLive.events++);`);
+        await waitFor(`window.__agentSource.readyState === 1`);
+        for (const [engine, expected] of [["codex", "Codex"], ["api", "Anthropic API"], [null, "Claude Code"]] as const) {
+          const eventsBefore = await js<number>(`window.__agentLive.events`);
+          check(`${label}: Agentenmotor ${engine ?? "Standard"} gespeichert`, (await patchSettings({ agents: { research: { engine } } })) === 200);
+          check(`${label}: engine aktualisiert Agentenpille auf ${expected} ohne Nachricht oder Neuladen`,
+            await waitFor(`${pillText} === ${JSON.stringify(expected)} && window.__agentLive.events > ${eventsBefore}`, 6000)
+            && await js<boolean>(`document.querySelectorAll(".msg").length === window.__agentLive.messages && document.getElementById("engine-name").title === ${JSON.stringify(expected + " antwortet.")}`));
+          if (engine === "codex") await shoot(`agenten-motor-live-${size.width}${suffix}`);
+        }
+        await js(`window.__agentSource.close()`);
+
       } finally {
         await d.stop();
       }
@@ -2132,7 +2440,7 @@ async function engineChecks() {
   await cdp("Emulation.setDeviceMetricsOverride", { width: 1280, height: 900, deviceScaleFactor: 2, mobile: false });
   const d = await startDemoServer({ host: "127.0.0.1", port: 0, password: PASSWORD, allowedHosts: [] }, { chat: createFakeChat(), telegramChat: createFakeChat(), log: () => {} });
   try {
-    await goto(`${d.server.url}/#/einstellungen/agenten`);
+    await goto(`${d.server.url}/#/einstellungen/modelle`);
     await waitFor(`document.querySelectorAll(".settings-engine-overrides li").length === 2`);
     await js(`document.querySelector(".settings-engine-overrides li button").click()`);
     check("Motor: Klick auf „Auf Standard\" entfernt genau eine Zeile und meldet es",
@@ -2140,8 +2448,8 @@ async function engineChecks() {
     await js(`document.querySelector(".settings-engine-overrides li button").click()`);
     check("Motor: zweiter Klick leert die Liste",
       await waitFor(`document.querySelectorAll(".settings-engine-overrides li").length === 0`));
-    check("Motor: danach „Keine. Alle Gespräche nehmen den Standard.\"",
-      await js<boolean>(`[...document.querySelectorAll("#settings-panel .settings-empty")].some(e => e.textContent === "Keine. Alle Gespräche nehmen den Standard.")`));
+    check("Motor: danach „Keine. Es gilt der Motor des Agenten, sonst der Standard.\"",
+      await js<boolean>(`[...document.querySelectorAll("#settings-panel .settings-empty")].some(e => e.textContent === "Keine. Es gilt der Motor des Agenten, sonst der Standard.")`));
     // Standard Codex über das Formular speichern
     await js(`(() => { const s = document.getElementById("settings-g-engine-default"); s.value = "codex"; s.dispatchEvent(new Event("change")); })()`);
     await js(`document.querySelector('[data-focus-key="save:section-engine"]').click()`);
@@ -2159,7 +2467,10 @@ async function engineChecks() {
       document.querySelector('[data-focus-key="save:section-engine"]').click();
     })()`);
     const savedEngine = () => js<string>(`fetch("/api/settings").then(r => r.json()).then(b => JSON.stringify(b.settings.engine))`);
-    const wantEngine = JSON.stringify({ default: "opencode", opencode: { model: "openrouter/anthropic/claude-opus-5.5", variant: "high", permission: "ask-deny" } });
+    // „Auf Standard" entfernt nur Topic-Ausnahmen; die Standard-Wechsel entfernen jeweils die doppelte Ersatzstufe.
+    const wantEngine = JSON.stringify({ ...DEMO_SETTINGS.engine, topics: undefined, default: "opencode",
+      backups: DEMO_SETTINGS.engine!.backups!.filter(stage => stage.engine !== "codex" && stage.engine !== "opencode"),
+      opencode: { model: "openrouter/anthropic/claude-opus-5.5", variant: "high", permission: "ask-deny" } });
     let engineSaved = false;
     for (let i = 0; i < 60 && !engineSaved; i++) {
       engineSaved = (await savedEngine()) === wantEngine;
@@ -2204,10 +2515,25 @@ async function modelsStatusChecks() {
         await cdp("Emulation.setDeviceMetricsOverride", { ...size, deviceScaleFactor: 2 });
         const settings = createDemoSettings();
         const base = createDemoStatus();
+        let longToolNames = false;
         // Nach der Anforderung meldet der Status nach kurzer Zeit einen neuen Prozessstart, nur im Speicher
         let restartedAt: number | null = null;
         const status = {
           ...base,
+          engines: async () => {
+            const engines = await base.engines!();
+            if (longToolNames) {
+              const tools = engines.find(e => e.engine === "codex")!.tools!;
+              // Obergrenze je Liste und 64 Zeichen ohne Leerzeichen, über die echte Status-API.
+              const names = Array.from({ length: 100 }, (_, i) => "w" + String(i).padStart(3, "0") + "x".repeat(60));
+              tools.inventory.mcp = names.map(name => ({ name, origin: "tybo" as const }));
+              tools.inventory.skills = names.map(name => ({ name, origin: "engine" as const }));
+              for (const key of ["mcp", "skills", "hints"] as const) {
+                tools.gaps[key] = names.map(name => ({ name, reason: "not_in_engine", text: "im Motor nicht eingerichtet" }));
+              }
+            }
+            return engines;
+          },
           startedAt: () => restartedAt ?? base.startedAt(),
           version: () => (restartedAt ? "0.0.1-demo" : base.version()),
           restartRequested: async () => !restartedAt && base.restartNotes.length > 0,
@@ -2237,10 +2563,10 @@ async function modelsStatusChecks() {
           // --- Modelle ---
           await click("#settings-tab-modelle");
           await waitFor(`!!document.getElementById("settings-g-aux-judge-provider")`);
-          check(`${label}: Reiter Modelle über die Adresse, vier Abschnitte (Offene Fäden seit Issue #293)`,
+          check(`${label}: Reiter Modelle über die Adresse, fünf Abschnitte (Motor seit Issue #673)`,
             (await js<string>(`location.hash`)) === "#/einstellungen/modelle" &&
               JSON.stringify(await js<string[]>(`[...document.querySelectorAll("#settings-panel h3")].map(h => h.textContent)`)) ===
-                JSON.stringify(["Standard für alle Agenten", "Nebenmodelle", "Fallback", "Offene Fäden"]));
+                JSON.stringify(["Motor", "Standard für alle Agenten", "Nebenmodelle", "Fallback", "Offene Fäden"]));
           check(`${label}: Standard nennt Wert und Quelle`,
             (await js<string>(`document.getElementById("settings-g-aux-judge-provider").options[0].textContent`)) === "Standard (claude:claude-opus-5, Voreinstellung)" &&
               (await js<string>(`document.getElementById("settings-g-fallback-openrouterModel").options[0].textContent`)) === "Standard (minimax/minimax-m2.7, Voreinstellung)");
@@ -2258,12 +2584,14 @@ async function modelsStatusChecks() {
           check(`${label}: Aux gespeichert als ollama:qwen3:8b`, settings.data().aux?.judge === "ollama:qwen3:8b", JSON.stringify(settings.data().aux));
 
           // Fallback: Filter ohne Serveranfrage, dann Kimi K3 und „Nur offline: Aus"
-          const requestsBefore = await js<number>(`performance.getEntriesByType("resource").length`);
+          // Ein engine-Ereignis nach dem Speichern darf parallel Gesprächs- und Motordaten nachladen.
+          const modelRequests = `performance.getEntriesByType("resource").filter(e => new URL(e.name).pathname === "/api/models").length`;
+          const requestsBefore = await js<number>(modelRequests);
           await typeInto('[data-focus-key="g-filter:fallback.openrouterModel"]', "kimi");
           check(`${label}: Filter zeigt nur Kimi K3, ohne Anfrage an den Server`,
             JSON.stringify(await js<string[]>(`[...document.getElementById("settings-g-fallback-openrouterModel").options].map(o => o.value)`)) ===
               JSON.stringify([" standard", "moonshotai/kimi-k3", " eigenes"]) &&
-              (await js<number>(`performance.getEntriesByType("resource").length`)) === requestsBefore);
+              (await js<number>(modelRequests)) === requestsBefore);
           await setSelect("settings-g-fallback-openrouterModel", "moonshotai/kimi-k3");
           await click('[data-focus-key="g-offline:false"]');
           await shoot(`einstellungen-modelle-fallback-${size.width}${suffix}`);
@@ -2379,6 +2707,83 @@ async function modelsStatusChecks() {
               // Motoren (Issue #126) stehen in derselben Listenform, aber mit eigenem Zustand
               (await count(".settings-keys:not(.settings-engines) li")) > 10 && (await noHorizontalScroll(size.width)));
           await shoot(`einstellungen-status-${size.width}${suffix}`);
+          // Werkzeuge (Issue #667): Demo-Werte, Tastatur, Aktualisieren und lange Namen.
+          const engineSection = '[aria-labelledby="settings-g-title-engines"]';
+          const codexDetails = '.settings-status-engines [data-engine="codex"] details';
+          const codexSummary = codexDetails + ' > summary';
+          const toolsFit = async () => (await noHorizontalScroll(size.width)) && await js<boolean>(`(() => {
+            const section = document.querySelector(${JSON.stringify(engineSection)});
+            return section.scrollWidth <= section.clientWidth && [...section.querySelectorAll("*")].every(e => {
+              const r = e.getBoundingClientRect();
+              return !r.width || (r.left >= 0 && r.right <= ${size.width});
+            });
+          })()`);
+          const shootTools = async (name: string, open: boolean) => {
+            if (!shots) return;
+            // Die Höhe reicht für den ganzen Abschnitt, die geprüfte Breite bleibt gleich.
+            const height = Math.max(size.height, await js<number>(`Math.ceil(document.querySelector(${JSON.stringify(engineSection)}).getBoundingClientRect().height) + 180`));
+            try {
+              await cdp("Emulation.setDeviceMetricsOverride", { ...size, height, deviceScaleFactor: 2 });
+              await js(`document.querySelector(${JSON.stringify(engineSection)}).scrollIntoView({ block: "start" })`);
+              check(`${label}: vollständiger Motoren-Abschnitt im Screenshot`, await js<boolean>(`(() => {
+                const r = document.querySelector(${JSON.stringify(engineSection)}).getBoundingClientRect();
+                return r.top >= 0 && r.bottom <= innerHeight && document.querySelector(${JSON.stringify(codexDetails)}).open === ${open};
+              })()`));
+              await shoot(name);
+            } finally {
+              await cdp("Emulation.setDeviceMetricsOverride", { ...size, deviceScaleFactor: 2 });
+            }
+          };
+          await js(`document.querySelector(${JSON.stringify(engineSection)}).scrollIntoView({ block: "start" })`);
+          check(`${label}: vier Motorzeilen mit Werkzeugen, Maßstab, Notizen-Lücken und Hinweis`, await js<boolean>(`(() => {
+            const list = document.querySelector(".settings-status-engines");
+            const text = engine => list.querySelector('[data-engine="' + engine + '"] .settings-engine-tools-summary').textContent;
+            return list.children.length === 4 && list.querySelectorAll(".settings-engine-tools-label").length === 4 &&
+              text("claude") === "2 MCP-Server, 1 Skill, Notizen · Maßstab" &&
+              text("codex").includes("1 Hinweis") && text("opencode").includes("Fehlt: 1 MCP-Server, Notizen") &&
+              text("api").includes("Fehlt: 1 MCP-Server, Notizen") &&
+              [...list.querySelectorAll("details")].every(d => !d.open);
+          })()`) && await toolsFit());
+          check(`${label}: Werkzeugzeilen auch bei nicht bereitem Motor in Textfarbe, ohne Bewegung`, await js<boolean>(`(() => {
+            const ink = getComputedStyle(document.querySelector(".settings-status-engines .settings-key-name")).color;
+            return [...document.querySelectorAll(".settings-status-engines .settings-engine-tools-summary, .settings-status-engines details")].every(e => {
+              const s = getComputedStyle(e); return s.color === ink && s.animationName === "none" && s.transitionDuration === "0s";
+            });
+          })()`));
+          await shootTools(`einstellungen-status-werkzeuge-${size.width}${suffix}`, false);
+          await js(`document.querySelector(${JSON.stringify(codexSummary)}).focus()`);
+          await pressKey("Enter", "Enter", 13, "\r");
+          check(`${label}: Einzelheiten per Enter geöffnet, Fokusring sichtbar`,
+            await waitFor(`document.querySelector(${JSON.stringify(codexDetails)}).open`) &&
+            await js<boolean>(`(() => { const s = getComputedStyle(document.activeElement); return s.outlineWidth === "2px" && s.outlineStyle === "solid"; })()`));
+          check(`${label}: Namen, Herkunft, Hinweis und feste Gründe genau aus der Antwort`, await js<boolean>(`(async () => {
+            const tools = (await (await fetch("/api/status")).json()).engines.find(e => e.engine === "codex").tools;
+            const details = document.querySelector(${JSON.stringify(codexDetails)});
+            const names = [...details.querySelectorAll(".settings-engine-tool-name")].map(e => e.textContent);
+            const texts = [...details.querySelectorAll(".settings-engine-tool-text")].map(e => e.textContent);
+            return [...tools.inventory.mcp, ...tools.inventory.skills, ...tools.gaps.mcp, ...tools.gaps.hints, ...tools.gaps.skills].every(e => names.includes(e.name)) &&
+              [...tools.gaps.mcp, ...tools.gaps.hints, ...tools.gaps.skills, ...tools.gaps.fixed].every(e => texts.includes(e.text)) &&
+              texts.includes("von tybo") && texts.includes("Plugins von Claude Code: 2");
+          })()`));
+          check(`${label}: aufgeklappte Werkzeuge ohne seitliches Scrollen`, await js<boolean>(`document.querySelector(${JSON.stringify(codexDetails)}).open`) && await toolsFit());
+          await shootTools(`einstellungen-status-werkzeuge-offen-${size.width}${suffix}`, true);
+          await js(`document.querySelector(${JSON.stringify(codexSummary)}).focus()`);
+          await pressKey(" ", "Space", 32, " ");
+          check(`${label}: Einzelheiten per Leertaste geschlossen`, await waitFor(`!document.querySelector(${JSON.stringify(codexDetails)}).open`));
+          await pressKey("Enter", "Enter", 13, "\r");
+          await waitFor(`document.querySelector(${JSON.stringify(codexDetails)}).open`);
+          await click('[data-focus-key="status-refresh"]');
+          check(`${label}: nach Aktualisieren offen und Fokus auf Einzelheiten`, await waitFor(`!document.querySelector('[data-focus-key="status-refresh"]').disabled &&
+            document.querySelector(${JSON.stringify(codexDetails)}).open && document.activeElement === document.querySelector(${JSON.stringify(codexSummary)})`));
+          longToolNames = true;
+          await click('[data-focus-key="status-refresh"]');
+          check(`${label}: 100 Namen je Liste mit je 64 Zeichen ohne Leerzeichen bleiben innerhalb der Breite`,
+            await waitFor(`document.querySelector(${JSON.stringify(codexDetails)}).querySelectorAll(".settings-engine-tool-name").length === 500`) &&
+            await js<boolean>(`[...document.querySelector(${JSON.stringify(codexDetails)}).querySelectorAll(".settings-engine-tool-name")].every(e => e.textContent.length === 64)`) &&
+            await toolsFit());
+          longToolNames = false;
+          await click('[data-focus-key="status-refresh"]');
+          await waitFor(`!document.querySelector('[data-focus-key="status-refresh"]').disabled`);
           await click('[data-focus-key="status-restart"]');
           await waitFor(`!!document.querySelector('[data-focus-key="status-restart-no"]')`);
           check(`${label}: Rückfrage, Fokus auf Abbrechen, noch kein Neustart`,
@@ -2395,6 +2800,7 @@ async function modelsStatusChecks() {
           check(`${label}: die Seite erkennt den neuen Prozess von selbst`,
             await waitFor(`${statusText}.includes(${JSON.stringify(`${BRAND.name} ist neu gestartet`)})`, 12000), await js<string>(statusText));
           check(`${label}: danach frischer Stand`, (await js<string>(`document.querySelector(".settings-facts dd").textContent`)).startsWith("0.0.1-demo"));
+          check(`${label}: Einzelheiten bleiben auch nach dem simulierten Neustart offen`, await js<boolean>(`document.querySelector(${JSON.stringify(codexDetails)}).open`));
         } finally {
           await d.stop();
         }
@@ -3458,6 +3864,289 @@ async function goalChecks() {
  * Neuladen. Danach die Erledigt-Zeile, am Handy 44 px Tippfläche, kein
  * seitliches Scrollen.
  */
+/** Job-Frage im echten Browser; Register und Status echt, Fortsetzung ohne Motor als Attrappe. */
+
+/** Jobs-Ansicht, vier Größen/Farben; WEB_JOBS_URL liefert Fotos aus laufendem web:dev. */
+async function jobViewChecks() {
+  const shots = process.argv.includes("--screenshots");
+  const out = join(import.meta.dir, "..", "docs", "webui", "screenshots");
+  const selected = (id: string) => `document.querySelector('[data-job-id="${id}"]')`;
+  const action = (id: string, name: string) => `${selected(id)}.querySelector('[data-job-action="${id}:${name}"]')`;
+  const ready = `document.getElementById("main").dataset.view === "jobs" && document.querySelectorAll("#jobs-body .job-item").length === 3`;
+  for (const scheme of shots ? ["light", "dark"] : ["light"]) {
+    await cdp("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: scheme }] });
+    for (const size of [{ width: 1280, height: 900, mobile: false }, { width: 390, height: 844, mobile: true }]) {
+      await cdp("Emulation.setDeviceMetricsOverride", { ...size, deviceScaleFactor: 2 });
+      const label = `Jobs ${size.width} px ${scheme}`;
+      const choices = createDemoChoices();
+      const jobs = createDemoJobs(choices);
+      const d = await startDemoServer({ host: "127.0.0.1", port: 0, password: PASSWORD, allowedHosts: [] }, { choices, jobs, log: () => {} });
+      const url = process.env.WEB_JOBS_URL || d.server.url;
+      const shoot = async (name: string) => {
+        if (!shots) return;
+        await Bun.sleep(150);
+        const { data } = await cdp("Page.captureScreenshot", { format: "png" });
+        const file = `jobs-${name}-${size.width}${scheme === "dark" ? "-dunkel" : ""}.png`;
+        await Bun.write(join(out, file), Buffer.from(data, "base64"));
+        console.log(`Bild ${file}`);
+      };
+      try {
+        await goto(url + "/");
+        await waitFor(`document.getElementById("jobs-count")?.textContent === "1"`);
+        if (size.mobile) await openDrawer();
+        check(`${label}: Eintrag mit hervorgehobener Wartezahl`, await js<boolean>(`document.getElementById("jobs-count").dataset.waiting === "true" && ${shown("open-jobs")}`));
+        await shoot("seitenleiste");
+        await js(`document.getElementById("open-jobs").click()`);
+        await waitFor(ready);
+        check(`${label}: Liste, Reihenfolge, Fokus und Adresse`, await js<boolean>(`location.hash === "#/jobs" && document.activeElement.id === "jobs-title" && document.querySelector("#jobs-body .job-item").dataset.phase === "waiting" && document.getElementById("open-jobs").getAttribute("aria-current") === "page"`));
+        check(`${label}: alle Status, Arbeitszeit, Lauf und Gespräch`, await js<boolean>(`["wartet auf dich", "läuft", "abgebrochen", "Arbeitszeit", "Lauf 1", "Strategie"].every(t => document.getElementById("jobs-body").textContent.includes(t))`));
+        check(`${label}: kein seitliches Scrollen`, await noHorizontalScroll(size.width));
+        await shoot("liste");
+        await js(`${selected(DEMO_JOB_IDS.waiting)}.querySelector("summary").click()`);
+        await waitFor(`${selected(DEMO_JOB_IDS.waiting)}.querySelector("details").open`);
+        check(`${label}: Frage und dieselben zwei Optionen`, await js<boolean>(`${selected(DEMO_JOB_IDS.waiting)}.querySelectorAll(".choice-button").length === 2 && ${selected(DEMO_JOB_IDS.waiting)}.textContent.includes("Soll ich auch kostenpflichtige Angebote vergleichen?")`));
+        await shoot("frage");
+        await js(`${action(DEMO_JOB_IDS.waiting, "log")}.click()`);
+        await waitFor(`!!document.querySelector(".job-log")`);
+        check(`${label}: Log maskiert, Lauf sichtbar`, await js<boolean>(`document.querySelector(".job-log").textContent.includes("[verborgen]") && document.querySelector(".job-file").textContent.includes("Lauf 1")`));
+        await shoot("log");
+        check(`${label}: Frage und Log ohne Überbreite`, await noHorizontalScroll(size.width));
+        await js(`${action(DEMO_JOB_IDS.aborted, "report")}.click()`);
+        await waitFor(`!!document.querySelector(".job-file .content h2")`);
+        await js(`document.querySelector(".job-file").scrollIntoView({ block: "center" })`);
+        check(`${label}: Bericht als Markdown`, await js<boolean>(`document.querySelector(".job-file .content h2").textContent === "Zwischenstand"`));
+        await shoot("bericht");
+
+        // Zustandswechsel auf einer frischen Attrappe, externe Fotovorlage bleibt unverändert.
+        await goto(d.server.url + "/#/jobs");
+        await waitFor(ready);
+        await js(`${action(DEMO_JOB_IDS.running, "stop")}.click()`);
+        check(`${label}: Bestätigung mit Fokus auf Abbrechen`, await js<boolean>(`document.activeElement.getAttribute("data-job-action") === "${DEMO_JOB_IDS.running}:cancel" && ${selected(DEMO_JOB_IDS.running)}.textContent.includes("nicht fortgesetzt")`));
+        await js(`${action(DEMO_JOB_IDS.running, "cancel")}.click()`);
+        check(`${label}: Abbrechen lässt Job laufen`, (await jobs.list(async () => "")).find(j => j.id === DEMO_JOB_IDS.running)?.phase === "running");
+        await js(`${action(DEMO_JOB_IDS.running, "stop")}.click(); ${action(DEMO_JOB_IDS.running, "confirm")}.click()`);
+        await waitFor(`${selected(DEMO_JOB_IDS.running)}.textContent.includes("gestoppt")`);
+        check(`${label}: Stoppen aktualisiert Liste`, (await jobs.list(async () => "")).find(j => j.id === DEMO_JOB_IDS.running)?.status === "gestoppt");
+        await js(`${action(DEMO_JOB_IDS.aborted, "resume")}.click()`);
+        await waitFor(`${selected(DEMO_JOB_IDS.aborted)}.textContent.includes("Lauf 2")`);
+        check(`${label}: Fortsetzen, neuer Lauf ohne alten Bericht`, await js<boolean>(`!${action(DEMO_JOB_IDS.aborted, "report")} && ${selected(DEMO_JOB_IDS.aborted)}.dataset.phase === "running"`));
+        await js(`${selected(DEMO_JOB_IDS.waiting)}.querySelector("summary").click(); ${selected(DEMO_JOB_IDS.waiting)}.querySelector('[data-key="a1"]').click()`);
+        await waitFor(`${selected(DEMO_JOB_IDS.waiting)}.dataset.phase === "running"`);
+        check(`${label}: Antwort gilt auch in Telegram und Pille zählt laufende`, (await choices.decideInTelegram(DEMO_JOB_CHOICE, "a2")).status === "already" && await js<boolean>(`document.getElementById("jobs-count").textContent === "2" && document.getElementById("jobs-count").dataset.waiting === "false"`));
+        if (size.width === 1280 && scheme === "light") {
+          await jobs.act(DEMO_JOB_IDS.waiting, "stop", "browser-poll-00000001", 2);
+          await waitFor(`${selected(DEMO_JOB_IDS.waiting)}.dataset.phase === "ended"`, 13_000);
+          check(`${label}: fremder Zustandswechsel wird ohne Neuladen abgeholt`, await js<boolean>(`${selected(DEMO_JOB_IDS.waiting)}.textContent.includes("gestoppt")`));
+        }
+        await js(`${action(DEMO_JOB_IDS.aborted, "open")}.click()`);
+        await waitFor(`document.getElementById("main").dataset.view === "chat" && document.getElementById("chat-title").textContent === "Strategie"`);
+        check(`${label}: Zum Gespräch öffnet Strategie`, await js<boolean>(`document.getElementById("jobs-view").hidden && location.hash === ""`));
+        await goto(d.server.url + "/#/jobs"); await waitFor(ready);
+        await js(`document.getElementById("jobs-back").click()`);
+        await waitFor(`document.getElementById("main").dataset.view === "chat"`);
+        check(`${label}: Direktlink und Zurück`, await js<boolean>(`location.hash === "" && document.getElementById("jobs-view").hidden`));
+      } finally { await d.stop(); }
+    }
+  }
+}
+
+async function jobResumeChoiceChecks() {
+  const shots = process.argv.includes("--screenshots");
+  const jobId = "20261118-120000-000623";
+  const out = join(import.meta.dir, "..", "docs", "webui", "screenshots");
+  for (const scheme of shots ? ["light", "dark"] as const : ["light"] as const) {
+    await emulateScheme(scheme);
+    for (const width of [1280, 390]) {
+      const label = `Job-Fortsetzen ${width} px ${scheme}`;
+      const root = await mkdtemp(join(dir, "job-choice-"));
+      const file = join(root, "choices.json");
+      setChoicesFileForTests(file);
+      let starts = 0;
+      const off = onChoiceDecided("job", () => { starts++; });
+      const port = createChoicePort({
+        register: { get: getChoiceChecked, list: listChoices, decide: decideChoice, onChange: onChoiceChange },
+        groupId: () => DEMO_GROUP_ID, log: () => {}, staleText: c => jobChoiceStaleText(root, c),
+      });
+      const jobDemo = await startDemoServer(
+        { host: "127.0.0.1", port: 0, password: PASSWORD, allowedHosts: [] },
+        { chat: createFakeChat(), log: () => {}, choices: { ...port, decideInTelegram: (id, key) => decideChoice(id, key, "telegram") } },
+      );
+      try {
+        const choice = await createChoice({ kind: "job", ref: jobId, action: "resume-1",
+          conversation: { type: "telegram", chatId: DEMO_GROUP_ID, topicId: 31 },
+          text: `Job ${jobId} fortsetzen? Kleiner Testauftrag\nLauf 2 bekommt erneut bis zu 1 Std.`,
+          options: [{ key: "resume", label: "Fortsetzen" }],
+        });
+        jobDemo.receiveNotice("topic-31", "job", choice.text, undefined, choice.id);
+        await cdp("Emulation.setDeviceMetricsOverride", { width, height: 844, mobile: width === 390, deviceScaleFactor: 2 });
+        await goto(`${jobDemo.server.url}/#/gespraech/topic-31`);
+        const box = `document.querySelector('.choice[data-choice="${choice.id}"]')`;
+        const status = `${box}?.querySelector('.choice-status')?.textContent`;
+        check(`${label}: Knopf sichtbar`, await waitFor(`${box}?.querySelector('button')?.textContent === 'Fortsetzen'`));
+        check(`${label}: kein seitliches Scrollen`, await noHorizontalScroll(width));
+        if (width === 390) check(`${label}: mindestens 44 px Tippfläche`, await js<boolean>(`${box}.querySelector('button').getBoundingClientRect().height >= 44`));
+        const shoot = async (state: string) => {
+          if (!shots) return;
+          await js(`document.getElementById('chat-log').scrollTop = document.getElementById('chat-log').scrollHeight`);
+          const { data } = await cdp("Page.captureScreenshot", { format: "png" });
+          await Bun.write(join(out, `job-fortsetzen-${state}-${width}-${scheme}.png`), Buffer.from(data, "base64"));
+        };
+        await shoot("offen");
+        if (width === 390) {
+          // Wie CLI in einem anderen Prozess: abgelaufen, ohne Ereignis an diesen Browser.
+          const stored = JSON.parse(await readFile(file, "utf8"));
+          stored.choices[choice.id].state = "expired";
+          await writeFile(file, JSON.stringify(stored));
+          await writeStatus(root, { version: 1, id: jobId, title: "Test", createdAt: new Date().toISOString(),
+            phase: "starting", run: 2, maxHours: 1, fullAccess: false, target: {} });
+          await js(`${box}.querySelector('button').click()`);
+          check(`${label}: alter Knopf sagt läuft schon`, await waitFor(`${status} === 'Job ${jobId} läuft schon.'`));
+          check(`${label}: kein zweiter Start`, starts === 0);
+        } else {
+          await js(`${box}.querySelector('button').click()`);
+          check(`${label}: Entscheidung sichtbar`, await waitFor(`(${status} || '').startsWith('Erledigt: Fortsetzen')`));
+          check(`${label}: genau eine Entscheidung`, starts === 1);
+        }
+        check(`${label}: Knopf nach Klick entfernt`, await js<boolean>(`!${box}.querySelector('button')`));
+        await shoot("erledigt");
+      } finally {
+        off();
+        await jobDemo.stop();
+        setChoicesFileForTests(null);
+      }
+    }
+  }
+}
+
+/** #624: echter Wächter und Antwort-Handler, nur Motor und Versand sind lokale Attrappen. */
+async function jobQuestionChecks() {
+  const { mkdirSync, writeFileSync } = await import("node:fs");
+  const { fakeDeps, fakeChild } = await import("../tests/jobs-fixture");
+  const { claudeProjectDir } = await import("../src/lib/engines/claude-notes");
+  const { runWatcher } = await import("../src/lib/jobs/runner");
+  const { jobFile, readStatus } = await import("../src/lib/jobs/store");
+  const { jobChoiceHandler, expireJobChoices } = await import("../src/lib/jobs/choices");
+  const { recoverWaitingQuestion } = await import("../src/lib/jobs/question-choices");
+  const shots = process.argv.includes("--screenshots");
+  const jobId = "20261118-150000-000624";
+  const sessionId = "12345678-1234-4234-8234-123456789abc";
+  const out = join(import.meta.dir, "..", "docs", "webui", "screenshots");
+  for (const scheme of shots ? ["light", "dark"] as const : ["light"] as const) {
+    await emulateScheme(scheme);
+    for (const width of [1280, 390]) {
+      const label = `Job-Rückfrage ${width} px ${scheme}`;
+      const root = await mkdtemp(join(dir, "job-question-"));
+      setChoicesFileForTests(join(root, "data", "choices.json"));
+      const port = createChoicePort({ register: { get: getChoiceChecked, list: listChoices, decide: decideChoice, onChange: onChoiceChange },
+        groupId: () => DEMO_GROUP_ID, log: () => {} });
+      const jobDemo = await startDemoServer({ host: "127.0.0.1", port: 0, password: PASSWORD, allowedHosts: [] },
+        { chat: createFakeChat(), log: () => {}, choices: { ...port, decideInTelegram: (id, key) => decideChoice(id, key, "telegram") } });
+      const deps = fakeDeps(root);
+      deps.claudeEnv = () => ({ HOME: root });
+      deps.expireResumeChoices = expireJobChoices;
+      deps.recoverWaiting = s => recoverWaitingQuestion(s, deps, { userId: "4711", groupId: DEMO_GROUP_ID, telegram: false });
+      deps.notify = async input => {
+        jobDemo.receiveNotice("topic-31", "job", input.text ?? "", undefined, input.choiceId);
+        return { sent: false, recorded: true };
+      };
+      let watching: Promise<number> = Promise.resolve(0);
+      let starts = 0;
+      deps.spawnWatcher = (id, run) => { starts++; watching = runWatcher(id, deps, run); return { pid: process.pid }; };
+      deps.spawnClaude = spec => {
+        deps.spawned.push(spec);
+        return fakeChild(deps.procs.spawn(60024), Promise.resolve({ code: 0, signal: null }), () => {
+          if (spec.cmd.includes("--resume")) {
+            writeFileSync(jobFile(root, jobId, "report"), "ANTWORT_OK: Gewählte Antwort B.");
+          } else {
+            writeFileSync(jobFile(root, jobId, "question"), JSON.stringify({ frage: "Soll ich A oder B verwenden?",
+              antworten: ["A", "B"], kontext: "Für den Bericht brauche ich diese Entscheidung." }));
+          }
+        });
+      };
+      const off = onChoiceDecided("job", jobChoiceHandler(deps));
+      try {
+        await writeStatus(root, { version: 1, id: jobId, title: "A oder B im Bericht", sessionId, createdAt: new Date().toISOString(),
+          phase: "starting", run: 1, maxHours: 1, fullAccess: false, target: { chatId: DEMO_GROUP_ID, topicId: 31 } });
+        await writeFile(jobFile(root, jobId, "brief"), "Frag mich, ob A oder B, und schreib die Antwort in den Bericht.");
+        mkdirSync(claudeProjectDir(root, root), { recursive: true });
+        writeFileSync(join(claudeProjectDir(root, root), `${sessionId}.jsonl`), "{}\n");
+        await runWatcher(jobId, deps);
+        const waiting = (await readStatus(root, jobId))!;
+        check(`${label}: Job wartet mit einer Frage`, waiting.phase === "waiting" && waiting.questionCount === 1 && (await listChoices()).length === 1);
+        const choiceId = waiting.waiting!.choiceId!;
+        const box = `document.querySelector('.choice[data-choice="${choiceId}"]')`;
+        await cdp("Emulation.setDeviceMetricsOverride", { width, height: 844, mobile: width === 390, deviceScaleFactor: 2 });
+        await goto(`${jobDemo.server.url}/#/gespraech/topic-31`);
+        check(`${label}: Frage und Knöpfe A/B sichtbar`, await waitFor(`${box}?.querySelectorAll('button').length === 2 && document.getElementById('messages').textContent.includes('Soll ich A oder B verwenden?')`));
+        check(`${label}: kein seitliches Scrollen`, await noHorizontalScroll(width));
+        if (width === 390) check(`${label}: mindestens 44 px Tippfläche`, await js<boolean>(`[...${box}.querySelectorAll('button')].every(b => b.getBoundingClientRect().height >= 44)`));
+        const shoot = async (state: string) => {
+          if (!shots) return;
+          await js(`document.getElementById('chat-log').scrollTop = document.getElementById('chat-log').scrollHeight`);
+          const { data } = await cdp("Page.captureScreenshot", { format: "png" });
+          await Bun.write(join(out, `job-rueckfrage-${state}-${width}-${scheme}.png`), Buffer.from(data, "base64"));
+        };
+        await shoot("offen");
+        await js(`${box}.querySelectorAll('button')[1].click()`);
+        check(`${label}: Antwort B erledigt und Bericht sichtbar`, await waitFor(`(${box}?.querySelector('.choice-status')?.textContent || '').startsWith('Erledigt: B') && document.getElementById('messages').textContent.includes('ANTWORT_OK: Gewählte Antwort B.')`));
+        await watching;
+        check(`${label}: genau ein Start mit --resume und Antwortdaten`, starts === 1 && deps.spawned[1]?.cmd.includes("--resume") && deps.spawned[1]?.prompt.includes('Antwort des Nutzers: "B"'));
+        check(`${label}: gleiche Session und erfolgreicher Bericht`, (await readStatus(root, jobId))?.outcome === "success" && (await readStatus(root, jobId))?.sessionId === sessionId);
+        check(`${label}: Knöpfe entfernt`, await js<boolean>(`!${box}.querySelector('button')`));
+        await shoot("bericht");
+        await goto(`${jobDemo.server.url}/#/gespraech/topic-31`);
+        check(`${label}: nach Neuladen weiter erledigt, Bericht bleibt`, await waitFor(`(${box}?.querySelector('.choice-status')?.textContent || '').startsWith('Erledigt: B') && document.getElementById('messages').textContent.includes('ANTWORT_OK: Gewählte Antwort B.')`));
+      } finally {
+        off();
+        await watching;
+        await jobDemo.stop();
+        setChoicesFileForTests(null);
+      }
+    }
+  }
+}
+
+/** Echter Rückgabeweg bis zum Browser, gleiche Motor-Attrappen wie im Terminal-Nachweis. */
+async function jobReturnChecks() {
+  const { startJobReturnProof, PROOF_REPORT, PROOF_REPLY } = await import("./job-return-proof");
+  const shots = process.argv.includes("--screenshots");
+  const out = join(import.meta.dir, "..", "docs", "webui", "screenshots");
+  const cookies = (await cdp("Network.getCookies")).cookies;
+  try {
+    for (const scheme of shots ? ["light", "dark"] as const : ["light"] as const) {
+      await emulateScheme(scheme);
+      for (const width of [1280, 390]) {
+        const proof = await startJobReturnProof(PASSWORD);
+        const label = `Job-Rückgabe ${width} px ${scheme}`;
+        try {
+          await cdp("Emulation.setDeviceMetricsOverride", { width, height: 844, mobile: width === 390, deviceScaleFactor: 2 });
+          const url = `${proof.server.url}/#/gespraech/${proof.conversationId}`;
+          await goto(url);
+          check(`${label}: isolierte Anmeldung`, await waitFor(`document.getElementById('login-form')`));
+          await js(`document.getElementById('password').value = ${JSON.stringify(PASSWORD)}; document.getElementById('login-form').requestSubmit()`);
+          check(`${label}: richtiges Gespräch offen`, await waitFor(`document.querySelector('.conversation[aria-current=true]')?.dataset.id === ${JSON.stringify(proof.conversationId)}`));
+          check(`${label}: Live-Verbindung bereit`, await waitFor(`document.getElementById('connection').hidden && document.getElementById('messages')`));
+          await proof.run();
+          check(`${label}: Bericht und Antwort kommen ohne Neuladen`, await waitFor(`document.querySelector('.msg-notice')?.textContent.includes(${JSON.stringify(PROOF_REPORT)}) && document.querySelector('.msg-assistant .bubble')?.textContent.includes(${JSON.stringify(PROOF_REPLY)})`));
+          const ordered = `(() => { const rows = [...document.querySelectorAll('#messages .msg')]; return rows.length === 2 && rows[0].classList.contains('msg-notice') && rows[1].classList.contains('msg-assistant'); })()`;
+          check(`${label}: genau Bericht, dann Antwort; keine Nutzerblase`, await js<boolean>(ordered) && await count('.msg-user') === 0);
+          check(`${label}: kein seitliches Scrollen`, await noHorizontalScroll(width));
+          if (shots) {
+            const { data } = await cdp("Page.captureScreenshot", { format: "png" });
+            await Bun.write(join(out, `job-zurueck-${width}-${scheme}.png`), Buffer.from(data, "base64"));
+          }
+          await goto(url);
+          check(`${label}: nach Neuladen weiterhin genau Bericht und Antwort`, await waitFor(ordered));
+        } finally { await proof.stop(); }
+      }
+    }
+  } finally {
+    await cdp("Network.clearBrowserCookies");
+    await cdp("Network.setCookies", { cookies: cookies.map((c: any) => ({ name: c.name, value: c.value, domain: c.domain,
+      path: c.path, secure: c.secure, httpOnly: c.httpOnly, ...(c.expires > 0 ? { expires: c.expires } : {}) })) });
+  }
+}
+
 async function choiceChecks() {
   const out = join(import.meta.dir, "..", "docs", "webui", "screenshots");
   const shots = process.argv.includes("--screenshots");
@@ -4631,6 +5320,11 @@ try {
   check("Senden gesperrt bei leerem Feld", await js<boolean>(`document.getElementById("send").disabled`));
   const cookies = (await cdp("Network.getCookies", { urls: [base] })).cookies as any[];
   const cookie = cookies.map(c => `${c.name}=${c.value}`).join("; ");
+  const scriptLengths = await js<{ bytes: number; expected: number }[]>(`Promise.all(["/app.js", "/settings.js"].map(async path => {
+    const response = await fetch(path, { cache: "reload" });
+    return { bytes: (await response.arrayBuffer()).byteLength, expected: Number(response.headers.get("content-length")) };
+  }))`);
+  check("Testproxy überträgt große Browser-Skripte vollständig", scriptLengths.every(file => file.bytes > 0 && file.bytes === file.expected), JSON.stringify(scriptLengths));
 
   // --- Senden, Fortschritt, Antwort -----------------------------------------
   const hostile = `<img src=x onerror="window.__xss=1">Hallo <b>fett</b>`;
@@ -4815,6 +5509,11 @@ try {
   await goalBudgetChecks();
   await topicMapChecks();
   await choiceChecks();
+  await jobViewChecks();
+  await pipelineViewChecks();
+  await jobResumeChoiceChecks();
+  await jobQuestionChecks();
+  await jobReturnChecks();
   await toolApprovalChecks();
   await reviewChecks();
   await footerChecks();
@@ -4963,7 +5662,8 @@ try {
   }
 } finally {
   ws.close();
-  proxy.stop(true);
+  cutConnections(true);
+  await new Promise<void>((resolve, reject) => proxy.close(error => error ? reject(error) : resolve()));
   chrome.kill();
   await chrome.exited;
   await server.stop();
@@ -4973,3 +5673,87 @@ try {
 
 console.log(failures ? `\n${failures} Prüfung(en) fehlgeschlagen` : "\nAlle Prüfungen bestanden");
 process.exit(failures ? 1 : 0);
+
+/** Pipeline-Ansicht mit vier Zuständen; WEB_PIPELINES_URL liefert Fotos aus web:dev. */
+async function pipelineViewChecks() {
+  const shots = process.argv.includes("--screenshots");
+  const out = join(import.meta.dir, "..", "docs", "webui", "screenshots");
+  const row = (id: string) => `document.querySelector('[data-pipeline-id="demo-${id}"]')`;
+  const focus = (key: string) => `document.querySelector('[data-pipeline-focus="${key}"]')`;
+  const ready = `document.getElementById("main").dataset.view === "pipelines" && document.querySelectorAll(".pipeline-item").length === 4`;
+  for (const scheme of shots ? ["light", "dark"] : ["light"]) {
+    await cdp("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: scheme }] });
+    for (const size of [{ width: 1280, height: 900, mobile: false }, { width: 390, height: 844, mobile: true }]) {
+      await cdp("Emulation.setDeviceMetricsOverride", { ...size, deviceScaleFactor: 2 });
+      const label = `Pipelines ${size.width} px ${scheme}`;
+      const pipelines = createDemoPipelines();
+      const d = await startDemoServer({ host: "127.0.0.1", port: 0, password: PASSWORD, allowedHosts: [] }, { pipelines, log: () => {} });
+      const url = process.env.WEB_PIPELINES_URL || d.server.url;
+      const shoot = async (name: string) => {
+        if (!shots) return;
+        await Bun.sleep(100);
+        const { data } = await cdp("Page.captureScreenshot", { format: "png" });
+        const file = `pipelines-${name}-${size.width}${scheme === "dark" ? "-dunkel" : ""}.png`;
+        await Bun.write(join(out, file), Buffer.from(data, "base64"));
+        console.log(`Bild ${file}`);
+      };
+      try {
+        await goto(url + "/");
+        check(`${label}: Zähler geladen`, await waitFor(`document.getElementById("pipelines-count")?.textContent === "1"`));
+        if (size.mobile) await openDrawer();
+        const isStale = await js<boolean>(`document.getElementById("pipelines-count").dataset.waiting === "false"`);
+        check(`${label}: Eintrag sichtbar`, await js<boolean>(shown("open-pipelines")));
+        if (!isStale) await shoot("seitenleiste");
+        await js(`document.getElementById("open-pipelines").click()`);
+        check(`${label}: Ansicht geöffnet`, await waitFor(ready));
+        check(`${label}: Reihenfolge und Fokus`, await js<boolean>(`JSON.stringify([...document.querySelectorAll(".pipeline-item")].map(n => n.dataset.state)) === JSON.stringify(["waiting", "halted", "running", "resting"]) && document.activeElement.id === "pipelines-title" && location.hash === "#/pipelines"`));
+        check(`${label}: Ruhe eingeklappt und Stoppzeile`, await js<boolean>(`!document.querySelector(".pipeline-resting").open && document.querySelector(".pipeline-stopped").textContent.includes("Pipelines gestoppt: Die Wächter sind aus")`));
+        check(`${label}: keine Start-, Stopp- oder Antwortknöpfe`, await js<boolean>(`[...document.querySelectorAll("#pipelines-body button")].every(b => b.textContent === "Zum Gespräch")`));
+        check(`${label}: kein seitliches Scrollen`, await noHorizontalScroll(size.width));
+        if (isStale) {
+          check(`${label}: alter Stand klar bezeichnet`, await js<boolean>(`document.getElementById("pipelines-status").textContent.includes("der Statusdienst läuft nicht")`));
+          await shoot("veraltet");
+          continue;
+        }
+        await shoot("liste");
+        await js(`${focus("demo-waiting:question")}.click()`);
+        check(`${label}: Frage aufgeklappt`, await waitFor(`${row("waiting")}.querySelector(".pipeline-question").open`));
+        check(`${label}: voller Text, Datum und Gespräch`, await js<boolean>(`${row("waiting")}.textContent.includes("alphabetisch") && ${row("waiting")}.textContent.includes("bisherige Verlauf") && !!${focus("demo-waiting:open")}`));
+        check(`${label}: Frage ohne Überbreite`, await noHorizontalScroll(size.width));
+        if (size.mobile) check(`${label}: Tippflächen mindestens 44 px`, await js<boolean>(`[...document.querySelectorAll("#pipelines-body button, #pipelines-body summary")].filter(e => e.getClientRects().length).every(e => e.getBoundingClientRect().height >= 44)`));
+        await shoot("frage");
+        await js(`${focus("demo-waiting:question")}.click(); ${focus("resting")}.click()`);
+        check(`${label}: Ruhe zeigt letzten Zustand, kein Gespräch bei fehlendem Ziel`, await js<boolean>(`document.querySelector(".pipeline-resting").open && ${row("resting")}.textContent.includes("zuletzt: wartet auf dich") && !${focus("demo-resting:open")}`));
+        // Zusätzlich die ganze Liste in einem hohen Fenster derselben Breite.
+        const height = await js<number>(`document.querySelector("#pipelines-view .settings-scroll").scrollHeight + 100`);
+        await cdp("Emulation.setDeviceMetricsOverride", { ...size, height, deviceScaleFactor: 2 });
+        await js(`document.querySelector("#pipelines-view .settings-scroll").scrollTop = 0`);
+        await shoot("uebersicht");
+        await cdp("Emulation.setDeviceMetricsOverride", { ...size, deviceScaleFactor: 2 });
+        await js(`${focus("demo-waiting:open")}.click()`);
+        check(`${label}: Zum Gespräch öffnet das richtige Topic`, await waitFor(`document.getElementById("main").dataset.view === "chat" && document.getElementById("chat-title").textContent === "Pipeline"`));
+        await goto(url + "/#/pipelines"); await waitFor(ready);
+        await js(`document.getElementById("pipelines-back").click()`);
+        check(`${label}: Direktlink und Zurück`, await waitFor(`document.getElementById("main").dataset.view === "chat" && location.hash === ""`));
+
+        if (size.width === 1280 && scheme === "light") {
+          await goto(d.server.url + "/#/pipelines"); await waitFor(ready);
+          await js(`${focus("demo-waiting:question")}.click(); ${focus("demo-waiting:question")}.focus()`);
+          const snapshot = (await pipelines.read())!;
+          snapshot.pipelines[2].step = { kind: "review", round: 2 };
+          pipelines.setSnapshot(snapshot);
+          check(`${label}: neuer Stand ohne Neuladen`, await waitFor(`${row("running")}.textContent.includes("Prüfer prüft")`, 13_000));
+          check(`${label}: Frage und Fokus überstehen Abgleich`, await js<boolean>(`${row("waiting")}.querySelector(".pipeline-question").open && document.activeElement.getAttribute("data-pipeline-focus") === "demo-waiting:question"`));
+          snapshot.generatedAt = new Date(Date.now() - 5 * 60_000 + 2000).toISOString(); pipelines.setSnapshot(snapshot);
+          await js(`document.dispatchEvent(new Event("visibilitychange"))`);
+          check(`${label}: frischer Stand vor der Altersgrenze`, await waitFor(`document.getElementById("pipelines-status").dataset.stale === "false"`));
+          check(`${label}: wird zwischen Abrufen von selbst veraltet`, await waitFor(`document.getElementById("pipelines-status").dataset.stale === "true"`, 5000));
+          check(`${label}: Zähler bleibt ohne Hervorhebung`, await js<boolean>(`!document.getElementById("open-pipelines").hidden && document.getElementById("pipelines-count").textContent === "1" && document.getElementById("pipelines-count").dataset.waiting === "false"`));
+          if (!process.env.WEB_PIPELINES_URL) await shoot("veraltet");
+          pipelines.setSnapshot(null); await js(`document.dispatchEvent(new Event("visibilitychange"))`);
+          check(`${label}: fehlende Datei blendet Eintrag aus`, await waitFor(`document.getElementById("open-pipelines").hidden && document.getElementById("pipelines-body").textContent.includes("Keine Pipelines")`));
+        }
+      } finally { await d.stop(); }
+    }
+  }
+}

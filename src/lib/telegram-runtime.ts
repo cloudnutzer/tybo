@@ -45,6 +45,7 @@ import { AgentIdentities } from "../channels/telegram/identities";
 import { logLostPieces, sendRendered, transmitViaApi } from "../channels/telegram/send";
 import { installTelegramOutputGuard } from "./telegram";
 import { createTelegramChoices, type TelegramChoices } from "./telegram-choices";
+import { PROJECT_ROOT } from "./env";
 import { createTelegramVoiceSender } from "./voice-message";
 import { resolveRuntimeProfile } from "./runtime-profile";
 import { rightsFromChatMember, type TelegramTopicApi } from "../web/topics";
@@ -189,6 +190,8 @@ export function createTelegramRuntime(deps: TelegramRuntimeDeps): TelegramRuntim
     owner,
     send: deps.choicesSend,
     telegram: () => telegramConfigured(env),
+    staleText: async choice => choice.kind === "job"
+      ? (await import("./jobs/choices")).jobChoiceStaleText(PROJECT_ROOT, choice) : undefined,
   });
 
   let mainBotId: number | null = null;

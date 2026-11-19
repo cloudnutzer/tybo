@@ -53,7 +53,7 @@ der ChatGPT-Anmeldung.
    nicht fertig.
 
 Schon eingerichtet? Dann reicht `tybo setup modelle` oder in der WebUI
-Einstellungen, Reiter Agenten, Motor.
+Einstellungen, Reiter Modelle, Motor.
 
 ## Was mit welchem Motor geht
 
@@ -63,7 +63,7 @@ Einstellungen, Reiter Agenten, Motor.
 | Fortlaufende Sessions je Gespräch, Fortschritt, Merk-Tags, `/stop` | ja | ja |
 | Destillat beim Ende einer Session, `/routine` | ja | ja, über Codex |
 | Modell je Agent | ja | nein, ein Modell und Effort für Codex |
-| MCP-Server und Skills | aus der Konfiguration von Claude Code | aus der Konfiguration von Codex |
+| MCP-Server und Skills | aus der Konfiguration von Claude Code | eigene Codex-Konfiguration hat Vorrang; tybo ergänzt [MCP-Server mit vollem Zugriff](erweiterungen.md#codex) und [Claude-Skills über Links](erweiterungen.md#skills-für-codex) |
 | Hooks | ja | nein |
 | Hintergrund-Jobs (`bun run job start`) | ja | nein, die Job-Regel fehlt dann im Prompt |
 | Nebenaufgaben (siehe unten) | ja | nur mit eigenem Nebenmodell über OpenRouter oder Ollama |

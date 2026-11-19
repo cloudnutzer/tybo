@@ -389,6 +389,28 @@ describe("/kern", () => {
       expect(existsSync(coreDraftFile())).toBe(false);
     });
 
+    test.each(["telegram", "web", "terminal"] as const)("Modell gesperrt: %s nennt Profilzeit, kein Entwurf oder Neuversuch", async channel => {
+      const previousZone = process.env.USER_TIMEZONE;
+      process.env.USER_TIMEZONE = "Asia/Tokyo";
+      let calls = 0;
+      const services = wire({ callAux: async () => {
+        calls++;
+        return { text: "", isError: true, disabled: true, blockedUntil: "2099-01-02T23:15:00Z" };
+      } });
+      try {
+        const replies = channel === "telegram" ? await telegram("/kern entwurf", services)
+          : await webOrTerminal(channel, "/kern entwurf", services);
+        expect(replies.at(-1)).toBe(CORE_COMMAND_TEXT.blocked("Sa, 03.01., 08:15"));
+        expect(calls).toBe(1);
+        expect(sentChoices).toEqual([]);
+        expect(await listChoices()).toEqual([]);
+        expect(existsSync(coreDraftFile())).toBe(false);
+      } finally {
+        if (previousZone === undefined) delete process.env.USER_TIMEZONE;
+        else process.env.USER_TIMEZONE = previousZone;
+      }
+    });
+
     test("zu lange Modellantwort wird an einer Zeilengrenze begrenzt, die Frage zeigt das Ergebnis", async () => {
       const line = `- ${"y".repeat(98)}`;
       const long = Array.from({ length: 40 }, () => line).join("\n");

@@ -10,7 +10,10 @@ import { createInstructionsApi, InstructionsChanged, instructionsDigest, type In
 import { createRevisionClock } from "../src/web/revision";
 import { createSettingsApi, inheritedAgentValues, SettingsFileInvalid, type SettingsPort } from "../src/web/settings";
 import { conversationEngines, createEnginesApi, type EngineAvailability, type EnginePort } from "../src/web/engines";
-import { DEMO_SPEECH_OPTIONS, demoLocalMode } from "../src/web/demo";
+import { DEMO_SPEECH_OPTIONS, DEMO_STATUS_ENGINES, demoLocalMode } from "../src/web/demo";
+import { apiModel } from "../src/lib/engines/api";
+import { FIXED_SHORT, MOTOR_TOOL_TEXT } from "../src/lib/engines/tool-display";
+import { TOOL_GAP_IDS, type EngineToolsResponse } from "../src/web/tool-parity-types";
 import { TYBO_BRAND } from "./brand-fixture";
 import { speechHarness, SPEECH_SOURCE } from "./speech-mode-fixture";
 import { CALL_SOURCE, CALL_STATUS } from "./call-mode-fixture";
@@ -165,6 +168,10 @@ function view(settings: any, extra: Record<string, unknown> = {}, codeEffort: Co
 }
 
 interface Options {
+  /** Issue #674: Schlüsselanzeige und verzögerte bzw. fehlgeschlagene Abfrage. */
+  openrouterKey?: any;
+  openrouterOffline?: boolean;
+  holdOpenrouter?: boolean;
   /** Issue #250: speech.js vor settings.js laden, mit Attrappen für Mikrofon, AudioContext und Stimme */
   speech?: boolean;
   /** Issue #258: call.js nach speech.js laden; GET /api/voice nennt modes.call */
@@ -208,6 +215,7 @@ interface Options {
   enginesFail?: boolean;
   /** engineOptions in GET /api/settings, Standard ENGINE_OPTIONS */
   engineOptions?: typeof ENGINE_OPTIONS;
+  engineView?: any;
   /** GET /api/conversations ohne Motor-Angaben (Server ohne Motor-Port) */
   noEngineInfo?: boolean;
   /** Ältere Web-Gespräche (IDs w-…), ohne sie keine */
@@ -343,6 +351,15 @@ function setup(options: Options = {}) {
     /** Motor (Issue #126): Verfügbarkeit, GET /api/engines scheitert, Antwort auf „Auf Standard" */
     availability: structuredClone(options.availability ?? AVAILABILITY),
     enginesFails: options.enginesFail ?? false,
+    openrouterKey: options.openrouterKey ?? { configured: false },
+    openrouterOffline: options.openrouterOffline ?? false,
+    holdOpenrouter: options.holdOpenrouter ?? false,
+    openrouterReleases: [] as (() => void)[],
+    engineView: structuredClone(options.engineView ?? { order: [], auto: { enabled: false, threshold: 95, returnBelow: 80 }, usage: {}, blocks: [] }),
+    engineCheck: null as null | { status: number; body: any } | "offline",
+    engineCheckedView: null as any,
+    holdEngineMethods: new Set<string>(),
+    engineReleases: [] as { method: string; release: () => void }[],
     engineReset: null as null | { status: number; body: any } | "offline",
     /** Session-Resets je Gespräch wie /motor standard */
     engineResets: [] as string[],
@@ -380,6 +397,11 @@ function setup(options: Options = {}) {
   /** Motor-Port über server.settings (Issue #126); GET /api/engines und „Auf Standard" laufen durch createEnginesApi */
   const enginePort: EnginePort = {
     engines: ENGINE_OPTIONS.engines,
+    resolvedModels: () => {
+      const model = effectiveFor(server.settings, FLAT_EFFORT).agents.general.model.value;
+      return { claude: model, api: apiModel(model), codex: server.settings.engine?.codex?.model ?? null, opencode: server.settings.engine?.opencode?.model ?? null };
+    },
+    timeZone: () => "Europe/Berlin",
     standard: () =>
       server.settings.engine?.default
         ? { engine: server.settings.engine.default, source: "settings" }
@@ -387,8 +409,14 @@ function setup(options: Options = {}) {
           ? { engine: ENV_LAYER.engine, source: "env" }
           : { engine: "claude", source: "code" },
     overrides: () => ({ ...(server.settings.engine?.topics ?? {}) }),
+    agentEngines: () => Object.fromEntries(Object.entries(server.settings.agents ?? {}).filter(([, a]) => a.engine).map(([id, a]) => [id, a.engine!])),
     sessionKey: sessionKeyOf,
     availability: async () => structuredClone(server.availability),
+    switchStatus: async () => structuredClone(server.engineView),
+    check: async () => {
+      if (server.engineCheckedView) server.engineView = structuredClone(server.engineCheckedView);
+      return { notMeasured: ["codex"], measurementResults: { claude: "measured", codex: "not-measurable", opencode: "not-measurable", api: "not-measurable" } };
+    },
     removeOverride: async key => {
       const topics = server.settings.engine?.topics;
       if (!topics || !(key in topics)) return false;
@@ -426,9 +454,10 @@ function setup(options: Options = {}) {
           ...(server.telegram.dm ? [{ id: server.telegram.dm.id, title: server.telegram.dm.title }] : []),
           ...server.telegram.topics.map((t: any) => ({ id: t.id, title: t.title })),
         ],
-        resetConversation: async (id, write) => {
+        resetConversation: async (id, options) => {
           server.engineResets.push(id);
-          await write();
+          await options.beforeReset?.();
+          await options.whileBlocked?.();
           return "done";
         },
       },
@@ -462,7 +491,7 @@ function setup(options: Options = {}) {
       // Motor je Gespräch und Standard wie server.ts (Issue #126), über dieselbe Funktion
       const telegram = structuredClone(server.telegram);
       if (!options.noEngineInfo) {
-        const ids = [...(telegram.dm ? [telegram.dm.id] : []), ...telegram.topics.map((t: any) => t.id)];
+        const ids = [...(telegram.dm ? [telegram.dm] : []), ...telegram.topics];
         const engines = conversationEngines(enginePort, ids);
         if (telegram.dm) telegram.dm.engine = engines[telegram.dm.id];
         for (const t of telegram.topics) t.engine = engines[t.id];
@@ -470,7 +499,7 @@ function setup(options: Options = {}) {
       const engine = options.noEngineInfo ? {} : { engine: { default: enginePort.standard().engine } };
       const web = structuredClone(options.web ?? []) as any[];
       if (!options.noEngineInfo) {
-        const engines = conversationEngines(enginePort, web.map(c => c.id));
+        const engines = conversationEngines(enginePort, web);
         for (const c of web) c.engine = engines[c.id];
       }
       const response = Response.json({ conversations: web, telegram, ...engine });
@@ -494,9 +523,23 @@ function setup(options: Options = {}) {
       const r = options.probe ? options.probe(server.requests.filter(x => x.path === path).length) : { status: 503, body: { error: "Telefonhörer ist nicht eingerichtet" } };
       return Response.json(r.body, { status: r.status });
     }
+    if (path === "/api/engines/openrouter" && method === "GET") {
+      const offline = server.openrouterOffline;
+      const body = structuredClone(server.openrouterKey);
+      if (server.holdOpenrouter) await new Promise<void>(release => server.openrouterReleases.push(release));
+      if (offline) throw new TypeError("Netzfehler TESTWERT-674-BROWSER");
+      return Response.json(body);
+    }
     if (path === "/api/engines" && method === "GET") {
       if (server.enginesFails) return Response.json({ error: "kaputt" }, { status: 500 });
       const result = await apis.engines.get();
+      if (server.holdEngineMethods.has("GET")) await new Promise<void>(release => server.engineReleases.push({ method, release }));
+      return Response.json(result.body, { status: result.status });
+    }
+    if (path === "/api/engines/check" && method === "POST") {
+      if (server.engineCheck === "offline") throw new TypeError("offline");
+      const result = server.engineCheck ?? await apis.engines.check();
+      if (server.holdEngineMethods.has("POST")) await new Promise<void>(release => server.engineReleases.push({ method, release }));
       return Response.json(result.body, { status: result.status });
     }
     if (path === "/api/engines/reset" && method === "POST") {
@@ -583,7 +626,7 @@ function setup(options: Options = {}) {
       const t = server.telegram.topics.find((x: any) => x.id === topicPatch[1]);
       if (!t) return Response.json({ error: "Gespräch nicht gefunden" }, { status: 404 });
       t.agent = body.agent;
-      return Response.json({ conversation: { ...t }, note: "Gilt ab der nächsten Nachricht in diesem Topic." });
+      return Response.json({ conversation: { ...t, engineStage: undefined }, note: "Gilt ab der nächsten Nachricht in diesem Topic." });
     }
     const messages = path.match(/^\/api\/conversations\/([^/]+)\/messages$/);
     if (messages) return Response.json({ messages: options.history?.[messages[1]] ?? [], hasMore: false, running: false });
@@ -611,7 +654,7 @@ function setup(options: Options = {}) {
   const visible = () => { for (const fn of docListeners["visibilitychange"] ?? []) fn(); };
   return {
     server, elements, nav, window, requests, all, byKey, agentHead, select, byClass, texts, choose, click, headerPanel, panelButtons, timers, fire,
-    visible, reloads: () => reloads, store, speechFakes,
+    visible, reloads: () => reloads, store, speechFakes, document,
   };
 }
 
@@ -1716,6 +1759,48 @@ describe("„Agent ändern …\" im Topic-Menü", () => {
     expect(speakers(app)).toEqual(["research"]);
   });
 
+  for (const stage of [
+    { engine: "codex", label: "Codex", model: "gpt-6-astra", role: "backup" },
+    { engine: null, label: null, role: "none" },
+  ]) test(`Agentenwechsel behält ${stage.role} bis zur neuen Vorschau für das Agentenmodell`, async () => {
+    const telegram = TOPICS();
+    const reason = { label: "Claude Code", kind: "threshold", resetKnown: true };
+    telegram.topics[0] = { ...telegram.topics[0], engineStage: { ...stage, reason } } as any;
+    const app = setup({ telegram, stored: "topic-443" });
+    await settle();
+    const pill = app.elements["engine-name"];
+    const text = stage.role === "backup" ? "Codex · springt ein" : "Kein Motor frei";
+    const title = "Claude Code ist gesperrt. " + (stage.role === "backup"
+      ? "Codex springt ein."
+      : "Kein Motor ist frei. Es antworten Ersatzmodelle mit eingeschränktem Werkzeugumfang.");
+    expect(pill.textContent).toBe(text);
+    // Das neue Agentenmodell kommt erst mit der Liste; die PATCH-Antwort trägt keine Vorschau.
+    app.server.telegram.topics[0].engineStage = {
+      engine: "claude", label: "Claude Code (claude-opus-5-5)", model: "claude-opus-5-5", role: "backup", reason,
+    };
+    app.server.holdConversations = true;
+    const before = app.requests("GET", "/api/conversations").length;
+    app.elements["conversation-menu"].dispatch("click");
+    await settle();
+    app.panelButtons(app.headerPanel()).find((b: Node) => b.textContent === "Agent ändern …")!.dispatch("click");
+    app.headerPanel().children.find((c: Node) => c.attributes["data-agent-choice"] === "critic")!.dispatch("click");
+    await settle();
+    expect(app.elements["agent-name"].textContent).toBe("Critic");
+    expect(pill.textContent).toBe(text);
+    expect(pill.attributes["data-engine"]).toBe(stage.engine ?? "");
+    expect(pill.attributes.title).toBe(title);
+    expect(app.elements["engine-status"].textContent).toBe(title);
+    expect(app.requests("GET", "/api/conversations")).toHaveLength(before + 1);
+    expect(app.server.conversationReleases).toHaveLength(1);
+    app.server.holdConversations = false;
+    for (const release of app.server.conversationReleases.splice(0)) release();
+    await settle();
+    expect(pill.attributes["data-engine"]).toBe("claude");
+    expect(pill.attributes.title).toBe("Claude Code ist gesperrt. Claude Code (claude-opus-5-5) springt ein.");
+    expect(app.elements["engine-status"].textContent).toBe(pill.attributes.title);
+    expect(pill.children.find((c: Node) => c.className === "engine-pill-full")!.textContent).toBe("Claude Code (claude-opus-5-5) · springt ein");
+  });
+
   test("aktuellen Agenten wählen schließt nur das Menü; auch ohne Löschrecht verfügbar", async () => {
     const app = setup({ telegram: TOPICS(), stored: "topic-443", rights: { group: true, manageTopics: true, deleteMessages: false } });
     await settle();
@@ -1825,7 +1910,7 @@ const MODELS = {
   ollama: { models: ["qwen3:8b", "llama4:1b"] },
 };
 
-const modelHelpers = new Function("document", "window", `${settingsSource}\nreturn { splitAuxSpec, globalFieldValue, globalSectionPatch, globalFieldState, listEntries, filterEntries, formatUptime, formatSessions, GLOBAL_SECTIONS, MODEL_DEFAULT, MODEL_CUSTOM, MODEL_NONE, PROVIDER_DEFAULT, OFFLINE_DEFAULT };`)(
+const modelHelpers = new Function("document", "window", `${settingsSource}\nreturn { splitAuxSpec, globalFieldValue, globalSectionPatch, globalFieldState, listEntries, filterEntries, formatUptime, formatSessions, engineToolsSummary, engineToolsDetails, toolText: SETTINGS_TEXT.tools, GLOBAL_SECTIONS, MODEL_DEFAULT, MODEL_CUSTOM, MODEL_NONE, PROVIDER_DEFAULT, OFFLINE_DEFAULT };`)(
   { getElementById: () => null }, {}
 ) as any;
 
@@ -1889,9 +1974,9 @@ describe("Reiter „Modelle\": Hilfsfunktionen", () => {
 });
 
 describe("Reiter „Modelle\"", () => {
-  test("drei Abschnitte; „Standard (…)\" nennt Wert und Quelle, auch bei Aux und Fallback", async () => {
+  test("Motor vor den drei Modellabschnitten; „Standard (…)\" nennt Wert und Quelle, auch bei Aux und Fallback", async () => {
     const app = await openModels({ settings: { agents: { research: { model: "claude-sonnet-5" }, critic: { effort: "xhigh" } } } });
-    expect(app.all().filter(n => n.tagName === "H3").map(n => n.textContent)).toEqual(["Standard für alle Agenten", "Nebenmodelle", "Fallback"]);
+    expect(app.all().filter(n => n.tagName === "H3").map(n => n.textContent)).toEqual(["Motor", "Standard für alle Agenten", "Nebenmodelle", "Fallback"]);
     expect(optionTexts(app, "settings-g-defaults-model")[0]).toBe("Standard (claude-opus-5-5, Voreinstellung)");
     expect(optionTexts(app, "settings-g-defaults-effort")[0]).toBe("Standard (high, Voreinstellung)");
     expect(optionValues(app, "settings-g-defaults-model")).toEqual([" standard", ...CLAUDE, " eigenes"]);
@@ -2023,7 +2108,7 @@ describe("Reiter „Modelle\"", () => {
     ENV_LAYER.fallback.offlineOnly = true;
     try {
       const app = await openModels();
-      const checked = (a: ReturnType<typeof setup>) => a.all().filter(n => n.attributes["role"] === "radio" && n.attributes["aria-checked"] === "true").map(n => n.textContent);
+      const checked = (a: ReturnType<typeof setup>) => a.all().find(n => n.attributes["role"] === "radiogroup" && n.attributes["aria-labelledby"] === "settings-g-offline-label")!.children.filter(n => n.attributes["aria-checked"] === "true").map(n => n.textContent);
       expect(checked(app)).toEqual(["Standard"]);
       expect(app.texts("actions-hint").some(t => t.endsWith("Standard ist zurzeit an (.env)."))).toBe(true);
       app.click("g-offline:false");
@@ -2521,7 +2606,7 @@ describe("Abschnitt „Motor\" (Issue #126)", () => {
     topics: [{ id: "topic-443", title: "Recherche", agent: "research", lastActivity: null }],
   };
   async function open(options: Options = {}) {
-    const app = setup({ hash: "#/einstellungen/agenten", telegram, ...options });
+    const app = setup({ hash: "#/einstellungen/modelle", telegram, ...options });
     await settle();
     const section = () => app.all().find(n => n.attributes["aria-labelledby"] === "settings-g-title-engine")!;
     return { app, section, first: section() };
@@ -2529,11 +2614,11 @@ describe("Abschnitt „Motor\" (Issue #126)", () => {
   const optionTexts = (app: ReturnType<typeof setup>, id: string) => app.select(id).children.map((o: any) => o.textContent);
   const optionValues = (app: ReturnType<typeof setup>, id: string) => app.select(id).children.map((o: any) => o.value);
 
-  test("oben im Reiter Agenten: Verfügbarkeit je Motor, Standard-Motor, Codex mit Modell, Effort und Rechten", async () => {
+  test("oben im Reiter Modelle: Verfügbarkeit je Motor, Standard-Motor, Codex mit Modell, Effort und Rechten", async () => {
     const { app, first } = await open();
-    // Der Abschnitt steht vor der Agentenliste
+    // Der Abschnitt steht zuerst, vor dem Standard für alle Agenten
     const panel = app.elements["settings-panel"].children;
-    expect(panel.indexOf(first)).toBeLessThan(panel.findIndex((n: any) => n.className === "settings-agents"));
+    expect(panel.indexOf(first)).toBe(0);
     expect(app.texts("settings-label", first)[0]).toBe("Motor");
     expect(app.texts("settings-key-name", first)).toEqual(["Claude Code", "Codex", "OpenCode"]);
     expect(app.texts("settings-key-state", first)).toEqual([
@@ -2557,14 +2642,14 @@ describe("Abschnitt „Motor\" (Issue #126)", () => {
 
   test("Akzeptanz: Standard „Codex\" speichern sendet engine.default und lädt die Motor-Liste neu", async () => {
     const { app } = await open();
-    const before = app.requests("GET", "/api/engines").length;
+    const before = app.requests("GET", "/api/engines").filter(r => r.path === "/api/engines").length;
     app.choose("settings-g-engine-default", "codex");
     expect(app.byKey("save:section-engine")!.disabled).toBe(false);
     app.click("save:section-engine");
     await settle();
     expect(app.requests("PATCH", "/api/settings")).toEqual([{ method: "PATCH", path: "/api/settings", body: { engine: { default: "codex" } } }]);
     expect(app.server.settings.engine).toEqual({ default: "codex" });
-    expect(app.requests("GET", "/api/engines").length).toBe(before + 1);
+    expect(app.requests("GET", "/api/engines").filter(r => r.path === "/api/engines").length).toBe(before + 1);
     expect(app.select("settings-g-engine-default").value).toBe("codex");
     expect(app.texts("settings-status", app.all().find(n => n.attributes["aria-labelledby"] === "settings-g-title-engine")!)).toContain("Gespeichert.");
     // Zurück auf „Standard" entfernt den eigenen Wert
@@ -2633,7 +2718,7 @@ describe("Abschnitt „Motor\" (Issue #126)", () => {
     expect(app.byKey("engine-reset:" + TOPIC)!.attributes["aria-label"]).toBe("Auf Standard: Recherche");
 
     const empty = await open();
-    expect(empty.app.texts("settings-empty", empty.section())).toEqual(["Keine. Alle Gespräche nehmen den Standard."]);
+    expect(empty.app.texts("settings-empty", empty.section())).toEqual(["Keine. Es gilt der Motor des Agenten, sonst der Standard."]);
   });
 
   test("Akzeptanz: „Auf Standard\" entfernt genau einen Eintrag, über den Session-Reset des Gesprächs", async () => {
@@ -2676,7 +2761,7 @@ describe("Abschnitt „Motor\" (Issue #126)", () => {
     });
     expect(app.texts("settings-key-state", section())).toEqual(["installiert, Version 2.1.281; Anmeldung nicht feststellbar", "nicht installiert"]);
 
-    const failing = setup({ hash: "#/einstellungen/agenten", telegram, enginesFail: true });
+    const failing = setup({ hash: "#/einstellungen/modelle", telegram, enginesFail: true });
     await settle();
     const s = failing.all().find(n => n.attributes["aria-labelledby"] === "settings-g-title-engine")!;
     expect(failing.texts("actions-error", s)).toEqual(["kaputt"]);
@@ -2818,11 +2903,16 @@ describe("Abschnitt „Motor\" (Issue #126)", () => {
 
   test("Agenten-Modelle mit Hinweis „gilt für Claude Code\"; Standard im Reiter Modelle ebenso", async () => {
     const { app } = await open();
+    tabButton(app, "agenten").dispatch("click");
+    await settle();
+    expect(app.byClass("settings-engine-link")[0].children.map((n: Node) => n.textContent).join("")).toBe("Standard-Motor und Ersatzstufen stehen unter Modelle.");
+    expect(app.byClass("settings-engine-link")[0].children[1].attributes.href).toBe("#/einstellungen/modelle");
+    expect(app.all().some(n => n.attributes["aria-labelledby"] === "settings-g-title-engine")).toBe(false);
     await openAgent(app, "research");
-    expect(app.texts("settings-engine-scope")).toEqual(["gilt für Claude Code"]);
+    expect(app.texts("settings-engine-scope")).toEqual(["gilt für Claude Code und Anthropic API"]);
     const models = setup({ hash: "#/einstellungen/modelle" });
     await settle();
-    expect(models.texts("actions-hint").some(t => t.includes("Gilt für Claude Code; Codex und OpenCode haben eigene Werte"))).toBe(true);
+    expect(models.texts("actions-hint").some(t => t.includes("Gilt für Claude Code und die Anthropic API; Codex und OpenCode haben eigene Werte oben im Abschnitt Motor."))).toBe(true);
   });
 });
 
@@ -2845,17 +2935,18 @@ describe("Kopfzeile: Motor-Pille (Issue #126)", () => {
   }
   const activity = () => FakeEventSource.all.filter(s => s.url === "/api/telegram/events" && !s.closed).at(-1)!;
 
-  test("Akzeptanz: Pille nur bei abweichendem Motor; beim Standard Claude Code ohne Ausnahme keine", async () => {
+  test("Akzeptanz: Pille immer sichtbar, auch beim Standard Claude Code", async () => {
     const app = setup({ telegram: telegram(), stored: "topic-443", settings: { engine: { topics: { "topic:-1001:443": "codex" } } } });
     await settle();
     expect(pill(app).hidden).toBe(false);
     expect(pill(app).textContent).toBe("Codex");
     expect(pill(app).attributes["data-engine"]).toBe("codex");
-    expect(pill(app).attributes.title).toBe("Motor dieses Gesprächs: Codex. Wechseln mit /motor.");
+    expect(pill(app).attributes.title).toBe("Codex antwortet.");
     await openConversation(app, "topic-12");
     expect(app.elements["agent-name"].textContent).toBe("Critic");
-    expect(pill(app).hidden).toBe(true);
-    expect(pill(app).textContent).toBe("");
+    expect(pill(app).hidden).toBe(false);
+    expect(pill(app).textContent).toBe("Claude Code");
+    expect(pill(app).textContent).toBe("Claude Code");
   });
 
   test("Akzeptanz: Standard nicht Claude: Pille überall, auch mit Claude Code als Ausnahme", async () => {
@@ -2867,30 +2958,33 @@ describe("Kopfzeile: Motor-Pille (Issue #126)", () => {
     expect(pill(app).textContent).toBe("Claude Code");
   });
 
-  test("OpenCode (Issue #129): Pille im Topic mit /motor opencode, andere Topics ohne; Standard OpenCode überall", async () => {
+  test("OpenCode (Issue #129): Pille im Topic mit /motor opencode, andere Topics Claude Code; Standard OpenCode überall", async () => {
     const app = setup({ telegram: telegram(), stored: "topic-443", settings: { engine: { topics: { "topic:-1001:443": "opencode" } } } });
     await settle();
     expect(pill(app).hidden).toBe(false);
     expect(pill(app).textContent).toBe("OpenCode");
     expect(pill(app).attributes["data-engine"]).toBe("opencode");
-    expect(pill(app).attributes.title).toBe("Motor dieses Gesprächs: OpenCode. Wechseln mit /motor.");
+    expect(pill(app).attributes.title).toBe("OpenCode antwortet.");
     await openConversation(app, "topic-12");
-    expect(pill(app).hidden).toBe(true);
+    expect(pill(app).hidden).toBe(false);
+    expect(pill(app).textContent).toBe("Claude Code");
     const standard = setup({ telegram: telegram(), stored: "dm", settings: { engine: { default: "opencode" } } });
     await settle();
     expect(pill(standard).textContent).toBe("OpenCode");
   });
 
-  test("Server ohne Motor-Angaben: keine Pille", async () => {
+  test("Server ohne Motor-Angaben: Claude Code als bisheriger Standard", async () => {
     const app = setup({ telegram: telegram(), stored: "topic-443", noEngineInfo: true, settings: { engine: { default: "codex" } } });
     await settle();
-    expect(pill(app).hidden).toBe(true);
+    expect(pill(app).hidden).toBe(false);
+    expect(pill(app).textContent).toBe("Claude Code");
   });
 
   test("/motor aus einem anderen Kanal, Standard und „Auf Standard\": SSE engine wechselt die Pille ohne Neuladen", async () => {
     const app = setup({ telegram: telegram(), stored: "dm" });
     await settle();
-    expect(pill(app).hidden).toBe(true);
+    expect(pill(app).hidden).toBe(false);
+    expect(pill(app).textContent).toBe("Claude Code");
     // /motor codex in Telegram schreibt die Ausnahme, der Server meldet engine
     app.server.settings.engine = { topics: { "dm:7": "codex" } };
     activity().emit("engine", { data: "{}" });
@@ -2906,7 +3000,27 @@ describe("Kopfzeile: Motor-Pille (Issue #126)", () => {
     app.server.settings.engine = {};
     activity().emit("engine", { data: "{}" });
     await settle();
-    expect(pill(app).hidden).toBe(true);
+    expect(pill(app).hidden).toBe(false);
+    expect(pill(app).textContent).toBe("Claude Code");
+  });
+
+  test("frische Vorschau nach engine, fehlende Vorschau verwirft den alten Zustand", async () => {
+    const app = setup({ telegram: telegram(), stored: "dm" });
+    await settle();
+    app.server.telegram.dm.engineStage = { engine: "codex", label: "Codex", model: "gpt-6-astra", role: "backup" };
+    activity().emit("engine", { data: "{}" });
+    await settle();
+    expect(pill(app).textContent).toBe("Codex · springt ein");
+    expect(pill(app).attributes["data-engine"]).toBe("codex");
+    expect(app.elements["engine-status"].textContent).toBe("Codex springt ein.");
+    expect(pill(app).attributes.title).toBe(app.elements["engine-status"].textContent);
+    delete app.server.telegram.dm.engineStage;
+    activity().emit("engine", { data: "{}" });
+    await settle();
+    expect(pill(app).textContent).toBe("Claude Code");
+    expect(pill(app).attributes["data-engine"]).toBe("claude");
+    expect(pill(app).attributes.title).toBe("Claude Code antwortet.");
+    expect(app.reloads()).toBe(0);
   });
 
   test("nach Verbindungsunterbrechung gleicht der Sammelstrom die Liste ab, auch die Pille", async () => {
@@ -2915,7 +3029,8 @@ describe("Kopfzeile: Motor-Pille (Issue #126)", () => {
     const source = activity();
     source.emit("open");
     await settle();
-    expect(pill(app).hidden).toBe(true);
+    expect(pill(app).hidden).toBe(false);
+    expect(pill(app).textContent).toBe("Claude Code");
     // Während der Lücke: /motor codex, das Ereignis ging verloren
     app.server.settings.engine = { topics: { "topic:-1001:443": "codex" } };
     source.emit("open");
@@ -2933,7 +3048,8 @@ describe("Kopfzeile: Motor-Pille im reinen Web-Gespräch, ohne Direktchat und To
     const app = setup({ web, stored: "w-1" });
     await settle();
     expect(app.elements["chat-title"].textContent).toBe("Notizen");
-    expect(pill(app).hidden).toBe(true);
+    expect(pill(app).hidden).toBe(false);
+    expect(pill(app).textContent).toBe("Claude Code");
     // Sammelstrom offen, obwohl es kein Telegram-Gespräch gibt
     const source = activity();
     expect(source).toBeDefined();
@@ -2949,7 +3065,8 @@ describe("Kopfzeile: Motor-Pille im reinen Web-Gespräch, ohne Direktchat und To
     app.server.settings.engine = {};
     source!.emit("engine", { data: "{}" });
     await settle();
-    expect(pill(app).hidden).toBe(true);
+    expect(pill(app).hidden).toBe(false);
+    expect(pill(app).textContent).toBe("Claude Code");
     // Standard auf der Einstellungsseite auf Codex
     app.server.settings.engine = { default: "codex" };
     source!.emit("engine", { data: "{}" });
@@ -2967,8 +3084,238 @@ describe("Kopfzeile: Motor-Pille im reinen Web-Gespräch, ohne Direktchat und To
     expect(again).not.toBe(source);
     again!.emit("open");
     await settle();
-    expect(pill(app).hidden).toBe(true);
+    expect(pill(app).hidden).toBe(false);
+    expect(pill(app).textContent).toBe("Claude Code");
     expect(app.reloads()).toBe(0);
+  });
+});
+
+function emptyEngineTools(): EngineToolsResponse {
+  return {
+    inventory: { mcp: [], skills: [], notes: "none", state: "ok" },
+    gaps: { mcp: [], skills: [], hints: [], notes: false, plugins: 0, fixed: [] },
+  };
+}
+
+describe("Statusseite: Werkzeug-Hilfen (Issue #667)", () => {
+  const { engineToolsSummary: summary, engineToolsDetails: details, toolText } = modelHelpers;
+
+  test("Bestand ohne Lücken, Einzahl und Mehrzahl; Claude Code ist der Maßstab", () => {
+    const tools = emptyEngineTools();
+    tools.inventory.mcp = [{ name: "dateien", origin: "tybo" }, { name: "suche", origin: "engine" }];
+    tools.inventory.skills = [{ name: "gruss", origin: "tybo" }];
+    tools.inventory.notes = "passed";
+    expect(summary("codex", tools)).toBe("2 MCP-Server, 1 Skill, Notizen");
+    expect(summary("claude", tools)).toBe("2 MCP-Server, 1 Skill, Notizen · Maßstab");
+    tools.inventory.skills.push({ name: "plan", origin: "engine" });
+    expect(summary("codex", tools)).toBe("2 MCP-Server, 2 Skills, Notizen");
+    expect(details("codex", tools).slice(0, 3)).toEqual([
+      { label: "MCP-Server", items: [{ name: "dateien", text: "von tybo" }, { name: "suche", text: "im Motor" }] },
+      { label: "Skills", items: [{ name: "gruss", text: "von tybo" }, { name: "plan", text: "im Motor" }] },
+      { label: "Notizen", items: [{ text: "von tybo" }] },
+    ]);
+  });
+
+  test("leer, null, unbekannt und älterer Server sind verschiedene Zustände", () => {
+    const tools = emptyEngineTools();
+    expect(summary("codex", tools)).toBe("keine eingerichtet");
+    expect(details("codex", tools)).toEqual([]);
+    expect(summary("claude", tools)).toBe("keine eingerichtet · Maßstab");
+    for (const engine of ["claude", "codex"]) {
+      expect(summary(engine, null)).toBe("nicht vollständig ermittelbar");
+      expect(details(engine, null)).toEqual([]);
+      expect(summary(engine, undefined)).toBeNull();
+      expect(details(engine, undefined)).toEqual([]);
+    }
+    tools.inventory.state = "unknown";
+    expect(summary("codex", tools)).toBe("nicht vollständig ermittelbar");
+    tools.inventory.mcp.push({ name: "dateien", origin: "engine" });
+    expect(summary("codex", tools)).toBe("1 MCP-Server · nicht vollständig ermittelbar");
+  });
+
+  test("Bestand mit allen Arten von Lücken und Hinweisen: Namen und text unverändert", () => {
+    const tools = emptyEngineTools();
+    tools.inventory.skills.push({ name: "gruss", origin: "tybo" });
+    tools.gaps.mcp = [{ name: "unzulaessig-a123", reason: "invalid_name", text: "Genau der Satz des Servers." }];
+    tools.gaps.skills = [{ name: "plan", reason: "head", text: "Ein anderer Satz, unverändert." }];
+    tools.gaps.hints = [{ name: "dienst", reason: "unsupported_source", text: "Der Hinweis des Servers." }];
+    tools.gaps.notes = true;
+    tools.gaps.plugins = 2;
+    tools.gaps.fixed = [{ id: "connectors", text: "Der feste Satz des Servers." }];
+    const before = JSON.stringify(tools);
+    expect(summary("codex", tools)).toBe("1 Skill · Fehlt: 1 MCP-Server, 1 Skill, Notizen, Konnektoren des Claude-Kontos · 1 Hinweis");
+    expect(details("codex", tools)).toEqual([
+      { label: "Skills", items: [{ name: "gruss", text: "von tybo" }] },
+      { label: "Notizen", items: [{ text: "keine vorhanden" }] },
+      { label: "Fehlende MCP-Server", items: [{ name: "unzulaessig-a123", text: tools.gaps.mcp[0].text }] },
+      { label: "Fehlende Skills", items: [{ name: "plan", text: tools.gaps.skills[0].text }] },
+      { label: "Hinweise", items: [{ name: "dienst", text: tools.gaps.hints[0].text }] },
+      { label: "", items: [{ text: MOTOR_TOOL_TEXT.notesMissing }] },
+      { label: "", items: [{ text: "Plugins von Claude Code: 2" }] },
+      { label: "Weitere Lücken", items: [{ text: tools.gaps.fixed[0].text }] },
+    ]);
+    expect(JSON.stringify(tools)).toBe(before);
+    expect(summary("claude", tools)).toBe("1 Skill · Maßstab");
+    expect(details("claude", tools).flatMap((g: any) => g.items).map((i: any) => i.text)).not.toContain(tools.gaps.fixed[0].text);
+  });
+
+  test("feste Lücken: unbekannte Kennungen zählen, ungültige Einträge werden übergangen", () => {
+    const tools: any = emptyEngineTools();
+    tools.gaps.fixed = [
+      { id: "connectors", text: "Wörtlicher Grund." },
+      { id: "neu", text: "Neuer Grund vom Server." },
+      { id: "hooks" }, "plugins", null, { id: "builtin", text: 7 },
+    ];
+    expect(summary("codex", tools)).toBe("keine eingerichtet · Fehlt: Konnektoren des Claude-Kontos, 1 weitere Lücke");
+    expect(details("codex", tools).at(-1)).toEqual({ label: "Weitere Lücken", items: [{ text: "Wörtlicher Grund." }, { text: "Neuer Grund vom Server." }] });
+    tools.gaps.fixed.push({ id: "constructor", text: "Weiterer neuer Grund." });
+    expect(summary("codex", tools)).toContain("2 weitere Lücken");
+    tools.gaps.fixed = ["plugins", { id: "hooks" }];
+    expect(summary("codex", tools)).toBe("keine eingerichtet");
+    expect(details("codex", tools)).toEqual([]);
+  });
+
+  test("Notizen nur bei self/passed im Bestand, Pluginzahl auch unbekannt; fremde Werte bleiben verborgen", () => {
+    const tools: any = emptyEngineTools();
+    tools.inventory.mcp = [{ name: "dateien", origin: "engine", secret: SECRET }, { name: "verborgen", origin: SECRET }];
+    tools.gaps.plugins = null;
+    tools.secret = tools.inventory.secret = tools.gaps.secret = SECRET;
+    for (const notes of ["self", "passed", "none", "off", SECRET]) {
+      tools.inventory.notes = notes;
+      expect(summary("codex", tools)).toBe("1 MCP-Server" + (["self", "passed"].includes(notes) ? ", Notizen" : ""));
+      const rows = details("codex", tools);
+      expect(rows.flatMap((g: any) => g.items).map((i: any) => i.text)).toContain(MOTOR_TOOL_TEXT.pluginsUnknown);
+      expect(JSON.stringify(rows)).not.toContain(SECRET);
+      expect(JSON.stringify(rows)).not.toContain("verborgen");
+    }
+  });
+
+  test("Kurzbezeichnungen und feste Sätze bleiben gleich wie im Chat und Prüfbericht", () => {
+    for (const id of TOOL_GAP_IDS) expect(toolText.fixedShort[id]).toBe(FIXED_SHORT[id]);
+    expect(toolText.notesMissing).toBe(MOTOR_TOOL_TEXT.notesMissing);
+    expect(toolText.pluginsUnknown).toBe(MOTOR_TOOL_TEXT.pluginsUnknown);
+  });
+
+  test("Demo: Notizen-Lücken, Hinweise und Pluginzahlen werden nicht verschwiegen", () => {
+    for (const entry of DEMO_STATUS_ENGINES) {
+      const text = summary(entry.engine, entry.tools);
+      if (entry.engine === "claude") expect(text).toBe("2 MCP-Server, 1 Skill, Notizen · Maßstab");
+      else {
+        if (entry.engine !== "codex") expect(text).toContain("Fehlt: 1 MCP-Server, Notizen");
+        else expect(text).toContain("1 Hinweis");
+        expect(details(entry.engine, entry.tools).flatMap((g: any) => g.items).map((i: any) => i.text)).toContain("Plugins von Claude Code: 2");
+      }
+    }
+  });
+});
+
+describe("Statusseite: Werkzeug-Anzeige (Issue #667)", () => {
+  test("eine zweite Zeile und ein Aufklapper je Demo-Motor im selben li; Agenten bleiben unverändert", async () => {
+    const app = await openStatus({ status: statusBody({ engines: DEMO_STATUS_ENGINES }) });
+    const list = app.byClass("settings-status-engines")[0];
+    expect(list.children).toHaveLength(4);
+    expect(app.texts("settings-key-name", list)).toEqual(["Claude Code", "Codex", "OpenCode", "Anthropic API"]);
+    expect(app.texts("settings-engine-tools-label", list)).toEqual(Array(4).fill("Werkzeuge"));
+    for (const [i, entry] of DEMO_STATUS_ENGINES.entries()) {
+      const li = list.children[i];
+      expect(app.texts("settings-engine-tools-summary", li)).toEqual([modelHelpers.engineToolsSummary(entry.engine, entry.tools)]);
+      const details = app.byClass("settings-engine-details", li)[0];
+      expect(details.tagName).toBe("DETAILS");
+      expect(details.open).toBe(false);
+      expect(details.children[0].tagName).toBe("SUMMARY");
+      expect(details.children[0].textContent).toBe("Einzelheiten");
+      expect(details.children[0].attributes["data-focus-key"]).toBe("engine-tools:" + entry.engine);
+      for (const gap of [...entry.tools!.gaps.mcp, ...entry.tools!.gaps.hints, ...entry.tools!.gaps.skills]) {
+        expect(app.texts("settings-engine-tool-name", details)).toContain(gap.name);
+        expect(app.texts("settings-engine-tool-text", details)).toContain(gap.text);
+      }
+      const fixed = entry.tools!.gaps.fixed;
+      if (fixed.length) expect(app.texts("settings-engine-tool-text", details).slice(-fixed.length)).toEqual(fixed.map(gap => gap.text));
+    }
+    tabButton(app, "agenten").dispatch("click");
+    await settle();
+    expect(app.byClass("settings-status-engines")).toHaveLength(0);
+    expect(app.byClass("settings-engine-tools")).toHaveLength(0);
+  });
+
+  test("Doku-Link nutzt das Repo aus BRAND, HEAD und einen abgesicherten neuen Tab", async () => {
+    const app = await openStatus({ status: statusBody({ engines: DEMO_STATUS_ENGINES }) });
+    app.window.TYBO_BRAND = { ...TYBO_BRAND, repo: "beispiel/fork" };
+    app.click("status-refresh");
+    await settle();
+    const note = app.byClass("settings-engine-tools-note")[0];
+    expect(note.children[0].textContent).toBe(`Ein Ersatzmotor bekommt von ${TYBO_BRAND.name} die Werkzeuge, die sich übertragen lassen. Was fehlt, steht mit Grund dabei. `);
+    const link = note.children[1];
+    expect(link.tagName).toBe("A");
+    expect(link.textContent).toBe("Werkzeuge im Ersatzmotor");
+    expect(link.attributes).toEqual({
+      href: "https://github.com/beispiel/fork/blob/HEAD/docs/erweiterungen.md#werkzeuge-im-ersatzmotor",
+      target: "_blank", rel: "noopener noreferrer",
+    });
+  });
+
+  test("erneutes Laden hält Aufklapper und Fokus je Motor; Schließen wird ebenso gemerkt", async () => {
+    const app = await openStatus({ status: statusBody({ engines: DEMO_STATUS_ENGINES }) });
+    const detailsFor = (engine: string) => app.all().find(n => n.attributes["data-engine"] === engine)!.children.at(-1)!;
+    const codex = detailsFor("codex");
+    codex.open = true;
+    codex.dispatch("toggle");
+    app.document.activeElement = app.byKey("engine-tools:codex");
+    app.document.querySelector = (selector: string) => app.byKey(selector.match(/data-focus-key="([^"]+)"/)?.[1] ?? "");
+    const before = statusRequests(app);
+    app.click("status-refresh");
+    await settle();
+    expect(statusRequests(app)).toBe(before + 1);
+    expect(detailsFor("codex")).not.toBe(codex);
+    expect(detailsFor("codex").open).toBe(true);
+    expect(detailsFor("claude").open).toBe(false);
+    expect(app.byKey("engine-tools:codex")!.focused).toBeGreaterThan(0);
+    // Ein verzögertes toggle des entfernten Elements überschreibt nichts.
+    codex.isConnected = false;
+    codex.open = false;
+    codex.dispatch("toggle");
+    app.click("status-refresh");
+    await settle();
+    expect(detailsFor("codex").open).toBe(true);
+    detailsFor("codex").open = false;
+    detailsFor("codex").dispatch("toggle");
+    app.click("status-refresh");
+    await settle();
+    expect(detailsFor("codex").open).toBe(false);
+  });
+
+  test("ältere Antwort ohne tools bleibt wie bisher; null, unbekannt und leer ohne leeren Aufklapper", async () => {
+    const engine = { engine: "codex", label: "Codex", installed: true, loggedIn: true };
+    const app = await openStatus({ status: statusBody({ engines: [engine] }) });
+    const legacyRow = app.byClass("settings-engines")[0].children[0];
+    expect(legacyRow.children.map(n => n.className)).toEqual(["settings-key-name", "settings-key-state"]);
+    expect(legacyRow.className).toBe("");
+    expect(app.byClass("settings-engine-tools")).toHaveLength(0);
+    expect(app.byClass("settings-engine-details")).toHaveLength(0);
+    expect(app.byClass("settings-engine-tools-note")).toHaveLength(0);
+    const unknown = emptyEngineTools();
+    unknown.inventory.state = "unknown";
+    for (const [tools, text] of [[null, "nicht vollständig ermittelbar"], [unknown, "nicht vollständig ermittelbar"], [emptyEngineTools(), "keine eingerichtet"]]) {
+      app.server.status = statusBody({ engines: [{ ...engine, tools }] });
+      app.click("status-refresh");
+      await settle();
+      expect(app.texts("settings-engine-tools-summary")).toEqual([text]);
+      expect(app.byClass("settings-engine-details")).toHaveLength(0);
+    }
+  });
+
+  test("auch HTML-artige Namen und Gründe sind nur Text; zusätzliche Antwortfelder bleiben verborgen", async () => {
+    const tools: any = emptyEngineTools();
+    tools.inventory.mcp = [{ name: "<img src=x>", origin: "tybo", address: SECRET }];
+    tools.gaps.skills = [{ name: "<skill>", text: "<b>Wörtlicher Grund</b>", reason: SECRET, value: SECRET }];
+    tools.gaps.fixed = [{ id: "connectors", text: "<script>nur Text</script>", secret: SECRET }, "hooks", { id: "plugins" }];
+    tools.extra = tools.inventory.extra = tools.gaps.extra = SECRET;
+    const app = await openStatus({ status: statusBody({ engines: [{ engine: "codex", tools }] }) });
+    expect(app.texts("settings-engine-tool-name")).toEqual(["<img src=x>", "<skill>"]);
+    expect(app.texts("settings-engine-tool-text")).toContain("<b>Wörtlicher Grund</b>");
+    expect(app.texts("settings-engine-tool-text").at(-1)).toBe("<script>nur Text</script>");
+    expect(app.all().map(n => n.textContent).join(" ")).not.toContain(SECRET);
+    expect(htmlWrites).toEqual([]);
   });
 });
 
@@ -2982,6 +3329,7 @@ describe("Statusseite: Motoren (Issue #126)", () => {
       readPackageJson: () => '{"version":"2.12.0"}',
       detectSupervisor: async () => "launchd",
       listSessions: async () => [],
+      toolParity: () => { throw new Error("Werkzeuge nicht ermittelbar"); },
       inspectEngine: async id =>
         id === "codex"
           ? { engine: "codex", checked: true, installed: true, loggedIn: false, version: "0.155.1", message: CODEX_NOT_LOGGED_IN }
@@ -3004,6 +3352,8 @@ describe("Statusseite: Motoren (Issue #126)", () => {
     ]);
     const items = app.byClass("settings-engines", section)[0].children;
     expect(items.map((li: any) => li.attributes["data-set"])).toEqual(["true", "false", "true", "false"]);
+    expect(app.texts("settings-engine-tools-summary", section)).toEqual(Array(4).fill("nicht vollständig ermittelbar"));
+    expect(app.byClass("settings-engine-details", section)).toHaveLength(0);
   });
 
   test("nicht installiert, Anmeldung nicht feststellbar; ohne Angabe „unbekannt\"", async () => {
@@ -4095,5 +4445,518 @@ describe("Reiter „Erinnerungen\" (Issue #323)", () => {
     tab("erinnerungen").dispatch("click");
     await settle();
     expect(app.requests("GET", "/api/reminders")).toHaveLength(2);
+  });
+});
+
+// Reihenfolge und Modellvorschau im Abschnitt Motor (Issue #673).
+describe("Motor bei den Modellen: Reihenfolge und Live-Stand", () => {
+  const engines = { ...ENGINE_OPTIONS, engines: [...ENGINE_OPTIONS.engines, { id: "api", label: "Anthropic API" }] };
+  const view = () => ({ order: [
+    { id: "claude", engine: "claude", state: "blocked", cause: "threshold", window: "weekly_all", blockedUntil: "2026-11-22T15:00:00Z", resetKnown: true },
+    { id: "codex", engine: "codex", state: "answering" },
+    { id: "claude:opus", engine: "claude", state: "free" },
+  ], blocks: [{ engine: "claude", cause: "threshold", window: "weekly_all", percent: 96 }], usage: {}, auto: { enabled: true, threshold: 95, returnBelow: 80 } });
+  async function open(options: Options = {}) {
+    const app = await openModels({ engineOptions: engines, ...options });
+    app.document.querySelector = (selector: string) => app.byKey(selector.match(/data-focus-key="([^"]+)"/)?.[1] ?? "");
+    return app;
+  }
+  const input = (app: Awaited<ReturnType<typeof open>>, key: string, value: string) => {
+    const field = app.byKey(key)!; field.value = value; field.dispatch("input");
+  };
+  const rows = (app: Awaited<ReturnType<typeof open>>) => app.byClass("settings-motor-order")[0].children;
+
+  test("Modell der ersten Stufe folgt dem Motor, auch vor dem Speichern und beim Tippen", async () => {
+    const app = await open({ settings: { agents: { general: { model: "opus" } }, defaults: { model: "claude-haiku-5-5" },
+      engine: { codex: { model: "codex-eigen" }, opencode: { model: "openrouter/test/eigen" } } } });
+    expect(app.byKey("engine-model:0")!.textContent).toBe("opus · Modell des Agenten");
+    expect(app.texts("actions-hint")).toContain("Bei Claude Code und Anthropic API gilt das Modell des Agenten. Codex und OpenCode nutzen die Einstellungen des Motors.");
+    app.choose("settings-g-engine-default", "codex");
+    expect(app.byKey("engine-model:0")!.textContent).toBe("codex-eigen");
+    input(app, "g-engine:codexModel", "codex-neu");
+    expect(app.byKey("engine-model:0")!.textContent).toBe("codex-neu");
+    input(app, "g-engine:codexModel", "");
+    expect(app.byKey("engine-model:0")!.textContent).toBe("Standard aus der Codex-Konfiguration");
+    app.choose("settings-g-engine-default", "opencode");
+    expect(app.byKey("engine-model:0")!.textContent).toBe("openrouter/test/eigen");
+    expect(app.byKey("engine-paid:0")!.textContent).toBe("zahlt je Verbrauch");
+    input(app, "g-custom:engine.opencodeModel", "openai/eigen");
+    expect(app.byKey("engine-model:0")!.textContent).toBe("openai/eigen");
+    expect(app.byKey("engine-paid:0")!.textContent).toBe("");
+    app.choose("settings-g-engine-opencodeModel", " standard");
+    expect(app.byKey("engine-model:0")!.textContent).toBe("Standard aus der OpenCode-Konfiguration");
+    app.choose("settings-g-engine-default", "api");
+    expect(app.byKey("engine-model:0")!.textContent).toBe(apiModel("opus") + " · Modell des Agenten");
+    expect(app.byKey("engine-paid:0")!.textContent).toBe("zahlt je Verbrauch");
+    expect(app.requests("PATCH")).toHaveLength(0);
+  });
+
+  test("Hinzufügen: Auswahl ohne API, Claude-Modell Pflicht, Doppelte abgelehnt und vier als Obergrenze", async () => {
+    const app = await open({ settings: {} });
+    app.click("engine-add");
+    expect(app.select("settings-engine-add-engine").children.map(n => n.value)).toEqual(["claude", "codex", "opencode"]);
+    app.click("engine-add-confirm");
+    expect(app.texts("actions-error").join()).toContain("Claude-Modell");
+    input(app, "engine-add-model", "opus");
+    app.choose("settings-engine-add-effort", "high");
+    app.click("engine-add-confirm");
+    expect(rows(app)).toHaveLength(3);
+    app.click("engine-add"); input(app, "engine-add-model", "opus"); app.click("engine-add-confirm");
+    expect(app.texts("actions-error")).toContain("Diese Stufe ist schon vorhanden.");
+    input(app, "engine-add-model", "sonnet"); app.click("engine-add-confirm");
+    for (const engine of ["codex", "opencode"]) {
+      app.click("engine-add"); app.choose("settings-engine-add-engine", engine); app.click("engine-add-confirm");
+    }
+    expect(app.byKey("engine-add")!.disabled).toBe(true);
+    expect(rows(app)).toHaveLength(6);
+    expect(app.byClass("settings-motor-order")[0].tagName).toBe("OL");
+    expect(app.byKey("engine-fallback")!.textContent).toBe("Ersatzmodelle mit eingeschränktem Werkzeugumfang");
+    app.click("save:section-engine"); await settle();
+    expect(app.server.settings.engine.backups).toEqual([{ engine: "claude", model: "opus", effort: "high" }, { engine: "claude", model: "sonnet" }, { engine: "codex" }, { engine: "opencode" }]);
+    app.click("engine-stage:codex:remove"); app.click("save:section-engine"); await settle();
+    expect(app.server.settings.engine.backups.map((s: any) => s.engine)).toEqual(["claude", "claude", "opencode"]);
+  });
+
+  test("Verschieben erhält Zustand und Fokus an der Stufe, live sagt neue Position; keine freie Stufe antwortet von selbst", async () => {
+    const app = await open({ settings: { engine: { backups: [{ engine: "codex" }, { engine: "claude", model: "opus" }] } }, engineView: view() });
+    const key = "engine-stage:claude:opus:up";
+    app.document.activeElement = app.byKey(key);
+    app.click(key);
+    expect(rows(app).slice(0, -1).map(n => n.attributes["data-stage-id"])).toEqual(["claude", "claude:opus", "codex"]);
+    expect(app.texts("settings-motor-state")).toEqual(["gesperrt bis So 16:00 (Woche, alle Modelle: 96 %)", "frei", "antwortet"]);
+    expect(app.byKey(key)!.focused).toBeGreaterThan(0);
+    expect(app.byKey(key)!.disabled).toBe(false);
+    expect(app.byKey(key)!.attributes["aria-disabled"]).toBe("true");
+    expect(app.texts("settings-engine-live", app.elements.settings)).toEqual(["Claude Code mit opus steht jetzt an Position 2."]);
+    app.server.engineView.order = app.server.engineView.order.map((s: any) => ({ ...s, state: "free" }));
+    FakeEventSource.all.find(s => s.url === "/api/telegram/events" && !s.closed)!.emit("engine");
+    await settle();
+    expect(app.texts("settings-motor-state")).toEqual(["frei", "frei", "frei"]);
+    expect(rows(app)[1].attributes["data-stage-id"]).toBe("claude:opus");
+    app.click("save:section-engine"); await settle();
+    expect(app.server.settings.engine.backups).toEqual([{ engine: "claude", model: "opus" }, { engine: "codex" }]);
+  });
+
+  test("engine lädt die Ansicht neu, ungespeicherte Modell- und Stufeneingaben bleiben", async () => {
+    const app = await open({ settings: { engine: { backups: [{ engine: "codex" }] } }, engineView: view() });
+    input(app, "g-engine:codexModel", "ungespeichert");
+    app.click("engine-add"); input(app, "engine-add-model", "opus");
+    const before = app.requests("GET", "/api/engines").filter(r => r.path === "/api/engines").length;
+    app.server.engineView.order[0] = { id: "claude", engine: "claude", state: "answering" };
+    app.server.engineView.order[1].state = "free";
+    FakeEventSource.all.find(s => s.url === "/api/telegram/events" && !s.closed)!.emit("engine");
+    await settle();
+    expect(app.requests("GET", "/api/engines").filter(r => r.path === "/api/engines")).toHaveLength(before + 1);
+    expect(app.byKey("g-engine:codexModel")!.value).toBe("ungespeichert");
+    expect(app.byKey("engine-add-model")!.value).toBe("opus");
+    expect(app.texts("settings-motor-state")).toEqual(["antwortet", "frei"]);
+    expect(app.reloads()).toBe(0);
+  });
+
+  test("geerbter Standard zählt; beim Wechsel auf eine Ersatzstufe ohne Modell entfällt nur diese beim Speichern", async () => {
+    ENV_LAYER.engine = "codex";
+    try {
+      const app = await open({ settings: { engine: { backups: [{ engine: "claude" }, { engine: "opencode" }] } } });
+      expect(app.byKey("engine-model:0")!.textContent).toBe("Standard aus der Codex-Konfiguration");
+      app.click("engine-add"); app.choose("settings-engine-add-engine", "codex"); app.click("engine-add-confirm");
+      expect(app.texts("actions-error")).toContain("Diese Stufe ist schon der Standard-Motor.");
+      app.click("engine-add");
+      input(app, "g-engine:codexModel", "eigen"); app.click("save:section-engine"); await settle();
+      expect(app.server.settings.engine.backups).toEqual([{ engine: "claude" }, { engine: "opencode" }]);
+      app.choose("settings-g-engine-default", "opencode");
+      expect(rows(app)).toHaveLength(4);
+      expect(app.texts("settings-motor-state").at(-1)).toBe("noch nicht gespeichert");
+      app.click("save:section-engine"); await settle();
+      expect(app.server.settings.engine.backups).toEqual([{ engine: "claude" }]);
+      expect(app.texts("actions-hint")).toContain("Die Ersatzstufe OpenCode ohne eigenes Modell entfällt, weil sie jetzt der Standard-Motor ist.");
+    } finally { delete ENV_LAYER.engine; }
+  });
+});
+
+describe("OpenRouter-Schlüssel im Motorabschnitt (Issue #674)", () => {
+  const reading = () => ({ configured: true, limit: 50, remaining: 12.4, limitReset: "monthly",
+    usage: 37.6, usageMonthly: 3.2, fetchedAt: recently(3) });
+  const row = (app: ReturnType<typeof setup>) => app.byClass("settings-openrouter-key")[0];
+  const text = (app: ReturnType<typeof setup>) => app.texts("settings-motor-reading", row(app))[0];
+  const requests = (app: ReturnType<typeof setup>) => app.requests("GET", "/api/engines/openrouter");
+
+  test("Zeile unter dem Stand: Überschrift, Rest, Erneuerung, Alter, Hinweis; ohne Konfiguration keine Zeile", async () => {
+    const app = await openModels({ openrouterKey: reading() });
+    expect(app.texts("settings-label", row(app))).toEqual(["OpenRouter (Schlüssel der Ersatzmodelle)"]);
+    expect(text(app)).toBe("12,40 $ von 50,00 $ übrig · Limit erneuert sich monatlich · vor 3 Minuten");
+    expect(app.texts("actions-hint", row(app))).toEqual(["OpenCode nutzt seine eigene Anmeldung. Das kann ein anderer Schlüssel sein als dieser."]);
+    expect(app.all().indexOf(row(app))).toBeGreaterThan(app.all().indexOf(app.byClass("settings-motor-usage")[0]));
+    app.server.openrouterKey = { ...reading(), limit: null, remaining: null };
+    app.click("engine-check"); await settle();
+    expect(text(app)).toBe("kein Limit am Schlüssel, in diesem Monat 3,20 $ verbraucht · vor 3 Minuten");
+    app.server.openrouterKey = { configured: false };
+    app.click("engine-check"); await settle();
+    expect(row(app)).toBeUndefined();
+    expect(row(await openModels())).toBeUndefined();
+  });
+
+  test("nur Öffnen und Ende von Jetzt messen lösen Abruf aus, nie Speichern, Reiterwechsel oder Motorereignis", async () => {
+    const app = await openModels({ openrouterKey: reading() });
+    expect(requests(app)).toHaveLength(1);
+    app.choose("settings-g-engine-codexEffort", "high");
+    app.click("save:section-engine"); await settle();
+    FakeEventSource.all.find(s => s.url === "/api/telegram/events" && !s.closed)!.emit("engine");
+    await settle();
+    tabButton(app, "agenten").dispatch("click"); await settle();
+    tabButton(app, "modelle").dispatch("click"); await settle();
+    expect(requests(app)).toHaveLength(1);
+    app.server.holdEngineMethods.add("POST");
+    app.click("engine-check"); await settle();
+    expect(requests(app)).toHaveLength(1);
+    app.server.engineReleases[0].release(); await settle();
+    expect(requests(app)).toHaveLength(2);
+    await closeSettings(app);
+    app.elements["open-settings"].dispatch("click"); await settle();
+    expect(requests(app)).toHaveLength(3);
+  });
+
+  test("Fehler sind gedämpft, Rohfehler bleiben unsichtbar, Eingaben und Messen bleiben benutzbar", async () => {
+    const app = await openModels({ openrouterKey: reading() });
+    app.choose("settings-g-engine-codexEffort", "high");
+    for (const error of ["OpenRouter lehnt den Schlüssel ab", "OpenRouter antwortet nicht (Zeitüberschreitung)", "OpenRouter ist gerade nicht erreichbar"]) {
+      app.server.openrouterKey = { configured: true, error };
+      app.click("engine-check"); await settle();
+      expect(text(app)).toBe(error);
+      expect(app.texts("actions-hint", row(app))).toContain(error);
+      expect(app.texts("actions-error")).toEqual([]);
+      expect(app.byKey("engine-check")!.disabled).toBe(false);
+      expect(app.select("settings-g-engine-codexEffort").value).toBe("high");
+      expect(app.byKey("save:section-engine")!.disabled).toBe(false);
+    }
+    app.server.openrouterOffline = true;
+    app.click("engine-check"); await settle();
+    expect(text(app)).toBe("OpenRouter ist gerade nicht erreichbar");
+    expect(app.all().some(n => n.textContent.includes("TESTWERT-674"))).toBe(false);
+    app.click("save:section-engine"); await settle();
+    expect(app.server.settings.engine.codex.effort).toBe("high");
+  });
+
+  test("hängender Schlüsselabruf blockiert keine Messung; ältere Antwort verdrängt keine neuere", async () => {
+    const app = await openModels({ openrouterKey: reading(), holdOpenrouter: true });
+    expect(row(app)).toBeUndefined();
+    expect(app.byKey("engine-check")!.disabled).toBe(false);
+    app.choose("settings-g-engine-codexEffort", "high");
+    app.server.openrouterKey = { ...reading(), remaining: 8.5 };
+    app.click("engine-check"); await settle();
+    expect(app.byKey("engine-check")!.disabled).toBe(false);
+    expect(app.server.openrouterReleases).toHaveLength(2);
+    app.server.openrouterReleases[1](); await settle();
+    expect(text(app)).toContain("8,50 $");
+    app.server.openrouterReleases[0](); await settle();
+    expect(text(app)).toContain("8,50 $");
+    expect(app.select("settings-g-engine-codexEffort").value).toBe("high");
+  });
+
+  test("später Fehler nach Schließen und erneutem Öffnen überschreibt keinen Erfolg", async () => {
+    const app = await openModels({ openrouterKey: reading(), holdOpenrouter: true, openrouterOffline: true });
+    await closeSettings(app);
+    app.server.holdOpenrouter = false;
+    app.server.openrouterOffline = false;
+    app.elements["open-settings"].dispatch("click"); await settle();
+    tabButton(app, "modelle").dispatch("click"); await settle();
+    expect(text(app)).toContain("12,40 $");
+    app.server.openrouterReleases[0](); await settle();
+    expect(text(app)).toContain("12,40 $");
+    expect(app.texts("actions-error")).toEqual([]);
+  });
+
+  test("fehlgeschlagene Messung lädt die Zeile trotzdem; initialer Netzfehler erfindet keine Konfiguration", async () => {
+    const app = await openModels({ openrouterOffline: true });
+    expect(row(app)).toBeUndefined();
+    expect(app.texts("actions-error")).toEqual([]);
+    app.server.openrouterOffline = false;
+    app.server.openrouterKey = reading();
+    app.server.engineCheck = "offline";
+    app.click("engine-check"); await settle();
+    expect(text(app)).toContain("12,40 $");
+    expect(requests(app)).toHaveLength(2);
+    expect(app.byKey("engine-check")!.disabled).toBe(false);
+  });
+});
+
+describe("Stand je Motor und Jetzt messen (Issue #673)", () => {
+  const original = { order: [{ id: "claude", engine: "claude", state: "free" }], blocks: [], usage: {}, auto: { enabled: false, threshold: 95, returnBelow: 80 } };
+  const fresh = () => ({ ...original, order: [{ id: "claude", engine: "claude", state: "answering" }],
+    usage: { claude: [{ id: "weekly_all", state: "known", percent: 42, source: "report", measuredAt: new Date().toISOString() }] } });
+  const activity = () => FakeEventSource.all.find(s => s.url === "/api/telegram/events" && !s.closed)!;
+
+  test("Stand ohne Messungen, OpenCode und API ohne Prozent; genau ein POST, deaktiviert, Antwort und Eingaben bleiben", async () => {
+    const app = await openModels({ engineOptions: { ...ENGINE_OPTIONS, engines: [...ENGINE_OPTIONS.engines, { id: "api", label: "Anthropic API" }] }, engineView: original });
+    const usage = app.byClass("settings-motor-usage")[0];
+    expect(app.texts("actions-hint", usage)).toEqual(["noch nicht gemessen", "noch nicht gemessen", "keine Messung in Prozent", "keine Messung in Prozent"]);
+    app.choose("settings-g-engine-codexEffort", "high");
+    app.server.engineCheckedView = fresh();
+    app.server.holdEngineMethods.add("POST");
+    const button = app.byKey("engine-check")!;
+    button.dispatch("click"); button.dispatch("click"); await settle();
+    expect(app.byKey("engine-check")!.disabled).toBe(true);
+    expect(app.requests("POST", "/api/engines/check")).toHaveLength(1);
+    app.server.engineReleases[0].release(); await settle();
+    expect(app.byKey("engine-check")!.disabled).toBe(false);
+    expect(app.texts("settings-motor-reading")[0]).toContain("42 % · Reset unbekannt · gerade eben · Verbrauchsbericht");
+    expect(app.texts("settings-motor-state")).toEqual(["antwortet"]);
+    expect(app.select("settings-g-engine-codexEffort").value).toBe("high");
+    expect(app.texts("settings-motor-measure-result")).toEqual(["Neu gemessen.", "Ohne Nachricht nicht messbar.", "Ohne Nachricht nicht messbar.", "Ohne Nachricht nicht messbar."]);
+  });
+
+  test("älteres GET überholt die Messantwort nicht; engine-Ereignis während des Messens wird danach abgeglichen", async () => {
+    const app = await openModels({ engineView: original });
+    app.server.holdEngineMethods.add("GET");
+    activity().emit("engine"); await settle();
+    app.server.engineCheckedView = fresh();
+    app.server.holdEngineMethods.add("POST");
+    app.click("engine-check"); await settle();
+    const before = app.requests("GET", "/api/engines").filter(r => r.path === "/api/engines").length;
+    activity().emit("engine"); await settle();
+    expect(app.requests("GET", "/api/engines").filter(r => r.path === "/api/engines")).toHaveLength(before);
+    app.server.holdEngineMethods.clear();
+    app.server.engineReleases.find(r => r.method === "POST")!.release(); await settle();
+    expect(app.requests("GET", "/api/engines").filter(r => r.path === "/api/engines")).toHaveLength(before + 1);
+    app.server.engineReleases.find(r => r.method === "GET")!.release(); await settle();
+    expect(app.texts("settings-motor-state")).toEqual(["antwortet"]);
+    expect(app.texts("settings-motor-reading")[0]).toContain("42 %");
+    expect(app.texts("settings-motor-measure-result")[0]).toBe("Neu gemessen.");
+  });
+
+  test("Messen gescheitert: HTTP- und Netzfehler stehen darunter, alter Stand bleibt, erneuter Versuch möglich", async () => {
+    const app = await openModels({ engineView: fresh() });
+    for (const failure of [{ status: 503, body: { error: "Messung nicht möglich" } }, "offline"] as const) {
+      app.server.engineCheck = failure;
+      app.click("engine-check"); await settle();
+      expect(app.byKey("engine-check")!.disabled).toBe(false);
+      expect(app.texts("actions-error")).toContain(failure === "offline" ? "Server nicht erreichbar. Es liegt keine neue Messung vor." : "Messung nicht möglich");
+      expect(app.texts("settings-motor-reading")[0]).toContain("42 %");
+    }
+  });
+});
+
+describe("Motor-Automatik (Issue #673)", () => {
+  async function open(settings: any = { engine: { backups: [{ engine: "codex" }] } }) {
+    const app = await openModels({ settings, engineView: { order: [{ id: "claude", engine: "claude", state: "free" }], blocks: [], usage: {}, auto: { enabled: false, threshold: 70, returnBelow: 55 } } });
+    app.document.querySelector = (selector: string) => app.byKey(selector.match(/data-focus-key="([^"]+)"/)?.[1] ?? "");
+    return app;
+  }
+  function input(app: Awaited<ReturnType<typeof open>>, key: string, value: string) {
+    const field = app.byKey("g-engine:" + key)!; field.value = value; field.dispatch("input");
+  }
+  test("Segment liest die Einstellung, ohne Wert An trotz wirksam Aus; ohne Ersatzstufe gesperrt", async () => {
+    const app = await open({});
+    expect(app.byKey("engine-auto:true")!.attributes["aria-checked"]).toBe("true");
+    expect(app.byKey("engine-auto:true")!.disabled).toBe(true);
+    expect(app.byKey("engine-auto:false")!.disabled).toBe(true);
+    expect(app.texts("actions-hint")).toContain("Erst eine Ersatzstufe hinzufügen");
+    expect(app.byKey("g-engine:autoThreshold")!.value).toBe("95");
+    expect(app.byKey("g-engine:autoReturnBelow")!.value).toBe("");
+    expect(app.byKey("save:section-engine")!.disabled).toBe(true);
+    const off = await open({ engine: { backups: [{ engine: "codex" }], auto: { enabled: false } } });
+    expect(off.byKey("engine-auto:false")!.attributes["aria-checked"]).toBe("true");
+    expect(off.byKey("engine-auto:false")!.disabled).toBe(false);
+  });
+  test("beide Erklärzeilen, Tastaturwahl, PATCH und Zustand nach Speichern ausschließlich vom Server", async () => {
+    const app = await open();
+    expect(app.texts("settings-engine-auto-explanation")).toEqual(["Erreicht ein Limit die Schwelle, antwortet ab der nächsten Nachricht die nächste freie Stufe. Zurück geht es nach dem Reset oder wenn der Stand unter die zweite Zahl fällt."]);
+    app.byKey("engine-auto:true")!.dispatch("keydown", { key: "ArrowRight", preventDefault() {} });
+    expect(app.byKey("engine-auto:false")!.focused).toBeGreaterThan(0);
+    expect(app.texts("settings-engine-auto-explanation")).toEqual(["An der Schwelle wird nicht gewechselt, Sperren wegen der Schwelle sind aufgehoben. Nach einem Limit-Fehler oder Ausfall springt weiter die nächste Stufe ein."]);
+    expect(app.texts("settings-motor-state")).toEqual(["frei", "noch nicht gespeichert"]);
+    app.server.engineView.order[0].state = "answering";
+    app.click("save:section-engine"); await settle();
+    expect(app.requests("PATCH").at(-1)!.body).toEqual({ engine: { auto: { enabled: false } } });
+    expect(app.texts("settings-motor-state")).toEqual(["antwortet", "noch nicht gespeichert"]);
+  });
+  test("Grenzen direkt am Feld: nur ganze 50 bis 99, Rückkehr mindestens 5 Punkte darunter; nichts Ungültiges gesendet", async () => {
+    const app = await open();
+    for (const value of ["49", "100", "75.5", ""]) {
+      input(app, "autoThreshold", value);
+      expect(app.byKey("g-engine:autoThreshold")!.attributes["aria-invalid"]).toBe("true");
+      expect(app.texts("actions-error")).toContain("Wechseln ab: eine ganze Zahl von 50 bis 99 %.");
+      app.click("save:section-engine"); await settle();
+      expect(app.requests("PATCH")).toHaveLength(0);
+    }
+    input(app, "autoThreshold", "50");
+    expect(app.byKey("g-engine:autoThreshold")!.attributes["aria-invalid"]).toBe("false");
+    expect(app.byKey("g-engine:autoReturnBelow")!.attributes.max).toBe("45");
+    expect(app.byKey("g-engine:autoReturnBelow")!.attributes.placeholder).toBe("35");
+    for (const value of ["46", "-1", "30.5"]) {
+      input(app, "autoReturnBelow", value);
+      expect(app.byKey("g-engine:autoReturnBelow")!.attributes["aria-invalid"]).toBe("true");
+      app.click("save:section-engine"); await settle();
+      expect(app.requests("PATCH")).toHaveLength(0);
+    }
+    input(app, "autoReturnBelow", "45");
+    app.click("save:section-engine"); await settle();
+    expect(app.requests("PATCH").at(-1)!.body).toEqual({ engine: { auto: { threshold: 50, returnBelow: 45 } } });
+    input(app, "autoThreshold", "99"); input(app, "autoReturnBelow", "");
+    app.click("save:section-engine"); await settle();
+    expect(app.requests("PATCH").at(-1)!.body).toEqual({ engine: { auto: { threshold: 99, returnBelow: null } } });
+    expect(app.server.settings.engine.auto).toEqual({ threshold: 99 });
+  });
+  test("engine-Ereignis lässt ungespeicherte Automatik-Wahl und Zahlen stehen", async () => {
+    const app = await open();
+    app.click("engine-auto:false"); input(app, "autoThreshold", "80"); input(app, "autoReturnBelow", "65");
+    FakeEventSource.all.find(s => s.url === "/api/telegram/events" && !s.closed)!.emit("engine"); await settle();
+    expect(app.byKey("engine-auto:false")!.attributes["aria-checked"]).toBe("true");
+    expect(app.byKey("g-engine:autoThreshold")!.value).toBe("80");
+    expect(app.byKey("g-engine:autoReturnBelow")!.value).toBe("65");
+  });
+});
+
+describe("Offenes Motor-Menü bleibt aktuell (Issue #676)", () => {
+  const activity = () => FakeEventSource.all.filter(s => s.url === "/api/telegram/events" && !s.closed).at(-1)!;
+  const choice = (app: ReturnType<typeof setup>, engine: string) => app.elements["engine-menu"].children.find(n => n.attributes["data-engine-choice"] === engine)!;
+  async function menuApp() {
+    const app = setup({ stored: "dm", telegram: { dm: { id: "dm", title: "Direktchat", agent: "general", lastActivity: null,
+      engineStage: { engine: "codex", label: "Codex", role: "backup" }, engineChoices: [
+        { engine: "claude", label: "Claude Code", state: "blocked", blockedUntil: "2026-11-22T15:00:00Z", resetKnown: true, cause: "threshold" },
+        { engine: "codex", label: "Codex", state: "answering" },
+      ],
+    } as any, topics: [] } });
+    await settle();
+    const original = app.document.createElement;
+    app.document.createElement = (tag: string) => {
+      const n = original(tag);
+      n.focus = () => { n.focused++; app.document.activeElement = n; };
+      return n;
+    };
+    app.document.querySelector = (selector: string) => {
+      const key = /^\[data-focus-key="(.*)"\]$/.exec(selector)?.[1];
+      return Object.values(app.elements).flatMap(root => app.all(root)).find(n => n.attributes["data-focus-key"] === key) ?? null;
+    };
+    app.elements["engine-name"].dispatch("click"); await settle();
+    return app;
+  }
+  test("engine lädt Liste und Ausnahmen neu, erhält Menü und Fokus; fehlende Felder löschen alten Stand", async () => {
+    const app = await menuApp();
+    expect(choice(app, "standard").attributes["aria-checked"]).toBe("true");
+    choice(app, "claude").focus();
+    const before = app.requests("GET", "/api/engines").length;
+    app.server.telegram.dm.engineChoices[0] = { engine: "claude", label: "Claude Code", state: "free" };
+    app.server.settings.engine = { topics: { "dm:7": "codex" } };
+    activity().emit("engine"); await settle();
+    expect(app.requests("GET", "/api/engines")).toHaveLength(before + 1);
+    expect(app.elements["engine-name"].attributes["aria-expanded"]).toBe("true");
+    expect(choice(app, "claude").children[1].textContent).toBe("frei");
+    expect(choice(app, "codex").attributes["aria-checked"]).toBe("true");
+    expect(app.document.activeElement).toBe(choice(app, "claude"));
+    delete app.server.telegram.dm.engineChoices;
+    delete app.server.telegram.dm.engineStage;
+    activity().emit("engine"); await settle();
+    expect(choice(app, "claude").children[1].textContent).toBe("");
+    expect(app.document.activeElement).toBe(choice(app, "claude"));
+    expect(app.reloads()).toBe(0);
+    app.server.telegram.dm.engineChoices = [{ engine: "claude", label: "Claude Code", state: "answering" }];
+    activity().emit("engine"); await settle();
+    expect(choice(app, "claude").children[1].textContent).toBe("frei");
+    expect(app.document.activeElement).toBe(choice(app, "claude"));
+  });
+  test("Fehler beim Laden: feste Namen, keine Markierung und alle wählbar", async () => {
+    const app = await menuApp();
+    app.server.enginesFails = true;
+    activity().emit("engine"); await settle();
+    const rows = app.elements["engine-menu"].children.filter(n => n.attributes.role === "menuitemradio");
+    expect(rows.map(n => n.attributes["data-engine-choice"])).toEqual(["standard", "claude", "codex", "opencode", "api"]);
+    expect(rows.every(n => n.attributes["aria-checked"] === "false" && n.attributes["aria-disabled"] === "false")).toBe(true);
+    expect(choice(app, "claude").children[1].textContent).toBe("");
+  });
+  test("verspätete Ausnahmen überschreiben keinen neueren Abruf; beim Öffnen immer neu laden", async () => {
+    const app = await menuApp();
+    app.server.holdEngineMethods.add("GET");
+    activity().emit("engine"); await settle();
+    app.server.settings.engine = { topics: { "dm:7": "codex" } };
+    activity().emit("engine"); await settle();
+    expect(app.server.engineReleases).toHaveLength(2);
+    app.server.engineReleases[1].release(); await settle();
+    expect(choice(app, "codex").attributes["aria-checked"]).toBe("true");
+    app.server.engineReleases[0].release(); await settle();
+    expect(choice(app, "codex").attributes["aria-checked"]).toBe("true");
+    app.server.holdEngineMethods.clear();
+    app.elements["engine-name"].dispatch("click");
+    const before = app.requests("GET", "/api/engines").length;
+    app.server.settings.engine = {};
+    app.elements["engine-name"].dispatch("click"); await settle();
+    expect(app.requests("GET", "/api/engines")).toHaveLength(before + 1);
+    expect(choice(app, "standard").attributes["aria-checked"]).toBe("true");
+  });
+});
+
+
+describe("Motor im Agentenformular (M14-28)", () => {
+  async function open(settings: SettingsData = {}, availability = AVAILABILITY) {
+    const { botSettings } = await import("../src/web/bot-settings");
+    const app = setup({ hash: "#/einstellungen/agenten", settings, availability,
+      engineOptions: botSettings.engineOptions as typeof ENGINE_OPTIONS });
+    await settle();
+    await openAgent(app, "research");
+    return app;
+  }
+
+  test("Auswahl genau wie das Schema plus Standard; nicht bereite Motoren bleiben wählbar", async () => {
+    const { SELECTABLE_ENGINES, settingsSchema } = await import("../src/lib/settings");
+    const app = await open({}, [...AVAILABILITY.filter(a => a.engine !== "opencode"),
+      { engine: "opencode", label: "OpenCode", installed: false, loggedIn: false }]);
+    const options = app.select("settings-engine-research").children;
+    expect(options.map(o => o.value)).toEqual([helpers.MODEL_DEFAULT, ...SELECTABLE_ENGINES]);
+    for (const option of options.slice(1)) {
+      expect(settingsSchema.safeParse({ agents: { research: { engine: option.value } } }).success).toBe(true);
+      expect(option.disabled).toBe(false);
+    }
+    expect(options[0].textContent).toBe("Standard (Claude Code)");
+    expect(options.find(o => o.value === "codex")!.textContent).toBe("Codex (nicht angemeldet)");
+    expect(options.find(o => o.value === "opencode")!.textContent).toBe("OpenCode (nicht installiert)");
+    expect(app.requests("GET", "/api/engines").length).toBeGreaterThan(0);
+    const unknown = await open({}, []);
+    expect(unknown.select("settings-engine-research").children.find(o => o.value === "codex")!.textContent).toBe("Codex");
+  });
+
+  for (const engine of ["claude", "codex", "opencode", "api"] as const) for (const inherited of [false, true]) {
+    test(`${engine}, Standard=${inherited}: Felder, Hinweise und gespeicherte Werte`, async () => {
+      const own = { model: "claude-sonnet-5", effort: "low" };
+      const app = await open({ agents: { research: own }, engine: { default: inherited ? engine : "claude" } });
+      if (!inherited) app.choose("settings-engine-research", engine);
+      const disabled = engine === "codex" || engine === "opencode";
+      expect(app.select("settings-model-research").disabled).toBe(disabled);
+      expect(app.select("settings-effort-research").disabled).toBe(disabled);
+      if (disabled) {
+        const hint = app.byClass("settings-agent-engine-note")[0];
+        expect(hint.children[0].textContent).toContain("Modell und Effort kommen aus den Einstellungen des Motors");
+        expect(hint.children[1].attributes.href).toBe("#/einstellungen/modelle");
+      }
+      if (engine === "api") expect(app.texts("settings-agent-engine-note")).toEqual(["Die Anthropic API nimmt nur volle Modellnamen (claude-…) und zahlt je Verbrauch."]);
+      if (!inherited) {
+        app.click("save:research");
+        await settle();
+        expect(app.requests("PATCH", "/api/settings").map(r => r.body)).toEqual([{ agents: { research: { engine } } }]);
+        expect(app.server.settings.agents.research).toEqual({ ...own, engine });
+        expect(app.agentHead("research").children[1].textContent.includes(engine === "codex" ? "Codex" : engine === "opencode" ? "OpenCode" : "Anthropic API")).toBe(engine !== "claude");
+        app.choose("settings-engine-research", helpers.MODEL_DEFAULT);
+        app.click("save:research");
+        await settle();
+        expect(app.requests("PATCH", "/api/settings").at(-1)!.body).toEqual({ agents: { research: { engine: null } } });
+        expect(app.server.settings.agents.research).toEqual(own);
+      }
+    });
+  }
+
+  test("eigenes Modell bleibt beim Ausgrauen gespeichert; ungespeicherter Motor übersteht neuen Serverstand", async () => {
+    const app = await open({ agents: { research: { model: "claude-eigenes-modell", effort: "high" } } });
+    app.choose("settings-engine-research", "codex");
+    expect(app.select("settings-custom-research").disabled).toBe(true);
+    expect(app.select("settings-custom-research").value).toBe("claude-eigenes-modell");
+    await closeSettings(app);
+    app.server.settings.agents.research.effort = "low";
+    await reopenSettings(app);
+    expect(app.select("settings-engine-research").value).toBe("codex");
+    expect(app.select("settings-effort-research").value).toBe("low");
+    app.click("save:research");
+    await settle();
+    expect(app.server.settings.agents.research).toEqual({ engine: "codex", model: "claude-eigenes-modell", effort: "low" });
+    expect(app.byKey("save:research")!.disabled).toBe(true);
+    app.choose("settings-engine-research", "api");
+    expect(app.select("settings-custom-research").disabled).toBe(false);
   });
 });

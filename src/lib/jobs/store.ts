@@ -6,12 +6,15 @@
  * status.json und am Ende report.md (schreibt der Job selbst).
  *
  * Status-Übergänge: starting → running → ended, oder direkt starting →
- * ended (Start gescheitert, vor dem Start gestoppt). ended ist endgültig:
+ * ended (Start gescheitert, vor dem Start gestoppt). ended gilt je Lauf:
  * Wer einen Job beendet (Wächter, stop, Zeitüberschreitung, Aufräumen beim
  * Bot-Start), muss den Übergang nach ended selbst gewinnen (claimOutcome).
  * Genau dieser Gewinner meldet sich, alle anderen schweigen. So gibt es
- * pro Job einen einzigen logischen Abschluss, auch wenn stop,
+ * pro Lauf einen einzigen logischen Abschluss, auch wenn stop,
  * Zeitüberschreitung und Prozessende gleichzeitig kommen.
+ * claimResume eröffnet unter derselben Sperre einen neuen Lauf, nur nach
+ * sicherer Beendigung und abgeschlossenem Versand. Alte Wächter schreiben
+ * ausschließlich in ihren eigenen Lauf (expectedRun).
  *
  * Wer mit stop, Zeitüberschreitung oder Abbruch gewinnt, muss danach noch
  * Claudes Prozessgruppe beenden. Das steht als termination "pending" im
@@ -23,16 +26,17 @@
  */
 
 import { randomBytes, randomUUID } from "node:crypto";
-import { readdir, readFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, unlink } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import { atomicWriteFile } from "../atomic-file";
 import { acquireFileLock, releaseFileLock, type FileLockOptions } from "../file-lock";
 import type { TerminateResult } from "./process";
+import type { JobQuestion } from "./question-file";
 
 /** 20260925-143012-a1b2c3: Startzeit (UTC) und Zufall */
 export const JOB_ID_PATTERN = /^\d{8}-\d{6}-[0-9a-f]{6}$/;
 
-export type JobPhase = "starting" | "running" | "ended";
+export type JobPhase = "starting" | "running" | "waiting" | "ended";
 
 export type JobOutcome =
   /** Exit 0 und report.md vorhanden */
@@ -46,7 +50,10 @@ export type JobOutcome =
   /** Wächter lief nicht mehr (Absturz, Neustart des Rechners oder des Bots) */
   | "aborted"
   /** Wächter oder Claude ließ sich nicht starten */
-  | "start_failed";
+  | "start_failed"
+  | "unanswered"
+  | "question_limit"
+  | "question_failed";
 
 /** Prozess mit Startzeit (ps lstart), damit eine wiederverwendete PID nicht als derselbe Prozess gilt */
 export interface ProcRef {
@@ -81,11 +88,44 @@ export interface JobTermination {
   result?: TerminateResult;
 }
 
+export type JobEngine = "claude" | "codex";
+
+export interface JobReturn {
+  run: number;
+  state: "pending" | "claimed" | "done" | "discarded";
+  owner?: ProcRef & { token: string };
+}
+
+export interface JobWaiting {
+  number: number;
+  question: JobQuestion;
+  askedAt: string;
+  deadlineAt: string;
+  choiceId?: string;
+  /** Telegram-Reply vor dem Laufwechsel dauerhaft sichern. */
+  reply?: { text: string; at: number };
+  delivery: JobNotice;
+}
+
 export interface JobStatus {
   version: 1;
   id: string;
   title: string;
   createdAt: string;
+  /** Ohne Feld: erster Lauf eines älteren Jobs. */
+  run?: number;
+  /** Anlagezeit des aktuellen Laufs, für die Schonfrist vor dem Wächter-Eintrag. */
+  runCreatedAt?: string;
+  resumeReason?: "aborted" | "timeout" | "unanswered" | "answer";
+  /** Anzahl der bereits gestellten Fragen, über alle Läufe hinweg. */
+  questionCount?: number;
+  waiting?: JobWaiting;
+  /** Ausschließlich die maskierte Antwort, nie der Modelltext der Frage als Anweisung. */
+  answer?: { text: string; questionNumber: number };
+  /** Abgeschlossene Arbeitszeit aller Läufe, ohne Wartezeit. */
+  activeMs?: number;
+  /** Verbrauch seit dem letzten ausdrücklich erneuerten Zeitbudget. Antworten erneuern es nicht. */
+  budgetUsedMs?: number;
   startedAt?: string;
   endedAt?: string;
   phase: JobPhase;
@@ -95,10 +135,21 @@ export interface JobStatus {
   /** Kurze Begründung (Startfehler, Zeitüberschreitung), ohne Geheimnisse */
   detail?: string;
   maxHours: number;
-  model: string;
+  /** Ohne Feld: älterer Job mit Claude */
+  engine?: JobEngine;
+  /** Feste Claude-Session; fehlt bei alten Jobs und bei Codex. Nie nach außen ausgeben. */
+  sessionId?: string;
+  /** Bei Codex ohne Angabe gilt dessen Konfiguration */
+  model?: string;
   effort?: string;
-  /** --full-access: bypassPermissions, sonst acceptEdits */
+  /** Volle Rechte ohne Rückfragen, sonst die eingeschränkte Stufe des Motors */
   fullAccess: boolean;
+  /** Bericht zusätzlich als Eingabe ins Zielgespräch, bleibt beim Fortsetzen erhalten. */
+  returnToChat?: boolean;
+  /** Anzahl der --zurueck-Jobs in dieser Kette, erster Job = 1. */
+  jobChain?: number;
+  /** Persistente Rückgabe je Lauf, unter status.lock; keine zweite Warteschlange. */
+  returnDelivery?: JobReturn;
   /** Zusätzlich erlaubte Werkzeuge (Recherche ohne --full-access, Issue #493) */
   allowedTools?: string[];
   /** Zusätzlich gesperrte Werkzeuge und Schreibregeln (Issue #493) */
@@ -112,6 +163,11 @@ export interface JobStatus {
   notice?: JobNotice;
   /** Prozesse aus dem Job, die nach Claudes Ende noch liefen (nicht beendet), Befehl maskiert */
   leftovers?: JobLeftover[];
+}
+
+/** Motor, Modell und Effort für Startausgabe, Liste und Log */
+export function jobModelLabel(status: Pick<JobStatus, "engine" | "model" | "effort">): string {
+  return [status.engine ?? "claude", status.model, status.effort].filter(Boolean).join(", ");
 }
 
 /** Prozess, den Claude gestartet hat und der Claude überlebt hat */
@@ -149,6 +205,7 @@ export const JOB_FILES = {
   watcherLog: "watcher.log",
   status: "status.json",
   report: "report.md",
+  question: "frage.json",
   lock: "status.lock",
 } as const;
 
@@ -160,7 +217,9 @@ function parseStatus(raw: string, id: string): JobStatus | null {
   try {
     const status = JSON.parse(raw);
     if (status?.version !== 1 || status.id !== id || typeof status.title !== "string") return null;
-    if (!["starting", "running", "ended"].includes(status.phase)) return null;
+    if (!["starting", "running", "waiting", "ended"].includes(status.phase)) return null;
+    if (status.phase === "waiting" && (!status.waiting || !Number.isSafeInteger(status.waiting.number) ||
+      status.waiting.number < 1 || !Number.isFinite(Date.parse(status.waiting.deadlineAt)))) return null;
     return status as JobStatus;
   } catch {
     return null;
@@ -187,14 +246,14 @@ const LOCK_OPTIONS: FileLockOptions = { waitMs: 15_000 };
 export async function updateStatus(
   root: string,
   id: string,
-  change: (status: JobStatus) => JobStatus | null,
+  change: (status: JobStatus) => JobStatus | null | Promise<JobStatus | null>,
 ): Promise<{ status: JobStatus | null; changed: boolean }> {
   const lockPath = jobFile(root, id, "lock");
   const me = await acquireFileLock(lockPath, LOCK_OPTIONS);
   try {
     const current = await readStatus(root, id);
     if (!current) return { status: null, changed: false };
-    const next = change(structuredClone(current));
+    const next = await change(structuredClone(current));
     if (!next) return { status: current, changed: false };
     await writeStatus(root, next);
     return { status: next, changed: true };
@@ -204,6 +263,10 @@ export async function updateStatus(
 }
 
 export interface ClaimExtra {
+  /** Ein verspäteter Abschluss eines alten Laufs darf keinen neuen beenden. */
+  expectedRun?: number;
+  expectedPhase?: JobPhase;
+  expectedQuestion?: number;
   exitCode?: number | null;
   signal?: string | null;
   detail?: string;
@@ -226,8 +289,12 @@ export async function claimOutcome(
   now: () => Date = () => new Date(),
 ): Promise<{ claimed: boolean; status: JobStatus | null; token?: string }> {
   const token = randomUUID();
-  const result = await updateStatus(root, id, status => {
-    if (status.phase === "ended") return null;
+  const result = await updateStatus(root, id, async status => {
+    if (status.phase === "ended" || (extra.expectedRun !== undefined && (status.run ?? 1) !== extra.expectedRun)) return null;
+    if (extra.expectedPhase !== undefined && status.phase !== extra.expectedPhase) return null;
+    if (extra.expectedQuestion !== undefined && status.waiting?.number !== extra.expectedQuestion) return null;
+    accountWork(status, now());
+    if (status.phase === "waiting") await archiveQuestion(root, status);
     status.phase = "ended";
     status.outcome = outcome;
     status.endedAt = now().toISOString();
@@ -235,11 +302,91 @@ export async function claimOutcome(
     if (extra.signal !== undefined) status.signal = extra.signal;
     if (extra.detail !== undefined) status.detail = extra.detail;
     if (extra.leftovers?.length) status.leftovers = extra.leftovers;
-    if (extra.terminate && status.claude) status.termination = { state: "pending" };
+    if (extra.terminate && status.claude && !status.waiting) status.termination = { state: "pending" };
     status.notice = { state: "pending", attempts: 0, owner: { ...owner, token } };
+    if (status.returnToChat) status.returnDelivery = { run: status.run ?? 1, state: outcome === "success" ? "pending" : "discarded" };
     return status;
   });
   return result.changed ? { claimed: true, status: result.status, token } : { claimed: false, status: result.status };
+}
+
+/** Fachliche Vorbedingungen für Befehl, Knopf und den gesperrten Laufwechsel. */
+export function resumeBlockReason(status: JobStatus): string | null {
+  if (status.engine === "codex") return "Codex-Jobs lassen sich noch nicht fortsetzen.";
+  if (status.workDir !== undefined) return "Jobs mit eigenem Arbeitsordner lassen sich noch nicht fortsetzen.";
+  if (!status.sessionId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(status.sessionId)) {
+    return "Dieser ältere Job hat keine gespeicherte gültige Claude-Session.";
+  }
+  if (status.phase === "waiting") return `Job ${status.id} wartet auf dich. Bitte die Frage per Knopf oder Telegram-Reply beantworten.`;
+  if (status.phase !== "ended") return `Job ${status.id} läuft schon oder startet gerade.`;
+  if (status.outcome !== "aborted" && status.outcome !== "timeout" && status.outcome !== "unanswered") {
+    return "Nur abgebrochene Jobs, Jobs mit überschrittener Zeit oder unbeantworteter Frage lassen sich fortsetzen; gestoppte oder sonst beendete Jobs nicht.";
+  }
+  if (!status.claude || !status.startedAt) return "Claude wurde für diesen Job noch nicht gestartet.";
+  if (status.outcome !== "unanswered" && (status.termination?.state !== "done" || !["gone", "foreign"].includes(status.termination.result ?? ""))) {
+    return "Die alte Prozessgruppe ist noch nicht sicher beendet. Fortsetzen ist deshalb gesperrt.";
+  }
+  if (status.notice?.state !== "sent" && status.notice?.state !== "failed") {
+    return "Die Meldung des vorigen Laufs ist noch nicht abgeschlossen. Bitte später fortsetzen.";
+  }
+  return null;
+}
+
+/**
+ * Einziger Übergang ended → starting. Der Aufrufer hält außerdem start.lock
+ * gegen doppelte Aufträge. Erst der Gewinner darf einen Wächter starten.
+ * Bericht und Log bleiben je altem Lauf erhalten, zählen aber nicht erneut.
+ */
+export async function claimResume(root: string, id: string, expectedRun: number, now: () => Date = () => new Date()) {
+  let error = "Der Job wurde inzwischen verändert. Bitte den aktuellen Zustand prüfen.";
+  const result = await updateStatus(root, id, async status => {
+    const reason = resumeBlockReason(status);
+    if (reason) { error = reason; return null; }
+    if ((status.run ?? 1) !== expectedRun) return null;
+    await archiveRunFiles(root, status);
+    const reasonBefore = status.outcome as "aborted" | "timeout" | "unanswered";
+    nextRun(status, now());
+    status.resumeReason = reasonBefore;
+    // Nur eine ausdrückliche Fortsetzung nach Abbruch/Timeout gewährt erneut Zeit.
+    if (reasonBefore !== "unanswered") status.budgetUsedMs = 0;
+    return status;
+  });
+  return { ...result, error: result.status ? error : `Job ${id} gibt es nicht.` };
+}
+
+/** Nur laufende Arbeit buchen; waiting und starting verbrauchen kein Budget. */
+export function accountWork(status: JobStatus, now: Date): void {
+  if (status.phase !== "running" || !status.startedAt) return;
+  const ms = Math.max(0, now.getTime() - Date.parse(status.startedAt));
+  status.activeMs = (status.activeMs ?? 0) + ms;
+  status.budgetUsedMs = (status.budgetUsedMs ?? 0) + ms;
+}
+
+export function remainingWorkMs(status: JobStatus): number {
+  return Math.max(0, status.maxHours * 3_600_000 - (status.budgetUsedMs ?? 0));
+}
+
+/** Aufrufer hält status.lock. Archiv enthält die geprüften und maskierten Daten. */
+export async function archiveQuestion(root: string, status: JobStatus): Promise<void> {
+  if (!status.waiting) return;
+  const dir = join(jobDir(root, status.id), "fragen");
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  await atomicWriteFile(join(dir, `${status.waiting.number}.json`), JSON.stringify(status.waiting.question, null, 2) + "\n");
+  await unlink(jobFile(root, status.id, "question")).catch((e: NodeJS.ErrnoException) => { if (e.code !== "ENOENT") throw e; });
+}
+
+export async function archiveRunFiles(root: string, status: JobStatus): Promise<void> {
+  for (const [name, prefix, ext] of [["report", "report", "md"], ["log", "job", "log"], ["question", "frage", "json"]] as const) {
+    await rename(jobFile(root, status.id, name), join(jobDir(root, status.id), `${prefix}-run-${status.run ?? 1}.${ext}`))
+      .catch((e: NodeJS.ErrnoException) => { if (e.code !== "ENOENT") throw e; });
+  }
+}
+
+export function nextRun(status: JobStatus, now: Date): void {
+  for (const field of ["watcher", "claude", "termination", "notice", "outcome", "startedAt", "endedAt", "exitCode", "signal", "detail", "leftovers", "waiting", "answer", "returnDelivery"] as const) delete status[field];
+  status.phase = "starting";
+  status.run = (status.run ?? 1) + 1;
+  status.runCreatedAt = now.toISOString();
 }
 
 /** Hält das Ergebnis der Beendigung fest, wenn token noch Besitzer der Meldung ist */

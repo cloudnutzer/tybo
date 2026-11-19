@@ -4,7 +4,7 @@
 import { expect, test } from "bun:test";
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { DEMO_FILES, startDemoServer } from "../src/web/demo";
+import { DEMO_FILES, DEMO_ENGINE_NOTICE, DEMO_ENGINE_HINT, startDemoServer } from "../src/web/demo";
 
 const config = { host: "127.0.0.1", port: 0, password: "demo-passwort-lang", allowedHosts: [] };
 
@@ -40,4 +40,21 @@ test("Demo: Meldungen im Verlauf, Bild als Vorschau, HTML nur als Anhang", async
     await demo.stop();
   }
   await expect(readdir(join(demo.filesDir))).rejects.toThrow();
+});
+
+
+test("Motorwechsel: Dienstmeldung im Direktchat, Hinweis im Turn, Motor und Modell in der Antwort", async () => {
+  const { createFakeChat } = await import("../src/web/fake-chat");
+  const demo = await startDemoServer(config, { log: () => {} });
+  try {
+    const history = await (await fetch(`${demo.server.url}/api/conversations/dm/messages`)).json();
+    expect(history.messages.find((m: any) => m.text === DEMO_ENGINE_NOTICE)).toMatchObject({ kind: "notice", source: "system", html: expect.stringContaining("Motorwechsel") });
+    const events: string[] = [];
+    const chat = createFakeChat({ delayMs: 0, stepMs: 0, notice: DEMO_ENGINE_HINT, replyInfo: { engine: "codex", model: "gpt-6-astra" } });
+    const result = await chat.runTurn({ conversationId: "dm", agent: "general", text: "Probe", sink: {
+      progress: () => {}, notice: text => { events.push(text); },
+    } });
+    expect(events).toEqual([DEMO_ENGINE_HINT]);
+    expect(result.info).toMatchObject({ engine: "codex", model: "gpt-6-astra" });
+  } finally { await demo.stop(); }
 });

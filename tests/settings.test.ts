@@ -10,6 +10,11 @@ import {
   updateSettings,
   withSettingsLock,
   SettingsFileInvalidError,
+  engineBackups,
+  engineAuto,
+  settingsSchema,
+  EFFORT_LEVELS,
+  SELECTABLE_ENGINES,
   type Settings,
 } from "../src/lib/settings";
 
@@ -39,6 +44,163 @@ afterEach(() => {
   setSettingsPath();
   chmodSync(dir, 0o700);
   rmSync(dir, { recursive: true, force: true });
+});
+
+describe("Motor je Agent (M14-28)", () => {
+  test("alte Datei und alle wählbaren Motoren bleiben beim Lesen und Schreiben erhalten", async () => {
+    for (const entry of [{ model: "opus", effort: "high" as const }, ...SELECTABLE_ENGINES.map(engine => ({ engine }))]) {
+      const settings = { agents: { research: entry } };
+      expect(settingsSchema.parse(settings)).toEqual(settings);
+      await writeSettings(settings);
+      expect(getSettings()).toEqual(settings);
+    }
+  });
+
+  test("ungültiger Motor wird abgelehnt, die letzte gültige Datei bleibt wirksam", async () => {
+    const valid: Settings = { agents: { research: { engine: "codex" } } };
+    await writeSettings(valid);
+    expect(getSettings()).toEqual(valid);
+    for (const engine of ["falsch", "", null, 1, true]) {
+      const invalid = { agents: { research: { engine } } };
+      expect(settingsSchema.safeParse(invalid).success).toBe(false);
+      await expect(writeSettings(invalid as Settings)).rejects.toThrow();
+      put(JSON.stringify(invalid));
+      expect(getSettings()).toEqual(valid);
+    }
+  });
+});
+
+describe("Claude-Notizen (M14-14)", () => {
+  test("alte Dateien bleiben gültig; nur Wahrheitswerte erlaubt, ungültige Werte ändern den Stand nicht", async () => {
+    for (const codex of [{}, { claudeNotes: true }, { claudeNotes: false }]) {
+      const settings = { engine: { codex } };
+      expect(settingsSchema.parse(settings)).toEqual(settings);
+      put(JSON.stringify(settings));
+      expect(getSettings()).toEqual(settings);
+    }
+    for (const claudeNotes of ["false", "true", 0, 1, null, {}, []]) {
+      const invalid = { engine: { codex: { claudeNotes } } };
+      expect(settingsSchema.safeParse(invalid).success).toBe(false);
+      await expect(writeSettings(invalid as Settings)).rejects.toThrow();
+      put(JSON.stringify(invalid));
+      expect(getSettings().engine?.codex?.claudeNotes).toBe(false);
+    }
+  });
+});
+
+describe("Codex-Skills (M14-13)", () => {
+  test("alte Dateien bleiben gültig, an/aus sind Wahrheitswerte; ungültige Werte ändern den Stand nicht", async () => {
+    for (const codex of [{}, { skills: true }, { skills: false }]) {
+      put(JSON.stringify({ engine: { codex } }));
+      expect(getSettings().engine?.codex).toEqual(codex);
+    }
+    for (const skills of ["false", 0, null, {}, []]) {
+      const invalid = { engine: { codex: { skills } } };
+      expect(settingsSchema.safeParse(invalid).success).toBe(false);
+      await expect(writeSettings(invalid as Settings)).rejects.toThrow();
+      put(JSON.stringify(invalid));
+      expect(getSettings().engine?.codex?.skills).toBe(false);
+    }
+  });
+});
+
+describe("Motor-Ersatzstufen und Automatik (M14-05)", () => {
+  test("alte Datei bleibt unverändert, Standards zentral aufgelöst", () => {
+    put(JSON.stringify({ engine: { default: "codex" } }));
+    expect(getSettings()).toEqual({ engine: { default: "codex" } });
+    expect(engineBackups()).toEqual([]);
+    expect(engineAuto()).toEqual({ enabled: false, threshold: 95, returnBelow: 80 });
+    expect(engineAuto({ engine: { auto: { enabled: true } } }).enabled).toBe(false);
+    expect(engineAuto({ engine: { backups: [], auto: { enabled: true } } }).enabled).toBe(false);
+  });
+
+  test("vier Stufen, Claude-Modelle und jede Effort-Stufe sind gültig", () => {
+    for (const effort of EFFORT_LEVELS) {
+      const settings: Settings = { engine: {
+        backups: [{ engine: "claude" }, { engine: "claude", model: "claude-opus-5-5[1m]", effort },
+          { engine: "codex" }, { engine: "opencode" }], auto: { threshold: 90 },
+      } };
+      put(JSON.stringify(settings));
+      expect(getSettings()).toEqual(settings);
+      expect(engineBackups()).toEqual(settings.engine!.backups!);
+      expect(engineAuto()).toEqual({ enabled: true, threshold: 90, returnBelow: 75 });
+    }
+    for (const threshold of [50, 99]) {
+      expect(settingsSchema.safeParse({ engine: { auto: { threshold, returnBelow: threshold - 5 } } }).success).toBe(true);
+    }
+    expect(settingsSchema.safeParse({ engine: { auto: { returnBelow: 0 } } }).success).toBe(true);
+    expect(settingsSchema.safeParse({ engine: { backups: [{ engine: "claude", model: "a".repeat(100) }] } }).success).toBe(true);
+    expect(engineAuto({ engine: { backups: [{ engine: "codex" }], auto: { enabled: false, returnBelow: 70 } } }))
+      .toEqual({ enabled: false, threshold: 95, returnBelow: 70 });
+  });
+
+  test("ungültige Datei und Schreibversuche lassen die letzte gültige Fassung stehen", async () => {
+    const valid: Settings = { engine: { backups: [{ engine: "codex" }], auto: { threshold: 90 } } };
+    const invalid = [
+      { backups: ["a", "b", "c", "d", "e"].map(model => ({ engine: "claude", model })) },
+      { backups: [{ engine: "codex", model: "gpt-test" }] },
+      { backups: [{ engine: "opencode", effort: "high" }] },
+      { backups: [{ engine: "claude", model: "opus", effort: "low" }, { engine: "claude", model: "opus", effort: "high" }] },
+      { backups: [{ engine: "codex" }, { engine: "codex" }] },
+      { backups: [{ engine: "api" }] },
+      ...["-option", "a b", "", "a".repeat(101), "../credentials"].map(model => ({ backups: [{ engine: "claude", model }] })),
+      { backups: [{ engine: "claude", effort: "ultra" }] },
+      ...[49, 100, 90.5].map(threshold => ({ auto: { threshold } })),
+      ...[-1, 70.5, 92].map(returnBelow => ({ auto: { returnBelow } })),
+      { auto: { threshold: 90, returnBelow: 86 } },
+      { auto: { enabled: "true" } },
+    ];
+    for (const engine of invalid) {
+      put(JSON.stringify(valid));
+      expect(getSettings()).toEqual(valid);
+      const before = readFileSync(file, "utf8");
+      await expect(writeSettings({ engine } as Settings)).rejects.toThrow();
+      expect(readFileSync(file, "utf8")).toBe(before);
+      put(JSON.stringify({ engine }));
+      expect(getSettings()).toEqual(valid);
+    }
+    expect(errorSpy).toHaveBeenCalledTimes(invalid.length);
+  });
+});
+
+describe("Codex-MCP-Einstellungen (M14-11)", () => {
+  test("gültige Teilkonfigurationen werden ohne neue Standards gelesen und geschrieben", async () => {
+    for (const mcp of [{}, { enabled: false }, { enabled: true, skip: [], public: [] },
+      { skip: ["suche", "A_1-b", "x".repeat(64)], public: ["stimme"] }]) {
+      const settings = { engine: { codex: { mcp } } };
+      put(JSON.stringify(settings));
+      expect(getSettings()).toEqual(settings);
+      await writeSettings(settings);
+      expect(JSON.parse(readFileSync(file, "utf8"))).toEqual(settings);
+    }
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  test("ungültige Namen, Typen und unbekannte Felder werden abgelehnt", async () => {
+    const valid: Settings = { engine: { codex: { mcp: { enabled: false } } } };
+    put(JSON.stringify(valid));
+    expect(getSettings()).toEqual(valid);
+    const invalid: unknown[] = [null, false, [], { enabled: "false" }, { skip: "suche" }, { public: [1] }, { enabled: true, typo: [] }];
+    for (const field of ["skip", "public"]) {
+      for (const name of ["", "a.b", "a b", "a\n", "a\rb", "ä", "x".repeat(65)]) invalid.push({ [field]: [name] });
+    }
+    for (const mcp of invalid) {
+      const settings = { engine: { codex: { mcp } } };
+      expect(settingsSchema.safeParse(settings).success).toBe(false);
+      await expect(writeSettings(settings as Settings)).rejects.toThrow();
+      put(JSON.stringify(settings));
+      expect(getSettings()).toEqual(valid);
+    }
+    expect(errorSpy).toHaveBeenCalledTimes(invalid.length);
+  });
+
+  test("alte Datei ohne MCP bleibt gültig und unverändert", () => {
+    const old = { engine: { default: "codex", codex: { model: "gpt-test", sandbox: "read-only" } } };
+    put(JSON.stringify(old));
+    expect(getSettings()).toEqual(old);
+    expect(getSettings().engine?.codex?.mcp).toBeUndefined();
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
 });
 
 describe("Laden", () => {

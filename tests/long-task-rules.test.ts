@@ -20,7 +20,7 @@ import {
   getAgentConfig,
 } from "../src/agents/base";
 import { createAgent, setAgentCatalogPaths, setPrompt } from "../src/agents/catalog";
-import { TEAMWORK_HEADING } from "../src/agents/prompt-parts";
+import { JOB_RULES, LEGACY_JOB_RULES, TEAMWORK_HEADING } from "../src/agents/prompt-parts";
 import { AGENT_NAMES } from "../src/agents/names";
 import * as chatTurn from "../src/lib/chat-turn";
 import * as turnLimits from "../src/lib/turn-limits";
@@ -170,6 +170,19 @@ describe("jeder Agent bekommt den Block", () => {
     expect(count(prompt)).toBe(1);
     const stored = JSON.parse(readFileSync(join(dir, "agents.json"), "utf8"));
     expect(stored.prompts.strategy).toBe(saved);
+  });
+
+  test.each([false, true])("gespeicherter Prompt vor --zurueck wird ersetzt, alte Minuten: %s", async oldMinutes => {
+    const rules = oldMinutes ? formatLongTaskRules({ idleMin: 5, maxMin: 30, jsonMin: 10 }) : LONG_TASK_RULES;
+    const old = rules.replace(JOB_RULES, LEGACY_JOB_RULES);
+    expect(old).toContain("It does not continue this chat session");
+    await setPrompt("strategy", `Eigener Anfang\n${old}\nEigener Schluss`);
+    const current = getAgentConfig("strategy")!.systemPrompt;
+    expect(current).toBe(`Eigener Anfang\n${LONG_TASK_RULES}\nEigener Schluss`);
+    expect(current).toContain("--zurueck");
+    expect(current).not.toContain("It does not continue this chat session");
+    expect(count(current)).toBe(1);
+    expect(JSON.parse(readFileSync(join(dir, "agents.json"), "utf8")).prompts.strategy).toContain(old);
   });
 });
 

@@ -63,6 +63,16 @@ export const CODEX_SANDBOX_LEVELS = ["read-only", "workspace-write", "full"] as 
 export type CodexSandbox = (typeof CODEX_SANDBOX_LEVELS)[number];
 export const DEFAULT_CODEX_SANDBOX: CodexSandbox = "full";
 
+/** Namen für Codex-Schlüsselpfade; auch ein abschließender Zeilenumbruch ist unzulässig. */
+export const CODEX_MCP_NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}(?![\s\S])/;
+const codexMcpName = z.string().regex(CODEX_MCP_NAME_PATTERN, "ungültiger MCP-Servername");
+const codexMcpSchema = z.object({
+  enabled: z.boolean().optional(),
+  skip: z.array(codexMcpName).optional(),
+  public: z.array(codexMcpName).optional(),
+}).strict();
+export type CodexMcpSettings = z.infer<typeof codexMcpSchema>;
+
 /**
  * Rechte von OpenCode (Entscheidung 0019, Issue #128): auto = `--auto`,
  * Fragen werden bestätigt, was die OpenCode-Konfiguration ausdrücklich
@@ -80,6 +90,29 @@ export const DEFAULT_OPENCODE_PERMISSION: OpenCodePermission = "auto";
  */
 export const SELECTABLE_ENGINES = ["claude", "codex", "opencode", "api"] as const;
 export type SelectableEngine = (typeof SELECTABLE_ENGINES)[number];
+
+/** Automatische Ersatzstufen (M14-03): api bleibt ausschließlich eine Wahl von Hand. */
+export const AUTO_STAGE_ENGINES = ["claude", "codex", "opencode"] as const;
+export type AutoStageEngine = (typeof AUTO_STAGE_ENGINES)[number];
+
+/** Claude-Modell als einzelnes CLI-Argument, höchstens 100 Zeichen. */
+export const BACKUP_MODEL_PATTERN = /^[A-Za-z0-9][\w.[\]-]*$/;
+const backupStage = z.discriminatedUnion("engine", [
+  z.object({
+    engine: z.literal("claude"),
+    model: modelName.max(100, "höchstens 100 Zeichen").regex(BACKUP_MODEL_PATTERN, "ungültiger Modellname").optional(),
+    effort: effort.optional(),
+  }).strict(),
+  z.object({ engine: z.literal("codex") }).strict(),
+  z.object({ engine: z.literal("opencode") }).strict(),
+]);
+const engineAutoSchema = z.object({
+  enabled: z.boolean().optional(),
+  threshold: z.number().int("ganze Prozentwerte").min(50, "50 bis 99 Prozent").max(99, "50 bis 99 Prozent").optional(),
+  returnBelow: z.number().int("ganze Prozentwerte").min(0, "mindestens 0 Prozent").optional(),
+}).strict().refine(auto => (auto.returnBelow ?? (auto.threshold ?? 95) - 15) <= (auto.threshold ?? 95) - 5, {
+  path: ["returnBelow"], message: "Rückkehrschwelle mindestens 5 Punkte unter der Schwelle",
+});
 
 /** Effort für Codex: dieselben Stufen wie Claude (seit 15.11.2026 auch dort mit max) */
 export const CODEX_EFFORT_LEVELS = EFFORT_LEVELS;
@@ -137,7 +170,8 @@ export const settingsSchema = z.object({
   // prueft die WebUI beim Aendern (applySettingsPatch); Eintraege zu
   // geloeschten Agenten bleiben stehen und werden ignoriert, kein Fehler.
   // So haengt das Lesen der Datei nicht vom Agenten-Katalog ab.
-  agents: z.record(z.string().regex(AGENT_ID_PATTERN, "ungültige Agenten-Kennung"), modelAndEffort).optional(),
+  agents: z.record(z.string().regex(AGENT_ID_PATTERN, "ungültige Agenten-Kennung"),
+    modelAndEffort.extend({ engine: z.enum(SELECTABLE_ENGINES).optional() })).optional(),
   aux: z
     .object({
       judge: auxSpec.optional(),
@@ -163,12 +197,20 @@ export const settingsSchema = z.object({
   engine: z
     .object({
       default: z.enum(SELECTABLE_ENGINES).optional(),
+      backups: z.array(backupStage).max(4, "höchstens 4 Ersatzstufen").refine(stages => {
+        const ids = stages.map(stage => `${stage.engine}:${stage.engine === "claude" ? stage.model ?? "" : ""}`);
+        return new Set(ids).size === ids.length;
+      }, "Ersatzstufen dürfen nicht doppelt vorkommen").optional(),
+      auto: engineAutoSchema.optional(),
       topics: z.record(z.string().regex(CONVERSATION_KEY_PATTERN, "ungültiger Gesprächsschlüssel"), z.enum(SELECTABLE_ENGINES)).optional(),
       codex: z
         .object({
           model: codexModelName.optional(),
           effort: z.enum(CODEX_EFFORT_LEVELS).optional(),
           sandbox: z.enum(CODEX_SANDBOX_LEVELS).optional(),
+          mcp: codexMcpSchema.optional(),
+          skills: z.boolean().optional(),
+          claudeNotes: z.boolean().optional(),
         })
         .optional(),
       opencode: z
@@ -264,6 +306,22 @@ export const settingsSchema = z.object({
 });
 
 export type Settings = z.infer<typeof settingsSchema>;
+
+/** Ersatzstufen in eingestellter Reihenfolge, ohne die gespeicherten Werte zu verändern. */
+export function engineBackups(settings: Settings = getSettings()): NonNullable<NonNullable<Settings["engine"]>["backups"]> {
+  return (settings.engine?.backups ?? []).map(stage => ({ ...stage }));
+}
+
+/** Ohne Ersatzstufe bleibt die Automatik auch bei ausdrücklichem enabled aus. */
+export function engineAuto(settings: Settings = getSettings()): { enabled: boolean; threshold: number; returnBelow: number } {
+  const auto = settings.engine?.auto;
+  const threshold = auto?.threshold ?? 95;
+  return {
+    enabled: engineBackups(settings).length > 0 && (auto?.enabled ?? true),
+    threshold,
+    returnBelow: auto?.returnBelow ?? threshold - 15,
+  };
+}
 
 const EMPTY: Settings = Object.freeze({}) as Settings;
 

@@ -5,6 +5,8 @@
  * Zwei Formen:
  * - frisch (buildPromptContext): alles, dazu der Kontext für die
  *   Fallback-Kette (src/lib/fallback/chain.ts), falls der Motor scheitert
+ *   Beim Motorwechsel erweitert handover nur den Verlauf des Motor-Prompts;
+ *   der Fallback-Kontext behält die üblichen zehn Nachrichten.
  * - fortgesetzt (buildResumePrompt): die Session kennt den Rest schon, also
  *   nur Zeit, Kanal, neue Merk-Einträge, passende Fakten, Suchtreffer und die
  *   Nachricht
@@ -27,6 +29,7 @@
  * leer, steht ausdrücklich da, dass es niemanden zu fragen gibt.
  */
 
+import { homedir } from "node:os";
 import { getAgentConfigOrGeneral, getUserProfile } from "../agents";
 import type { AgentConfig } from "../agents/types";
 import {
@@ -52,11 +55,29 @@ import { coreForPrompt } from "./memory/core";
 import { storeOr } from "./store";
 import type { FactWish, HitsWithFacts, MemoryItem, Message } from "./store/types";
 import { QUESTION_TAG_SECTION } from "./turn-questions";
+import type { HandoverReason } from "./session-manager";
+import type { EngineId } from "./engines/types";
+import { claudeNotesSection } from "./engines/claude-notes";
+import { projectSecrets } from "./jobs/mask";
+import { getSettings } from "./settings";
 
 export type { PromptChannel } from "../agents/prompt-parts";
 
+const PROJECT_ROOT = process.cwd();
 /** Nachrichten aus dem eigenen Topic im frischen Prompt */
 const RECENT_LIMIT = 10;
+export const HANDOVER_MAX_MESSAGES = 30;
+/** Budget des formatierten Verlaufs einschließlich Sprecher, Zeiten und Zeilenumbrüchen. */
+export const HANDOVER_MAX_CHARS = 24_000;
+const HANDOVER_RECENT_MAX_CHARS = 6_000;
+/** Datenbank und Rechner können beim Speichern der ersten Antwort leicht auseinanderliegen. */
+const HANDOVER_CLOCK_TOLERANCE_MS = 5_000;
+
+export interface PromptHandover {
+  fromLabel: string;
+  reason: HandoverReason;
+  since: number;
+}
 /** Treffer der semantischen Suche je Prompt */
 const SIMILAR_LIMIT = 5;
 /** Länge eines Suchtreffers im Prompt, danach "..." */
@@ -80,6 +101,8 @@ export interface PromptContextOptions {
   topicId?: number;
   /** Kanal der Antwort; fehlt er, gelten die Telegram-Regeln */
   channel?: PromptChannel;
+  engine?: EngineId;
+  handover?: PromptHandover;
 }
 
 export interface ResumePromptOptions {
@@ -115,6 +138,8 @@ export interface PromptSources {
   /** Als Text, wenn die Quelle die gezeigten Fakten nicht nennt */
   memory(userMessage: string): Promise<string | MemorySelection>;
   knowledge(userMessage: string): Promise<string>;
+  /** Fertiger Abschnitt mit den Projekt-Notizen von Claude Code, nur für Codex */
+  claudeNotes(): Promise<string>;
   /** Letzte Nachrichten des Topics, älteste zuerst; topicId null heißt ohne Topic */
   recent(chatId: string, limit: number, topicId: number | null): Promise<Message[]>;
   similar(chatId: string, query: string, limit: number): Promise<Message[]>;
@@ -126,6 +151,13 @@ export interface PromptSources {
   timeZone(): string;
 }
 
+const readClaudeNotes = () => claudeNotesSection({ projectRoot: PROJECT_ROOT, home: homedir(), secrets: projectSecrets(PROJECT_ROOT) });
+let claudeNotesSource = readClaudeNotes;
+/** Tests mit Teil-Quellen dürfen nie die echten Notizen lesen. */
+export function setClaudeNotesSourceForTests(source: (() => string) | null): void {
+  claudeNotesSource = source ?? readClaudeNotes;
+}
+
 /** Echte Quellen; ohne Datenbank (Issue #314) gibt es keinen Verlauf, keine Treffer und kein Delta */
 export const defaultPromptSources: PromptSources = {
   agent: name => getAgentConfigOrGeneral(name, { consultationHints: false }),
@@ -135,6 +167,7 @@ export const defaultPromptSources: PromptSources = {
   core: () => coreForPrompt(),
   memory: userMessage => getMemorySelection(userMessage),
   knowledge: userMessage => getKnowledgeContext(userMessage),
+  claudeNotes: async () => getSettings().engine?.codex?.claudeNotes === false ? "" : claudeNotesSource(),
   recent: (chatId, limit, topicId) => storeOr([], store => store.messages.recent(chatId, limit, topicId)),
   similar: (chatId, query, limit) => storeOr([], store => store.messages.search(chatId, query, limit)),
   followUp: followUpSearch,
@@ -178,6 +211,37 @@ function orEmpty<T>(read: () => Promise<T>, empty: T): Promise<T> {
   return read().catch(() => empty);
 }
 
+/** Sessionbeginn aus dem Verlauf, einschließlich unmittelbar vorausgehender Nutzerbeiträge. */
+function handoverConversation(messages: Message[], since: number, now: Date): string | undefined {
+  const recent = messages.slice(-HANDOVER_MAX_MESSAGES);
+  let start = recent.findIndex(message => message.created_at !== undefined
+    && Date.parse(message.created_at) >= since - HANDOVER_CLOCK_TOLERANCE_MS);
+  if (start < 0) return undefined;
+  while (start > 0 && recent[start - 1]!.role === "user") start--;
+  // Kurze Sessions dürfen den üblichen Kontext nicht verkleinern (Auslegung von 0027).
+  const first = Math.min(start, Math.max(0, recent.length - RECENT_LIMIT));
+  const lines = recent.slice(first).map((message, index) => formatConversationContext(
+    [message], now,
+    first + index >= Math.max(start, recent.length - 4) ? HANDOVER_RECENT_MAX_CHARS : undefined
+  ));
+  let length = lines.join("\n").length;
+  while (length > HANDOVER_MAX_CHARS && lines.length) {
+    length -= lines.shift()!.length + (lines.length ? 1 : 0);
+  }
+  return lines.join("\n");
+}
+
+export const HANDOVER_REASONS: Record<HandoverReason, string> = {
+  limit: "Limit erreicht",
+  outage: "Ausfall",
+  user: "Wahl des Nutzers",
+  changed: "Einstellung oder Verfügbarkeit geändert",
+};
+
+function handoverLine(handover: PromptHandover): string {
+  return `Du übernimmst dieses Gespräch von ${handover.fromLabel}. Der Wechsel hat einen technischen Grund (${HANDOVER_REASONS[handover.reason]}); für den Nutzer läuft das Gespräch weiter. Unten steht der Verlauf seit Beginn der Session. Knüpfe daran an, ohne den Wechsel zu erklären.`;
+}
+
 /**
  * Prompt für die Folgenachricht einer laufenden Session (docs/topic-sessions.md
  * F-1/F-3). System-Prompt, Profil, Kern, Gedächtnis und Verlauf hat die Session
@@ -217,17 +281,20 @@ export async function buildPromptContext(opts: PromptContextOptions, sources: Pa
   const timeZone = s.timeZone();
   const { userMessage, chatId, agentName } = opts;
 
-  const [profile, core, selection, recent, hits, knowledge] = await Promise.all([
+  const [profile, core, selection, recent, hits, knowledge, claudeNotes] = await Promise.all([
     s.profile(),
     orEmpty(() => s.core(), ""),
     s.memory(userMessage),
     // Nur das eigene Topic: ohne Topic null (nicht undefined), sonst kämen Forum-Topics dazu
-    s.recent(chatId, RECENT_LIMIT, opts.topicId ?? null),
+    s.recent(chatId, opts.handover ? HANDOVER_MAX_MESSAGES : RECENT_LIMIT, opts.topicId ?? null),
     orEmpty(() => s.similar(chatId, userMessage, SIMILAR_LIMIT), [] as Message[]),
     orEmpty(() => s.knowledge(userMessage), ""),
+    opts.engine === "codex" ? orEmpty(() => s.claudeNotes(), "") : "",
   ]);
   const { context: memory, factIds: shownFactIds } = asSelection(selection);
-  const conversation = formatConversationContext(recent, s.now());
+  const now = s.now();
+  const conversation = formatConversationContext(opts.handover ? recent.slice(-RECENT_LIMIT) : recent, now);
+  const handover = opts.handover ? handoverConversation(recent, opts.handover.since, now) : undefined;
   const overrides = s.overrides(agentName);
   const similar = similarSection(hits, timeZone);
   const agent = s.agent(agentName);
@@ -245,7 +312,8 @@ export async function buildPromptContext(opts: PromptContextOptions, sources: Pa
     ...section("CURRENT TIME", formatPromptTime(s.now(), timeZone)),
     ...section("MEMORY", memory),
     ...section("KNOWLEDGE BASE", knowledge),
-    ...section("RECENT CONVERSATION", conversation),
+    ...(claudeNotes ? [claudeNotes] : []),
+    ...section("RECENT CONVERSATION", handover && opts.handover ? `${handoverLine(opts.handover)}\n${handover}` : conversation),
     ...similar,
     ...(consultation ? [consultation] : []),
     ...(lookup ? [lookup] : []),

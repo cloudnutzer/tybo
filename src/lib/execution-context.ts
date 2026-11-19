@@ -102,6 +102,8 @@ export function isAbortError(e: unknown): boolean {
 }
 
 export const currentExecution = () => storage.getStore();
+/** Hintergrundmessungen erben weder Gesprächskennung noch dessen Abbruch. */
+export function withoutExecution<T>(fn: () => T): T { return storage.exit(fn); }
 export function checkAborted(): void {
   if (currentExecution()?.controller.signal.aborted) throw abortError();
 }

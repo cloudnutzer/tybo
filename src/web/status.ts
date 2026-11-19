@@ -16,6 +16,12 @@
 import { BRAND } from "../brand";
 import type { EngineAvailability } from "./engines";
 import type { ApiResult } from "./settings";
+import { MCP_GAP_REASONS, SKILL_GAP_REASONS, TOOL_GAP_IDS, TOOL_GAP_TEXT, TOOL_HINT_REASONS,
+  TOOL_NOTES, TOOL_ORIGINS, TOOL_STATES, type EngineToolsResponse, type ToolGap, type ToolReason,
+} from "./tool-parity-types";
+
+/** Nur /api/status erweitert die Verfügbarkeit; /api/engines behält seinen Vertrag. */
+export interface StatusEngineAvailability extends EngineAvailability { tools?: EngineToolsResponse | null }
 
 export type Supervisor = "launchd" | "pm2" | "systemd";
 export type StorageBackend = "supabase" | "none";
@@ -180,7 +186,7 @@ export interface StatusPort {
    * Motoren (Issue #126): installiert, angemeldet, Version je Motor. Wirft,
    * wenn es nicht ermittelbar ist; fehlt die Methode, meldet die API null.
    */
-  engines?(): Promise<EngineAvailability[]>;
+  engines?(): Promise<StatusEngineAvailability[]>;
   /**
    * Telegram-Eingang (Issue #562); null ohne Telegram, im Webhook-Betrieb
    * oder vor dem ersten Ergebnis. Fehlt die Methode, meldet die API null.
@@ -210,7 +216,7 @@ function errorName(e: unknown): string {
 }
 
 /** Ein Motor für die Statusseite: installiert, angemeldet (null: nicht feststellbar), Version */
-function statusEngine(a: EngineAvailability): EngineAvailability {
+export function statusEngine(a: StatusEngineAvailability): StatusEngineAvailability {
   return {
     engine: String(a.engine),
     label: String(a.label),
@@ -218,6 +224,41 @@ function statusEngine(a: EngineAvailability): EngineAvailability {
     loggedIn: a.loggedIn === true ? true : a.loggedIn === false ? false : null,
     ...(typeof a.version === "string" && /^[0-9A-Za-z.+-]{1,40}$/.test(a.version) ? { version: a.version } : {}),
     ...(typeof a.message === "string" && a.message ? { message: a.message.slice(0, 300) } : {}),
+    tools: statusTools(a.tools),
+  };
+}
+
+const object = (value: unknown): Record<string, unknown> | undefined =>
+  value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+const member = <T extends string>(value: unknown, values: readonly T[]): value is T =>
+  typeof value === "string" && values.includes(value as T);
+const toolName = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9._-]{1,64}(?![\s\S])/.test(value);
+const list = <T>(value: unknown, parse: (entry: Record<string, unknown>) => T | undefined): T[] =>
+  (Array.isArray(value) ? value : []).flatMap(entry => {
+    const raw = object(entry);
+    const clean = raw && parse(raw);
+    return clean ? [clean] : [];
+  }).slice(0, 100);
+
+/** Nur Namen und feste Mengen; fremde Texte und Zusatzfelder verlassen den Server nicht. */
+function statusTools(value: unknown): EngineToolsResponse | null {
+  const raw = object(value), inventory = object(raw?.inventory), gaps = object(raw?.gaps);
+  if (!inventory || !gaps || !member(inventory.notes, TOOL_NOTES) || !member(inventory.state, TOOL_STATES)
+    || typeof gaps.notes !== "boolean") return null;
+  const inventoryList = (value: unknown) => list(value, entry => toolName(entry.name) && member(entry.origin, TOOL_ORIGINS)
+    ? { name: entry.name, origin: entry.origin } : undefined);
+  const gapList = <R extends ToolReason>(value: unknown, reasons: readonly R[]): (ToolGap<R> & { text: string })[] =>
+    list(value, entry => toolName(entry.name) && member(entry.reason, reasons) && entry.text === TOOL_GAP_TEXT[entry.reason]
+      ? { name: entry.name, reason: entry.reason, text: TOOL_GAP_TEXT[entry.reason] } : undefined);
+  return {
+    inventory: { mcp: inventoryList(inventory.mcp), skills: inventoryList(inventory.skills), notes: inventory.notes, state: inventory.state },
+    gaps: {
+      mcp: gapList(gaps.mcp, MCP_GAP_REASONS), hints: gapList(gaps.hints, TOOL_HINT_REASONS), skills: gapList(gaps.skills, SKILL_GAP_REASONS),
+      notes: gaps.notes,
+      plugins: typeof gaps.plugins === "number" && Number.isSafeInteger(gaps.plugins) && gaps.plugins >= 0 ? gaps.plugins : null,
+      fixed: list(gaps.fixed, entry => member(entry.id, TOOL_GAP_IDS) && entry.text === TOOL_GAP_TEXT[entry.id]
+        ? { id: entry.id, text: TOOL_GAP_TEXT[entry.id] } : undefined),
+    },
   };
 }
 

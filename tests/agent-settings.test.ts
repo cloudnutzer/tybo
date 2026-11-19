@@ -12,6 +12,9 @@ import type { ClaudeResult, ClaudeStreamOptions } from "../src/lib/claude";
 import type { BotSession } from "../src/lib/session-manager";
 import { isolateAgentCatalog } from "./catalog-fixture";
 import { createClaudeEngine } from "../src/lib/engines";
+import { createSettingsApi } from "../src/web/settings";
+import { botSettings } from "../src/web/bot-settings";
+import { SELECTABLE_ENGINES } from "../src/lib/settings";
 
 // Vorrang: config/settings.json (Agent, dann Standard) vor .env vor Agenten-Datei.
 // Einstellungen kommen hier aus temporären Dateien oder Fakes, Claude ist gefälscht.
@@ -44,6 +47,36 @@ afterEach(() => {
 
 const fileAgent = (model: string, effort?: string) => () =>
   ({ name: "Test", systemPrompt: "", model, ...(effort ? { effort } : {}) }) as AgentConfig;
+
+describe("Motor je Agent über PATCH /api/settings", () => {
+  test("alle Motoren, alte Datei, ungültige Werte und Entfernen ohne Verlust von Modell und Effort", async () => {
+    const api = createSettingsApi({ ...botSettings, speechOptions: undefined }, () => {});
+    const values = { model: "opus", effort: "high" as const };
+    putSettings({ agents: { research: values } });
+    expect((await api.get()).status).toBe(200);
+    const patch = (agents: unknown) => api.patch(JSON.stringify({ agents }));
+    for (const engine of SELECTABLE_ENGINES) {
+      expect((await patch({ research: { engine } })).status).toBe(200);
+      expect(getSettings().agents?.research).toEqual({ ...values, engine });
+    }
+    for (const engine of ["ungueltig", 4, false, {}]) {
+      const res = await patch({ research: { engine } });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBeString();
+      expect(getSettings().agents?.research).toEqual({ ...values, engine: "api" });
+    }
+    for (const engine of [null, "", "   "]) {
+      await patch({ research: { engine: "codex" } });
+      expect((await patch({ research: { engine } })).status).toBe(200);
+      expect(getSettings().agents?.research).toEqual(values);
+    }
+    for (const agents of [{ research: null }, null]) {
+      await patch({ research: { ...values, engine: "codex" } });
+      expect((await patch(agents)).status).toBe(200);
+      expect(getSettings().agents).toBeUndefined();
+    }
+  });
+});
 
 describe("Agenten-Namen", () => {
   test("canonicalAgentName löst Aliasse wie getAgentConfig auf", () => {

@@ -1,12 +1,15 @@
 /**
  * Fehler-Auswertung der Claude-CLI (Issue #325). Maßgeblich ist das Signal
  * der CLI im result-Ereignis bzw. JSON-Objekt (is_error, subtype,
- * api_error_status). Nur wenn keines der drei Felder vorliegt (Textformat,
- * altes JSON, fehlendes result-Ereignis), entscheidet ein Textmuster.
+ * api_error_status). Ohne diese Felder entscheidet ein Textmuster. Ein
+ * Erfolgssignal wird nur bei rejected zusammen mit leerem Text oder einem
+ * belegten Limit-Meldungsanfang zum Fehler (Issue #652).
  *
  * So löst eine echte Antwort, die zufällig „billing" oder „usage limit"
  * enthält, keinen Fallback auf ein anderes Modell aus.
  */
+
+import type { EngineErrorKind, EngineRateLimit } from "../engines/types";
 
 /** Die drei Felder, mit denen die CLI selbst einen Fehler meldet */
 export interface CliErrorSignal {
@@ -55,6 +58,26 @@ const SHORT_REPLY_MARKERS = [
 /** Unterhalb dieser Länge gelten auch die weichen Marker */
 const SHORT_REPLY_CHARS = 500;
 
+type ClaudeLimitKind = Extract<EngineErrorKind, "usage_limit" | "quota">;
+type ClaudeLimitSignal = Pick<EngineRateLimit, "status" | "errorCode">;
+
+/** Belegte Limit-Meldungen: nur kurze Texte, nur der Anfang, ohne führenden Leerraum. */
+export function claudeLimitText(text: string): ClaudeLimitKind | undefined {
+  const message = text.trimStart();
+  if (message.length >= SHORT_REPLY_CHARS) return undefined;
+  if (/^you['’]re out of usage credits\b/i.test(message)) return "quota";
+  if (/^you['’]ve (?:hit|reached) your\b/i.test(message)) return "usage_limit";
+  return undefined;
+}
+
+/** Fehlerart eines bereits als Fehler beurteilten Laufs; Kontingent geht vor Nutzungsgrenze. */
+export function claudeLimitError(text: string, rateLimit?: ClaudeLimitSignal): ClaudeLimitKind | undefined {
+  const fromText = claudeLimitText(text);
+  if (rateLimit?.errorCode === "credits_required" || fromText === "quota") return "quota";
+  if (rateLimit?.status === "rejected" || fromText === "usage_limit") return "usage_limit";
+  return undefined;
+}
+
 /** Textmuster für Anmelde-, API- und Kontingentfehler; nur Rückfall ohne CLI-Signal */
 export function isClaudeErrorResponse(text: string): boolean {
   const haystack = text.toLowerCase();
@@ -79,9 +102,17 @@ export function isCreditLimitError(text: string): boolean {
 }
 
 /**
- * Gesamturteil für ein Ergebnis: CLI-Signal zuerst, Textmuster auf den
- * Antworttext nur ohne Signal.
+ * Gesamturteil: CLI-Fehler gelten immer. Gegen ein Erfolgssignal braucht es
+ * rejected und leeren Text oder eine Limit-Meldung; ohne Signal reicht der Text.
  */
-export function judgeClaudeResult(fields: CliErrorSignal | null | undefined, text: string): boolean {
-  return hasCliSignal(fields) ? isCliResultError(fields) : isClaudeErrorResponse(text);
+export function judgeClaudeResult(
+  fields: CliErrorSignal | null | undefined,
+  text: string,
+  rateLimit?: ClaudeLimitSignal
+): boolean {
+  const limitText = claudeLimitText(text) !== undefined;
+  const rejected = rateLimit?.status === "rejected";
+  const empty = text.trim() === "";
+  if (hasCliSignal(fields)) return isCliResultError(fields) || (rejected && (empty || limitText));
+  return isClaudeErrorResponse(text) || limitText || (rejected && empty);
 }

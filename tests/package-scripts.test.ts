@@ -16,7 +16,7 @@ describe("package.json-Skripte", () => {
       // Betrieb
       "tybo", "start", "vps", "whatsapp", "voice",
       // Aufgaben und Routinen
-      "restart:request", "notify", "nachschlagen", "job", "checkin", "briefing", "health", "sip-zustand", "updates",
+      "restart:request", "notify", "nachschlagen", "job", "limits", "checkin", "briefing", "health", "sip-zustand", "updates",
       // Einrichtung
       "setup", "setup:launchd", "setup:services", "setup:verify", "setup:google", "uninstall", "test:tools",
       // Entwicklung

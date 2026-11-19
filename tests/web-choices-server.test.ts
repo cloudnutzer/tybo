@@ -258,6 +258,15 @@ describe("Verlauf: choice statt choiceId", () => {
 });
 
 describe("Route POST /api/conversations/<id>/choices/<choiceId>", () => {
+  test("alter Job-Knopf reicht die aktuelle Statusauskunft an den Browser durch", async () => {
+    const ctx = await start();
+    const c = await askInTelegram(ctx, { chatId: USER });
+    ctx.choices.port.decide = async () => ({ status: "expired", choice: { id: c.id, state: "expired", options: [] }, message: "Job läuft schon." });
+    const res = await post(ctx, "dm", c.id, { option: "ok" });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ expired: true, message: "Job läuft schon.", error: "Job läuft schon." });
+  });
+
   test("Klick entscheidet für alle Kanäle (via web); Doppelklick 409 mit dem ersten Ergebnis", async () => {
     const ctx = await start();
     const c = await askInTelegram(ctx, { chatId: GROUP, topicId: 443 });

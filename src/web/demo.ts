@@ -47,15 +47,20 @@ import { goalCardActions, type GoalCard, type GoalPort } from "./goals";
 import { createChoicePort, type ChoicePort, type ChoiceRegister, type RegisterChoice, type RegisterDecideOutcome } from "./choices";
 import { COMMANDS_TEXT, type CommandListEntry, type CommandPort } from "./commands";
 import { CLAUDE_MODELS, type ModelCatalog } from "./models";
+import type { OpenRouterKeyPort } from "./openrouter-key";
 import type { EffectiveSettings, ModelAndEffort, SettingsData, SettingsPort, SpeechOptions, ValidateResult } from "./settings";
 import type { LocalModeStatus, VoicePort } from "./voice";
 import type { SpeechPort } from "./speech";
-import { keyStatus, type StatusPort, type Supervisor } from "./status";
-import type { EngineAvailability, EnginePort } from "./engines";
+import { keyStatus, type StatusPort, type StatusEngineAvailability, type Supervisor } from "./status";
+import { toolGapsResponse, type EngineTools } from "./tool-parity-types";
+import { cleanEngineMessage, type ConversationEngineChoice, type ConversationEngineStage, type EngineAvailability, type EngineBlockView, type EnginePort, type EngineStageView, type EngineSwitchView } from "./engines";
 import { UploadStore } from "./uploads";
 import type { KeysPort } from "./keys";
 import type { PushDeps } from "./push-api";
 import type { RoutineActInput, RoutineHistoryInput, RoutineInput, RoutineListInput, RoutineRunInput, RoutinesPort } from "./routines";
+import type { JobItem, JobsPort } from "./jobs";
+import type { PipelinesPort } from "./pipelines";
+import type { PipelineStatus, PipelineStatusFile } from "./pipeline-status";
 import type { ThreadCloseReason, ThreadRecord, ThreadsPort } from "./threads";
 import type { ReminderRecord, RemindersPort } from "./reminders";
 import { ConversationStore, type ReplyInfo } from "./store";
@@ -177,6 +182,10 @@ type DemoRow = ReplyInfo & {
   choiceId?: string;
 };
 
+/** Historische Wechselmeldung und Turn-Hinweis im Wortlaut von M14-10. */
+export const DEMO_ENGINE_NOTICE = "Motorwechsel: Claude Code steht bei 96 % (Woche, Fable). Ab der nächsten Nachricht antwortet Codex. Zurück geht es von selbst nach dem Reset am Do, 19.11., 13:00 Uhr. Stand und Wahl: /motor";
+export const DEMO_ENGINE_HINT = "Hier antwortet jetzt Codex statt Claude Code (Limit erreicht). Der Verlauf ist übergeben.";
+
 function demoDirectChat(now: number): DemoRow[] {
   const rows: DemoRow[] = [];
   // Alle 40 Minuten eine Nachricht, die jüngste vor 20 Minuten
@@ -193,6 +202,8 @@ function demoDirectChat(now: number): DemoRow[] {
       rows.push({ id: `dm-${n}`, role: "assistant", text: DM_ANSWERS[pair % DM_ANSWERS.length], createdAt: micro(time, n), agent, ...info });
     }
   }
+  // Die vorhandene Anzahl und die Cursor bleiben für die Nachladeprobe erhalten.
+  Object.assign(rows[rows.length - 3], { kind: "notice", source: "system", text: DEMO_ENGINE_NOTICE });
   return rows;
 }
 
@@ -324,6 +335,7 @@ function demoChoiceRows(after: number): DemoRow[] {
 }
 
 export interface DemoChoices extends ChoicePort {
+  expireInDemo?(id: string): void;
   /** Simuliert einen Klick in Telegram (via telegram) */
   decideInTelegram(id: string, key: string): Promise<RegisterDecideOutcome>;
 }
@@ -333,13 +345,14 @@ export interface DemoChoices extends ChoicePort {
  * src/lib/choices.ts (erster Klick gewinnt, unbekannte Option lässt offen),
  * dahinter der echte ChoicePort. Nichts aus src/lib, nie data/choices.json.
  */
-export function createDemoChoices(now: number = Date.now()): DemoChoices {
+export function createDemoChoices(now: number = Date.now(), jobTopicId = 31): DemoChoices {
   const conversation = { type: "telegram" as const, chatId: DEMO_GROUP_ID, topicId: 31 };
   const choices = new Map<string, RegisterChoice>([
     [DEMO_CHOICES.done, {
       id: DEMO_CHOICES.done, conversation, options: DEMO_CHOICE_OPTIONS, state: "done",
       result: { key: "ok", label: "Erlauben", via: "telegram", at: now - 12 * DAY + 3 * MINUTE },
     }],
+    [DEMO_JOB_CHOICE, { id: DEMO_JOB_CHOICE, kind: "job", ref: DEMO_JOB_IDS.waiting, conversation: { ...conversation, topicId: jobTopicId }, options: [{ key: "a1", label: "Nur kostenlose Angebote" }, { key: "a2", label: "Auch kostenpflichtige Angebote" }], state: "open" }],
     [DEMO_CHOICES.open, { id: DEMO_CHOICES.open, conversation, options: DEMO_CHOICE_OPTIONS, state: "open" }],
   ]);
   const listeners = new Set<(change: { type: string; choice: RegisterChoice }) => void>();
@@ -368,7 +381,12 @@ export function createDemoChoices(now: number = Date.now()): DemoChoices {
     },
   };
   const port = createChoicePort({ register, groupId: () => DEMO_GROUP_ID, log: () => {} });
-  return { ...port, decideInTelegram: (id, key) => decide(id, key, "telegram") };
+  return { ...port, decideInTelegram: (id, key) => decide(id, key, "telegram"), expireInDemo(id) {
+    const c = choices.get(id);
+    if (!c || c.state !== "open") return;
+    c.state = "expired";
+    for (const listener of [...listeners]) listener({ type: "expired", choice: copy(c) });
+  } };
 }
 
 /** Legt die Beispieldateien in der Demo-Ablage an (dir/<id>/<name>) */
@@ -1069,7 +1087,7 @@ export function createDemoStatus(options: { supervisor?: Supervisor | null; now?
     },
     keys: () => keys,
     // Motoren (Issue #126): feste Angaben, nie ein echter Prüfbefehl
-    engines: async () => structuredClone(DEMO_ENGINE_AVAILABILITY),
+    engines: async () => structuredClone(DEMO_STATUS_ENGINES),
     now,
   };
 }
@@ -1181,12 +1199,16 @@ export async function startDemoServer(
     status?: StatusPort;
     /** Routinen-Attrappe (Issue #284), Standard: createDemoRoutines() */
     routines?: RoutinesPort;
+    jobs?: JobsPort;
+    pipelines?: PipelinesPort;
     /** Fäden-Attrappe (Issue #293), Standard: createDemoThreads über den Demo-Einstellungen */
     threads?: ThreadsPort;
     /** Erinnerungs-Attrappe (Issue #323), Standard: createDemoReminders() mit Beispieldaten */
     reminders?: RemindersPort;
     /** Motor-Attrappe (Issue #126), Standard: createDemoEngines über den Demo-Einstellungen */
     engines?: EnginePort;
+    /** Fertige Anzeige-Attrappe, nie ein Schlüssel oder Netzabruf (Issue #674). */
+    openrouterKey?: OpenRouterKeyPort;
     /** Einstellungen, Anweisungen, Modell-Listen (Issue #38), Standard: Attrappen im Speicher */
     settings?: SettingsPort & { data?(): SettingsData };
     /** Status der Sprechmodi (Issue #248), Standard: createDemoVoice über den Demo-Einstellungen */
@@ -1276,6 +1298,8 @@ export async function startDemoServer(
       status: deps.status ?? createDemoStatus(),
       // Routinen (Issue #284): feste Beispieldaten, nie launchctl oder pm2
       routines: deps.routines ?? createDemoRoutines(),
+      jobs: deps.jobs ?? createDemoJobs(choices),
+      pipelines: deps.pipelines ?? createDemoPipelines(),
       // Offene Fäden (Issue #293): Beispieldaten im Speicher, an und aus über dieselben Einstellungen
       threads: deps.threads ?? createDemoThreads({ settings: deps.settings?.data ? (deps.settings as SettingsPort & { data(): SettingsData }) : agents.settings }),
       // Erinnerungen (Issue #323): Beispieldaten im Speicher, nie data/reminders.json oder Supabase
@@ -1285,6 +1309,7 @@ export async function startDemoServer(
       // Motor (Issue #126): Codex verfügbar, „Recherche" weicht ab; nie ein echter Prüfbefehl.
       // Über denselben Einstellungen wie /api/settings, auch wenn sie hereingereicht werden
       engines: deps.engines ?? createDemoEngines(deps.settings?.data ? (deps.settings as SettingsPort & { data(): SettingsData }) : agents.settings),
+      openrouterKey: deps.openrouterKey ?? createDemoOpenRouterKey(),
       // Sprechmodus (Issue #248): Status aus festen Anbietern und denselben Demo-Einstellungen
       voice: deps.voice ?? createDemoVoice(deps.settings?.data ? (deps.settings as SettingsPort & { data(): SettingsData }) : agents.settings),
       // Sprechmodus (Issue #249): fester erkannter Text, die Browser-Stimme spricht
@@ -1354,9 +1379,9 @@ export const DEMO_COMMANDS: readonly CommandListEntry[] = [
   {
     name: "motor",
     aliases: ["engine"],
-    description: "Motor dieses Gesprächs zeigen oder wechseln (Claude Code, Codex, OpenCode, Anthropic API)",
+    description: "Motor und Stand zeigen, wechseln, Automatik an/aus, neu prüfen",
     args: "optional",
-    argsHint: "[claude|codex|opencode|api|standard]",
+    argsHint: "[werkzeuge|claude|codex|opencode|api|standard|auto an|auto aus|pruefen]",
   },
   {
     name: "agent",
@@ -1446,8 +1471,9 @@ export function createDemoCommands(): CommandPort {
  * Session-Reset für Demo und web:dev (Issue #61): es gibt keine Claude-
  * Sessions, also ist nie etwas zurückzusetzen.
  */
-export const demoSessionReset: ConversationSessionReset = async (_id, whileBlocked) => {
-  if (whileBlocked) await whileBlocked();
+export const demoSessionReset: ConversationSessionReset = async (_id, options) => {
+  await options?.beforeReset?.();
+  await options?.whileBlocked?.();
   return { status: "done", reset: 0, sessionMode: true };
 };
 
@@ -1570,19 +1596,41 @@ export function createDemoSpeech(): SpeechPort {
   };
 }
 
-/** Verfügbarkeit in der Demo: alle Motoren angemeldet, erfundene Versionen */
+/** Verfügbarkeit in der Demo: OpenCode nicht bereit, übrige Motoren angemeldet, erfundene Versionen. */
 export const DEMO_ENGINE_AVAILABILITY: EngineAvailability[] = [
   { engine: "claude", label: "Claude Code", installed: true, loggedIn: true, version: "2.1.281" },
   { engine: "codex", label: "Codex", installed: true, loggedIn: true, version: "0.155.1" },
-  { engine: "opencode", label: "OpenCode", installed: true, loggedIn: true, version: "1.18.33" },
+  { engine: "opencode", label: "OpenCode", installed: false, loggedIn: false, message: "OpenCode ist nicht installiert" },
   { engine: "api", label: "Anthropic API", installed: true, loggedIn: true },
 ];
+
+/** Nur erfundene Werkzeugnamen; der Status hat einen eigenen Antworttyp. */
+export const DEMO_STATUS_ENGINES: StatusEngineAvailability[] = DEMO_ENGINE_AVAILABILITY.map(availability => {
+  const engine = availability.engine;
+  const tools: EngineTools = {
+    inventory: {
+      mcp: [{ name: "beispiel-dateien", origin: engine === "codex" || engine === "api" ? "tybo" : "engine" }],
+      skills: engine === "api" ? [] : [{ name: "beispiel-gruss", origin: engine === "codex" ? "tybo" : "engine" }],
+      notes: engine === "claude" ? "self" : engine === "codex" ? "passed" : "off", state: "ok",
+    },
+    gaps: { mcp: [], hints: [], skills: [], notes: false, plugins: null, fixed: [] },
+  };
+  if (engine !== "claude") {
+    tools.gaps.mcp = [{ name: "beispiel-suche", reason: engine === "codex" ? "auth_unknown" : "not_in_engine" }];
+    tools.gaps.fixed = ["connectors", "plugins", "hooks", "builtin"];
+    tools.gaps.plugins = 2;
+    tools.gaps.notes = engine !== "codex";
+  } else tools.inventory.mcp.push({ name: "beispiel-suche", origin: "engine" });
+  if (engine === "codex") tools.gaps.hints = [{ name: "beispiel-tybo-dienst", reason: "secret_in_url" }];
+  if (engine === "api") tools.gaps.fixed.push("skills");
+  return { ...availability, tools: { inventory: tools.inventory, gaps: toolGapsResponse(tools.gaps) } };
+});
 
 /** Session-Schlüssel des Direktchats der Demo (erfundene Nutzer-ID) */
 export const DEMO_DM_SESSION_KEY = "dm:1000000001";
 /** Das Topic „Recherche" der Demo läuft mit Codex (Ausnahme wie nach /motor codex) */
 export const DEMO_CODEX_TOPIC = "topic-443";
-/** Das Topic „Finanzen" der Demo läuft mit OpenCode (Ausnahme wie nach /motor opencode, Issue #129) */
+/** Im Topic „Finanzen" ist OpenCode eingestellt; da er fehlt, antwortet eine Ersatzstufe (Issue #675) */
 export const DEMO_OPENCODE_TOPIC = "topic-12";
 
 /** Session-Schlüssel wie conversationSessionKey im Bot, für die Demo-Gespräche */
@@ -1596,8 +1644,13 @@ export function demoSessionKey(conversationId: string): string | null {
 
 /** Beispielstand der Einstellungen in der Demo, mit der Codex-Ausnahme für „Recherche" und OpenCode für „Finanzen" */
 export const DEMO_SETTINGS: SettingsData = {
-  agents: { research: { model: "claude-sonnet-5" }, critic: { effort: "xhigh" } },
-  engine: { topics: { [`topic:${DEMO_GROUP_ID}:443`]: "codex", [`topic:${DEMO_GROUP_ID}:12`]: "opencode" } },
+  agents: { general: { model: "claude-fable-5-2" }, research: { model: "claude-sonnet-5" }, critic: { effort: "xhigh" } },
+  engine: {
+    topics: { [`topic:${DEMO_GROUP_ID}:443`]: "codex", [`topic:${DEMO_GROUP_ID}:12`]: "opencode" },
+    backups: [{ engine: "claude", model: "claude-opus-5-5" }, { engine: "codex" },
+      { engine: "claude", model: "claude-sonnet-5-5" }, { engine: "opencode" }],
+    auto: { threshold: 95 },
+  },
 };
 
 /**
@@ -1607,23 +1660,133 @@ export const DEMO_SETTINGS: SettingsData = {
  */
 export function createDemoEngines(
   settings: Pick<SettingsPort, "readForWrite" | "write"> & { data(): SettingsData },
-  options: { availability?: EngineAvailability[]; watchMs?: number } = {}
+  options: { availability?: EngineAvailability[]; watchMs?: number; now?: () => number } = {}
 ): EnginePort {
   const standard = () => {
     const own = settings.data().engine?.default;
     return own ? { engine: own, source: "settings" as const } : { engine: "claude", source: "code" as const };
   };
+  const resolvedModels = (): Record<string, string | null> => {
+    const data = settings.data();
+    const model = data.agents?.general?.model ?? data.defaults?.model ?? DEMO_CODE_DEFAULTS.model;
+    return { claude: model,
+      // Wie apiModel; der Demo-Server importiert keine Motor-Laufzeit.
+      api: /^claude-[a-z0-9][\w.-]*$/.test(model) ? model : DEMO_CODE_DEFAULTS.model,
+      codex: data.engine?.codex?.model ?? null, opencode: data.engine?.opencode?.model ?? null };
+  };
   const overrides = (): Record<string, string> => ({ ...(settings.data().engine?.topics ?? {}) });
+  // Feste Beispielmessungen ab dem Start der Demo, nie Dateien oder Motoren abfragen.
+  const now = (options.now ?? Date.now)();
+  const since = new Date(now - 60_000).toISOString();
+  const reset = new Date(now + 24 * 60 * 60_000).toISOString();
+  const blocks: EngineBlockView[] = [
+    { engine: "claude", cause: "threshold", window: "weekly_scoped:fable", percent: 96, since, until: reset, resetKnown: true },
+    { engine: "claude", cause: "limit", family: "opus", since, until: new Date(now + 60 * 60_000).toISOString(), resetKnown: false },
+  ];
+  const usage: EngineSwitchView["usage"] = {
+    claude: [{ id: "weekly_scoped:fable", state: "known", percent: 96, measuredAt: since, resetsAt: reset, source: "report" },
+      { id: "session", state: "expired", measuredAt: since, resetsAt: new Date(now - 1).toISOString(), source: "stream" }],
+    codex: [{ id: "weekly_all", state: "known", percent: 42, measuredAt: since, resetsAt: reset, source: "session-file" }],
+    opencode: [], api: [],
+  };
+  const switchStatus = async (availability: readonly EngineAvailability[], data = settings.data(), wish?: string, agent = "general"): Promise<EngineSwitchView> => {
+    const threshold = data.engine?.auto?.threshold ?? 95;
+    const auto = { enabled: !!data.engine?.backups?.length && (data.engine?.auto?.enabled ?? true), threshold,
+      returnBelow: data.engine?.auto?.returnBelow ?? threshold - 15 };
+    const activeBlocks = data.engine?.backups?.length ? blocks.filter(block => Date.parse(block.until) > (options.now ?? Date.now)() && (block.cause !== "threshold" || auto.enabled)) : [];
+    const idOf = (stage: { engine: string; model?: string }) => stage.engine === "claude" && stage.model ? `claude:${stage.model}` : stage.engine;
+    const stages: { engine: string; model?: string }[] = [{ engine: wish ?? data.engine?.default ?? "claude" }];
+    for (const stage of [{ engine: data.engine?.default ?? "claude" }, ...data.engine?.backups ?? []]) {
+      if (stage.engine !== "api" && !stages.some(previous => idOf(previous) === idOf(stage) || (!stage.model && previous.engine === stage.engine))) stages.push(stage);
+    }
+    let answering = false;
+    const order: EngineStageView[] = stages.map(stage => {
+      const chosenModel = stage.model ?? (stage.engine === "claude" || stage.engine === "api"
+        ? data.agents?.[agent]?.model ?? data.defaults?.model ?? DEMO_CODE_DEFAULTS.model
+        : stage.engine === "codex" ? data.engine?.codex?.model : data.engine?.opencode?.model);
+      const model = stage.engine === "api" && !/^claude-[a-z0-9][\w.-]*$/.test(chosenModel ?? "") ? DEMO_CODE_DEFAULTS.model : chosenModel;
+      const status = availability.find(entry => entry.engine === stage.engine);
+      const base = { id: idOf(stage), engine: stage.engine, label: status?.label ?? stage.engine, model: model ?? null };
+      if (!status?.installed || status.loggedIn !== true) return { ...base, state: "not_ready" };
+      const family = model?.match(/(?:^|-)(fable|opus)(?=-|$)/)?.[1];
+      const block = stage.engine === "claude" && family ? activeBlocks.find(entry => entry.family === family || entry.window === `weekly_scoped:${family}`) : undefined;
+      if (block) return { ...base, state: "blocked", blockedUntil: block.until, cause: block.cause, resetKnown: block.resetKnown,
+        ...(block.window ? { window: block.window } : {}) };
+      const state = answering ? "free" : "answering";
+      answering = true;
+      return { ...base, state };
+    });
+    return { order, auto, usage: structuredClone(usage), blocks: structuredClone(activeBlocks) };
+  };
   const listeners = new Set<() => void>();
   let timer: ReturnType<typeof setInterval> | null = null;
   let last = "";
-  const snapshot = () => JSON.stringify({ standard: standard(), overrides: overrides() });
+  const snapshot = () => JSON.stringify(settings.data());
   return {
     engines: DEMO_ENGINE_OPTIONS.engines,
     standard,
+    resolvedModels,
+    timeZone: () => "Europe/Berlin",
     overrides,
+    agentEngines: () => Object.fromEntries(Object.entries(settings.data().agents ?? {})
+      .filter(([, entry]) => entry.engine !== undefined).map(([name, entry]) => [name, entry.engine!])),
     sessionKey: demoSessionKey,
+    conversationSnapshot(conversations) {
+      const data = settings.data();
+      const base = data.engine?.default ?? "claude";
+      const availability = options.availability ?? DEMO_ENGINE_AVAILABILITY;
+      const engines = Object.fromEntries(conversations.map(c => [c.id, data.engine?.topics?.[demoSessionKey(c.id) ?? ""] ?? data.agents?.[c.agent]?.engine ?? base]));
+      const choices: Record<string, ConversationEngineChoice[]> = {};
+      const stages = Promise.all(conversations.map(async c => {
+          const view = await switchStatus(availability, data, engines[c.id], c.agent);
+          let answering = view.order.find(stage => stage.state === "answering");
+          let reason = view.order[0];
+          // Ohne Ersatzstufen gilt wie im Bot der alte Rückfall auf Claude Code.
+          if (!data.engine?.backups?.length) {
+            const wanted = availability.find(a => a.engine === engines[c.id]);
+            const engine = engines[c.id] === "claude" || wanted?.installed && wanted.loggedIn ? engines[c.id] : "claude";
+            answering = { id: engine, engine, label: DEMO_ENGINE_OPTIONS.engines.find(e => e.id === engine)!.label, state: "answering",
+              model: engine === "claude" ? data.agents?.[c.agent]?.model ?? data.defaults?.model ?? DEMO_CODE_DEFAULTS.model : resolvedModels()[engine] };
+            if (engine === engines[c.id]) reason = answering;
+          }
+          const role = !answering ? "none" : answering.id !== reason.id ? "backup"
+            : data.engine?.topics?.[demoSessionKey(c.id) ?? ""] ? "manual" : "first";
+          const block = reason.state === "blocked" ? view.blocks.find(b => b.engine === reason.engine && b.until === reason.blockedUntil && b.cause === reason.cause) : undefined;
+          const status = availability.find(a => a.engine === reason.engine);
+          const message = status && cleanEngineMessage(status);
+          const until = view.order.filter(s => s.state === "blocked").map(s => s.state === "blocked" ? s.blockedUntil : "").sort()[0];
+          const stage: ConversationEngineStage = {
+            engine: answering?.engine ?? null,
+            label: answering ? answering.label + (answering.id.startsWith("claude:") && answering.model ? ` (${answering.model})` : "") : null,
+            ...(answering?.model ? { model: answering.model } : {}), role,
+            ...((role === "backup" || role === "none") ? { reason: {
+              label: reason.label, kind: reason.state === "blocked" ? reason.cause : "not_ready",
+              ...(block ? { until: block.until, resetKnown: block.resetKnown,
+                ...(block.window ? { window: block.window } : {}), ...(block.percent !== undefined ? { percent: block.percent } : {}),
+              } : {}),
+              ...(reason.state === "not_ready" && message ? { message } : {}),
+            } } : {}),
+            ...(role === "none" && until ? { until } : {}),
+          };
+          choices[c.id] = await Promise.all(DEMO_ENGINE_OPTIONS.engines.map(async ({ id, label }): Promise<ConversationEngineChoice> => {
+            const choice = (await switchStatus(availability, data, id, c.agent)).order[0];
+            const base = { engine: id, label, ...(choice.model ? { model: choice.model } : {}) };
+            if (choice.state === "blocked") return { ...base, state: choice.state, blockedUntil: choice.blockedUntil,
+              cause: choice.cause, resetKnown: choice.resetKnown, ...(choice.window ? { window: choice.window } : {}) };
+            if (choice.state === "not_ready") {
+              const status = availability.find(a => a.engine === id);
+              const message = status && cleanEngineMessage(status);
+              return { ...base, state: choice.state, installed: status?.installed === true, ...(message ? { message } : {}) };
+            }
+            return { ...base, state: answering?.id === choice.id && answering.model === choice.model ? "answering" : "free" };
+          }));
+          return [c.id, stage] as const;
+        })).then(Object.fromEntries);
+      return { default: base, timeZone: "Europe/Berlin", engines, stages, choices: stages.then(() => choices) };
+    },
     availability: async () => structuredClone(options.availability ?? DEMO_ENGINE_AVAILABILITY),
+    switchStatus,
+    check: async () => ({ notMeasured: ["claude", "codex"] }),
     async removeOverride(key) {
       const current = await settings.readForWrite();
       const topics = { ...(current.engine?.topics ?? {}) };
@@ -1682,7 +1845,7 @@ export function createDemoSettings(
 
   function validate(value: unknown): ValidateResult {
     const issues: { path: string; message: string }[] = [];
-    const v = (value ?? {}) as SettingsData;
+    const v = structuredClone(value ?? {}) as SettingsData;
     const entries: [string, ModelAndEffort | undefined][] = [["defaults", v.defaults]];
     for (const [name, entry] of Object.entries(v.agents ?? {})) {
       // Wie das Schema in src/lib/settings.ts: jede gültige Kennung; aktive Agenten prüft applySettingsPatch
@@ -1697,7 +1860,54 @@ export function createDemoSettings(
     }
     // Motor (Issue #126) grob wie das Schema: bekannte Motoren und Stufen, Modellname ohne Leerzeichen
     const engineIds = DEMO_ENGINE_OPTIONS.engines.map(e => e.id);
+    for (const [name, entry] of Object.entries(v.agents ?? {})) {
+      if (entry.engine !== undefined && !(engineIds as readonly string[]).includes(entry.engine)) issues.push({ path: `agents.${name}.engine`, message: oneOf(engineIds) });
+    }
     const engine = v.engine;
+    if (engine?.backups !== undefined) {
+      if (!Array.isArray(engine.backups) || engine.backups.length > 4) {
+        issues.push({ path: "engine.backups", message: "Liste mit höchstens 4 Ersatzstufen" });
+      } else {
+        const ids = new Set<string>();
+        for (const [index, stage] of engine.backups.entries()) {
+          const path = `engine.backups.${index}`;
+          if (!stage || typeof stage !== "object" || Array.isArray(stage)
+            || !["claude", "codex", "opencode"].includes(stage.engine)
+            || Object.keys(stage).some(key => !["engine", "model", "effort"].includes(key))) {
+            issues.push({ path, message: "ungültige Ersatzstufe" });
+            continue;
+          }
+          if (stage.engine !== "claude" && (stage.model !== undefined || stage.effort !== undefined)) {
+            issues.push({ path, message: "Modell und Effort nur bei Claude Code" });
+          }
+          if (typeof stage.model === "string") stage.model = stage.model.trim();
+          if (stage.model !== undefined && (typeof stage.model !== "string" || stage.model.length > 100 || !/^[A-Za-z0-9][\w.[\]-]*$/.test(stage.model))) {
+            issues.push({ path: `${path}.model`, message: "ungültiger Modellname" });
+          }
+          if (stage.effort !== undefined && !(DEMO_EFFORT_LEVELS as readonly string[]).includes(stage.effort)) {
+            issues.push({ path: `${path}.effort`, message: oneOf(DEMO_EFFORT_LEVELS) });
+          }
+          const id = `${stage.engine}:${stage.model ?? ""}`;
+          if (ids.has(id)) issues.push({ path, message: "Ersatzstufe doppelt" });
+          ids.add(id);
+        }
+      }
+    }
+    if (engine?.auto !== undefined) {
+      const auto = engine.auto;
+      if (!auto || typeof auto !== "object" || Array.isArray(auto)
+        || Object.keys(auto).some(key => !["enabled", "threshold", "returnBelow"].includes(key))) {
+        issues.push({ path: "engine.auto", message: "ungültige Automatik" });
+      } else {
+        if (auto.enabled !== undefined && typeof auto.enabled !== "boolean") issues.push({ path: "engine.auto.enabled", message: "boolean erwartet" });
+        if (auto.threshold !== undefined && !(Number.isInteger(auto.threshold) && auto.threshold >= 50 && auto.threshold <= 99)) {
+          issues.push({ path: "engine.auto.threshold", message: "ganze Zahl von 50 bis 99" });
+        }
+        if (auto.returnBelow !== undefined && !(Number.isInteger(auto.returnBelow) && auto.returnBelow >= 0 && auto.returnBelow <= (auto.threshold ?? 95) - 5)) {
+          issues.push({ path: "engine.auto.returnBelow", message: "ganze Zahl ab 0 und mindestens 5 Punkte unter der Schwelle" });
+        }
+      }
+    }
     if (engine?.default !== undefined && !engineIds.includes(engine.default as never)) {
       issues.push({ path: "engine.default", message: oneOf(engineIds) });
     }
@@ -1843,6 +2053,13 @@ export function createDemoInstructions(
       return removed;
     },
   };
+}
+
+/** Fertige Schlüssel-Anzeige ohne Anmeldung und Netzabruf (Issue #674). */
+export function createDemoOpenRouterKey(): OpenRouterKeyPort {
+  const fetchedAt = new Date(Date.now() - 3 * 60_000).toISOString();
+  return { read: async () => ({ configured: true, limit: 50, remaining: 12.4, limitReset: "monthly",
+    usage: 37.6, usageMonthly: 3.2, fetchedAt }) };
 }
 
 /** Modell-Listen ohne Netzabruf für web:dev, Demo und Browser-Durchlauf (Issue #38) */
@@ -1995,4 +2212,92 @@ export function createDemoAgents(options: Omit<Parameters<typeof createDemoTopic
   catalog = createDemoAgentCatalog({ telegram: topics.telegram });
   const current = catalog;
   return { topics, catalog: current, settings: createDemoSettings(options.settings, () => current.names()) };
+}
+
+/** Jobs bleiben in web:dev vollständig im Speicher, einschließlich der Rückfrage. */
+export const DEMO_JOB_CHOICE = "DemoJob00001";
+export const DEMO_JOB_IDS = { waiting: "20261118-100000-000001", running: "20261118-090000-000002", aborted: "20261117-080000-000003" };
+export function createDemoJobs(choices: DemoChoices = createDemoChoices(), conversation = { id: "topic-31", name: "Strategie" }): JobsPort {
+  const base = { run: 1, duration: "12 Min", conversation, question: null };
+  const jobs: JobItem[] = [
+    { ...base, id: DEMO_JOB_IDS.waiting, title: "Angebote für den Newsletter vergleichen", phase: "waiting", status: "wartet auf dich", actions: ["stop", "log"],
+      question: { number: 1, text: "Soll ich auch kostenpflichtige Angebote vergleichen?", context: "Die kostenlosen Angebote sind geprüft. Für den nächsten Vergleich brauche ich deine Auswahl.",
+        answers: ["Nur kostenlose Angebote", "Auch kostenpflichtige Angebote"], conversationId: conversation.id, choice: null } },
+    { ...base, id: DEMO_JOB_IDS.running, title: "Quellen für den Wochenbericht prüfen", phase: "running", status: "läuft", duration: "6 Min", actions: ["stop", "log"] },
+    { ...base, id: DEMO_JOB_IDS.aborted, title: "Entwurf für die nächste Ausgabe", phase: "ended", status: "abgebrochen", duration: "24 Min", actions: ["resume", "log", "report"] },
+  ];
+  const requests = new Set<string>();
+  const resume = (j: JobItem) => { j.run++; j.phase = "running"; j.status = "läuft"; j.question = null; j.actions = ["stop", "log"]; };
+  async function sync() {
+    const j = jobs[0];
+    if (!j.question) return;
+    j.question.choice = await choices.view(DEMO_JOB_CHOICE, conversation.id);
+    if (j.question.choice.state === "done") resume(j);
+  }
+  return {
+    home: "/home/demo",
+    async list() {
+      await sync();
+      return structuredClone([...jobs].sort((a, b) => Number(b.phase === "waiting") - Number(a.phase === "waiting") || Number(a.phase === "ended") - Number(b.phase === "ended")));
+    },
+    async content(id, kind, run) {
+      await sync();
+      const j = jobs.find(j => j.id === id);
+      if (!j || !j.actions.includes(kind)) return null;
+      if (run !== undefined && j.run !== run) return "stale";
+      return { run: j.run, text: kind === "report" ? "## Zwischenstand\n\nDer Entwurf ist vorbereitet.\n\n- Quellen gesammelt\n- Nächster Schritt: Beispiele ergänzen"
+        : `Lauf ${j.run} gestartet\nQuellen werden geprüft\nZugang: [verborgen]\nZwischenstand gespeichert\n${j.status}` };
+    },
+    async act(id, action, request, run) {
+      await sync();
+      if (requests.has(request)) return "already";
+      requests.add(request);
+      const j = jobs.find(j => j.id === id);
+      if (!j) return "unknown";
+      if (j.run !== run) return "stale";
+      if (!j.actions.includes(action)) return "blocked";
+      if (action === "resume") resume(j);
+      else {
+        j.phase = "ended"; j.status = "gestoppt"; j.question = null; j.actions = ["log"];
+        if (id === DEMO_JOB_IDS.waiting) choices.expireInDemo?.(DEMO_JOB_CHOICE);
+      }
+      return "done";
+    },
+  };
+}
+
+/** Vier erfundene Pipelines; der Status bleibt vollständig im Speicher. */
+export function createDemoPipelines(now = Date.now(), conversation = "topic-60") {
+  const at = (minutes: number) => new Date(now - minutes * 60_000).toISOString();
+  const base: PipelineStatus = {
+    id: "demo-waiting", name: "Lesegarten", description: "Eine kleine Bibliothek für gemeinsame Leselisten.",
+    state: "waiting", since: at(27 * 60), lastActivityAt: at(27 * 60), restingState: null, hanging: false,
+    milestone: "L2 Gemeinsam lesen", ghRepo: "beispiel/lesegarten", issue: { number: 42, title: "Leselisten gemeinsam ordnen" },
+    step: { kind: "review", round: 2 }, reason: "Der Meilenstein ist bereit für deine Abnahme.",
+    events: [{ at: at(28 * 60), type: "build" }, { at: at(27 * 60 + 35), type: "checks" },
+      { at: at(27 * 60 + 20), type: "review", round: 2 }, { at: at(27 * 60 + 1), type: "merged" }, { at: at(27 * 60), type: "waiting" }],
+    question: { at: at(27 * 60), text: "Sollen die Leselisten beim ersten Öffnen alphabetisch oder nach dem letzten Buch sortiert sein?\n\nAlphabetisch findet man bekannte Listen schnell wieder. Nach dem letzten Buch bleibt die zuletzt benutzte Liste oben. Beide Varianten funktionieren auf kleinen Bildschirmen. Bitte schreibe deine Wahl im Gespräch; dort steht auch der bisherige Verlauf." },
+    conversation,
+  };
+  const initial: PipelineStatusFile = {
+    version: 1, generatedAt: at(0), supervisors: { check: false, watch: false, follow: false }, pipelines: [base,
+      { ...base, id: "demo-halted", name: "Wolkenkarte", description: "Ein Wettertagebuch für unterwegs.", state: "halted", since: at(85), lastActivityAt: at(85),
+        milestone: "W1 Erste Einträge", issue: { number: 18, title: "Einträge nach Datum anzeigen" }, ghRepo: null, step: { kind: "checks" },
+        reason: "Ein Prüflauf ist fehlgeschlagen. Die Plan-Session übernimmt.", question: null, events: [{ at: at(90), type: "checks" }, { at: at(85), type: "halted" }] },
+      { ...base, id: "demo-running", name: "Klangpfad", description: "Eine Sammlung kleiner Hörspaziergänge.", state: "running", since: at(35), lastActivityAt: at(2),
+        milestone: "K3 Orte ergänzen", issue: { number: 27, title: "Stationen auf der Karte verbinden" }, ghRepo: null, step: { kind: "ci", round: 1 },
+        reason: null, question: null, events: [{ at: at(35), type: "build" }, { at: at(2), type: "ci", round: 1 }] },
+      { ...base, id: "demo-resting", name: "Papierboot", description: "Ein Archiv für kurze Geschichten.", state: "resting", since: at(3 * 24 * 60), lastActivityAt: at(5 * 24 * 60), restingState: "waiting",
+        milestone: "P1 Erste Sammlung", issue: null, ghRepo: null, step: null, question: null, conversation: null,
+        reason: "Der letzte Meilenstein wartet auf Abnahme.", events: [{ at: at(5 * 24 * 60), type: "waiting" }] },
+    ],
+  };
+  let replacement: PipelineStatusFile | null | undefined;
+  return {
+    display: () => (text: string, max: number) => text.length > max ? text.slice(0, max - 1) + "…" : text,
+    async read(): Promise<PipelineStatusFile | null> {
+      return structuredClone(replacement === undefined ? { ...initial, generatedAt: new Date().toISOString() } : replacement);
+    },
+    setSnapshot(value: PipelineStatusFile | null) { replacement = structuredClone(value); },
+  } satisfies PipelinesPort & { setSnapshot(value: PipelineStatusFile | null): void };
 }

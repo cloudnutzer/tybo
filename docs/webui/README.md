@@ -512,6 +512,62 @@ nichts. Ohne Telegram (den Start ohne Token bringt erst Issue #228):
   (gemeinsamer Nachrichtenspeicher, echte Outbox ohne Token, kein
   `src/bot.ts`, keine `.env`). Bilder: `screenshots/ohne-telegram-*.png`.
 
+### Motorwahl und automatischer Wechsel
+
+Unter **Einstellungen, Modelle, Motor** stehen der Standard-Motor und bis
+zu vier Ersatzstufen in ihrer Reihenfolge. „Stufe hinzufügen“ ergänzt
+Claude Code, Codex oder OpenCode, „Hoch“ und „Runter“ ändern die Reihenfolge.
+Eine Claude-Ersatzstufe kann ein eigenes Modell und Effort haben. Codex und
+OpenCode nutzen ihre Einstellungen im selben Abschnitt. Nach Änderungen im
+Abschnitt speichern. Im Reiter „Agenten“ führt ein Verweis hierher.
+
+Im Formular jedes Agenten steht **Motor** über Modell und Effort. „Standard
+(<Motor>)“ folgt dem allgemeinen Standard; sonst gelten Claude Code, Codex,
+OpenCode oder Anthropic API für diesen Agenten. Eine Wahl mit `/motor` im
+Gespräch hat Vorrang, danach folgt der Agent, dann der Standard. Bei Codex
+und OpenCode sind Modell und Effort ausgegraut, bleiben aber gespeichert;
+ein Link führt zu den Einstellungen des Motors. Claude Code und Anthropic
+API nutzen die Agentenwerte. Der API-Hinweis nennt volle Modellnamen
+(`claude-…`) und die Zahlung je Verbrauch. Fehlende Installation oder
+Anmeldung steht an der Auswahl, ohne sie zu sperren. Speichern gilt pro
+Agent. Die Agentenliste nennt einen vom Standard abweichenden Motor.
+
+Nach einer Motoränderung aktualisiert sich die Chat-Pille ohne Nachricht
+und ohne Neuladen. Sie zeigt die nächste Stufe für den Agenten des Gesprächs;
+antwortet ein anderer Agent, nennt die Metazeile unter dessen Antwort seinen
+Motor. Die nächste Nachricht nach einem Motorwechsel beginnt eine neue
+Session mit Verlaufsübergabe. Sperren und Ersatzstufen gelten weiterhin.
+
+Die **Automatik** ist mit Ersatzstufen standardmäßig an. „Wechseln ab (%)“
+ist zunächst 95, „Zurück unter (%)“ leer bedeutet Schwelle minus 15, also 80.
+Eine jüngere Messung unter der Rückkehrschwelle oder der Reset gibt das
+Fenster frei. Automatik aus beendet nur Sperren wegen der Schwelle;
+Einspringen nach Limit-Fehlern und Ausfällen bleibt aktiv. Ohne Ersatzstufen
+gilt die Wechselregel nicht. „Jetzt messen“ liest verfügbare Messquellen neu
+und bewertet die Sperren. Stand, Reset-Zeit und Alter stehen je Motor dabei.
+
+Die **Motor-Pille im Chat** zeigt den antwortenden Motor, bei Ersatz mit
+Grund im Menü, oder „Kein Motor frei“. Im Menü lässt sich ein Motor für das
+Gespräch wählen und mit „Standard (Automatik)“ wieder freigeben. Dasselbe geht in allen
+Kanälen mit `/motor claude`, `/motor codex`, `/motor opencode`, `/motor api`
+und `/motor standard`. Letzteres entfernt nur die Gesprächswahl und führt
+zum Motor des Agenten, sonst zum Standard zurück. `/motor` zeigt die Wahl und die Reihenfolge,
+`/motor auto an` und `/motor auto aus` ändern die allgemeine Automatik,
+`/motor pruefen` entspricht der Prüfung von Hand. Die Wahl setzt einen
+Motor, kein bestimmtes Modell einer Ersatzstufe.
+
+Ein Wechsel wird im Direktchat gemeldet; vor der ersten Ersatzantwort steht
+zusätzlich ein Hinweis im betroffenen Gespräch. Unter normalen Antworten
+nennt die Metazeile den Motor und, sofern eingestellt, das Modell. Wenn
+keine Stufe frei ist, antworten Ersatzmodelle mit eingeschränktem
+Werkzeugumfang, mit Herkunftszusatz. Der Reiter **Status** zeigt je Motor
+die Zeile **Werkzeuge** mit Bestand und Lücken; `/motor werkzeuge` zeigt
+denselben Bestand im Gespräch. Mehr zu Einrichtung, Rechten und bezahlten
+Stufen: [Ersatzstufen und Automatik](../erweiterungen.md#ersatzstufen-und-automatik).
+Meldungen und Rückkehr: [Der Motor hat gewechselt](../troubleshooting.md#der-motor-hat-gewechselt).
+Die [Motorwechsel-Abnahme](motorwechsel-abnahme.md) führt durch jede Stufe,
+acht Werkzeugaufgaben und zwei Wechselübungen mit anschließendem Aufräumen.
+
 ### Sprache (Entscheidungen 0023 und 0024)
 
 - Sprechmodus (V2) und eigener ElevenLabs-Agent (V1):
@@ -529,6 +585,162 @@ nichts. Ohne Telegram (den Start ohne Token bringt erst Issue #228):
   Stand Issue #490: Format, Prüfung, Vorlagen, Ablage und Sprachschicht
   ElevenLabs (`src/lib/voice-agents/layer.ts`, `elevenlabs.ts`), noch ohne
   Befehl; Doku in `docs/sprechen.md`, „Sprachagenten: Rezepte“.
+
+### Jobs (Issue #626)
+
+„Jobs“ neben „Offene Fäden“ öffnet `#/jobs`: wartende Jobs zuerst, dann
+startende und laufende, danach die letzten 20 beendeten. Die Pille zählt
+wartende Jobs hervorgehoben, sonst laufende leise. Titel, Status, Arbeitszeit
+ohne Wartezeit, Laufnummer und Ursprungsgespräch kommen aus derselben Quelle
+wie `/jobs`. Einzelheiten: [Hintergrund-Jobs](../hintergrund-jobs.md#jobs-in-der-webui).
+
+„Frage beantworten“ klappt die Frage mit den vorhandenen Auswahlknöpfen auf.
+Die erste Antwort gilt in Browser und Telegram. „Zum Gespräch“ öffnet den
+Ursprung. „Fortsetzen“ und „Stoppen“ erscheinen nur, wenn die Quelle sie
+anbietet; Stoppen verlangt eine Bestätigung. „Log“ und „Bericht“ öffnen die
+Datei des aktuellen Laufs direkt in der Liste. Es gibt keinen Startknopf.
+
+Die offene Ansicht gleicht alle zehn Sekunden ab, außerdem bei Job-Meldungen,
+Auswahl-Änderungen und beim Zurückkehren in den Tab. Fehler zeigen den letzten
+bekannten Stand mit „Erneut laden“; Aktionen bleiben währenddessen gesperrt.
+
+Die API läuft hinter Anmeldung und Origin-Prüfung wie die Routinen:
+
+| Route | Ergebnis bzw. Eingabe |
+| --- | --- |
+| `GET /api/jobs` | `jobs`, `waiting`, `running`; je Job nur Titel, Status/Phase, Arbeitszeit, Lauf, WebUI-Gespräch, Frage/Auswahl und erlaubte Aktionen |
+| `GET /api/jobs/<id>/log?run=<n>` | Maskierter Text und Laufnummer; maximal 200 Zeilen, 300 Zeichen je Zeile, 60.000 Zeichen insgesamt |
+| `GET /api/jobs/<id>/report?run=<n>` | Maskierter Text, sicheres Markdown-HTML und Laufnummer; über 128 KiB nur Größenhinweis |
+| `POST /api/jobs/<id>/resume` | `{"request":"<16 bis 64 Zeichen>","expectedRun":1}` |
+| `POST /api/jobs/<id>/stop` | Zusätzlich `"confirm":true`; Antwort nach Prozessbeendigung, Versand im Hintergrund |
+
+Kennungen bestehen aus Buchstaben, Ziffern, `_` und `-`. Das gemeinsame
+Rückfragenregister beansprucht jede Kennung nur einmal, auch nach Neustarts.
+Die Laufnummer verhindert Aktionen aus einem alten Tab. Fehlende Dateien
+ergeben 404, veraltete Läufe 409, ungültige Job-IDs oder Eingaben 400.
+Frageknöpfe entscheiden ausschließlich über
+`POST /api/conversations/<gespräch>/choices/<auswahl>` im Gespräch der Frage.
+
+`src/web/jobs.ts` kennt nur den Port; `src/web/bot-jobs.ts` verbindet den Kern
+über `src/app/bot-web.ts` und `src/web/startup.ts`. Liste und Aktionen geben
+keine PIDs, absoluten Pfade, Session-IDs, Telegram-Chat-IDs oder Auftragstexte
+aus. Log und Bericht sind fremder Inhalt und können Auftragsteile und Pfade
+enthalten; `.env`-Werte und Session-ID sind maskiert, Home-Pfade gekürzt.
+
+`web:dev` und Demo verwenden veränderliche Attrappen im Speicher. Der
+Browser-Durchlauf `bun run scripts/web-browser-check.ts --nur jobs
+--screenshots` prüft die Ansicht bei 390 und 1280 Pixeln in hell und dunkel.
+Mit `WEB_JOBS_URL=http://127.0.0.1:3199` stammen die Fotos aus einem separat
+laufenden `WEB_DEV_DEMO=1`-`web:dev`; Aktionen prüft der Durchlauf weiterhin
+auf frischen eigenen Attrappen. Fotos stehen unter `screenshots/jobs-*.png`.
+`src/bot.ts` wird dafür weder gestartet noch importiert.
+
+### Pipelines (Issue #646)
+
+„Pipelines“ neben „Jobs“ öffnet `#/pipelines`. Der Eintrag erscheint erst,
+wenn eine Statusdatei mindestens eine gültige Pipeline enthält. Die Pille
+zählt zuerst „wartet auf dich“ hervorgehoben, sonst laufende Pipelines.
+Die Liste zeigt Wartende, Angehaltene, Laufende und zuletzt eingeklappt
+„Ruht“. Name, Beschreibung, Dauer, Meilenstein, Issue, Schritt und Grund
+stehen zusammen; die letzten fünf erkannten Ereignisse lassen sich aufklappen.
+Ruhende Pipelines zeigen ihren letzten Zustand weiter an.
+
+Die letzte höchstens 14 Tage alte Frage erscheint mit Datum und gekürzter
+Vorschau, aufgeklappt als Klartext. Sie kann inzwischen beantwortet sein.
+„Zum Gespräch“ öffnet das zugeordnete, tatsächlich vorhandene WebUI-Gespräch.
+Geantwortet wird dort; die Ansicht steuert keine Pipeline. Sind alle drei
+übermittelten Wächter ausgeschaltet, erscheint der Hinweis „Pipelines
+gestoppt“. Fehlt der Ladezustand, wird daraus kein Stopp abgeleitet.
+
+Die offene Ansicht fragt alle zehn Sekunden nach, sonst alle 30 Sekunden,
+zusätzlich beim Öffnen und Zurückkehren in den Tab. Dauer und Ablaufdatum
+werden im Browser weitergerechnet, auch während ein Abruf hängt. Nach mehr
+als fünf Minuten ohne neuen Zeitstempel zeigt sie „Stand von …, der
+Statusdienst läuft nicht oder liefert keinen neuen Stand“. Der Eintrag und
+sein letzter Zähler bleiben sichtbar, aber ohne Warte-Hervorhebung.
+Lese- und Verbindungsfehler zeigen den letzten Stand mit „Erneut laden“.
+
+#### Austauschformat `data/pipeline-status.json`
+
+Die Quelle liest ausschließlich diese Datei relativ zum Bot-Projektordner.
+Ein externer Erzeuger ersetzt sie atomar. Der öffentliche Typ steht in
+`src/web/pipeline-status.ts`. Die Datei ist höchstens 1 MiB groß und enthält
+höchstens 100 Pipelines. Symbolische Links und Nicht-Dateien werden abgelehnt.
+Zeitstempel sind ISO-8601 in UTC mit `Z`; unbekannte optionale Angaben sind
+`null`. Beispiel mit erfundenen Daten:
+
+```json
+{
+  "version": 1,
+  "generatedAt": "2026-11-18T14:00:00.000Z",
+  "supervisors": { "check": false, "watch": false, "follow": false },
+  "pipelines": [{
+    "id": "lesegarten",
+    "name": "Lesegarten",
+    "description": "Gemeinsame Leselisten",
+    "state": "waiting",
+    "since": "2026-11-17T11:00:00.000Z",
+    "lastActivityAt": "2026-11-17T11:00:00.000Z",
+    "restingState": null,
+    "hanging": false,
+    "milestone": "L2 Gemeinsam lesen",
+    "ghRepo": "beispiel/lesegarten",
+    "issue": { "number": 42, "title": "Leselisten ordnen" },
+    "step": { "kind": "review", "round": 2 },
+    "reason": "Bereit für die Abnahme.",
+    "events": [{ "at": "2026-11-17T11:00:00.000Z", "type": "waiting" }],
+    "question": { "at": "2026-11-17T11:00:00.000Z", "text": "Welche Sortierung soll bleiben?" },
+    "conversation": "topic-60"
+  }]
+}
+```
+
+| Feld | Bedeutung und Grenzen |
+| --- | --- |
+| `version`, `generatedAt` | Version genau `1`, Erzeugungszeit; mehr als fünf Minuten alt oder über eine Minute in der Zukunft gilt als veraltet |
+| `supervisors` | Optional; drei boolesche Ladezustände `check`, `watch`, `follow`, ohne Dienstnamen; nur drei `false` bedeuten „Wächter aus“ |
+| `id`, `state` | Eindeutige Kennung, 1 bis 80 Buchstaben, Ziffern, `_` oder `-`; Zustand `running`, `waiting`, `halted` oder `resting` |
+| `since`, `lastActivityAt` | Beginn des Zustands und letzte Protokollaktivität; bei unbekannter Zeit `null` |
+| `restingState`, `hanging` | Bei Ruhe letzter Zustand `waiting` oder `halted`, sonst `null`; Hängehinweis nur bei `running` und `true` |
+| `name`, `description`, `milestone` | Freitext, höchstens 120, 300 bzw. 200 Zeichen; Meilenstein darf `null` sein |
+| `ghRepo`, `issue` | Nur `besitzer/name`; Besitzer höchstens 39, Repo höchstens 100 Zeichen, nur Buchstaben/Ziffern und erlaubte Namenszeichen, keine URL oder Pfadbestandteile. Issue als positive sichere Ganzzahl mit Titel bis 300 Zeichen, sonst `null` |
+| `step` | `null` oder `{kind, round?}`; Runde als positive Ganzzahl bis 1000 |
+| `reason` | Freitext bis 1000 Zeichen oder `null` |
+| `events` | `{at, type, round?}`, höchstens die letzten fünf erkannten Ereignisse nach Zeit sortiert; niemals rohe Protokollzeilen |
+| `question` | `null` oder `{at, text}`, Text höchstens 4000 Zeichen; nur gesendete Fragen, keine zukünftigen oder älter als 14 Tage |
+| `conversation` | Nur `dm`, `topic-<positive Zahl>` mit höchstens 15 Ziffern oder `null` |
+
+Schritte (`kind`): `plan`, `build`, `fix`, `checks`, `ci`, `review`, `ux`,
+`review-lock`, `network`, `prerequisite`. Ereignisse (`type`): dieselben
+Werte und `issue`, `worker-done`, `review-done`, `resumed`, `halted`,
+`waiting`, `merged`. Eine PR-Nummer ist keine Issue-Nummer.
+
+Erzeuger und API verwenden eine Positivliste, auch für verschachtelte
+Objekte. Freitext wird vor dem Kürzen mit derselben Geheimnisliste wie
+Job-Logs maskiert; absolute Pfade werden durch `[Pfad verborgen]` ersetzt,
+bezeichnete Prozessnummern durch `[Prozess verborgen]`. Zeitstempel,
+Kennungen, Nummern und Wahrheitswerte werden nicht als Freitext maskiert.
+Unbekannte Felder fallen weg, ungültige Pipeline-Kennungen/Zustände und
+doppelte Kennungen ebenso. Ungültige optionale Felder werden weggelassen
+oder `null`, Texte gekürzt. Eine ungültige Gesamthülle wird abgelehnt.
+
+`GET /api/pipelines` liegt hinter derselben Anmeldung wie Jobs und liefert
+`generatedAt`, `stale`, `pipelines`, `waiting`, `running` sowie optional
+`supervisors`. Die API baut `issue.url` ausschließlich selbst aus dem
+geprüften `ghRepo` und der Issue-Nummer; `ghRepo` selbst verlässt sie nicht.
+`conversation` wird nur bei einem vorhandenen Gespräch zu `{id, name}`,
+sonst `null`. Fehlende Datei oder Quelle ergibt 200 mit leerer Liste,
+`generatedAt: null`, `stale: false` und Zählern 0; eine unlesbare,
+übergroße oder ungültige Datei ergibt 503 mit einer allgemeinen Meldung.
+Schreibmethoden sind nicht erlaubt, Antworten werden nicht zwischengespeichert.
+
+`web:dev` und Demo enthalten je eine erfundene Pipeline pro Zustand.
+`bun run scripts/web-browser-check.ts --nur pipelines --screenshots` prüft
+390 und 1280 Pixel, hell und dunkel, Navigation, automatische Aktualisierung,
+Veralten ohne neue Antwort und den fehlenden Eintrag ohne Daten.
+Mit `WEB_PIPELINES_URL=http://127.0.0.1:3199` entstehen die Fotos aus dem
+separat laufenden `WEB_DEV_DEMO=1`-`web:dev`; `WEB_DEV_PIPELINES_STALE=1`
+liefert dort einen alten Stand. Fotos: `screenshots/pipelines-*.png`.
 
 ### Routinen und offene Fäden (Entscheidung 0025)
 

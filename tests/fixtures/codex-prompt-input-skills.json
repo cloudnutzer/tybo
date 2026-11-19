@@ -1,0 +1,12 @@
+[
+  {
+    "type": "message",
+    "role": "developer",
+    "content": [
+      {
+        "type": "input_text",
+        "text": "<skills_instructions>\n## Skills\n### Skill roots\n- `r0` = `/home/example/.codex/skills/.system`\n- `r1` = `/project/.agents/skills`\n### Available skills\n- header-probe: Public test description. (file: r1/folder_probe/SKILL.md)\n</skills_instructions>"
+      }
+    ]
+  }
+]

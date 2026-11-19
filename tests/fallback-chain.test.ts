@@ -2,7 +2,8 @@
  * Fallback-Kette (Issue #331): Reihenfolge, Schalter, Tool-Loop, Budget,
  * Abbruch und Kontext. Kein Netz, keine CLI, keine MCP-Server: fetch, der
  * Claude-Aufruf, Werkzeugliste, Werkzeugaufruf und Budget kommen als
- * Abhängigkeiten herein. Die Einstellungsdatei liegt im Temp-Ordner.
+ * Abhängigkeiten herein. Limit-Proben nutzen den echten Claude-Aufruf mit
+ * Prozessattrappe. Die Einstellungsdatei liegt im Temp-Ordner.
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -11,7 +12,9 @@ import { join } from "node:path";
 import { OPENROUTER_APP_HEADERS } from "../src/brand";
 import { setSettingsPath } from "../src/lib/settings";
 import { abortExecutions, isAbortError, runCancelable } from "../src/lib/execution-context";
-import type { ClaudeOptions, ClaudeResult } from "../src/lib/claude";
+import { callClaude, setRuntimeForTests, setSpawnForTests, type ClaudeOptions, type ClaudeResult } from "../src/lib/claude";
+import { setMcpReaderForTests } from "../src/lib/subprocess-env";
+import { isolateShellEnv } from "./shell-env";
 import type { OpenAITool } from "../src/lib/mcp/manager";
 import {
   NO_BACKEND_REPLY,
@@ -20,6 +23,8 @@ import {
   type ChainDeps,
 } from "../src/lib/fallback/chain";
 import { runToolLoop, type ToolLoopDeps } from "../src/lib/fallback/openai-tool-loop";
+
+isolateShellEnv({ CLAUDE_AUTH: "subscription", ANTHROPIC_API_KEY: undefined });
 
 const ENV_KEYS = [
   "OPENROUTER_API_KEY",
@@ -52,6 +57,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setSpawnForTests(null);
+  setRuntimeForTests(null);
+  setMcpReaderForTests(null);
   for (const k of ENV_KEYS) {
     if (saved[k] === undefined) delete process.env[k];
     else process.env[k] = saved[k];
@@ -177,6 +185,37 @@ function deps(over: {
 }
 
 const REQ = { question: "Wie wird das Wetter?", context: "## MEMORY\nAlex mag Regen." };
+
+describe("Claude-CLI am Limit über den echten callClaude-Aufruf", () => {
+  for (const text of ["You've hit your weekly limit · resets Nov 22, 4pm", "You're out of usage credits."]) {
+    for (const exitCode of [0, 1]) {
+      test(`${text}, Exit ${exitCode}: nächste Stufe antwortet`, async () => {
+        process.env.OPENROUTER_API_KEY = "test-schluessel-nicht-echt";
+        process.env.FALLBACK_K3 = "false";
+        setMcpReaderForTests(() => new Set());
+        setRuntimeForTests({ terminate: () => {} });
+        const commands: string[][] = [];
+        setSpawnForTests(((options: { cmd: string[] }) => {
+          commands.push(options.cmd);
+          return {
+            pid: 0, stdin: { write() {}, end() {} },
+            stdout: new Response(text).body!, stderr: new Response("").body!,
+            exited: Promise.resolve(exitCode),
+            kill() { throw new Error("Echtes Prozesssignal ist in diesem Test verboten"); },
+          };
+        }) as any);
+        const f = scriptedFetch({ "minimax/minimax-m2.7": [textReply("Antwort der nächsten Stufe")] });
+        const result = await runFallbackChain(REQ, deps({ fetch: f.fn, claude: callClaude }));
+        expect(commands).toHaveLength(1);
+        const formatIndex = commands[0].indexOf("--output-format");
+        expect(formatIndex).toBeGreaterThan(-1);
+        expect(commands[0][formatIndex + 1]).toBe("text");
+        expect(result).toEqual({ text: "Antwort der nächsten Stufe", source: "openrouter", model: "minimax/minimax-m2.7" });
+        expect(f.sent.map(request => request.body.model)).toEqual(["minimax/minimax-m2.7"]);
+      });
+    }
+  }
+});
 
 describe("Reihenfolge K3 → Opus-CLI → OpenRouter → Ollama", () => {
   beforeEach(() => {
@@ -672,5 +711,28 @@ describe("Antworttext", () => {
   test("Herkunftszusatz auf Deutsch", () => {
     expect(fallbackReplyText({ text: "Hallo", source: "openrouter", model: "m" })).toBe("Hallo\n\n_(Antwort über openrouter)_");
     expect(fallbackReplyText({ text: "Hallo", source: "kimi-k3", model: "m" })).toBe("Hallo\n\n_(Antwort über kimi-k3)_");
+  });
+});
+
+describe("Claude-CLI und Wechselregel", () => {
+  test("bei false kein Claude-Lauf und kein Versuchslog; die nächste Stufe antwortet", async () => {
+    process.env.OPENROUTER_API_KEY = "test-schluessel-nicht-echt";
+    process.env.FALLBACK_K3 = "false";
+    process.env.FALLBACK_CLAUDE_MODEL = "claude-opus-5-5";
+    const cli = fakeClaude([{ text: "darf nicht laufen", isError: false }]);
+    const http = scriptedFetch({ "minimax/minimax-m2.7": [textReply("Ersatz antwortet")] });
+    const checked: string[] = [];
+    const result = await runFallbackChain({ ...REQ, allowClaudeCli: model => { checked.push(model); return false; } }, deps({ claude: cli.fn, fetch: http.fn }));
+    expect(result).toMatchObject({ source: "openrouter", text: "Ersatz antwortet" });
+    expect(checked).toEqual(["claude-opus-5-5"]);
+    expect(cli.calls).toHaveLength(0);
+    const cliLogs = spies[0].mock.calls.flat().map(String).filter(line => line.includes("Claude-CLI"));
+    expect(cliLogs).toEqual(["[Fallback] Claude-CLI (claude-opus-5-5) ausgelassen: gesperrt, bereits versucht oder nicht bereit."]);
+  });
+  test("bei true läuft Claude wie bisher", async () => {
+    const cli = fakeClaude([{ text: "Claude antwortet", isError: false }]);
+    const result = await runFallbackChain({ ...REQ, allowClaudeCli: () => true }, deps({ claude: cli.fn }));
+    expect(result.source).toBe("opus5");
+    expect(cli.calls).toHaveLength(1);
   });
 });

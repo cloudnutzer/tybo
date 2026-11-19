@@ -39,11 +39,15 @@ import { createCallMemory, type BotCallPort } from "../web/bot-call";
 import { createBotChoices } from "../web/bot-choices";
 import { createBotCommands } from "../web/bot-commands";
 import { createBotEngines } from "../web/bot-engines";
+import { syncEngineAuto } from "../lib/engine-auto-sync";
 import { createBotFiles } from "../web/bot-files";
 import { createBotGoals } from "../web/bot-goals";
 import { createBotKeys } from "../web/bot-keys";
 import { prepareBotPush } from "../web/bot-push";
 import { createBotReminders } from "../web/bot-reminders";
+import { createBotJobs } from "../web/bot-jobs";
+import { createBotPipelines } from "../web/bot-pipelines";
+import { createJobDeps } from "../lib/jobs/default-deps";
 import { createBotRoutines } from "../web/bot-routines";
 import { createBotSessionReset } from "../web/bot-session-reset";
 import { botInstructions, botSettings, botVoice } from "../web/bot-settings";
@@ -63,6 +67,7 @@ import type { IntentTurn, TelegramChatDeps } from "../web/bot-turn";
 import { createBotVoiceClone } from "../web/bot-voice-clone";
 import { createWebServer, type WebServer } from "../web/server";
 import { startWebUi } from "../web/startup";
+import { createOpenRouterKey, type OpenRouterKeyOptions } from "../web/openrouter-key";
 import { UploadStore } from "../web/uploads";
 
 type Env = Record<string, string | undefined>;
@@ -83,6 +88,8 @@ export interface BotWebDeps {
   start?: typeof startWebUi;
   /** Nur für Tests: Chat-Kern, Speicher, Merk-Tor, /goal und Fäden der Turns (Standard die echten) */
   parts?: Partial<BotWebParts>;
+  /** Nur für Tests: Abruf des Ersatzmodell-Schlüssels ohne echtes Netz. */
+  openrouterKeyFetch?: OpenRouterKeyOptions["fetch"];
 }
 
 type BotWebParts = Required<Pick<TelegramChatDeps, "runStreamingTurn" | "saveMessage" | "processIntents" | "noteThreads" | "threadHint" | "onAgentTurn">>;
@@ -179,6 +186,7 @@ export async function startBotWeb(deps: BotWebDeps): Promise<WebServer | null> {
     // Topics aus der WebUI (Issue #29) nur mit Telegram (Issue #228)
     topics: runtime.topicApi ? createBotTopics(env, runtime.topicApi) : undefined,
     settings: botSettings,
+    onSettingsSaved: () => syncEngineAuto(),
     instructions: botInstructions,
     voice: botVoice,
     speech: createBotSpeech(conversationOf),
@@ -210,9 +218,13 @@ export async function startBotWeb(deps: BotWebDeps): Promise<WebServer | null> {
     opencodeModels: listOpenCodeModels,
     status: createBotStatus(env),
     routines: createBotRoutines(env, deps.choices.routineChoices),
+    jobs: createBotJobs({ deps: createJobDeps({ root: deps.root, env }), userId: dmChatId(env), groupId: () => botGroupId(env) }),
+    pipelines: createBotPipelines({ root: deps.root }),
     threads: createBotThreads({ userId: () => dmChatId(env), groupId: () => botGroupId(env) }),
     reminders: createBotReminders({ topicNames: getTopicNames }),
     engines: createBotEngines(conversationOf),
+    // env ist im Bot process.env, wie bei der Fallback-Kette; erst beim Abruf lesen.
+    openrouterKey: createOpenRouterKey({ key: () => env.OPENROUTER_API_KEY?.trim(), fetch: deps.openrouterKeyFetch }),
     // Schlüssel-Seite (Issue #62): Ändern nur mit WEB_ALLOW_KEY_EDIT=true
     keys: createBotKeys(env),
     // Web Push (Issue #225): fehlen die VAPID-Schlüssel, legt der Bot sie einmal an

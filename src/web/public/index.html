@@ -23,6 +23,8 @@
   <script src="/call.js" defer></script>
   <script src="/voice-clone.js" defer></script>
   <script src="/settings.js" defer></script>
+  <script src="/jobs.js" defer></script>
+  <script src="/pipelines.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body class="app">
@@ -76,6 +78,16 @@
         <span>Offene Fäden</span>
         <span id="threads-count" class="threads-count" hidden></span>
       </button>
+      <button type="button" id="open-jobs" class="quiet-button settings-entry" aria-describedby="jobs-count">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="7" width="16" height="14" rx="2"/><path d="M9 7V3h6v4M4 12h16M10 12v3h4v-3"/></svg>
+        <span>Jobs</span>
+        <span id="jobs-count" class="threads-count" hidden></span>
+      </button>
+      <button type="button" id="open-pipelines" class="quiet-button settings-entry" aria-describedby="pipelines-count" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="18" r="2"/><path d="M7 6h7a5 5 0 010 10H9a4 4 0 010-8M14 18h3"/></svg>
+        <span>Pipelines</span>
+        <span id="pipelines-count" class="threads-count" hidden></span>
+      </button>
       <a id="open-voice-agents" class="quiet-button settings-entry voice-agents-entry" href="/sprachagenten">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 10v4M9 7v10M13 4v16M17 8v8M21 11v2"/></svg>
         <span>Sprachagenten</span>
@@ -113,8 +125,12 @@
       </button>
       <h1 class="chat-title"><button type="button" id="chat-title" class="title-button" disabled>{{brand.name}}</button></h1>
       <input type="text" id="title-input" class="title-input" aria-label="Titel des Gesprächs" autocomplete="off" spellcheck="false" enterkeyhint="done" hidden>
-      <span id="agent-name" class="agent-chip"></span>
-      <span id="engine-name" class="engine-pill" hidden></span>
+      <div class="chat-badges">
+        <span id="agent-name" class="agent-chip"></span>
+        <button type="button" id="engine-name" class="engine-pill" aria-haspopup="menu" aria-expanded="false" aria-controls="engine-menu" aria-describedby="engine-status" hidden></button>
+        <span id="engine-status" class="visually-hidden" role="status"></span>
+        <div id="engine-menu" class="actions-panel engine-menu" role="menu" aria-label="Motor für dieses Gespräch" hidden></div>
+      </div>
       <button type="button" id="conversation-menu" class="icon-button topbar-menu" aria-label="Gesprächsoptionen" aria-expanded="false" aria-controls="conversation-actions" hidden>
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/></svg>
       </button>
@@ -264,6 +280,38 @@
           <div id="settings-tabs" class="theme-switch settings-tabs" role="tablist" aria-label="Bereiche der Einstellungen"></div>
           <p id="settings-notice" class="settings-notice" role="alert" hidden></p>
           <div id="settings-panel" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-agenten"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="jobs-view" class="jobs-view" aria-labelledby="jobs-title" hidden>
+      <header class="topbar">
+        <button type="button" id="jobs-back" class="icon-button" aria-label="Zurück zum Chat">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+        </button>
+        <h1 id="jobs-title" class="chat-title settings-title" tabindex="-1">Jobs</h1>
+      </header>
+      <div class="settings-scroll">
+        <div class="column">
+          <p class="settings-intro">Deine Hintergrund-Aufträge. Wartende zuerst, danach laufende und die letzten 20 beendeten Jobs.</p>
+          <p id="jobs-status" class="settings-status" role="status"></p>
+          <div id="jobs-body"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="pipelines-view" class="pipelines-view" aria-labelledby="pipelines-title" hidden>
+      <header class="topbar">
+        <button type="button" id="pipelines-back" class="icon-button" aria-label="Zurück zum Chat">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+        </button>
+        <h1 id="pipelines-title" class="chat-title settings-title" tabindex="-1">Pipelines</h1>
+      </header>
+      <div class="settings-scroll">
+        <div class="column">
+          <p class="settings-intro">Was auf dich wartet, steht oben. Antworten schreibst du im jeweiligen Gespräch.</p>
+          <p id="pipelines-status" class="settings-status" role="status"></p>
+          <div id="pipelines-body"></div>
         </div>
       </div>
     </section>

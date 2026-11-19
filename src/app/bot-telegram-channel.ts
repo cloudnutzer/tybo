@@ -55,7 +55,7 @@ export interface BotTelegramChannelDeps {
   env: Env;
   runtime: TelegramRuntime;
   turns: BotTurns<Context>;
-  choices: Pick<BotChoices, "topicChoices" | "proactiveChoices" | "reviewResults">;
+  choices: Pick<BotChoices, "topicChoices" | "proactiveChoices" | "reviewResults"> & Partial<Pick<BotChoices, "jobReply">>;
   services: CommandServices;
   isShuttingDown(): boolean;
   afterTurn(chatId: string, topicId?: number): void;
@@ -141,7 +141,7 @@ export function wireTelegramChannel(deps: BotTelegramChannelDeps) {
       sessionsForKey: getSessionsForKey,
       shouldDistill,
       distill: distillSession,
-      reset: key => resetSession(key),
+      reset: (key, options) => resetSession(key, undefined, options),
       sessionModeEnabled: isSessionModeEnabled,
     },
     agentReply: reply,
@@ -181,6 +181,7 @@ export function wireTelegramChannel(deps: BotTelegramChannelDeps) {
     owner,
     scope,
     text: {
+      jobReply: deps.choices.jobReply,
       captureTopicName: parts.captureTopicName,
       saveMessage,
       matchCommand: text => commandRegistry.match(text, "telegram"),

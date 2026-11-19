@@ -97,7 +97,7 @@ export function getAgentConfigOrGeneral(agentName: string, opts?: AgentConfigOpt
 // ---------------------------------------------------------------------------
 
 /** Schlüssel in config/settings.json: aktiver Agent (Aliasse aufgelöst), sonst "general" */
-function settingsKey(agentName: string): string {
+export function settingsKey(agentName: string): string {
   return resolveAgentName(agentName) ?? "general";
 }
 

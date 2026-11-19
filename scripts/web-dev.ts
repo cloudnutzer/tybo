@@ -73,6 +73,7 @@ import {
   createDemoInstructions,
   createDemoCommands,
   createDemoEngines,
+  DEMO_ENGINE_HINT,
   createDemoVoice,
   createDemoSpeech,
   createDemoKeys,
@@ -80,6 +81,9 @@ import {
   createDemoModels,
   createDemoStatus,
   createDemoRoutines,
+  createDemoJobs,
+  createDemoPipelines,
+  createDemoChoices,
   createDemoThreads,
   createDemoReminders,
   startDemoServer,
@@ -120,11 +124,20 @@ if (speechMode && (speechMode !== "real" || process.env.WEB_DEV_DEMO === "1")) {
   );
 }
 
+// Alter Stand als Fotovorlage; ausschließlich die Attrappe im Speicher.
+const pipelines = createDemoPipelines(Date.now(), process.env.WEB_DEV_DEMO === "1" ? "topic-60" : "topic-1");
+if (process.env.WEB_DEV_PIPELINES_STALE === "1") {
+  const snapshot = (await pipelines.read())!;
+  snapshot.generatedAt = new Date(Date.now() - 6 * 60_000).toISOString();
+  pipelines.setSnapshot(snapshot);
+}
+
 let stop: () => Promise<void>;
 if (process.env.WEB_DEV_DEMO === "1") {
   let demo;
   try {
-    demo = await startDemoServer(result.config, { chat: createFakeChat(), telegramChat: createFakeChat(), push: await devPush() });
+    const engineExample = { notice: DEMO_ENGINE_HINT, replyInfo: { engine: "codex" as const, model: "gpt-6-astra" } };
+    demo = await startDemoServer(result.config, { chat: createFakeChat(engineExample), telegramChat: createFakeChat(engineExample), pipelines, push: await devPush() });
   } catch (e) {
     console.error(`[web] Demo startet nicht: ${e instanceof Error ? e.message : String(e)}`);
     process.exit(1);
@@ -136,6 +149,7 @@ if (process.env.WEB_DEV_DEMO === "1") {
   // GO_PROJECT_ROOT im Verzeichnis des laufenden Bots
   const dataRoot = join(import.meta.dir, "..", "data");
   // Topics, Agenten-Katalog und Einstellungen als eine Attrappe im Speicher (Issue #50)
+  const demoChoices = createDemoChoices(Date.now(), 1);
   const demoAgents = createDemoAgents({ seed: false });
   const demoTopics = demoAgents.topics;
   const { telegram, topics } = demoTopics;
@@ -177,6 +191,9 @@ if (process.env.WEB_DEV_DEMO === "1") {
     status: createDemoStatus(),
     // Routinen (Issue #284): feste Beispieldaten, nie launchctl oder pm2 des Rechners
     routines: createDemoRoutines(),
+    jobs: createDemoJobs(demoChoices, { id: "topic-1", name: "General" }),
+    pipelines,
+    choices: demoChoices,
     // Offene Fäden (Issue #293): Beispieldaten im Speicher, nie data/threads.json des Checkouts
     threads: createDemoThreads({ settings: demoAgents.settings }),
     // Erinnerungen (Issue #323): Beispieldaten im Speicher, nie data/reminders.json oder Supabase

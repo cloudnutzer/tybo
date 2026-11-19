@@ -11,6 +11,7 @@ import { maskSecrets, secretRefusedText } from "../memory/secrets";
 import { chunkForTelegram } from "../telegram";
 import { threadConversation } from "../threads/detect";
 import { ALL_CHANNELS, type CommandContext, type CommandDefinition } from "./types";
+import { formatSwitchTime } from "../engine-switch-text";
 
 const APPLIES = "Gilt ab der nächsten frischen Session, /new erzwingt es hier sofort.";
 
@@ -30,6 +31,7 @@ export const CORE_COMMAND_TEXT = {
   draftUnavailable: "Entwürfe gibt es hier nicht, weil die Rückfragen fehlen. /kern setzen <text> geht trotzdem.",
   noConversation: "In diesem Gespräch lässt sich keine Rückfrage zeigen, nichts geändert.",
   working: "Ich fasse die Fakten zu einem Entwurf zusammen, das kann ein paar Minuten dauern...",
+  blocked: (until: string) => `Kein Entwurf: Claude Code ist bis ${until} am Limit. Abhilfe: ein anderes Nebenmodell für das Destillat einstellen (WebUI, Modelle) oder nach dem Reset /kern entwurf erneut senden. Nichts geändert.`,
   draft: {
     offered: "Der Entwurf steht zur Entscheidung bereit, übernommen ist noch nichts.",
     no_facts: "Es gibt noch keine Fakten für einen Entwurf. /kern setzen <text> nimmt deinen eigenen Text.",
@@ -37,7 +39,7 @@ export const CORE_COMMAND_TEXT = {
     core_unreadable: "config/kern.md ist nicht lesbar, also gibt es keinen Entwurf. Nichts geändert.",
     model_failed: "Das Modell für den Entwurf hat nichts Brauchbares geliefert. Nichts geändert.",
     not_delivered: "Der Entwurf ließ sich nicht zustellen. Nichts geändert.",
-  } satisfies Record<OfferDraftOutcome, string>,
+  } satisfies Record<Extract<OfferDraftOutcome, string>, string>,
 } as const;
 
 const TEXT = CORE_COMMAND_TEXT;
@@ -99,7 +101,9 @@ async function draft(ctx: CommandContext): Promise<void> {
   await ctx.notice(TEXT.working);
   const stop = ctx.working();
   try {
-    await ctx.reply(TEXT.draft[await core.offerDraft(conversation)]);
+    const outcome = await core.offerDraft(conversation);
+    await ctx.reply(typeof outcome === "string" ? TEXT.draft[outcome]
+      : TEXT.blocked(formatSwitchTime(outcome.blockedUntil, process.env.USER_TIMEZONE || "UTC")));
   } catch (e) {
     if (isAbortError(e)) throw e;
     console.log(`[kern] /kern entwurf fehlgeschlagen (${e instanceof Error ? e.name : typeof e}, ${ctx.channel})`);

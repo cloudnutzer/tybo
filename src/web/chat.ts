@@ -8,6 +8,8 @@
  */
 
 import type { TurnSink } from "../lib/chat-turn";
+import type { JobReportTurn } from "../lib/jobs/report-input";
+import type { ReturnResult } from "../lib/jobs/return";
 import type { ApiAttachment, MessageAttachment } from "./attachments";
 import type { ApiChoice } from "./choices";
 import { COMMAND_NOTICE_SOURCE, COMMANDS_TEXT, type CommandExecution, type CommandOutcome } from "./commands";
@@ -16,6 +18,8 @@ import { toSpeakable } from "./speakable";
 import { NOTICE_SOURCE_PATTERN, pickNoticeFile, type NoticeFile } from "./notice";
 import { pickReplyInfo, type Conversation, type NewMessage, type ReplyInfo, type StoredMessage } from "./store";
 import { errorLogFields } from "./error-log";
+
+export type { JobReportTurn, ReturnResult };
 
 export const MAX_MESSAGE_CHARS = 200_000;
 export const DEFAULT_KEEPALIVE_MS = 20_000;
@@ -30,6 +34,8 @@ const SHUTDOWN_FLUSH_MS = 100;
 export type MessageSource = "web" | "terminal";
 
 export interface RunTurnOptions {
+  /** Interne Eingabe aus einem Job, nie aus einer HTTP-Anfrage übernommen. */
+  jobReport?: JobReportTurn;
   conversationId: string;
   agent: string;
   text: string;
@@ -79,6 +85,8 @@ export interface RunTurnOptions {
 }
 
 export interface TurnResult {
+  /** Interner Auftrag vor dem Modellaufruf zurückgestellt, ohne sichtbare Fehlermeldung. */
+  deferred?: boolean;
   text: string;
   /**
    * Abbruch. Ein Text ist dann die Meldung dafür (z. B. „Bot wurde beendet"),
@@ -380,7 +388,7 @@ export class ChatHub {
     approvalId?: string,
     source: MessageSource = "web",
     attachments: ApiAttachment[] = [],
-    options: { speech?: boolean; onDone?: () => void; reservation?: unknown; noTelegram?: boolean; onReply?: (text: string) => void } = {}
+    options: { speech?: boolean; onDone?: () => void; reservation?: unknown; noTelegram?: boolean; onReply?: (text: string) => void; jobReport?: JobReportTurn } = {}
   ): Promise<{ status: "busy" } | { status: "stale" } | { status: "closing" } | { status: "started"; message: StoredMessage }> {
     const id = conversation.id;
     if (this.closing) return { status: "closing" };
@@ -399,7 +407,11 @@ export class ChatHub {
 
     // Schon vor dem ersten await verfolgen: shutdown() wartet auch auf einen
     // Turn, dessen Nutzernachricht gerade noch gespeichert wird
-    const accepted = this.store.appendMessage(id, {
+    // Der Bericht ist bereits eine Meldung. Die interne Eingabe speichert nur
+    // der Chat-Kern mit Herkunft, sie wird nie zur zweiten Nutzerblase.
+    const accepted = options.jobReport
+      ? Promise.resolve({ id: `job-report-${options.jobReport.id}-${options.jobReport.run}`, role: "user" as const, text, createdAt: new Date().toISOString() })
+      : this.store.appendMessage(id, {
       role: "user",
       text,
       ...(attachments.length ? { attachments } : {}),
@@ -408,11 +420,12 @@ export class ChatHub {
     const forTurn: MessageAttachment[] = attachments.map(a => ({ id: a.id, name: a.name, size: a.size, mime: a.mime, kind: a.kind }));
     const done = accepted.then(
       message => {
-        if (this.publishUserMessages) this.publishApiMessage(id, toApiMessage(message));
+        if (this.publishUserMessages && !options.jobReport) this.publishApiMessage(id, toApiMessage(message));
         this.publish(id, "status", { running: true });
         return this.runInBackground(conversation, text, turn, message.id, message.createdAt, source, forTurn, speech, options.reservation, {
           noTelegram: !!options.noTelegram,
           onReply: options.onReply,
+          jobReport: options.jobReport,
         });
       },
       () => {
@@ -431,6 +444,20 @@ export class ChatHub {
     });
     const message = await accepted;
     return { status: "started", message };
+  }
+
+  /** Interner Job-Auftrag durch dieselbe Sperre und dieselben Live-Ereignisse wie Chat-Eingaben. */
+  async sendJobReport(conversation: HubConversation, input: JobReportTurn): Promise<ReturnResult> {
+    if (!this.chat) return "retry";
+    let result: ReturnResult = "done";
+    let finish!: () => void;
+    const finished = new Promise<void>(resolve => { finish = resolve; });
+    const accepted = await this.send(conversation, input.text, undefined, "web", [], {
+      jobReport: { ...input, onDeferred: () => { result = "retry"; } }, onDone: finish,
+    });
+    if (accepted.status !== "started") return "retry";
+    await finished;
+    return result;
   }
 
   /**
@@ -1010,7 +1037,7 @@ export class ChatHub {
     attachments: MessageAttachment[] = [],
     speech = false,
     reservation?: unknown,
-    extra: { noTelegram?: boolean; onReply?: (text: string) => void } = {}
+    extra: { noTelegram?: boolean; onReply?: (text: string) => void; jobReport?: JobReportTurn } = {}
   ): Promise<void> {
     const id = conversation.id;
     let active = true;
@@ -1063,10 +1090,19 @@ export class ChatHub {
           ...(speech ? { speech: true } : {}),
           ...(reservation !== undefined ? { reservation } : {}),
           ...(extra.noTelegram ? { noTelegram: true } : {}),
+          ...(extra.jobReport ? { jobReport: extra.jobReport } : {}),
           sink,
           ask,
           endAsk,
         });
+        if (result.deferred) {
+          active = false;
+          extra.jobReport?.onDeferred?.();
+          this.running.delete(id);
+          this.publish(id, "status", { running: false });
+          this.wakeIdle(id);
+          return;
+        }
         if (result.aborted || turn.stopRequested) {
           // Eine eigene Abbruchmeldung des Turns (Bot beendet) geht vor
           const own = result.aborted && result.text?.trim() ? result.text : null;

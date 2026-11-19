@@ -87,6 +87,18 @@ describe("replyQuote", () => {
 });
 
 describe("createTelegramTextInbox", () => {
+  test("gezielter Job-Reply wird vor Speicherung, Befehl und normalem Turn abgefangen", async () => {
+    let calls = 0;
+    const s = setup({ jobReply: async ctx => { calls++; return !!ctx.message?.reply_to_message; } });
+    await s.inbox(ctxFor("/help", { replyTo: { message_id: 42 } }));
+    expect(calls).toBe(1);
+    expect(s.saved).toEqual([]);
+    expect(s.commands).toEqual([]);
+    expect(s.answers).toEqual([]);
+    await s.inbox(ctxFor("Gewöhnlicher Text", { topicId: 5 }));
+    expect(s.saved).toHaveLength(1);
+    expect(s.answers).toHaveLength(1);
+  });
   test("leere Nachricht: nichts gespeichert, keine Antwort", async () => {
     const s = setup();
     await s.inbox(ctxFor("   "));

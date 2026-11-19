@@ -1,21 +1,29 @@
-import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { test, expect, describe, beforeEach, afterEach, spyOn } from "bun:test";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   getResumableSession,
   getSessionsForKey,
   normalizeSession,
+  noteHandover,
   recordSessionTurn,
   resetSession,
+  resetSessionOrThrow,
+  retainHandover,
+  sessionEpoch,
+  SESSION_IDLE_MS,
+  takeHandover,
   setSessionsFileForTests,
   takeExpiredSession,
   type BotSession,
 } from "../src/lib/session-manager";
-import { runJsonTurn, type ChatTurnDeps } from "../src/lib/chat-turn";
+import { prepareClaudeCall, runJsonTurn, type ChatTurnDeps } from "../src/lib/chat-turn";
 import { createClaudeEngine, type Engine, type EngineId, type EngineRequest } from "../src/lib/engines";
 import type { ClaudeOptions, ClaudeResult } from "../src/lib/claude";
 import { sessionKeyFor } from "../src/lib/store/message-rules";
+import { setSwitchStateFileForTests, updateSwitchState } from "../src/lib/engine-switch-state";
+import { setUsageFileForTests } from "../src/lib/engines/usage";
 
 // Issue #122: Sessions merken ihren Motor. Echte Ablage (sessions.json) in
 // einem Temp-Ordner über setSessionsFileForTests; Motoren sind Attrappen.
@@ -31,10 +39,14 @@ beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "tybo-122-"));
   file = join(dir, "sessions.json");
   setSessionsFileForTests(file);
+  setSwitchStateFileForTests(join(dir, "switch.json"));
+  setUsageFileForTests(join(dir, "usage.json"));
 });
 
 afterEach(async () => {
   setSessionsFileForTests(null);
+  setSwitchStateFileForTests(null);
+  setUsageFileForTests(null);
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -58,6 +70,125 @@ async function writeLegacy(entries: ReturnType<typeof legacyEntry>[]) {
 }
 
 const onDisk = async () => JSON.parse(await readFile(file, "utf8")) as Record<string, Record<string, unknown>>;
+
+describe("Übergabenotizen (Issue #658)", () => {
+  const key = "topic:-100658:1";
+  const other = "topic:-100658:2";
+  const notesFile = () => join(dir, "session-handover.json");
+  const notesOnDisk = async () => JSON.parse(await readFile(notesFile(), "utf8"));
+  const peek = (agent = "general") => takeHandover(key, agent, { preserveUntilRecorded: true });
+  async function seed() {
+    await writeLegacy([legacyEntry(key, "general", "geheime-session-id"), legacyEntry(key, "research", "zweite-session-id"), legacyEntry(other, "general", "fremde-session-id")]);
+    await noteHandover(key, "user");
+    await noteHandover(other, "user");
+  }
+
+  test("nur Herkunft, atomare Datei, einmal entnehmen und Neustart", async () => {
+    await seed();
+    const notes = await notesOnDisk();
+    expect(Object.keys(notes[`${key}:general`]).sort()).toEqual(["agentName", "engine", "model", "notedAt", "reason", "since"]);
+    expect(JSON.stringify(notes)).not.toContain("session-id");
+    setSessionsFileForTests(file);
+    expect(await takeHandover(key, "general")).toMatchObject({ engine: "claude", model: MODEL, since: NOW - 5000, reason: "user" });
+    expect(await takeHandover(key, "general")).toBeUndefined();
+    expect((await notesOnDisk())[`${other}:general`]).toBeDefined();
+  });
+
+  test("ohne neue Session bleibt ursprüngliche Notiz, mit Session wird sie ersetzt", async () => {
+    await seed();
+    const first = await peek();
+    await resetSession(key, undefined, { preserveHandover: true });
+    await noteHandover(key, "changed");
+    expect(await peek()).toEqual(first);
+    await recordSessionTurn(key, "general", "codex-modell", "codex", "neu");
+    expect(await peek()).toBeUndefined();
+    await noteHandover(key, "user");
+    expect(await peek()).toMatchObject({ engine: "codex", model: "codex-modell" });
+  });
+
+  test("18 Stunden ruhende Session und veraltete Notiz werden nicht übergeben", async () => {
+    await writeLegacy([legacyEntry(key, "general", "alt", { lastActivity: Date.now() - SESSION_IDLE_MS - 1000 })]);
+    await noteHandover(key, "user");
+    expect(await peek()).toBeUndefined();
+    await retainHandover(key, { agentName: "general", engine: "claude", model: MODEL, since: NOW, reason: "user", notedAt: Date.now() - SESSION_IDLE_MS - 1 });
+    expect(await peek()).toBeUndefined();
+    expect(await notesOnDisk()).toEqual({});
+  });
+
+  test.each([
+    ["resetSession", false], ["resetSession", true], ["resetSessionOrThrow", false], ["resetSessionOrThrow", true], ["Agent", false],
+  ] as const)("%s preserve=%s: Gesprächsgrenzen und alle Agenten", async (kind, preserveHandover) => {
+    await seed();
+    const before = await notesOnDisk();
+    if (kind === "resetSessionOrThrow") await resetSessionOrThrow(key, { preserveHandover });
+    else await resetSession(key, kind === "Agent" ? "general" : undefined, { preserveHandover });
+    const kept = preserveHandover || kind === "Agent";
+    for (const agent of ["general", "research"]) expect(!!(await peek(agent))).toBe(kept);
+    const after = await notesOnDisk();
+    expect(after[`${other}:general`]).toEqual(before[`${other}:general`]);
+    expect((await getSessionsForKey(other))[0]!.engineSessionId).toBe("fremde-session-id");
+    expect(await getSessionsForKey(key)).toHaveLength(kind === "Agent" ? 1 : 0);
+  });
+
+  test("/new ohne Session entfernt trotzdem alle Notizen, Epoche gilt sofort", async () => {
+    await seed();
+    const note = (await peek())!;
+    await resetSession(key, undefined, { preserveHandover: true });
+    const epoch = sessionEpoch(key);
+    const reset = resetSession(key);
+    expect(sessionEpoch(key)).toBe(epoch + 1);
+    await reset;
+    await retainHandover(key, note, epoch);
+    expect(await peek()).toBeUndefined();
+    expect(await peek("research")).toBeUndefined();
+  });
+
+  test("/new bei Schreibfehler: gelöschte Notiz lebt im Arbeitsspeicher nicht wieder auf", async () => {
+    await seed();
+    const oldFile = await readFile(notesFile(), "utf8");
+    await rm(notesFile());
+    await mkdir(notesFile());
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await resetSession(key);
+      expect(errors.mock.calls.length).toBeGreaterThan(0);
+      await rm(notesFile(), { recursive: true });
+      await writeFile(notesFile(), oldFile);
+      expect(await peek()).toBeUndefined();
+      expect(await peek("research")).toBeUndefined();
+      expect(await getSessionsForKey(key)).toEqual([]);
+    } finally { errors.mockRestore(); }
+  });
+
+  test("Lese- und Schreibfehler kosten keine Antwort und ergeben keine Übergabe", async () => {
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await writeFile(notesFile(), "kaputt");
+      expect(await peek()).toBeUndefined();
+      await recordSessionTurn(key, "general", MODEL, "claude", "s");
+      await rm(notesFile());
+      await mkdir(notesFile());
+      await noteHandover(key, "user");
+      expect(await peek()).toBeUndefined();
+      expect(errors.mock.calls).toHaveLength(2);
+    } finally { errors.mockRestore(); }
+  });
+
+  test("Notiz bleibt bei fehlgeschlagener Session-Ablage und endet erst beim erfolgreichen Speichern", async () => {
+    await seed();
+    await resetSession(key, undefined, { preserveHandover: true });
+    await rm(file);
+    await mkdir(file);
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(await recordSessionTurn(key, "general", "", "codex", "neu")).toBe(false);
+      expect(await peek()).toBeDefined();
+      await rm(file, { recursive: true });
+      expect(await recordSessionTurn(key, "general", "", "codex", "neu")).toBe(true);
+      expect(await peek()).toBeUndefined();
+    } finally { errors.mockRestore(); }
+  });
+});
 
 describe("BotSession mit Motor", () => {
   test("alter Eintrag ohne engine wird als Claude-Session gelesen", async () => {
@@ -200,6 +331,19 @@ function turnDeps(calls: EngineCall[], distilled: BotSession[], reply: (engine: 
 const sink = { progress() {}, notice() {} };
 
 describe("Chat-Turn und Motor der Session", () => {
+  test("prepareClaudeCall liefert Motor, Modell und Beginn der fortgesetzten und alten Session", async () => {
+    const key = sessionKeyFor(CHAT, 20);
+    await writeLegacy([legacyEntry(key, "general", "S-alt")]);
+    const deps = turnDeps([], [], () => "neu");
+    const resumed = await prepareClaudeCall("weiter", CHAT, "general", 20, MODEL, deps, "claude");
+    expect(resumed.resumedSession).toMatchObject({ engine: "claude", model: MODEL, startedAt: NOW - 5000 });
+    expect(resumed.expiredSession).toBeUndefined();
+    const changed = await prepareClaudeCall("weiter", CHAT, "general", 20, "", deps, "codex");
+    expect(changed.expiredSession).toMatchObject({ engine: "claude", model: MODEL, startedAt: NOW - 5000 });
+    expect(changed.resumedSession).toBeUndefined();
+    expect(changed.handover).toMatchObject({ since: NOW - 5000, reason: "changed" });
+  });
+
   test("alte sessions.json ohne engine: Turn mit Claude setzt die Session fort (schlanker Prompt)", async () => {
     const key = sessionKeyFor(CHAT, 20);
     await writeLegacy([legacyEntry(key, "general", "S-alt")]);
@@ -253,4 +397,23 @@ describe("Chat-Turn und Motor der Session", () => {
     expect(calls[2]).toEqual({ engine: "claude", prompt: "voller-prompt", resumeSessionId: undefined, model: MODEL });
     expect((await onDisk())[`${key}:general`]).toMatchObject({ engine: "claude", engineSessionId: "S-neu" });
   });
+});
+
+test("prepareClaudeCall delegiert das Destillat trotz Sperre und verwirft die alte Session", async () => {
+  const key = sessionKeyFor(CHAT, 50);
+  await recordSessionTurn(key, "general", "claude-fable-5-2", "claude", "alte-session");
+  await updateSwitchState(state => ({ ...state, blocks: [{
+    engine: "claude", cause: "outage", since: new Date().toISOString(),
+    until: new Date(Date.now() + 600_000).toISOString(), resetKnown: true,
+  }] }));
+  const distilled: BotSession[] = [];
+  const deps = turnDeps([], distilled, () => "neu");
+  const prepared = await prepareClaudeCall("weiter", CHAT, "general", 50, "", deps, "opencode");
+  expect(prepared.resumeId).toBeUndefined();
+  expect(prepared.fullPrompt).toBe("voller-prompt");
+  expect(await getSessionsForKey(key)).toEqual([]);
+  expect(distilled).toHaveLength(1);
+  expect(distilled[0]).toMatchObject({ engine: "claude", engineSessionId: "alte-session" });
+  await prepareClaudeCall("noch einmal", CHAT, "general", 50, "", deps, "opencode");
+  expect(distilled).toHaveLength(1);
 });

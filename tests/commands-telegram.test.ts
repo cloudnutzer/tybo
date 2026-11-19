@@ -203,7 +203,7 @@ recall <frage> - alte Gespraeche durchsuchen
       .replace(" · /k3 <frage> - Kimi K3 direkt", "")
       .replace(
         "/new - Gespraech in diesem Topic frisch starten\n",
-        "/new - Gespraech in diesem Topic frisch starten\n/motor - Motor dieses Gespraechs zeigen · /motor codex · /motor opencode · /motor claude · /motor standard\n"
+        "/new - Gespraech in diesem Topic frisch starten\n/motor - Motor und Stand dieses Gespraechs · /motor werkzeuge · /motor codex · /motor opencode · /motor claude · /motor api · /motor standard\n/motor pruefen - neu messen · /motor auto an · /motor auto aus\n"
       )
       .replace("/voice <text> - Antwort", "/jobs - Hintergrund-Jobs: laufende und zuletzt beendete\n/voice <text> - Antwort")
       .replace("recall <frage> - alte", "/faeden - offene Faeden: meine Fragen, auf die noch eine Antwort fehlt\n/faeden zu <nr> - Faden schliessen · /faeden alle - auch die geschlossenen der letzten 7 Tage\n/erinnerungen - offene Erinnerungen aller Gespraeche · /erinnerungen absagen <kennung>\nrecall <frage> - alte")

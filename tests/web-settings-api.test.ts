@@ -72,6 +72,17 @@ async function server(settings: SettingsPort | null = botSettings) {
 }
 
 describe("GET /api/settings", () => {
+  test("Modell-PATCH erhält skills: false; skills selbst bleibt nur in der Datei änderbar", async () => {
+    await writeFile(file, JSON.stringify({ engine: { codex: { skills: false } } }));
+    const ctx = await server();
+    const changed = await ctx.api("/api/settings", "PATCH", { engine: { codex: { model: "gpt-test" } } });
+    expect(changed.status).toBe(200);
+    expect(await readFileJson()).toEqual({ engine: { codex: { model: "gpt-test", skills: false } } });
+    const refused = await ctx.api("/api/settings", "PATCH", { engine: { codex: { skills: true } } });
+    expect(refused.status).toBe(400);
+    expect(await readFileJson()).toEqual({ engine: { codex: { model: "gpt-test", skills: false } } });
+  });
+
   test("ohne Datei: leere Einstellungen, alles aus dem Code, Agentenliste und Effort-Stufen", async () => {
     const ctx = await server();
     const res = await ctx.api("/api/settings");
@@ -104,6 +115,58 @@ describe("GET /api/settings", () => {
 });
 
 describe("PATCH /api/settings", () => {
+  test("Hook läuft nach Freigabe der Dateisperre, nur bei Erfolg; sein Fehler macht kein 500", async () => {
+    let locked = false;
+    let calls = 0;
+    const logs: string[] = [];
+    const api = createSettingsApi({ ...botSettings, lock: async fn => {
+      locked = true;
+      try { return await fn(); } finally { locked = false; }
+    } }, message => logs.push(message), undefined, async () => {
+      expect(locked).toBe(false);
+      calls++;
+      throw new Error("interner Fehler mit vertraulichem Inhalt");
+    });
+    expect((await api.patch(JSON.stringify({ engine: { backups: [{ engine: "codex" }] } }))).status).toBe(200);
+    expect((await readFileJson()) as unknown).toEqual({ engine: { backups: [{ engine: "codex" }] } });
+    expect((await api.patch(JSON.stringify({ engine: { backups: [{ engine: "api" }] } }))).status).toBe(400);
+    expect(calls).toBe(1);
+    expect(logs.join(" ")).not.toContain("vertraulichem");
+  });
+
+  test("Ersatzliste ganz ersetzen und entfernen, Automatik teilweise ändern oder entfernen", async () => {
+    const ctx = await server();
+    const patch = (engine: unknown) => ctx.api("/api/settings", "PATCH", { engine });
+    expect((await patch({ backups: [{ engine: "claude", model: "opus", effort: "high" }, { engine: "codex" }], auto: { enabled: false, threshold: 90 } })).status).toBe(200);
+    expect((await patch({ backups: [{ engine: "opencode" }], auto: { returnBelow: 70 } })).status).toBe(200);
+    expect((await readFileJson()) as unknown).toEqual({ engine: { backups: [{ engine: "opencode" }], auto: { enabled: false, threshold: 90, returnBelow: 70 } } });
+    expect((await patch({ backups: [], auto: { enabled: null } })).status).toBe(200);
+    expect(await readFileJson()).toEqual({ engine: { auto: { threshold: 90, returnBelow: 70 } } });
+    expect((await patch({ backups: [{ engine: "codex" }] })).status).toBe(200);
+    expect((await patch({ backups: null, auto: null })).status).toBe(200);
+    expect(await readFileJson()).toEqual({});
+  });
+
+  test("ungültige Ersatzstufen und Automatik ändern nichts, auch ein widersprüchlicher Teil-PATCH", async () => {
+    const before = JSON.stringify({ engine: { backups: [{ engine: "codex" }], auto: { threshold: 95, returnBelow: 85 } } });
+    await writeFile(file, before);
+    const ctx = await server();
+    for (const engine of [
+      { backups: [{ engine: "api" }] }, { backups: [{ engine: "codex", model: "gpt-test" }] },
+      { backups: [{ engine: "claude", model: "-option" }] },
+      { backups: [{ engine: "codex" }, { engine: "codex" }] },
+      { backups: ["a", "b", "c", "d", "e"].map(model => ({ engine: "claude", model })) },
+      { backups: {} }, { auto: { threshold: 120 } }, { auto: { threshold: 89 } },
+      { auto: { threshold: 90.5 } }, { auto: { returnBelow: -1 } }, { auto: { enabled: "true" } },
+      { auto: { other: 1 } },
+    ]) {
+      const response = await ctx.api("/api/settings", "PATCH", { engine });
+      expect(response.status).toBe(400);
+      expect((await response.json()).error).toBeString();
+      expect(await readFile(file, "utf8")).toBe(before);
+    }
+  });
+
   test("setzt Werte, führt zusammen, restartRequired false, Quelle settings", async () => {
     const ctx = await server();
     let res = await ctx.api("/api/settings", "PATCH", { agents: { research: { model: " claude-sonnet-5 " } } });
@@ -695,8 +758,8 @@ describe("Motor in /api/settings (Issue #126)", () => {
     expect(body.effective.engine.default).toEqual({ value: "codex", source: "settings" });
     // „Standard (…)" darunter: ohne eigenen Wert gälte Claude Code aus dem Code
     expect(body.inheritedModels.engine.default).toEqual({ value: "claude", source: "code" });
-    expect(configuredEngine(DM_KEY)).toEqual({ engine: "codex", source: "settings" });
-    expect(configuredEngine(TOPIC_KEY)).toEqual({ engine: "claude", source: "topic" });
+    expect(configuredEngine(DM_KEY, "general")).toEqual({ engine: "codex", source: "settings" });
+    expect(configuredEngine(TOPIC_KEY, "general")).toEqual({ engine: "claude", source: "topic" });
     expect(ctx.logs).toContain("Einstellungen geändert: engine.default");
   });
 
@@ -753,7 +816,7 @@ describe("Motor in /api/settings (Issue #126)", () => {
       },
     });
     expect(body.effective.engine.default).toEqual({ value: "opencode", source: "settings" });
-    expect(configuredEngine("dm:1")).toEqual({ engine: "opencode", source: "settings" });
+    expect(configuredEngine("dm:1", "general")).toEqual({ engine: "opencode", source: "settings" });
     expect(ctx.logs).toContain("Einstellungen geändert: engine.default, engine.opencode.model, engine.opencode.variant, engine.opencode.permission");
     // Werte nie im Log
     expect(ctx.logs.join("\n")).not.toContain("claude-opus-5.5");

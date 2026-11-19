@@ -44,6 +44,12 @@ function rig(overrides: Partial<BotShutdownParts> = {}) {
 }
 
 describe("Beenden des Bots", () => {
+  test("Motorwechsel-Meldungen werden vor Telegram und WebUI angehalten", async () => {
+    const r = rig({ stopSwitchNotices: () => { r.events.push("motorwechsel aus"); } });
+    await r.lifecycle.shutdown("SIGTERM");
+    expect(r.events.indexOf("motorwechsel aus")).toBeLessThan(r.events.indexOf("telegram"));
+    expect(r.events).toContain("motorwechsel aus");
+  });
   test("feste Reihenfolge, Flag schon vor dem Abbruch gesetzt", async () => {
     const r = rig();
     await r.lifecycle.shutdown("SIGTERM");

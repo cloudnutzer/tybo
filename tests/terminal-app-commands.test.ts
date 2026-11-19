@@ -63,7 +63,7 @@ describe("Befehle im Vollmodus", () => {
     stdin.type("Lange Frage\r");
     await s.telegramChat.turn("topic-443");
     await waitFor(() => stdout.text.includes("Denkt nach"), 3000, "Statuszeile");
-    const urgent = ["/goal pause", "/goal stop", "/goal cancel", "/goal done", "/goal abbrechen", "/abbruch"];
+    const urgent = ["/motor", "/motor werkzeuge", "/engine werkzeuge", "/motor auto aus", "/motor auto an", "/motor pruefen", "/engine PRU\u0308FEN", "/goal pause", "/goal stop", "/goal cancel", "/goal done", "/goal abbrechen", "/abbruch"];
     for (const text of urgent) {
       stdin.type(`${text}\r`);
       await waitFor(() => s.commandRuns.some(r => r.text === text), 3000, text);

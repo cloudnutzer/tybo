@@ -39,8 +39,9 @@ export type ChoiceVia = "telegram" | "web" | "terminal";
 /** Wie Choice in src/lib/choices.ts, nur die Felder, die die WebUI braucht */
 export interface RegisterChoice {
   id: string;
-  /** Art wie ChoiceKind in src/lib/choices.ts (tool, review, goal, topicmap, routine, thread, memory, reminder, proactive, ask, call, cleanup, core, secret, sprachagent) */
+  /** Art wie ChoiceKind in src/lib/choices.ts, einschließlich job für Fortsetzen. */
   kind?: string;
+  ref?: string;
   conversation: { type: "telegram"; chatId: string; topicId?: number } | { type: "web"; conversationId: string };
   options: { key: string; label: string }[];
   state: ChoiceState;
@@ -91,15 +92,15 @@ export interface ChoiceChange {
 }
 
 /** Arten aus src/lib/choices.ts; andere Werte fallen weg */
-export type ChoiceKindName = "tool" | "review" | "goal" | "topicmap" | "routine" | "thread" | "memory" | "reminder" | "proactive" | "ask" | "call" | "cleanup" | "core" | "secret" | "sprachagent";
-const CHOICE_KIND_NAMES: readonly ChoiceKindName[] = ["tool", "review", "goal", "topicmap", "routine", "thread", "memory", "reminder", "proactive", "ask", "call", "cleanup", "core", "secret", "sprachagent"];
+export type ChoiceKindName = "tool" | "review" | "goal" | "topicmap" | "routine" | "thread" | "memory" | "reminder" | "proactive" | "ask" | "call" | "cleanup" | "core" | "secret" | "sprachagent" | "job";
+const CHOICE_KIND_NAMES: readonly ChoiceKindName[] = ["tool", "review", "goal", "topicmap", "routine", "thread", "memory", "reminder", "proactive", "ask", "call", "cleanup", "core", "secret", "sprachagent", "job"];
 /** Höchstens so viele gemerkte neue Fragen (gegen doppelte Meldung aus Zuhörer und Abgleich) */
 const ANNOUNCED_LIMIT = 500;
 
 export type ChoiceDecideResult =
   | { status: "decided"; choice: ApiChoice }
-  | { status: "already"; choice: ApiChoice }
-  | { status: "expired"; choice: ApiChoice }
+  | { status: "already"; choice: ApiChoice; message?: string }
+  | { status: "expired"; choice: ApiChoice; message?: string }
   /** unbekannt oder aus einem anderen Gespräch */
   | { status: "not_found" }
   | { status: "invalid_option" };
@@ -167,6 +168,8 @@ export function choiceViewFor(choice: ApiChoice, owner: string | null, viewer: s
 
 export interface ChoicePortDeps {
   register: ChoiceRegister;
+  /** Auskunft beim alten Knopf, ohne eine zweite Entscheidung. */
+  staleText?(choice: RegisterChoice): Promise<string | undefined>;
   /** Chat des Direktchats: TELEGRAM_USER_ID, ohne Telegram "web" */
   userId?: string;
   /** Chat-ID der Forum-Gruppe, bei jedem Aufruf neu; null ohne Gruppe */
@@ -242,14 +245,18 @@ export function createChoicePort(deps: ChoicePortDeps): ChoicePort {
     if (!before || ownerOf(before) !== conversationId) return { status: "not_found" };
     if (!CHOICE_KEY_PATTERN.test(option)) return { status: "invalid_option" };
     const outcome = await deps.register.decide(choiceId, option, via);
+    let message: string | undefined;
+    if (outcome.status === "already" || outcome.status === "expired") {
+      try { message = await deps.staleText?.(before); } catch { /* Standardantwort bleibt verfügbar. */ }
+    }
     switch (outcome.status) {
       case "decided":
         log(`Rückfrage ${choiceId} in ${conversationId} entschieden (${via})`);
         return { status: "decided", choice: toApiChoice(outcome.choice) };
       case "already":
-        return { status: "already", choice: toApiChoice(outcome.choice) };
+        return { status: "already", choice: toApiChoice(outcome.choice), ...(message ? { message } : {}) };
       case "expired":
-        return { status: "expired", choice: expiredChoice(choiceId) };
+        return { status: "expired", choice: expiredChoice(choiceId), ...(message ? { message } : {}) };
       case "invalid_key":
         return { status: "invalid_option" };
       default:

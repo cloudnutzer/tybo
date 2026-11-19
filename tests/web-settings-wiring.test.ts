@@ -16,11 +16,13 @@ const repo = resolve(import.meta.dir, "..");
 describe("startWebUi", () => {
   test("reicht settings, instructions und models an createServer weiter", async () => {
     const models = createModelCatalog({ fetch: async () => Response.json({}) });
+    const onSettingsSaved = async () => {};
     let received: WebServerDeps | null = null;
     const server = await startWebUi({
       env: { WEB_ENABLED: "true", WEB_PASSWORD: "test-passwort-lang" },
       chat: { runTurn: async () => ({ text: "" }), stop() {} },
       settings: botSettings,
+      onSettingsSaved,
       instructions: botInstructions,
       models,
       createServer: async (_config, deps) => {
@@ -32,6 +34,7 @@ describe("startWebUi", () => {
     });
     expect(server).not.toBeNull();
     expect(received!.settings).toBe(botSettings);
+    expect(received!.onSettingsSaved).toBe(onSettingsSaved);
     expect(received!.instructions).toBe(botInstructions);
     expect(received!.models).toBe(models);
   });
@@ -42,7 +45,7 @@ describe("startWebUi", () => {
 
 describe("Server importiert src/lib nicht", () => {
   test("settings.ts, instructions.ts und models.ts ohne Importe aus src/lib, src/agents oder src/bot", async () => {
-    for (const name of ["settings.ts", "instructions.ts", "models.ts", "server.ts"]) {
+    for (const name of ["settings.ts", "engines.ts", "instructions.ts", "models.ts", "openrouter-key.ts", "server.ts"]) {
       const src = await Bun.file(join(repo, "src", "web", name)).text();
       const imports = [...src.matchAll(/^import[^;]*from\s+"([^"]+)"/gm)].map(m => m[1]);
       for (const path of imports) {

@@ -15,7 +15,7 @@
  * - Dateien aus Meldungen (rich) dazu: Audio und Video inline mit Range, weil
  *   Safari ohne Range nichts abspielt, nach denselben Prüfungen. HTML inline nur
  *   mit SANDBOXED_HTML_CSP: Die Seite läuft ohne eigenen Ursprung, kommt also
- *   weder an Sitzung noch an die API.
+ *   weder an Sitzung noch an die API. Einbetten darf sie nur die eigene Seite.
  *
  * Reine Web-Seite: nichts aus src/lib. Die echte FileSource baut
  * src/web/bot-files.ts für src/bot.ts.
@@ -74,12 +74,18 @@ const HTML_EXTENSIONS = new Set([".html", ".htm"]);
  * Ursprung (keine Cookies, keine Anfragen als angemeldeter Nutzer), ohne
  * connect-src schickt sie nichts per Skript nach außen. Eigene Skripte, Bilder,
  * Schriften und eingebettete Hörproben laufen weiter.
+ *
+ * frame-ancestors 'self' (Issue #708): Die installierte Web-App auf dem iPhone
+ * zeigt die Datei in einem iframe der eigenen Seite, weil ein eigener Tab dort
+ * die App ohne Rückweg ersetzt. Fremde Seiten dürfen sie weiter nicht
+ * einbetten, und die Sandbox gilt im iframe genauso: kein Ursprung, kein
+ * Wechsel der äußeren Seite (allow-top-navigation fehlt).
  */
 export const SANDBOXED_HTML_CSP =
   "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox allow-downloads; " +
   "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline' https:; " +
   "img-src data: blob: https:; media-src data: blob:; font-src data: https:; " +
-  "base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+  "base-uri 'none'; form-action 'none'; frame-ancestors 'self'";
 
 /** Bildtyp mit Vorschau für einen Dateinamen, sonst null */
 export function inlineImageType(name: string): string | null {
@@ -232,6 +238,8 @@ export async function serveOutboxFile(
           "Content-Disposition": contentDisposition("inline", shownName),
           "X-Content-Type-Options": "nosniff",
           "Content-Security-Policy": SANDBOXED_HTML_CSP,
+          // Passend zu frame-ancestors 'self'; alle anderen Antworten behalten DENY (./server)
+          "X-Frame-Options": "SAMEORIGIN",
         },
       });
     }

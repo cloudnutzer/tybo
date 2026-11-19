@@ -28,6 +28,7 @@ import type { SetupContext } from "../context";
 import { presentValue } from "../model";
 import { claudeRunContext, type Finding, type SpecialCheck } from "./report";
 import { engineCheck } from "./engine";
+import { engineToolChecks, type EngineToolDeps } from "./engine-tools";
 import { serviceFindings } from "./services";
 import { callFinding, speechFindings } from "./speech";
 import { describeStatus, fetchRelayStatus } from "../../lib/sip-relay/status";
@@ -263,6 +264,6 @@ export const sipRelayCheck: SpecialCheck = {
 };
 
 /** Alle Spezialprüfungen in der Reihenfolge des Berichts */
-export function defaultSpecials(options: { callModel?: Partial<CallModelDeps> } = {}): SpecialCheck[] {
-  return [engineCheck, telegramCheck, databaseCheck, servicesCheck, extrasCheck, speechCheck, callCheck(options.callModel), sipRelayCheck];
+export function defaultSpecials(options: { callModel?: Partial<CallModelDeps>; engineTools?: Partial<EngineToolDeps> } = {}): SpecialCheck[] {
+  return [engineCheck, ...engineToolChecks(options.engineTools), telegramCheck, databaseCheck, servicesCheck, extrasCheck, speechCheck, callCheck(options.callModel), sipRelayCheck];
 }

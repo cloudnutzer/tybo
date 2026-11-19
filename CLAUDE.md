@@ -154,10 +154,10 @@ Projektordner. Für ihn gilt:
   `TYBO_TOPIC_ID` und `TYBO_CHAT_ID`, ohne sie der Direktchat. Über die
   Outbox (`src/lib/outbox.ts`) erscheint alles auch in der WebUI, ohne
   Telegram nur dort.
-- **Lange Aufträge** laufen als Hintergrund-Job (`bun run job start`), nie per
-  `setsid` oder `claude -p` im Hintergrund; ohne Claude Code gibt es keine
-  ([Server](docs/server.md)). Ein Job meldet sich immer, auch nach Absturz.
-  `--full-access` nur für selbst formulierte Aufträge ([mehr](docs/hintergrund-jobs.md)).
+- **Lange Aufträge** laufen als Hintergrund-Job (`bun run job start`, auch
+  `--engine codex`), nie per `setsid` oder `claude -p` im Hintergrund; der Bot
+  bietet sie nur mit Claude Code an ([Server](docs/server.md)). Ein Job meldet sich
+  immer, auch nach Absturz. `--full-access` nur für selbst formulierte Aufträge ([mehr](docs/hintergrund-jobs.md)).
 - **Hooks:** Subprozesse tragen `TYBO_SUBPROCESS=1`. Liefert ein `Stop`-Hook
   `additionalContext`, antwortet Claude ein zweites Mal und nur das Letzte
   kommt an. Solche Hooks in `.claude/settings.local.json` mit
@@ -200,22 +200,22 @@ Aufforderung zum Testen.
 | `bun run check` | Typprüfung und alle Tests |
 | `bun run notify` | `--source <name>` mit `--text` oder `--file`, dazu `--caption`, `--topic` |
 | `bun run nachschlagen` | `"<suchtext>"` sucht in Fakten, Nachrichten, Wissensbasis und Bildern, Ausgabe als JSON; nur lesend |
-| `bun run job` | `start --title <titel> --brief <datei>`, `list`, `stop <id>`, `log <id>` |
+| `bun run job` | `start --title <titel> --brief <datei>`, `list`, `stop <id>`, `resume <id>`, `log <id>` |
+| `bun run limits` | `set --engine <motor> --window <kennung> --percent <zahl>` oder `set --stdin` liefert eigene Messwerte; `show` liest den Stand ([Format](docs/erweiterungen.md#eigene-messwerte-für-limits)) |
 | `bun run restart:request` | Neustart, sobald die laufende Antwort fertig ist |
 | `bun run checkin`, `bun run briefing` | Check-in bzw. Morgenbriefing einmal von Hand |
 | `bun run health` | Nachtcheck; `--no-send` nur anzeigen, `--no-model` ohne Modell |
 | `bun run updates` | Claude Code und Codex aktualisieren; `--apply` auch Bun und Homebrew, `--smoke` nur prüfen |
 
-Logs liegen in `logs/`, Fehler der Claude CLI in `logs/telegram-relay.error.log`.
-Kommt keine Antwort oder eine vom Ersatzmodell, scheitert meist die Claude
+Logs liegen in `logs/`, Fehler der Claude CLI in `logs/telegram-relay.error.log`. Kommt keine Antwort oder eine vom Ersatzmodell, scheitert meist die Claude
 CLI (Anmeldung, Abo-Limit, `PATH`); mehr in [Störungen](docs/troubleshooting.md).
 
 ## Wo was steht
 
-- Ein Turn, egal aus welchem Kanal: `src/lib/chat-turn.ts`, Abschluss mit
-  Merk-Tags, `/goal` und Fäden in `src/lib/turn-finish.ts`
-- Motoren (Claude Code, Codex, OpenCode, API): `src/lib/engines/`,
-  Ersatzmodelle: `src/lib/fallback/`
+- Ein Turn: `src/lib/chat-turn.ts`; Merk-Tags, `/goal` und Fäden: `src/lib/turn-finish.ts`
+- Motoren: `src/lib/engines/`; Ersatzmodelle mit eingeschränktem Werkzeugumfang: `src/lib/fallback/`
+- Motorwechsel: `src/lib/engine-switch.ts`; Messwerte: `src/lib/engines/usage.ts`
+- Werkzeuge für Codex: `src/lib/engines/codex-mcp.ts`, `src/lib/engines/codex-skills.ts`, `src/lib/engines/claude-notes.ts`, `src/lib/engines/tool-parity.ts`
 - Sessions pro Topic (`SESSION_MODE=resume`, `/new`):
   `src/lib/session-manager.ts`, [Konzept](docs/topic-sessions.md)
 - Gedächtnis und Tags wie `[REMEMBER:]`: `src/lib/memory/`; Tags nach

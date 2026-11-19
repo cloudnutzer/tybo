@@ -37,6 +37,9 @@ import {
 import { getSettings, setSettingsPath, type Settings } from "../src/lib/settings";
 import { SPEECH_TURN_HINT } from "../src/lib/speech/spoken-turn";
 import { createBotChat, createTelegramChat, type WebSavedMessage } from "../src/web/bot-turn";
+import { subprocessEnv } from "../src/lib/subprocess-env";
+import { codexEnv } from "../src/lib/engines/codex";
+import { opencodeEnv } from "../src/lib/engines/opencode";
 
 const DM = "4711";
 const GROUP = "-1001234567890";
@@ -84,8 +87,8 @@ function setup(opts: { sessionMode?: boolean } = {}) {
   const sink: TurnSink = { progress: () => {}, notice: t => void notices.push(t) };
   const deps: Partial<ChatTurnDeps> = {
     getEngine: id => engines[id],
-    resolveEngine: (key, d?: Partial<EngineChoiceDeps>) =>
-      resolveEngine(key, { ...d, env: () => ({}), checkEngine: async id => ({ ...READY, engine: id }), log: () => {} }),
+    resolveEngine: (key, d: Partial<EngineChoiceDeps> | undefined, turn) =>
+      resolveEngine(key, { ...d, env: () => ({}), checkEngine: async id => ({ ...READY, engine: id }), log: () => {} }, turn),
     forgetEngineCheck: () => {},
     runFallbackChain: async ({ question: prompt, context }) => {
       fallbackCalls.push({ prompt, context });
@@ -143,6 +146,18 @@ afterEach(async () => {
 });
 
 describe("withTurnHint", () => {
+  test.each(["claude", "codex", "opencode"] as const)("Job-Kette im echten Chat-Kern bis zur %s-Umgebung, nächste Nachricht wieder ohne", async engine => {
+    const s = setup({ sessionMode: false });
+    const seen: (string | undefined)[] = [];
+    const env = () => engine === "codex" ? codexEnv(dir, "dm:4711", { home: dir, env: { TYBO_JOB_CHAIN: "99" }, quiet: true })
+      : engine === "opencode" ? opencodeEnv(dir, "dm:4711")
+      : subprocessEnv({ cwd: dir, home: dir, env: { TYBO_JOB_CHAIN: "99" }, conversationKey: "dm:4711" });
+    const base = fakeEngine(engine);
+    s.deps.getEngine = () => ({ ...base, async run(req) { seen.push(env().TYBO_JOB_CHAIN); return base.run(req); } });
+    await s.turn({ engine, jobChain: 3 });
+    await s.turn({ engine });
+    expect(seen).toEqual(["3", undefined]);
+  });
   test("hängt den Hinweis unter eigener Überschrift an, ohne Hinweis bleibt der Prompt gleich", () => {
     expect(withTurnHint("Prompt", HINT)).toBe(`Prompt${SUFFIX}`);
     expect(withTurnHint("Prompt", undefined)).toBe("Prompt");

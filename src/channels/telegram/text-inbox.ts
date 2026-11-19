@@ -60,6 +60,7 @@ export function promptWithQuote(prompt: string, quote: ReplyQuote | undefined): 
 
 /** Was vom grammY-Context gebraucht wird */
 export interface TextUpdate {
+  from?: { id: number | string };
   chat?: { id: number | string };
   message?: { text?: string; message_id?: number; message_thread_id?: number; reply_to_message?: unknown };
   reply(text: string, other?: Record<string, unknown>): Promise<unknown>;
@@ -75,6 +76,8 @@ export interface TextReplyRequest<C> {
 }
 
 export interface TextInboxDeps<C extends TextUpdate> {
+  /** Gezielte Antwort auf eine Job-Frage, vor Speicherung und normalem Chat-Turn. */
+  jobReply?(ctx: C): Promise<boolean>;
   captureTopicName(topicId: number, message: unknown): Promise<unknown>;
   saveMessage(message: Message): Promise<unknown>;
   matchCommand(text: string): CommandMatch | null | undefined;
@@ -109,6 +112,8 @@ export function createTelegramTextInbox<C extends TextUpdate>(deps: TextInboxDep
     if (!text) return;
     const chatId = String(ctx.chat?.id ?? "");
     const topicId = ctx.message?.message_thread_id;
+
+    if (await deps.jobReply?.(ctx)) return;
 
     if (topicId !== undefined) void deps.captureTopicName(topicId, ctx.message).catch(() => {});
 

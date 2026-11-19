@@ -13,13 +13,14 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { activeEngineCallCount, inspectEngine, type EngineId, type EngineStatus } from "../lib/engines";
-import { configuredEngine, defaultEngineSetting, engineLabel, engineModelAndEffort, SELECTABLE_ENGINES, sessionModel } from "../lib/engine-choice";
+import { configuredEngine, agentEngineSetting, engineLabel, engineModelAndEffort, SELECTABLE_ENGINES, sessionModel } from "../lib/engine-choice";
 import { toAvailability } from "./bot-engines";
 import { activeExecutionCount } from "../lib/execution-context";
 import { detectSupervisor, RESTART_MARKER, requestRestart } from "../lib/restart-request";
 import { isSessionModeEnabled, listStoredSessions, SESSION_IDLE_MS } from "../lib/session-manager";
 import { searchDisplayState } from "../setup/search-record";
 import { currentIntakeView, intakeStatePath } from "../lib/telegram-intake";
+import { createToolParitySnapshot, toolGapsResponse, type ToolParitySnapshot } from "../lib/engines/tool-parity";
 import {
   countResumableSessions,
   keyStatus,
@@ -30,6 +31,7 @@ import {
   type SemanticSearchState,
   type Supervisor,
   type TelegramIntakeStatus,
+  type StatusEngineAvailability,
 } from "./status";
 
 const execFileAsync = promisify(execFile);
@@ -100,6 +102,8 @@ export interface BotStatusDeps {
   semanticSearch(): Promise<SemanticSearchState | null>;
   /** Verfügbarkeit eines Motors (Issue #126), Standard inspectEngine; Tests reichen eine Attrappe herein */
   inspectEngine(id: EngineId): Promise<EngineStatus>;
+  /** Ein gemeinsamer, rein lesender Bestand pro Abruf; für Tests vollständig ersetzbar. */
+  toolParity(): ToolParitySnapshot;
   /** Zustand des Telegram-Eingangs dieses Prozesses (Issue #562), Standard aus data/telegram-intake.json */
   telegramIntake(): Promise<TelegramIntakeStatus | null>;
   now(): number;
@@ -121,13 +125,14 @@ export function createBotStatus(env: Env = process.env, overrides: Partial<BotSt
     modelFor: (agentName, engine) => sessionModel(engineModelAndEffort(engine as EngineId, agentName).model),
     // Wie chat-turn.ts ohne TurnOptions.engine: Motor des Gesprächs laut Einstellungen
     // (ohne Verfügbarkeitsprüfung: die Anzeige startet keinen codex-Prozess)
-    engineFor: (_agentName, sessionKey) => (sessionKey ? configuredEngine(sessionKey).engine : defaultEngineSetting().engine),
+    engineFor: (agentName, sessionKey) => (sessionKey ? configuredEngine(sessionKey, agentName).engine : agentEngineSetting(agentName).engine),
     activeExecutions: activeExecutionCount,
     activeClaudeCalls: activeEngineCallCount,
     restartMarker: RESTART_MARKER,
     requestRestart: note => requestRestart(note),
     semanticSearch: () => searchDisplayState(root, env),
     inspectEngine,
+    toolParity: createToolParitySnapshot,
     // Nur der Zustand, den dieser Prozess geschrieben hat
     telegramIntake: () => currentIntakeView(intakeStatePath(root), pid => pid === process.pid),
     now: Date.now,
@@ -171,16 +176,24 @@ export function createBotStatus(env: Env = process.env, overrides: Partial<BotSt
     requestRestart: note => d.requestRestart(note),
     keys: () => keyStatus(d.env),
     semanticSearch: () => d.semanticSearch(),
-    engines: () =>
-      Promise.all(
+    engines: () => {
+      let tools: ToolParitySnapshot | null;
+      try { tools = d.toolParity(); } catch { tools = null; }
+      return Promise.all(
         SELECTABLE_ENGINES.map(async id => {
+          let availability: StatusEngineAvailability;
           try {
-            return toAvailability(await d.inspectEngine(id));
+            availability = toAvailability(await d.inspectEngine(id));
           } catch {
-            return { engine: id, label: engineLabel(id), installed: false, loggedIn: false, message: `${engineLabel(id)} ließ sich nicht prüfen` };
+            availability = { engine: id, label: engineLabel(id), installed: false, loggedIn: false, message: `${engineLabel(id)} ließ sich nicht prüfen` };
           }
+          try {
+            availability.tools = tools ? { inventory: tools.inventory(id), gaps: toolGapsResponse(tools.gaps(id)) } : null;
+          } catch { availability.tools = null; }
+          return availability;
         })
-      ),
+      );
+    },
     telegramIntake: () => d.telegramIntake(),
     now: () => d.now(),
   };

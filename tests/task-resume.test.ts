@@ -1,11 +1,96 @@
 import { test, expect, describe } from "bun:test";
-import { resumeMacTask, type TaskResumeDeps, taskResumePrompt, taskResumeRecord, taskTarget } from "../src/lib/task-resume";
+import { resumeMacTask, type TaskResumeDeps, taskResumePrompt, taskResumeRecord, taskTarget, taskHandoverPrompt } from "../src/lib/task-resume";
 import { runExecution, abortExecutions } from "../src/lib/execution-context";
 import { sessionKeyFor } from "../src/lib/store/message-rules";
 import type { ClaudeOptions, ClaudeResult } from "../src/lib/claude";
 import type { BotSession } from "../src/lib/session-manager";
 import { createClaudeEngine } from "../src/lib/engines";
 import { processTurnIntents } from "../src/lib/intent-gate";
+import { currentExecution } from "../src/lib/execution-context";
+import { ABORT_REPLY, type TurnOptions } from "../src/lib/chat-turn";
+
+const handover = { originalPrompt: "Notiz anlegen", question: "Wie lang?", options: ["Kurz", "Ausführlich"] };
+
+describe("Übergabe einer Knopf-Antwort (Issue #659)", () => {
+  test("feste Nachricht mit Auftrag, Frage, Beschriftungen und unveränderter Antwort", () => {
+    expect(taskHandoverPrompt(handover, "Ausführlich")).toBe([
+      "Der Nutzer hat eine Rückfrage aus diesem Gespräch per Knopf beantwortet.",
+      "Ursprünglicher Auftrag: Notiz anlegen", "Rückfrage: Wie lang?",
+      "Zur Auswahl standen: Kurz | Ausführlich", "Antwort des Nutzers: Ausführlich",
+      "Setze den Auftrag mit dieser Antwort fort.",
+    ].join("\n"));
+    const prompt = taskHandoverPrompt({ ...handover, originalPrompt: "x".repeat(2_001), options: [] }, " Ja\nBitte ");
+    expect(prompt).toContain(`Ursprünglicher Auftrag: ${"x".repeat(2_000)}\n`);
+    expect(prompt).not.toContain("Zur Auswahl standen:");
+    expect(prompt).toContain("Antwort des Nutzers:  Ja\nBitte \n");
+  });
+
+  for (const errorKind of ["usage_limit", "capacity", "other"] as const) {
+    test(`${errorKind}: erst Lauf auswerten, dann genau einmal in derselben Sperre übergeben`, async () => {
+      const s = setup({ result: () => ({ text: "Fehler", isError: true, errorKind }) });
+      const transfers: TurnOptions[] = [];
+      const notes: unknown[][] = [];
+      Object.assign(s.deps, {
+        getSettings: () => ({ engine: { backups: [{ engine: "codex" }] } }),
+        readSwitchState: () => ({ version: 1, blocks: [], counters: [] }),
+        checkEngine: async () => ({ installed: true, loggedIn: false, loginUnknown: true }),
+        noteStageRun: async (...args: unknown[]) => { notes.push(args); },
+        handoverTurn: async (opts: TurnOptions) => {
+          expect(notes).toHaveLength(1);
+          expect(currentExecution()).toMatchObject({ key: `topic:${CHAT}:49`, agent: "research", sessionLock: true });
+          transfers.push(opts);
+          opts.onInfo?.({ agent: "research", engine: "codex", model: "codex-test", durationMs: 1 });
+          opts.onSessionId?.("codex-neu", { engine: "codex", model: "codex-test" });
+          return "Notiz fertig";
+        },
+      });
+      const outcome = await resumeMacTask({ chat_id: CHAT, thread_id: 49, session_id: "claude-alt", metadata: { agent_name: "research" } },
+        CHAT, "Kurz", s.deps, "web", handover);
+      expect(s.calls).toHaveLength(1);
+      expect(s.calls[0].resumeSessionId).toBe("claude-alt");
+      expect(transfers).toHaveLength(1);
+      expect(transfers[0]).toMatchObject({ userMessage: taskHandoverPrompt(handover, "Kurz"), chatId: CHAT, topicId: 49, agentName: "research", channel: "web" });
+      expect(notes[0][6]).toEqual({ abandoned: errorKind !== "other" });
+      expect(outcome).toMatchObject({ status: "done", engine: "codex", resumeId: "codex-neu", result: { text: "Notiz fertig", sessionId: "codex-neu" } });
+    });
+  }
+
+  for (const kind of ["engine", "fallback", "none", "timeout", "abort"] as const) {
+    test(`Übergabe meldet ${kind} mit sicheren Session-Angaben`, async () => {
+      const s = setup({});
+      Object.assign(s.deps, {
+        getSettings: () => ({ engine: { backups: [{ engine: "codex" }] } }),
+        readSwitchState: () => ({ version: 1, blocks: [], counters: [] }),
+        checkEngine: async () => ({ installed: false, loggedIn: false }),
+        handoverTurn: async (opts: TurnOptions) => {
+          expect(opts.longRunNotices).toBe(false);
+          opts.sink.notice("Codex übernimmt.");
+          opts.onSessionId?.("codex-id", { engine: "codex", model: "" });
+          opts.onTools?.({ uses: [{ name: "Write" }] });
+          opts.onQuestion?.({ question: "Noch eine Notiz?", options: ["Ja", "Nein"], via: "tag", offer: async () => { throw new Error("Nicht anbieten"); } });
+          opts.onInfo?.({ agent: "general", durationMs: 1, ...(kind === "engine" ? { engine: "codex" }
+            : kind === "fallback" ? { model: "ersatz" } : kind === "timeout" ? { timedOut: true } : {}) });
+          return kind === "abort" ? ABORT_REPLY : "Antwort";
+        },
+      });
+      const result = await resumeMacTask({ session_id: "claude-alt" }, CHAT, "Kurz", s.deps, "web", handover);
+      if (kind === "abort") { expect(result).toEqual({ status: "aborted" }); return; }
+      expect(result).toMatchObject({ status: "done", via: "handover", notices: ["Codex übernimmt."] });
+      if (result.status !== "done") throw new Error("Übergabe erwartet");
+      expect(result.result.tools).toEqual({ uses: [{ name: "Write" }] });
+      if (kind === "engine") {
+        expect(result).toMatchObject({ engine: "codex", model: "", resumeId: "codex-id", followUp: { question: "Noch eine Notiz?", options: ["Ja", "Nein"] } });
+      } else {
+        expect(result.engine).toBeUndefined();
+        expect(result.resumeId).toBe("");
+        expect(result.result.sessionId).toBeUndefined();
+        expect("followUp" in result).toBe(false);
+        expect(result.result.isError).toBe(kind !== "fallback");
+        expect(!!result.result.timedOut).toBe(kind === "timeout");
+      }
+    });
+  }
+});
 
 // Issue #189: Knopf-Antworten laufen über runExecution (echte Sperre), mit
 // dem Modell, Effort und den Werkzeugen des Agenten; die Session wird erst in
@@ -63,6 +148,15 @@ function topic() {
   const topicId = nextTopic++;
   return { topicId, key: sessionKeyFor(CHAT, topicId) };
 }
+
+test("Knopf-Fortsetzung fordert nach Claude ebenfalls eine Messung an, nach Abbruch nicht", async () => {
+  for (const aborted of [false, true]) {
+    const s = setup({ result: () => ({ text: "Antwort", isError: false, aborted }) }); let requested = 0;
+    s.deps.scheduleClaudeUsageAfterChat = () => { requested++; expect(s.calls).toHaveLength(1); };
+    await resumeMacTask({ session_id: "fortsetzen" }, CHAT, "Ja", s.deps);
+    expect(requested).toBe(aborted ? 0 : 1);
+  }
+});
 
 describe("Knopf-Antwort über runExecution", () => {
   test("zwei gleichzeitige Turns im selben Topic: Knopf-Antwort wartet und nimmt die neue Session", async () => {

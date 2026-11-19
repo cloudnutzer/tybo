@@ -20,6 +20,8 @@
 
 import { toolUsesFromEvent, type ToolUse } from "../turn-tools";
 import type { CliErrorSignal } from "./result";
+import type { EngineRateLimit } from "../engines/types";
+import { rateLimitWindowId, type UsageWindow } from "../engines/usage";
 
 /** So viele Werkzeugschritte bleiben für den Bericht beim Zeitlimit */
 export const MAX_RUN_STEPS = 8;
@@ -95,6 +97,9 @@ export interface StreamReading {
   readonly result?: { readonly text: string; readonly signal: CliErrorSignal };
   /** Summe der Kosten aller result-Ereignisse (Hook-Folgeturns melden je eins), Issue #346 */
   readonly costUsd?: number;
+  readonly rateLimit?: EngineRateLimit;
+  /** Letzter strukturierter Verbrauchsbericht; Texte des lokalen Befehls gehören nicht dazu. */
+  readonly usageReport?: Record<string, unknown>;
   /** Letzter Textblock, ungekürzt */
   readonly lastText: string;
   readonly uses: readonly ToolUse[];
@@ -149,9 +154,67 @@ export function readStreamEvent(reading: StreamReading, event: Record<string, an
       return readResult(reading, event);
     case "assistant":
       return readAssistant(reading, event, at);
+    case "rate_limit_event":
+      return readRateLimit(reading, event.rate_limit_info, at);
     default:
       return { reading, signals: [] };
   }
+}
+
+/** Zeitwerte im Ereignis sind Unix-Sekunden; ungültige Werte werfen nie. */
+function resetTime(value: unknown): string | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined;
+  const date = new Date(value * 1000);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
+}
+
+function validUtilization(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function rateLimitWindow(type: unknown, value: unknown, measuredAt: string): UsageWindow | undefined {
+  const id = rateLimitWindowId(type);
+  if (!id || !isRecord(value) || !validUtilization(value.utilization)) return undefined;
+  const resetsAt = resetTime(value.resetsAt);
+  if (value.resetsAt !== undefined && resetsAt === undefined) return undefined;
+  return {
+    id, percent: Math.round(Math.min(1, value.utilization) * 100), measuredAt, source: "stream",
+    ...(resetsAt !== undefined ? { resetsAt } : {}),
+  };
+}
+
+function readRateLimit(reading: StreamReading, info: unknown, at: number): StreamTransition {
+  const unchanged = { reading, signals: [] };
+  if (!isRecord(info) || !Number.isFinite(at)) return unchanged;
+  const date = new Date(at);
+  if (!Number.isFinite(date.getTime())) return unchanged;
+  const measuredAt = date.toISOString();
+  // Kein Objekt zählt wie fehlend. Ein vorhandenes Objekt ist maßgeblich,
+  // auch wenn es leer ist oder nur unbekannte bzw. kaputte Einträge enthält.
+  const unified = isRecord(info.unifiedWindows) ? info.unifiedWindows : undefined;
+  const resetsAt = resetTime(info.resetsAt);
+  if (!unified && ((info.utilization !== undefined && !validUtilization(info.utilization))
+    || (info.resetsAt !== undefined && resetsAt === undefined))) return unchanged;
+
+  const windows = new Map(reading.rateLimit?.windows.map(window => [window.id, window]));
+  const entries = unified ? Object.entries(unified) : [[info.rateLimitType, info]];
+  let measured = false;
+  for (const [type, value] of entries) {
+    const window = rateLimitWindow(type, value, measuredAt);
+    if (window) {
+      windows.set(window.id, window);
+      measured = true;
+    }
+  }
+  // Die Kopffelder ersetzen die vorige Meldung, die Fenster werden gesammelt.
+  const rateLimit: EngineRateLimit = { windows: [...windows.values()] };
+  for (const field of ["status", "rateLimitType", "errorCode", "overageStatus"] as const) {
+    if (typeof info[field] === "string") rateLimit[field] = info[field];
+  }
+  if (resetsAt !== undefined) rateLimit.resetsAt = resetsAt;
+  if (typeof info.isUsingOverage === "boolean") rateLimit.isUsingOverage = info.isUsingOverage;
+  if (!measured && Object.keys(rateLimit).length === 1) return unchanged;
+  return { reading: { ...reading, rateLimit }, signals: [] };
 }
 
 function readResult(reading: StreamReading, event: Record<string, any>): StreamTransition {
@@ -168,6 +231,7 @@ function readResult(reading: StreamReading, event: Record<string, any>): StreamT
 }
 
 function readAssistant(reading: StreamReading, event: Record<string, any>, at: number): StreamTransition {
+  if (isRecord(event.usage_report)) reading = { ...reading, usageReport: event.usage_report };
   const blocks = event.message?.content;
   if (!Array.isArray(blocks)) return { reading, signals: [] };
   const key = turnKey(reading, event.message.id);
@@ -238,6 +302,8 @@ export interface StreamOutcome {
   /** Fehler-Felder der CLI; ohne result-Ereignis alle leer */
   signal: CliErrorSignal;
   costUsd?: number;
+  rateLimit?: EngineRateLimit;
+  usageReport?: Record<string, unknown>;
   /** Mehr als ein fertiger Turn: so viele wurden zum Text verbunden */
   joinedTurns?: number;
   uses: ToolUse[];
@@ -266,6 +332,8 @@ export function finishStreamReading(reading: StreamReading): StreamOutcome {
     ...(reading.sessionId ? { sessionId: reading.sessionId } : {}),
     signal,
     ...(reading.costUsd !== undefined ? { costUsd: reading.costUsd } : {}),
+    ...(reading.rateLimit ? { rateLimit: reading.rateLimit } : {}),
+    ...(reading.usageReport ? { usageReport: reading.usageReport } : {}),
     ...(joinedTurns ? { joinedTurns } : {}),
     uses: [...reading.uses],
     steps: [...reading.steps],

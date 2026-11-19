@@ -27,6 +27,17 @@ Entscheidung:
   erste Bytes müssen passen) und HTML in einem eigenen Tab öffnen. HTML kommt dann
   mit `Content-Security-Policy: sandbox` ohne `allow-same-origin`: Die Seite hat
   keinen eigenen Ursprung, kommt also nicht an Sitzung oder API.
+- Seit 18.11.2026 (Issue #708): In der installierten App auf iPhone oder iPad
+  ersetzt ein Download-Link oder ein eigener Tab die einzige Ansicht, und nichts
+  führt zurück (im Simulator mit iOS 26.4 nachgestellt). Dort ist
+  „Herunterladen" deshalb ein Knopf, der die Datei über dieselbe Route lädt und
+  an den Teilen-Dialog des Systems gibt, und „Öffnen" zeigt HTML im Betrachter
+  der Seite, einem `<dialog>` mit iframe. Dafür trägt nur die HTML-Antwort
+  `frame-ancestors 'self'` und `X-Frame-Options: SAMEORIGIN`; alle anderen
+  Antworten bleiben bei `'none'` und `DENY`. Die Sandbox ohne Ursprung gilt im
+  iframe unverändert, das iframe selbst erlaubt dazu weder Downloads noch den
+  Wechsel der äußeren Seite. In allen anderen Browsern und installierten Apps
+  bleiben die Links. Die Vorschau eines Bildes öffnet überall den Betrachter.
 - Der Bot-Prozess holt neue Einträge anderer Prozesse selbst ab (kurzes
   Abfrageintervall) und meldet sie live an offene Browser; die Absender
   brauchen keinen Zugang zur WebUI.

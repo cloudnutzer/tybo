@@ -93,4 +93,10 @@ describe("Server und Status-API importieren src/lib nicht", () => {
     const imports = [...src.matchAll(/^import[^;]*from\s+"([^"]+)"/gm)].map(m => m[1]);
     for (const path of imports) expect(/\.\.\/(lib|agents|bot)/.test(path)).toBe(false);
   });
+
+  test("Werkzeug-Vertrag ohne Laufzeit-Abhängigkeiten", async () => {
+    const contract = await Bun.file(join(repo, "src/web/tool-parity-types.ts")).text();
+    expect(contract).not.toMatch(/^import\s/m);
+    expect(contract).not.toMatch(/(?:require|import)\s*\(/);
+  });
 });

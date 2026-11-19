@@ -1,5 +1,89 @@
 # Changelog
 
+## 2.18.0: a second engine when the limit is full, jobs that come back to you
+
+- **Backup stages:** when the limit of your subscription was full, a
+  fallback model with a reduced set of tools answered. Now you can line up to
+  four backup stages behind your default engine, for example Claude Code
+  with another model, then Codex, then OpenCode. If a stage is at its limit
+  or not ready (not installed, not signed in), the next free one answers,
+  also within the same turn when a run fails at the limit. The fallback
+  models stay as the last net. Set it up in the WebUI under settings,
+  "Modelle", section "Motor", or as `engine.backups` in
+  `config/settings.json`. Without backup stages everything works as before.
+- **Automatic switch:** with backup stages tybo switches before the limit is
+  hit. A measurement at or above the threshold (95 %, adjustable from 50 to
+  99) blocks that limit window until it resets; a newer measurement below
+  the return threshold (15 points lower by default) releases it early. A
+  running answer is never switched. `/motor auto aus` turns the threshold
+  off; limit errors and outages still make the next stage step in.
+- **Handover and messages:** every engine keeps its own session. After a
+  switch the new engine gets the conversation so far (up to 30 messages and
+  24,000 characters). A switch is reported once in the direct chat and in
+  the WebUI, and the conversation shows a note before the first answer of
+  the other engine, also on the way back and when no stage is free.
+- **Limits per engine:** tybo keeps the state of every limit window with its
+  reset time: for Claude Code from the event stream of each run and from its
+  usage report (week, five hours, the weekly limit of a model family), for
+  Codex from the session file of each run. For OpenRouter the WebUI shows
+  credit and limit of the key. Your own script can deliver measurements with
+  `bun run limits set`; `bun run limits show` prints the state. tybo reads no
+  login token of an engine and calls no undocumented endpoint.
+- **Engine per conversation and per agent:** an agent can have its own
+  engine (WebUI, settings, "Agenten"). The order of precedence is
+  conversation (`/motor codex`), agent, default; `/motor standard` only
+  removes the choice of the conversation. The direct Anthropic API stays a
+  choice by hand and never steps in as a backup.
+- **`/motor`** shows the order of stages, why this engine answers, and state
+  and age of the measurements. New: `/motor auto an`, `/motor auto aus`,
+  `/motor pruefen` (measure again and re-evaluate blocks) and
+  `/motor werkzeuge`.
+- **In the browser:** the chat always shows the engine of the conversation
+  as a pill; its menu gives the reason and switches the engine for this
+  conversation. The section "Motor" moved from "Agenten" to the top of the
+  "Modelle" tab, with order, automatic switch, state per engine and "Jetzt
+  messen". The "Status" tab lists the tools of every engine.
+- **The same tools in Codex:** so that Codex can stand in for Claude Code,
+  tybo hands it the MCP servers Claude Code uses as parameters of each run
+  (only at permission level "Voller Zugriff", nothing is written into the
+  Codex configuration), makes the skills of Claude Code visible through
+  links under `.agents/skills/`, and adds the overview of Claude Code's
+  project notes to a new Codex session. `/motor werkzeuge`, `tybo pruefen`
+  and the "Status" tab show what each engine has and what is missing, with
+  the reason. Each part can be turned off under `engine.codex` in
+  `config/settings.json` (`mcp`, `skills`, `claudeNotes`).
+- **Side tasks during a block:** the judge of `/goal`, threads and the
+  review move to the OpenRouter fallback model while the limit windows of
+  their Claude model are blocked. Without an OpenRouter key they pause until
+  the block ends.
+
+- **Jobs on Codex, defaults from the settings:** `bun run job start --engine
+  codex` runs a background job on Codex. Without `--model` and `--effort` a
+  job now takes model and effort from `config/settings.json`
+  (`defaults.model` for Claude, `engine.codex.model` for Codex), no longer a
+  fixed default.
+- **Resume a job:** a job that was aborted or ran out of time can continue
+  in the same Claude session, with the button "Fortsetzen" at its message or
+  with `bun run job resume <id>`. Nothing resumes by itself, and the job
+  keeps its ID ("Lauf 2", "Lauf 3").
+- **Jobs can ask:** a Claude job can stop, ask you a question with answer
+  buttons and carry on with your answer; in Telegram you can also reply to
+  the question with a text. Up to five questions per job; a question
+  unanswered for 48 hours ends the job, which can then be resumed.
+- **`--zurueck`:** with this option the report of a job goes back into the
+  conversation that started it, and tybo works on with it, for example to
+  check it or to start the next step. At most three such jobs may follow
+  one another.
+- **Jobs in the browser:** a new view "Jobs" next to "Offene Fäden" lists
+  jobs that wait for you, running ones and the last 20 finished. There you
+  answer a question, resume or stop a job and read its log and report.
+
+- **Files in the installed app on iPhone and iPad:** opening or downloading a
+  file led to a page with no way back. "Herunterladen" now hands the file to
+  the share sheet, and "Öffnen" shows an HTML file in a viewer with a close
+  button. In every browser a tap on an image preview opens the image in that
+  viewer.
+
 ## 2.17.0: voice agents from recipes, a tidier memory
 
 - **Voice agents from recipes:** a voice agent is no longer assembled by hand

@@ -16,7 +16,7 @@
  */
 
 import type { spawn } from "bun";
-import { checkAborted } from "../execution-context";
+import { abortError, checkAborted } from "../execution-context";
 import { registerEngineCall, unregisterEngineCall, type EngineCallEntry, type EngineProc } from "../engines/calls";
 import { createLineReader } from "../engines/lines";
 import { superviseRun, type RunControl } from "../engines/lifecycle";
@@ -58,6 +58,8 @@ export interface ClaudeProcessSpec {
   idleTimeoutMs?: number;
   /** Schlüssel im Abbruch-Register; ohne Angabe die laufende Ausführung */
   abortKey?: string;
+  signal?: AbortSignal;
+  quiet?: boolean;
   /**
    * Zeilenweise lesen. Der Parser ruft alive() für jede gültige, vollständige
    * Zeile auf; nur das zählt als Lebenszeichen, nicht leere oder kaputte
@@ -104,6 +106,7 @@ export interface ClaudeProcessOutcome {
  */
 export async function runClaudeProcess(spec: ClaudeProcessSpec, rt: ClaudeRuntime): Promise<ClaudeProcessOutcome> {
   checkAborted();
+  if (spec.signal?.aborted) throw abortError();
   const start = () =>
     rt.spawn({
       detached: startsOwnGroup(rt.os),
@@ -164,6 +167,9 @@ export async function runClaudeProcess(spec: ClaudeProcessSpec, rt: ClaudeRuntim
       : {}),
   });
   const control = run;
+  const onAbort = () => { entry.aborted = true; control.stop("abort"); };
+  spec.signal?.addEventListener("abort", onAbort, { once: true });
+  if (spec.signal?.aborted) onAbort();
 
   const hitLimit = (kind: "total" | "idle") => {
     const at = rt.now();
@@ -183,12 +189,13 @@ export async function runClaudeProcess(spec: ClaudeProcessSpec, rt: ClaudeRuntim
   // Prozessende oder einem anderen Beenden bleibt ein Schreibfehler folgenlos:
   // die PID kann längst neu vergeben sein
   void (async () => {
+    if (control.phase !== "running") return;
     await proc.stdin.write(spec.input);
     await proc.stdin.end();
   })().catch((err) => {
     if (control.exited || control.phase !== "running") return;
     inputError = err;
-    console.error("[Claude] Prompt konnte nicht übergeben werden:", err instanceof Error ? err.message : String(err));
+    if (!spec.quiet) console.error("[Claude] Prompt konnte nicht übergeben werden:", err instanceof Error ? err.message : String(err));
     control.stop("input");
   });
 
@@ -196,6 +203,7 @@ export async function runClaudeProcess(spec: ClaudeProcessSpec, rt: ClaudeRuntim
   try {
     end = await control.done;
   } finally {
+    spec.signal?.removeEventListener("abort", onAbort);
     rt.clearTimeout(totalTimer);
     if (idleTimer !== undefined) rt.clearInterval(idleTimer);
     unregisterEngineCall(spec.abortKey, entry);

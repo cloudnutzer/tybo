@@ -6,7 +6,7 @@
  * Browser in derselben Topic-Session und Konsultationen im Browser.
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAgent, deleteAgent, getAgent, setPrompt } from "../src/agents/catalog";
@@ -25,7 +25,7 @@ import {
 } from "../src/agents/prompt-parts";
 import { resolveStreamingLimits, runStreamingTurn, type ChatTurnDeps, type TurnOptions } from "../src/lib/chat-turn";
 import type { Engine, EngineRequest, EngineResult } from "../src/lib/engines";
-import { buildPromptContext, buildResumePrompt, type PromptSources } from "../src/lib/prompt-builder";
+import { buildPromptContext, buildResumePrompt, HANDOVER_MAX_CHARS, setClaudeNotesSourceForTests, type PromptSources } from "../src/lib/prompt-builder";
 import {
   getResumableSession,
   getSessionsForKey,
@@ -41,6 +41,8 @@ import { TELEGRAM_FORMAT_RULES } from "../src/lib/telegram";
 import { QUESTION_TAG_SECTION } from "../src/lib/turn-questions";
 import { webConsultRunner } from "../src/web/bot-turn";
 import { isolateAgentCatalog } from "./catalog-fixture";
+import { notesFixture } from "./claude-notes-fixture";
+import { claudeNotesSection } from "../src/lib/engines/claude-notes";
 
 isolateAgentCatalog();
 
@@ -59,6 +61,7 @@ function fakeSources(over: Partial<PromptSources> = {}): { sources: PromptSource
     core: async () => "",
     memory: async () => "FACTS:\n- mag Tee",
     knowledge: async () => "- [howto] Drucker",
+    claudeNotes: async () => "",
     recent: async (chatId, limit, topicId) => {
       seen.recent.push({ chatId, limit, topicId });
       return [msg("user", "Hallo", minutesAgo(30)), msg("assistant", "Hi", minutesAgo(29))];
@@ -82,6 +85,189 @@ function fakeSources(over: Partial<PromptSources> = {}): { sources: PromptSource
 
 const sections = (prompt: string) => prompt.split("\n\n---\n\n");
 const heads = (prompt: string) => sections(prompt).map(s => s.split("\n")[0]);
+
+describe("Claude-Notizen im Prompt (Issue #664)", () => {
+  let home: string;
+  let notes: ReturnType<typeof notesFixture>;
+  const opts = { userMessage: "Frage", chatId: "100", agentName: "general" };
+  beforeEach(async () => {
+    home = await mkdtemp(join(tmpdir(), "tybo-notes-prompt-"));
+    setSettingsPath(join(home, "settings.json"));
+    notes = notesFixture(home);
+  });
+  afterEach(async () => {
+    setClaudeNotesSourceForTests(() => "");
+    setSettingsPath();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  test("Standard an; Einstellung aus und wieder an wirkt ohne Neustart, Fallback bleibt bytegleich", async () => {
+    let reads = 0;
+    setClaudeNotesSourceForTests(() => { reads++; return notes.section; });
+    const { claudeNotes: _, ...sources } = fakeSources().sources;
+    const normal = await buildPromptContext(opts, sources);
+    let tick = 1000;
+    for (const codex of [{}, { claudeNotes: false }, { claudeNotes: true }, {}]) {
+      await writeFile(join(home, "settings.json"), JSON.stringify({ engine: { codex } }));
+      await utimes(join(home, "settings.json"), ++tick, tick);
+      const before = reads;
+      const result = await buildPromptContext({ ...opts, engine: "codex" }, sources);
+      expect(result.fullPrompt.includes(notes.section)).toBe(codex.claudeNotes !== false);
+      expect(reads - before).toBe(codex.claudeNotes === false ? 0 : 1);
+      expect(result.fallbackContext).toBe(normal.fallbackContext);
+    }
+  });
+
+  for (const handover of [undefined, { fromLabel: "Claude Code", reason: "limit" as const, since: NOW.getTime() - 3600_000 }]) {
+    test(`Codex: fester Abschnitt vor dem ${handover ? "Übergabe-Verlauf" : "Verlauf"}, Fallback bytegleich`, async () => {
+      const { sources } = fakeSources({ claudeNotes: async () => notes.section });
+      const baseline = await buildPromptContext({ ...opts, handover }, sources);
+      const result = await buildPromptContext({ ...opts, handover, engine: "codex" }, sources);
+      const parts = sections(result.fullPrompt);
+      const index = parts.indexOf(notes.section);
+      expect(index).toBeGreaterThan(0);
+      expect(parts[index - 1]).toStartWith("## KNOWLEDGE BASE\n");
+      expect(parts[index + 1]).toStartWith("## RECENT CONVERSATION\n");
+      expect(parts.at(-1)).toBe("## USER MESSAGE\nFrage");
+      expect(result.fallbackContext).toBe(baseline.fallbackContext);
+      expect(result.fallbackContext).not.toContain(notes.index);
+    });
+  }
+  test.each([undefined, "claude", "opencode", "api"] as const)("%s: Quelle nie gelesen, Prompt bytegleich", async engine => {
+    const { sources } = fakeSources();
+    const baseline = await buildPromptContext(opts, sources);
+    let reads = 0;
+    sources.claudeNotes = async () => { reads++; return notes.section; };
+    expect(await buildPromptContext({ ...opts, engine }, sources)).toEqual(baseline);
+    expect(reads).toBe(0);
+  });
+  test("Codex ohne Notizen-Ordner: kein Abschnitt; Folgenachricht liest ihn nie", async () => {
+    const { sources } = fakeSources({ claudeNotes: async () => claudeNotesSection({ projectRoot: "/anderes-projekt", home, secrets: [] }) });
+    const result = await buildPromptContext({ ...opts, engine: "codex" }, sources);
+    expect(result.fullPrompt).not.toContain("CLAUDE CODE NOTES");
+    expect(result.fallbackContext).not.toContain("CLAUDE CODE NOTES");
+    sources.claudeNotes = async () => { throw new Error("Folgenachricht darf keine Notizen lesen"); };
+    expect(await buildResumePrompt(opts, sources)).not.toContain("CLAUDE CODE NOTES");
+  });
+  test("Teil-Quellen sind durch den Preload vom echten Heimatverzeichnis abgeschottet", async () => {
+    const { claudeNotes: _, ...sources } = fakeSources().sources;
+    const result = await buildPromptContext({ ...opts, engine: "codex" }, sources);
+    expect(result.fullPrompt).not.toContain("CLAUDE CODE NOTES");
+  });
+});
+
+describe("Übergabe-Verlauf (Issue #658)", () => {
+  const opts = { userMessage: "weiter", chatId: "100", agentName: "general", topicId: 7 };
+  const handover = { fromLabel: "Claude Code", reason: "changed" as const, since: NOW.getTime() - 60 * 60_000 };
+  const history = (count: number) => Array.from({ length: count }, (_, i) =>
+    msg(i % 2 === 0 ? "user" : "assistant", `Nachricht-${i}!`, minutesAgo(count - i)));
+  const conversation = (prompt: string) => sections(prompt).find(s => s.startsWith("## RECENT CONVERSATION\n")) ?? "";
+  function source(messages: Message[]) {
+    const limits: number[] = [];
+    const { sources } = fakeSources({ recent: async (chatId, limit, topicId) => {
+      expect([chatId, topicId]).toEqual(["100", 7]);
+      limits.push(limit);
+      return messages.slice(-limit);
+    } });
+    return { sources, limits };
+  }
+
+  test("ein Abruf mit 30 statt 10, Fallback-Kontext bleibt wortgleich", async () => {
+    const { sources, limits } = source(history(40));
+    const normal = await buildPromptContext(opts, sources);
+    const moved = await buildPromptContext({ ...opts, handover }, sources);
+    expect(limits).toEqual([10, 30]);
+    expect(moved.fallbackContext).toBe(normal.fallbackContext);
+    expect(conversation(moved.fullPrompt)).not.toContain("Nachricht-9!");
+    expect(conversation(moved.fullPrompt)).toContain("Nachricht-10!");
+    expect(conversation(moved.fullPrompt).match(/Nachricht-/g)).toHaveLength(30);
+    expect(await buildPromptContext({ ...opts, handover: undefined }, sources)).toEqual(normal);
+  });
+
+  test("erste Frage und zwei aufeinanderfolgende Nutzerbeiträge vor startedAt bleiben; alte Antwort entfällt", async () => {
+    const messages = [
+      msg("assistant", "Antwort der vorigen Session", minutesAgo(30)),
+      msg("user", "Wichtige Zahl 7319", minutesAgo(29)),
+      msg("user", "Noch eine Bedingung", minutesAgo(28)),
+      msg("assistant", "Erste Antwort", minutesAgo(27)),
+      ...history(12),
+    ];
+    const { sources } = source(messages);
+    const { fullPrompt } = await buildPromptContext({ ...opts, handover: { ...handover, since: Date.parse(minutesAgo(27)) } }, sources);
+    expect(fullPrompt).toContain("Wichtige Zahl 7319");
+    expect(fullPrompt).toContain("Noch eine Bedingung");
+    expect(fullPrompt).not.toContain("Antwort der vorigen Session");
+  });
+
+  test("erste Antwort knapp vor der Rechneruhr verliert die erste Frage nicht", async () => {
+    const { sources } = source([
+      msg("user", "Nur hier: 7319", minutesAgo(20)),
+      msg("assistant", "Antwort", minutesAgo(19)), ...history(12),
+    ]);
+    const { fullPrompt } = await buildPromptContext({ ...opts, handover: { ...handover, since: Date.parse(minutesAgo(19)) + 2_000 } }, sources);
+    expect(fullPrompt).toContain("Nur hier: 7319");
+  });
+
+  test("kurze alte Session: mindestens letzte zehn, davor bisherige Kürzung", async () => {
+    const messages = history(14);
+    messages[11]!.content = "a".repeat(1000);
+    const { sources } = source(messages);
+    const { fullPrompt } = await buildPromptContext({ ...opts, handover: { ...handover, since: Date.parse(minutesAgo(1)) } }, sources);
+    const recent = conversation(fullPrompt);
+    expect(recent).toContain("Nachricht-4!");
+    expect(recent).not.toContain("Nachricht-3!");
+    expect(recent).toContain("a".repeat(800) + "...");
+    expect(recent).not.toContain("a".repeat(801));
+  });
+
+  test("jüngste vier bis 6000, ältere Antworten bis 800 und Nutzerbeiträge bis 20000", async () => {
+    const messages = history(8);
+    messages[0]!.content = "u".repeat(20_100);
+    messages[1]!.content = "a".repeat(900);
+    for (let i = 4; i < 8; i++) messages[i]!.content = String(i).repeat(1000);
+    const { sources } = source(messages);
+    const { fullPrompt } = await buildPromptContext({ ...opts, handover }, sources);
+    const recent = conversation(fullPrompt);
+    // Die älteste lange Nachricht passt nicht mehr ins Budget, die übrigen bleiben.
+    expect(recent).not.toContain("u".repeat(100));
+    expect(recent).toContain("a".repeat(800) + "...");
+    for (let i = 4; i < 8; i++) expect(recent).toContain(String(i).repeat(1000));
+    const short = source([msg("user", "u".repeat(20_100), minutesAgo(8)), ...history(5)]);
+    expect(conversation((await buildPromptContext({ ...opts, handover }, short.sources)).fullPrompt)).toContain("u".repeat(20_000) + "...");
+  });
+
+  test("24000 Zeichen samt Zeiten und Sprechern: älteste zuerst weg, jüngste gekappt", async () => {
+    const messages = history(8).map((message, i) => ({ ...message, content: String(i).repeat(7000) }));
+    const { sources } = source(messages);
+    const { fullPrompt } = await buildPromptContext({ ...opts, handover }, sources);
+    const recent = conversation(fullPrompt).split("\n").filter(line => line.startsWith("[")).join("\n");
+    expect(recent.length).toBeLessThanOrEqual(HANDOVER_MAX_CHARS);
+    expect(recent).not.toContain("4".repeat(100));
+    for (const i of [5, 6, 7]) {
+      expect(recent).toContain(String(i).repeat(5997) + "...");
+      expect(recent).not.toContain(String(i).repeat(5998));
+    }
+  });
+
+  test("kein passender Zeitpunkt oder kein Speicher: normaler Prompt ohne Übergabe", async () => {
+    for (const messages of [history(20), []]) {
+      const { sources } = source(messages);
+      const normal = await buildPromptContext(opts, sources);
+      const moved = await buildPromptContext({ ...opts, handover: { ...handover, since: NOW.getTime() + 60_000 } }, sources);
+      expect(moved).toEqual(normal);
+    }
+  });
+
+  test.each([
+    ["limit", "Limit erreicht"], ["outage", "Ausfall"],
+    ["user", "Wahl des Nutzers"], ["changed", "Einstellung oder Verfügbarkeit geändert"],
+  ] as const)("Übergabezeile mit Grund %s vor dem Verlauf", async (reason, label) => {
+    const { sources } = source(history(12));
+    const { fullPrompt, fallbackContext } = await buildPromptContext({ ...opts, handover: { ...handover, reason } }, sources);
+    expect(conversation(fullPrompt)).toStartWith(`## RECENT CONVERSATION\nDu übernimmst dieses Gespräch von Claude Code. Der Wechsel hat einen technischen Grund (${label}); für den Nutzer läuft das Gespräch weiter. Unten steht der Verlauf seit Beginn der Session. Knüpfe daran an, ohne den Wechsel zu erklären.\n[`);
+    expect(fallbackContext).not.toContain("Du übernimmst");
+  });
+});
 
 describe("fester Kern (Issue #522)", () => {
   const HEADING = "## USER CORE (confirmed by the user)";
@@ -121,6 +307,17 @@ describe("fester Kern (Issue #522)", () => {
 });
 
 describe("frischer Prompt", () => {
+  test("ohne Motorwechsel bleiben voller Prompt, Fallback und Resume bytegleich zum Stand vor #658", async () => {
+    // Gegen buildPromptContext/buildResumePrompt des Basis-Branches webui ermittelt.
+    const { sources } = fakeSources();
+    const full = await buildPromptContext({ userMessage: "Frage?", chatId: "100", agentName: "general", topicId: 7 }, sources);
+    const resume = await buildResumePrompt({ userMessage: "weiter", chatId: "100", sinceMs: NOW.getTime() - 3_600_000, channel: "web" }, sources);
+    const hash = (text: string) => new Bun.CryptoHasher("sha256").update(text).digest("hex");
+    expect(hash(full.fullPrompt)).toBe("949ebd4f47b31b5c4fe510657be772ba57710e3798a93449e6d1289c02163999");
+    expect(hash(full.fallbackContext)).toBe("23242ba5ecd4c7c18c25ee98f615fc7d39289f935b500c302ce3b43f5d3157fd");
+    expect(hash(resume)).toBe("5e6e5d9400d993f55b76bfb840569e82ce448a26a9b50896baab750b0dfb2dde");
+  });
+
   test("Reihenfolge der Abschnitte, Kanal Telegram ohne Angabe", async () => {
     const { sources } = fakeSources();
     const { fullPrompt } = await buildPromptContext({ userMessage: "Frage?", chatId: "100", agentName: "general", topicId: 7 }, sources);

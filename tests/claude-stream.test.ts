@@ -4,6 +4,7 @@
  * Eigener Aufruf: bun test --preload ./tests/preload-env.ts tests/claude-stream.test.ts
  */
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   finishStreamReading,
   firstTextSnippet,
@@ -334,6 +335,9 @@ describe("Zustandsübergang", () => {
     tool(undefined, "Bash", { command: "ls" }),
     text(undefined, ANSWER),
     text("m3", AFTER_HOOK),
+    { type: "rate_limit_event", rate_limit_info: { rateLimitType: "five_hour", utilization: 0.42 } },
+    { type: "rate_limit_event", rate_limit_info: { rateLimitType: "seven_day", utilization: 0.91 } },
+    { type: "rate_limit_event", rate_limit_info: { rateLimitType: "seven_day", utilization: 0.92 } },
     result(AFTER_HOOK, { total_cost_usd: 0.1 }),
   ];
 
@@ -372,6 +376,142 @@ describe("Zustandsübergang", () => {
     const b = readStreamEvent(middle, text("m9", ANSWER), 5000);
     expect(a).toEqual(b);
     expect(finishStreamReading(middle).lastText).toBe("Ich schaue zuerst in die Konfiguration und dann in die Logs.");
+  });
+});
+
+describe("Limit-Messwerte", () => {
+  const at = Date.parse("2026-01-02T12:00:00.000Z");
+  const reset = "2026-11-22T15:00:00.000Z";
+  const event = (rate_limit_info: unknown): Event => ({ type: "rate_limit_event", rate_limit_info });
+  const known = { status: "allowed_warning", rateLimitType: "seven_day", utilization: 0.91, resetsAt: 1795359600 };
+  const read = (info: unknown) => readStream(lines([event(info)], [at])).outcome.rateLimit;
+
+  test("Vorlage: 6 Prozent, Reset in UTC, Quelle stream, Messzeit der Zeile, Antwort unverändert", () => {
+    const fixture = readFileSync(new URL("./fixtures/claude-rate-limit-stream.jsonl", import.meta.url), "utf8").trim().split("\n");
+    const run = readStream(fixture.map((line, i) => ({ line, at: at + i * 1000 })));
+    expect(run.activeLines).toBe(4);
+    expect(run.signals).toEqual([]);
+    expect(run.outcome).toMatchObject({ text: "ok", costUsd: 0.005, signal: { is_error: false }, rateLimit: {
+      status: "allowed", rateLimitType: "seven_day", resetsAt: reset,
+      overageStatus: "rejected", isUsingOverage: false,
+      windows: [{ id: "weekly_all", percent: 6, resetsAt: reset, measuredAt: "2026-01-02T12:00:02.000Z", source: "stream" }],
+    } });
+    expect(run.outcome.rateLimit).not.toHaveProperty("overageDisabledReason");
+  });
+
+  // Die folgenden Ereignisse sind aus dem dokumentierten Format gebaut,
+  // keine Mitschnitte eines echten Laufs.
+  test("ohne unifiedWindows kommen 91 Prozent aus der obersten Ebene", () => {
+    expect(read(known)).toEqual({ status: "allowed_warning", rateLimitType: "seven_day", resetsAt: reset,
+      windows: [{ id: "weekly_all", percent: 91, resetsAt: reset, measuredAt: new Date(at).toISOString(), source: "stream" }],
+    });
+  });
+
+  test("fünf Stunden neben der Woche, interne Fenster haben Vorrang", () => {
+    const rate = read({ ...known, unifiedWindows: {
+      five_hour: { utilization: 0.42, resetsAt: 1794790800, status: "allowed" },
+      seven_day: { utilization: 0.06, resetsAt: 1795359600, status: "allowed" },
+    } });
+    expect(rate?.windows).toEqual([
+      { id: "session", percent: 42, resetsAt: "2026-11-16T01:00:00.000Z", measuredAt: new Date(at).toISOString(), source: "stream" },
+      { id: "weekly_all", percent: 6, resetsAt: reset, measuredAt: new Date(at).toISOString(), source: "stream" },
+    ]);
+  });
+
+  test("Teil-Limits: Opus und Sonnet, Reset darf fehlen", () => {
+    for (const family of ["opus", "sonnet"]) {
+      expect(read({ rateLimitType: `seven_day_${family}`, utilization: 0.5 })?.windows).toEqual([
+        { id: `weekly_scoped:${family}`, percent: 50, measuredAt: new Date(at).toISOString(), source: "stream" },
+      ]);
+    }
+  });
+
+  test("Arten ohne Zuordnung behalten die Kopffelder, auch Reset und Fehler ohne Prozentfenster", () => {
+    for (const rateLimitType of ["overage", "seven_day_overage_included", "unbekannt"]) {
+      expect(read({ ...known, rateLimitType, errorCode: "credits_required", overageStatus: "rejected", isUsingOverage: true }))
+        .toEqual({ status: "allowed_warning", rateLimitType, resetsAt: reset,
+          errorCode: "credits_required", overageStatus: "rejected", isUsingOverage: true, windows: [] });
+    }
+    const { utilization: _, ...withoutPercent } = known;
+    expect(read(withoutPercent)).toEqual({ status: "allowed_warning", rateLimitType: "seven_day", resetsAt: reset, windows: [] });
+  });
+
+  test("Rundung und obere Begrenzung nur im Aufrufer der Ablage", () => {
+    for (const [utilization, percent] of [[0, 0], [0.0649, 6], [0.065, 7], [1, 100], [1.5, 100], [Number.MAX_VALUE, 100]]) {
+      expect(read({ ...known, utilization })?.windows[0]?.percent).toBe(percent);
+    }
+  });
+
+  test("kaputte oberste Ebene verändert weder Zustand noch bisherige Messungen", () => {
+    const good = frozen(readStreamEvent(startStreamReading(), event(known), at).reading);
+    for (const info of [undefined, null, "Text", [], {}, { ...known, utilization: "0.5" },
+      { ...known, utilization: -1 }, { ...known, utilization: NaN }, { ...known, utilization: Infinity },
+      { ...known, resetsAt: "1795359600" }, { ...known, resetsAt: -1 }, { ...known, resetsAt: 1e99 }]) {
+      expect(readStreamEvent(startStreamReading(), event(info), at).reading.rateLimit?.windows ?? []).toEqual([]);
+      expect(readStreamEvent(good, event(info), at).reading).toBe(good);
+    }
+  });
+
+  test("kaputte einzelne interne Fenster werden verworfen, gültige bleiben", () => {
+    for (const broken of [null, "Text", { utilization: "0.5" }, { utilization: -1 },
+      { utilization: NaN }, { utilization: Infinity }, { utilization: 0.5, resetsAt: "1795359600" },
+      { utilization: 0.5, resetsAt: -1 }, { utilization: 0.5, resetsAt: 1e99 }]) {
+      const rate = read({ ...known, unifiedWindows: { seven_day: broken, five_hour: { utilization: 0.42 } } });
+      expect(rate?.windows.map(w => [w.id, w.percent])).toEqual([["session", 42]]);
+    }
+  });
+
+  test("unifiedWindows ohne Objekt nutzt die oberste Ebene; leeres oder unbekanntes Objekt bleibt leer", () => {
+    for (const unifiedWindows of [undefined, null, "Text", 1, []]) {
+      expect(read({ ...known, unifiedWindows })?.windows[0]?.percent).toBe(91);
+    }
+    for (const unifiedWindows of [{}, { overage: { utilization: 0.9 } }, { seven_day: { utilization: "0.5" } }]) {
+      expect(read({ ...known, unifiedWindows })?.windows).toEqual([]);
+    }
+  });
+
+  test("gleiche Art: letzte Messung; verschiedene Arten: beide Fenster, letzte Kopffelder", () => {
+    const events = [event({ ...known, rateLimitType: "five_hour", utilization: 0.42, isUsingOverage: false }),
+      event(known), event({ rateLimitType: "seven_day", utilization: 0.92, status: "rejected", errorCode: "limit" })];
+    const outcome = readStream(lines(events, [at, at + 1000, at + 2000])).outcome;
+    expect(outcome.rateLimit).toEqual({ rateLimitType: "seven_day", status: "rejected", errorCode: "limit", windows: [
+      { id: "session", percent: 42, resetsAt: reset, measuredAt: new Date(at).toISOString(), source: "stream" },
+      { id: "weekly_all", percent: 92, measuredAt: new Date(at + 2000).toISOString(), source: "stream" },
+    ] });
+    expect(readStream(lines([...events, event({ rateLimitType: "overage" })])).outcome.rateLimit?.windows).toHaveLength(2);
+  });
+
+  test("ohne Ereignis kein neues Ergebnisfeld, unbrauchbare Uhrzeit kein Wurf", () => {
+    expect(readStream(lines([result("ok")])).outcome).not.toHaveProperty("rateLimit");
+    for (const at of [NaN, Infinity, 1e99]) {
+      expect(readStreamEvent(startStreamReading(), event(known), at).reading).not.toHaveProperty("rateLimit");
+    }
+  });
+});
+
+describe("Verbrauchsbericht", () => {
+  test("letztes Objekt aus assistant, auch ohne Nachrichtenblöcke; übriges Ergebnis unverändert", () => {
+    const first = frozen({ rate_limits: { limits: [] } });
+    const last = frozen({ rate_limits: { limits: [{ kind: "session", percent: 21 }] } });
+    const events = [init(), text("m1", ANSWER), result(ANSWER, { total_cost_usd: 0 })];
+    const before = readStream(lines(events)).outcome;
+    const run = readStream(lines([
+      ...events, frozen({ type: "assistant", usage_report: first }),
+      frozen({ type: "assistant", usage_report: last }),
+      { type: "result", ...result(ANSWER), usage_report: first },
+    ]));
+    expect(run.outcome).toEqual({ ...before, usageReport: last });
+  });
+
+  test("fehlend, null, Text und Array übergehen; bisherigen Bericht behalten", () => {
+    const report = frozen({ rate_limits: { limits: null } });
+    const reading = frozen(readStreamEvent(startStreamReading(), { type: "assistant", usage_report: report }, 0).reading);
+    for (const usage_report of [undefined, null, "Bericht", 1, []]) {
+      const event = frozen({ type: "assistant", usage_report });
+      expect(finishStreamReading(readStreamEvent(startStreamReading(), event, 1).reading)).not.toHaveProperty("usageReport");
+      expect(readStreamEvent(reading, event, 1).reading).toBe(reading);
+    }
+    expect(readStream(lines(["{kaputt"])).outcome).not.toHaveProperty("usageReport");
   });
 });
 

@@ -107,6 +107,7 @@ export const CHOICE_SOURCES: Record<ChoiceKind, string> = {
   secret: "gedaechtnis",
   // Sprachagenten (Issue #492), wie VOICE_AGENT_SOURCE in voice-agents/manage.ts
   sprachagent: "sprachagent",
+  job: "job",
 };
 
 const VIA_TEXT: Record<ChoiceChannel, string> = {
@@ -371,6 +372,8 @@ export interface TelegramChoicesDeps {
   send?: (input: SendAndRecordInput) => Promise<SendAndRecordResult>;
   /** Telegram eingerichtet? In bot.ts telegramConfigured (Issue #227); ohne Angabe ja */
   telegram?: () => boolean;
+  /** Aktuelle Auskunft bei einem alten Knopf, ohne den Entscheidungshandler erneut aufzurufen. */
+  staleText?(choice: Choice): Promise<string | undefined>;
   log?: Log;
 }
 
@@ -467,17 +470,22 @@ export function createTelegramChoices(deps: TelegramChoicesDeps): TelegramChoice
       await answer("Gerade nicht möglich, bitte gleich nochmal");
       return;
     }
+    const staleAnswer = async (choice: Choice, fallback: string) => {
+      let text: string | undefined;
+      try { text = await deps.staleText?.(choice); } catch { /* Standardantwort bleibt verfügbar. */ }
+      await answer(clip(text ?? fallback, CALLBACK_ANSWER_MAX));
+    };
     switch (outcome.status) {
       case "decided":
         // Nachgezogen hat der Zuhörer
         await answer(decidedAnswer(outcome.choice));
         return;
       case "already":
-        await answer(alreadyText(outcome.choice));
+        await staleAnswer(outcome.choice, alreadyText(outcome.choice));
         await stripClicked();
         return;
       case "expired":
-        await answer("Abgelaufen");
+        await staleAnswer(current, "Abgelaufen");
         await stripClicked();
         return;
       case "unknown":

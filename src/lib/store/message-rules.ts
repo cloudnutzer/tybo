@@ -33,6 +33,17 @@ export function isDisplayOnly(metadata: unknown): boolean {
   return (metadata as { display_only?: unknown }).display_only === true;
 }
 
+/** Interne Job-Eingabe: Kontext beim Motorwechsel, aber keine Nutzeraussage oder zweite Browserblase. */
+export function isJobReport(metadata: unknown): boolean {
+  if (!metadata || typeof metadata !== "object") return false;
+  const report = (metadata as { job_report?: unknown }).job_report;
+  return report !== null && typeof report === "object";
+}
+
+export function withoutJobReports<T extends { metadata?: unknown }>(rows: T[]): T[] {
+  return rows.filter(row => !isJobReport(row.metadata));
+}
+
 /** Wirft Meldungen aus einer Trefferliste, als Sicherung nach der Abfrage */
 export function withoutDisplayOnly<T extends { metadata?: unknown }>(rows: T[]): T[] {
   return rows.filter(row => !isDisplayOnly(row?.metadata));

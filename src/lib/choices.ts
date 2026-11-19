@@ -43,7 +43,7 @@ import { atomicWriteFile } from "./atomic-file";
 // Datenmodell
 // ---------------------------------------------------------------------------
 
-export const CHOICE_KINDS = ["tool", "review", "goal", "topicmap", "routine", "thread", "memory", "reminder", "proactive", "ask", "call", "cleanup", "core", "secret", "sprachagent"] as const;
+export const CHOICE_KINDS = ["tool", "review", "goal", "topicmap", "routine", "thread", "memory", "reminder", "proactive", "ask", "call", "cleanup", "core", "secret", "sprachagent", "job"] as const;
 export type ChoiceKind = (typeof CHOICE_KINDS)[number];
 
 export const CHOICE_CHANNELS = ["telegram", "web", "terminal"] as const;

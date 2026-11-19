@@ -682,7 +682,8 @@ body.app {
 /*
  * Motor (Issue #126): Zustand als Pille mit Haarlinie wie die Stopp-Notiz,
  * ohne Punkt und ohne Fläche, damit sie sich vom Agent-Chip abhebt.
- * In der Kopfzeile nur bei abweichendem oder Nicht-Claude-Motor.
+ * Immer die nächste Stufe; Sperren und Pausen bleiben neutral.
+ * Am Handy steht das Modell im title und der Live-Zeile, Name und Zusatz bleiben sichtbar.
  */
 .engine-pill {
   display: inline-flex;
@@ -698,6 +699,36 @@ body.app {
   white-space: nowrap;
 }
 .engine-pill[hidden] { display: none; }
+.engine-pill-compact { display: none; }
+.chat-badges { display: flex; align-items: center; gap: 0.5rem; flex-shrink: 0; }
+
+/* Nur der Knopf im Chat, nicht die Motor-Pillen in den Einstellungen. */
+.topbar button.engine-pill { position: relative; background: transparent; cursor: pointer; }
+.topbar button.engine-pill::after { content: ""; position: absolute; inset: calc((100% - 2.75rem) / 2) 0; min-height: 2.75rem; }
+.topbar button.engine-pill:hover { background: var(--hover); color: var(--ink); }
+.chat-badges { position: relative; }
+.engine-menu { width: 22rem; right: 0; max-height: calc(100dvh - 9rem); overflow-y: auto; }
+.engine-menu-summary { margin: 0; padding: 0.65rem; }
+.engine-menu-link { display: flex; align-items: center; min-height: 2.75rem; padding: 0.5rem 0.65rem; }
+.engine-menu-choice { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0.15rem 0.65rem; width: 100%; min-height: 2.75rem; padding: 0.5rem 0.65rem; text-align: left; align-items: center; }
+.engine-menu-choice[aria-checked="true"] { background: var(--hover); }
+.engine-menu-choice[aria-checked="true"] .engine-menu-name { font-weight: 600; }
+.engine-menu-choice[aria-checked="true"] .engine-menu-name::after { content: " ✓"; }
+.engine-menu-choice[aria-disabled="true"] { color: var(--muted); cursor: default; }
+.engine-menu-state { color: var(--muted); font-size: 0.75rem; font-variant-numeric: tabular-nums; }
+.engine-menu-note { grid-column: 1 / -1; color: var(--muted); font-size: 0.75rem; overflow-wrap: anywhere; }
+.engine-menu-link { border-top: 1px solid var(--line); border-radius: 0; }
+
+@media (max-width: 40rem) {
+  .topbar { display: grid; grid-template-columns: 2.5rem minmax(4rem, 1fr) 2.75rem; }
+  .topbar > #menu { grid-column: 1; grid-row: 1; }
+  .topbar > .chat-title, .topbar > .title-input { grid-column: 2; grid-row: 1; }
+  .topbar > .topbar-menu { grid-column: 3; grid-row: 1; }
+  .chat-badges { grid-column: 1 / -1; grid-row: 2; justify-content: flex-end; padding-bottom: 0.25rem; }
+  .chat-badges:has(.agent-chip:empty):has(.engine-pill[hidden]) { display: none; }
+  .topbar .engine-pill-full { display: none; }
+  .topbar .engine-pill-compact { display: inline; }
+}
 
 .connection {
   margin: 0;
@@ -961,6 +992,67 @@ body.app {
 /* Name, Öffnen und Herunterladen passen auf dem Handy nicht in eine Zeile */
 .file-card:has(.file-open) { flex-wrap: wrap; }
 .file-card:has(.file-open) .file-info { flex-basis: 8rem; }
+/* Vorschau als Knopf: öffnet das Bild im Betrachter (Issue 708) */
+.file-zoom { display: block; align-self: flex-start; max-width: 100%; border-radius: 0.6rem; cursor: zoom-in; }
+/* Sichern in der installierten App auf dem iPhone: Knopf beim Laden, Hinweis oder Fehler unter der Karte */
+.file-download[aria-busy="true"] { opacity: 0.6; cursor: default; }
+.file-note { margin: 0; color: var(--muted); font-size: 0.8125rem; overflow-wrap: anywhere; }
+.file-note-error { color: var(--error); }
+
+/*
+ * Betrachter (Issue 708): Bild oder HTML-Datei über der ganzen Seite, ein
+ * <dialog>. Fläche bg, Kopfzeile mit Namen und Schließen an einer Haarlinie,
+ * kein Schatten, keine Bewegung. Schließen ist immer 2.75rem groß und rückt
+ * mit den sicheren Rändern unter Notch und Statusleiste hervor.
+ */
+.viewer {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  border: 0;
+  background: var(--bg);
+  color: var(--ink);
+  overflow: hidden;
+}
+
+/* Nur geöffnet: Ein geschlossenes <dialog> bleibt über die Regel des Browsers unsichtbar */
+.viewer[open] { display: flex; flex-direction: column; }
+
+.viewer-bar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 0.75rem 0.5rem 1rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.viewer-title { flex: 1; min-width: 0; overflow: hidden; font-size: 0.9375rem; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+
+.viewer-close {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 2.75rem;
+  height: 2.75rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--raised);
+  color: var(--ink);
+}
+
+.viewer-close:hover { background: var(--hover); }
+/* Ein Tipp neben das Bild schließt */
+.viewer-stage { display: flex; flex: 1; align-items: center; justify-content: center; min-width: 0; min-height: 0; padding: 0.75rem; cursor: zoom-out; }
+.viewer-image { max-width: 100%; max-height: 100%; border-radius: 0.3rem; object-fit: contain; cursor: default; }
+.viewer-stage:has(.viewer-page) { padding: 0; cursor: default; }
+/* HTML-Datei: weißes Blatt wie in einem eigenen Tab, auch im Dunkelmodus der App */
+.viewer-page { width: 100%; height: 100%; border: 0; background: white; color-scheme: light; }
 
 /*
  * Rückfrage-Knöpfe (M10, Entscheidung 0017): eine Reihe leiser Knöpfe unter der
@@ -980,6 +1072,7 @@ body.app {
 .msg-attachments { display: flex; flex-direction: column; align-items: flex-end; gap: 0.4rem; width: min(85%, 28rem); }
 .msg-attachments .file { width: 100%; align-items: flex-end; }
 .msg-attachments .file-card { width: 100%; }
+.msg-attachments .file-zoom { align-self: flex-end; }
 
 .msg-error .bubble {
   width: 100%;
@@ -1515,7 +1608,12 @@ body.app {
 /* Offene Fäden (Issue #293): dieselbe Form wie die Einstellungen */
 .main[data-view="threads"] > :not(.threads-view) { display: none !important; }
 
+.main[data-view="jobs"] > :not(.jobs-view) { display: none !important; }
+.main[data-view="pipelines"] > :not(.pipelines-view) { display: none !important; }
+
 .settings,
+.jobs-view,
+.pipelines-view,
 .threads-view {
   flex: 1;
   min-height: 0;
@@ -1699,7 +1797,56 @@ body.app {
 .settings-engines .settings-key-name { font-family: inherit; font-size: 0.9375rem; }
 .settings-engines .settings-key-state { flex-shrink: 1; text-align: right; overflow-wrap: anywhere; }
 .settings-engines li[data-set="false"] .settings-key-state { color: var(--muted); }
+/* Werkzeuge nur in der Statusliste (Issue #667), unabhängig von der Bereitschaft. */
+.settings-status-engines > .settings-engine-with-tools { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0.25rem; padding: 0.75rem 0; }
+.settings-status-engines .settings-engine-heading { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 0.25rem 0.75rem; }
+.settings-status-engines .settings-engine-tools { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.25rem 0.75rem; }
+.settings-status-engines .settings-engine-tools-label { color: var(--muted); }
+.settings-status-engines .settings-engine-tools-summary { color: var(--ink); text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.settings-status-engines .settings-engine-details { min-width: 0; overflow-wrap: anywhere; }
+.settings-status-engines .settings-engine-details > summary {
+  min-height: 2.75rem;
+  padding: 0.5rem 0.25rem;
+  border-radius: 0.6rem;
+  color: var(--muted);
+  cursor: pointer;
+  list-style-position: inside;
+}
+.settings-status-engines .settings-engine-details > summary::marker { color: var(--muted); }
+.settings-status-engines .settings-engine-details > summary:hover { color: var(--ink); background: var(--hover); }
+.settings-status-engines .settings-engine-details > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.settings-status-engines .settings-engine-tool-items { list-style: none; margin: 0.25rem 0 0.5rem; padding: 0; display: grid; gap: 0.5rem; }
+.settings-status-engines .settings-engine-tool-items > li { display: block; min-width: 0; padding: 0; border: 0; color: var(--ink); overflow-wrap: anywhere; }
+.settings-status-engines .settings-engine-tool-name { display: block; font-weight: 500; }
+.settings-engine-tools-note { overflow-wrap: anywhere; }
+@media (max-width: 40rem) {
+  .settings-status-engines .settings-engine-tools { grid-template-columns: minmax(0, 1fr); }
+  .settings-status-engines .settings-engine-tools-summary { text-align: left; }
+}
 /* Abweichende Gespräche: Name und Motor links, „Auf Standard" rechts; am Handy umbrechend */
+/* Motor-Reihenfolge: Zustände in normaler Schrift, ohne Warnfarbe oder Bewegung. */
+.settings-motor-order { margin: 0.5rem 0; padding-left: 1.75rem; font-size: 0.9375rem; }
+.settings-motor-order > li { padding: 0.75rem 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.settings-motor-order > li::marker { color: var(--muted); font-variant-numeric: tabular-nums; }
+.settings-motor-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0.5rem 1rem; align-items: start; }
+.settings-motor-details { display: grid; gap: 0.25rem; min-width: 0; }
+.settings-motor-name { font-weight: 600; }
+.settings-motor-model { color: var(--muted); overflow-wrap: anywhere; }
+.settings-motor-state { color: var(--ink); text-align: right; font-size: 0.875rem; font-variant-numeric: tabular-nums; }
+.settings-motor-actions { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.25rem; }
+.settings-motor-actions .quiet-button { width: auto; }
+.settings-motor-order button, .settings-motor-add button { min-width: 2.75rem; min-height: 2.75rem; }
+.settings-motor-actions [aria-disabled="true"] { opacity: 0.6; cursor: default; }
+.settings-motor-usage { list-style: none; padding: 0; margin: 0; display: grid; gap: 0.75rem; }
+.settings-motor-usage h5 { margin: 0; }
+.settings-motor-reading { margin: 0.25rem 0 0; font-size: 0.875rem; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.settings-motor-fallback button { text-align: left; white-space: normal; overflow-wrap: anywhere; }
+.settings-engine-auto .settings-switch { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (max-width: 40rem) {
+  .settings-motor-row { grid-template-columns: minmax(0, 1fr); }
+  .settings-motor-state { text-align: left; }
+}
+
 .settings-engine-overrides { list-style: none; margin: 0; padding: 0; display: grid; gap: 1px; font-size: 0.9375rem; }
 .settings-engine-overrides li {
   display: flex;
@@ -2336,4 +2483,44 @@ body.voice-agents-page {
 @media (max-width: 40rem) {
   .voice-agent-controls .quiet-button,
   .voice-agent-switch select { min-height: 2.75rem; }
+}
+
+/* Jobs (Issue #626): dieselbe Lesespalte, Haarlinien und Knöpfe wie die Fäden. */
+#jobs-count[data-waiting="true"], .job-state[data-waiting="true"] { background: var(--active); color: var(--accent); }
+#pipelines-count[data-waiting="true"] { background: var(--active); color: var(--accent); }
+.job-group + .job-group { margin-top: 1.5rem; }
+.job-group > .group-label { margin: 0 0 0.25rem; }
+.job-item { display: grid; gap: 0.5rem; min-width: 0; padding: 0.75rem 0; border-bottom: 1px solid var(--line); }
+.job-item p { margin: 0; overflow-wrap: anywhere; }
+.job-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem; min-width: 0; }
+.job-title { margin: 0; font-size: 0.9375rem; font-weight: 600; overflow-wrap: anywhere; }
+.job-state { padding: 0.15rem 0.5rem; border-radius: 999px; background: var(--hover); color: var(--muted); font-size: 0.75rem; }
+.job-actions { margin: 0; gap: 0.25rem 0.5rem; }
+.job-actions .quiet-button, .job-file > .quiet-button { width: auto; }
+.job-question { min-width: 0; }
+.job-question > summary { width: fit-content; max-width: 100%; cursor: pointer; color: var(--accent); }
+.job-question[open] > summary { margin-bottom: 0.5rem; }
+.job-question > .thread-context { margin-top: 0.25rem; }
+.job-file { min-width: 0; padding: 0.75rem; background: var(--code); border-radius: 0.6rem; }
+.job-log { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24rem; overflow: auto; font-size: 0.8125rem; }
+.job-file .content { min-width: 0; overflow-wrap: anywhere; }
+.job-file .content pre { overflow: auto; }
+/* Pipelines teilen die Listenbausteine der Jobs, ohne zusätzliche Farben. */
+.pipeline-stopped, #pipelines-status[data-stale="true"] { padding: 0.75rem; background: var(--hover); border-radius: 0.6rem; color: var(--ink); font-size: 0.8125rem; }
+.pipeline-stopped { margin: 0 0 1rem; }
+.pipeline-issue { font-size: 0.875rem; }
+.pipeline-issue a { color: var(--accent); text-underline-offset: 0.15em; }
+.pipeline-preview { display: block; color: var(--muted); font-size: 0.8125rem; white-space: normal; }
+.pipeline-question > summary, .pipeline-events > summary, .pipeline-resting > summary { display: list-item; list-style-position: inside; }
+.pipeline-question[open] .pipeline-preview { display: none; }
+.pipeline-question-text, .pipeline-reason { white-space: pre-wrap; }
+.pipeline-events > summary, .pipeline-resting > summary { width: fit-content; cursor: pointer; }
+.pipeline-events > summary { font-size: 0.8125rem; }
+.pipeline-event-list { list-style: none; margin: 0.25rem 0; padding: 0; color: var(--muted); font-size: 0.75rem; }
+.pipeline-event-list li { display: flex; flex-wrap: wrap; gap: 0.25rem 0.75rem; padding: 0.15rem 0; }
+.pipeline-event-list time { font-variant-numeric: tabular-nums; }
+.pipeline-resting > summary { font-weight: 600; }
+@media (max-width: 56rem) {
+  .job-actions .quiet-button, .job-question > summary, .job-file > .quiet-button { min-height: 2.75rem; }
+  .pipeline-events > summary, .pipeline-resting > summary { min-height: 2.75rem; }
 }

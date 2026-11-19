@@ -291,3 +291,16 @@ describe("Codex-Prozess bekommt diese Umgebung", () => {
     }
   });
 });
+
+
+test("Werkzeug-Bestand bekommt dieselbe Codex-Umgebung ohne Logausgabe", () => {
+  setMcpReaderForTests(() => new Set());
+  const lines: string[] = [];
+  setSubprocessEnvLoggerForTests(line => lines.push(line));
+  try {
+    const quiet = codexEnv(project, undefined, { quiet: true });
+    expect(lines).toEqual([]);
+    expect(quiet).toEqual(codexEnv(project));
+    expect(lines).toHaveLength(1);
+  } finally { setSubprocessEnvLoggerForTests(null); setMcpReaderForTests(null); }
+});

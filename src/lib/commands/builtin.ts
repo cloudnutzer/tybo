@@ -9,9 +9,14 @@
  * „credit" ohne Schrägstrich) und /plan zeigen seit Issue #346 in allen
  * Kanälen den Stand aus src/lib/spend/credit.ts.
  */
+import { motorUnscoped, normalizeMotorArgs } from "./motor-args";
+import { engineLabel, SELECTABLE_ENGINES } from "../engine-choice";
 
+import { limitMotorText, motorNotReadyNote, motorStageStateText, motorStatusText, MOTOR_TEXT as MOTOR_STATUS_TEXT } from "../motor-text";
 import { BRAND } from "../../brand";
 import { BOARD_TEXT } from "../board-meeting";
+import { noteHandover } from "../session-manager";
+import { hasToolGaps, motorToolsText, MOTOR_TOOL_TEXT, toolSummary, type MotorToolsEntry } from "../engines/tool-display";
 import { formatRoutineHistory, formatRoutineList } from "../routines/format";
 import { routineLogLine } from "../routines/log";
 import { cancelReminder, cancelText, formatReminderList, listOpenReminders, parseReminderRef, REMINDERS_TEXT } from "../schedule/overview";
@@ -69,7 +74,8 @@ export const HELP_TEXT = `🤖 **${BRAND.name} Spickzettel**
 
 **Sessions & Routinen:**
 /new - Gespraech in diesem Topic frisch starten
-/motor - Motor dieses Gespraechs zeigen · /motor codex · /motor opencode · /motor claude · /motor standard
+/motor - Motor und Stand dieses Gespraechs · /motor werkzeuge · /motor codex · /motor opencode · /motor claude · /motor api · /motor standard
+/motor pruefen - neu messen · /motor auto an · /motor auto aus
 /routine [Hinweis] - den hier gezeigten Ablauf als Routine einfrieren
 /routinen - zeitgesteuerte Dienste: Zeitplan, Status, letzter und naechster Lauf
 /routinen <name> - letzte 20 Laeufe mit Knoepfen: Jetzt testen, Pausieren, Fortsetzen
@@ -563,69 +569,70 @@ async function runLearn(ctx: CommandContext): Promise<void> {
 // /motor (Issue #125, Entscheidung 0018): Motor pro Gespräch
 // ---------------------------------------------------------------------------
 
-export const MOTOR_TEXT = {
-  unavailable: "Die Motor-Wahl ist hier nicht verfügbar.",
-  usage: "Wechseln: /motor claude · /motor codex · /motor opencode · /motor api · /motor standard",
-  busy: "In diesem Gespräch läuft gerade eine Antwort. Erst /stop, dann /motor.",
-  fileInvalid: "config/settings.json ist ungültig, der Motor wurde nicht geändert. Bitte die Datei reparieren oder löschen.",
-  notSaved: "Der Motor konnte nicht gespeichert werden.",
-  newSession: "Das beginnt eine neue Session, das Gedächtnis bleibt.",
-  /** Claude Code nicht bereit (Issue #567): wer dann antwortet, entscheidet die Kette der Ersatzmodelle */
-  claudeNotReady: `Bis das behoben ist, antworten höchstens Ersatzmodelle, falls eingerichtet. Mehr zeigt ${BRAND.cli} pruefen.`,
-} as const;
-
-const MOTOR_SOURCE_TEXT = {
-  topic: "mit /motor für dieses Gespräch gesetzt",
-  settings: "Standard aus den Einstellungen",
-  env: "Standard aus TYBO_ENGINE in .env",
-  code: "eingebauter Standard",
-} as const;
+export const MOTOR_TEXT = { ...MOTOR_STATUS_TEXT, ...MOTOR_TOOL_TEXT } as const;
 
 const MOTOR_STANDARD_WORDS = ["standard", "default"];
-
-function motorLabel(list: { engine: string; label: string }[], engine: string): string {
-  return list.find(e => e.engine === engine)?.label ?? engine;
-}
 
 async function runMotor(ctx: CommandContext): Promise<void> {
   const engines = ctx.services.engines;
   if (!engines) return ctx.reply(MOTOR_TEXT.unavailable);
-  const arg = ctx.args.trim().toLowerCase();
-  const list = await engines.available();
-  const label = (engine: string) => motorLabel(list, engine);
-  const notReadyNote = (engine: string) => {
-    const status = list.find(e => e.engine === engine);
-    if (!status || status.ready) return "";
-    const why = status.message ? ` (${status.message})` : "";
-    // Claude Code ist selbst der Rückfallmotor (Issue #567): dann gibt es kein „bis dahin antwortet Claude Code“
-    if (engine === "claude") return `\n${status.label} ist gerade nicht bereit${why}. ${MOTOR_TEXT.claudeNotReady}`;
-    return `\n${status.label} ist gerade nicht bereit${why}, bis dahin antwortet ${label("claude")}.`;
+  const arg = normalizeMotorArgs(ctx.args);
+  const readTools = (list: Awaited<ReturnType<typeof engines.available>>): MotorToolsEntry[] => list.filter(e => e.ready).map(e => {
+    const engine = e.engine as MotorToolsEntry["engine"];
+    try { return { engine, label: e.label, tools: engines.tools?.(engine, list) }; }
+    catch { return { engine, label: e.label }; }
+  });
+  const render = (preview: Awaited<ReturnType<typeof engines.preview>>) => {
+    const toolLines = engines.tools ? readTools(preview.available).filter(e => e.engine !== "claude" && (!e.tools || hasToolGaps(e.tools.gaps)))
+      .map(e => `${e.label}: ${e.tools ? `${toolSummary(e.tools)} ${MOTOR_TEXT.moreTools}` : MOTOR_TEXT.toolsUnknown}`) : [];
+    return motorStatusText({ ...preview, toolLines }, process.env.USER_TIMEZONE || "UTC", Date.now());
   };
-
-  if (!arg) {
-    const current = engines.configured(ctx.sessionKey);
-    const standard = engines.standard();
-    const available = list.map(e => (e.ready ? `${e.label} ✓` : `${e.label} (${e.message ?? "nicht bereit"})`)).join(", ");
-    await ctx.reply(
-      [
-        `Motor dieses Gesprächs: ${label(current.engine)} (${MOTOR_SOURCE_TEXT[current.source]})`,
-        `Standard: ${label(standard.engine)} (${MOTOR_SOURCE_TEXT[standard.source]})`,
-        `Verfügbar: ${available}`,
-        MOTOR_TEXT.usage,
-      ].join("\n") + notReadyNote(current.engine)
-    );
+  if (!arg) return ctx.reply(render(await engines.preview(ctx.sessionKey, ctx.agent)));
+  if (arg === "werkzeuge") return ctx.reply(motorToolsText(readTools(await engines.available())) || MOTOR_TEXT.noEngineReady);
+  if (arg === "auto" || arg.startsWith("auto ")) {
+    if (arg !== "auto an" && arg !== "auto aus") return ctx.reply(MOTOR_TEXT.autoUsage);
+    try {
+      const result = await engines.setAuto(arg === "auto an");
+      const lines = [result.enabled
+        ? `Automatik an: Wechsel ab ${result.auto.threshold} %, zurück unter ${result.auto.returnBelow} %.`
+        : MOTOR_TEXT.autoOff];
+      if (result.enabled && !result.hasBackups) lines.push(MOTOR_TEXT.backupsMissing);
+      lines.push(render(await engines.preview(ctx.sessionKey, ctx.agent)));
+      await ctx.reply(limitMotorText(lines.join("\n\n")));
+    } catch (error) {
+      await ctx.reply(error instanceof Error && error.name === "SettingsFileInvalidError" ? MOTOR_TEXT.fileInvalid : MOTOR_TEXT.notSaved);
+    }
     return;
   }
-
+  if (arg === "pruefen" || arg === "prüfen") {
+    const stop = ctx.working();
+    try {
+      const result = await engines.check(ctx.sessionKey, ctx.agent);
+      const lines = [result.before === 0 ? "Geprüft: Es gab keine Sperre." : `Geprüft: ${result.lifted} Sperren aufgehoben, ${result.remaining} bleiben.`];
+      if (result.liftedWithoutMeasurement) lines.push(MOTOR_TEXT.nextRun);
+      const notMeasured = [...new Map(result.preview.stages.filter(stage => result.notMeasured.includes(stage.engine))
+        .map(stage => [stage.engine, stage.label])).values()];
+      if (notMeasured.length) lines.push(`Nicht neu messbar: ${notMeasured.join(", ")}. Der Stand kommt mit dem nächsten Lauf.`);
+      for (const id of [...new Set(result.preview.stages.map(stage => stage.engine))]) {
+        if (result.measurementResults[id] === "failed") {
+          lines.push(`${engineLabel(id)}: Messung ohne Ergebnis, der alte Stand bleibt. Das gilt für die Messwerte; Sperren wurden neu geprüft.`);
+        }
+      }
+      await ctx.reply(limitMotorText([...lines, "", render(result.preview)].join("\n")));
+    } finally { stop(); }
+    return;
+  }
+  const label = (engine: string) => engineLabel(engine as (typeof SELECTABLE_ENGINES)[number]);
   const toStandard = MOTOR_STANDARD_WORDS.includes(arg);
-  if (!toStandard && !list.some(e => e.engine === arg)) {
-    const names = [...list.map(e => e.engine), "standard"].join(", ");
+  if (!toStandard && !(SELECTABLE_ENGINES as readonly string[]).includes(arg)) {
+    const names = [...SELECTABLE_ENGINES, "standard"].join(", ");
     await ctx.reply(`Unbekannter Motor „${ctx.args.trim().slice(0, 40)}". Möglich: ${names}.`);
     return;
   }
 
-  const before = engines.configured(ctx.sessionKey);
-  const after = toStandard ? engines.standard().engine : arg;
+  const before = engines.configured(ctx.sessionKey, ctx.agent);
+  const inherited = engines.inherited(ctx.agent);
+  const after = toStandard ? inherited.engine : arg;
   const changes = before.engine !== after;
   let written = false;
   let writeError: unknown;
@@ -647,7 +654,11 @@ async function runMotor(ctx: CommandContext): Promise<void> {
   // ein neuer Turn kann nicht zwischen Reset und Schreiben mit dem alten Motor starten.
   let sessionMode = false;
   if (changes) {
-    const reset = await ctx.resetSession({ whileBlocked: write });
+    const reset = await ctx.resetSession({
+      whileBlocked: write,
+      beforeReset: () => noteHandover(ctx.sessionKey, "user"),
+      preserveHandover: true,
+    });
     if (reset.status === "busy") return ctx.reply(MOTOR_TEXT.busy);
     sessionMode = reset.status === "done" && reset.sessionMode;
   }
@@ -661,16 +672,33 @@ async function runMotor(ctx: CommandContext): Promise<void> {
 
   const lines: string[] = [];
   if (toStandard) {
+    const target = inherited.source === "agent" ? "den Motor des Agenten" : "den Standard";
     lines.push(
       before.source === "topic"
-        ? `Ausnahme entfernt: dieses Gespräch nimmt wieder den Standard, ${label(after)}.`
-        : `Dieses Gespräch nimmt schon den Standard, ${label(after)}.`
+        ? `Ausnahme entfernt: dieses Gespräch nimmt wieder ${target}, ${label(after)}.`
+        : `Dieses Gespräch nimmt schon ${target}, ${label(after)}.`
     );
   } else {
     lines.push(changes ? `Dieses Gespräch läuft jetzt mit ${label(after)}.` : `Dieses Gespräch läuft schon mit ${label(after)}.`);
   }
   if (changes && sessionMode) lines.push(MOTOR_TEXT.newSession);
-  await ctx.reply(lines.join(" ") + notReadyNote(after));
+  const preview = await engines.preview(ctx.sessionKey, ctx.agent);
+  if (preview.hasBackups) {
+    const wanted = preview.stages[0];
+    if (wanted?.state === "blocked" || wanted?.state === "not_ready") {
+      const stateText = motorStageStateText(wanted, process.env.USER_TIMEZONE || "UTC");
+      const state = wanted.state === "blocked" ? stateText.split(" (")[0] : stateText;
+      const answering = preview.answering;
+      lines.push(`${wanted.label} ist ${state}, bis dahin ${answering
+        ? `antwortet ${answering.label}${answering.model ? ` mit ${answering.model}` : ""}`
+        : "antworten Ersatzmodelle mit eingeschränktem Werkzeugumfang"}.`);
+    }
+    if (!toStandard) lines.push(after === "api"
+      ? "Fällt die Anthropic API aus, springt die nächste Stufe ein."
+      : `Ist ${label(after)} am Limit oder fällt aus, springt die nächste Stufe ein.`);
+  }
+  const note = preview.hasBackups ? "" : motorNotReadyNote(preview, after);
+  await ctx.reply(limitMotorText(lines.join(" ") + note + (toStandard ? ` ${MOTOR_TEXT.standardOrder}` : "")));
 }
 
 async function runCritic(ctx: CommandContext): Promise<void> {
@@ -721,10 +749,11 @@ export const BUILTIN_COMMANDS: readonly CommandDefinition[] = [
   {
     name: "motor",
     aliases: ["engine"],
-    description: "Motor dieses Gesprächs zeigen oder wechseln (Claude Code, Codex, OpenCode, Anthropic API)",
+    description: "Motor und Stand zeigen, wechseln, Automatik an/aus, neu prüfen",
     args: "optional",
-    argsHint: "[claude|codex|opencode|api|standard]",
+    argsHint: "[werkzeuge|claude|codex|opencode|api|standard|auto an|auto aus|pruefen]",
     channels: ALL_CHANNELS,
+    unscoped: motorUnscoped,
     run: runMotor,
   },
   {

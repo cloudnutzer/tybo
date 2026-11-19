@@ -326,6 +326,19 @@ describe.skipIf(!available.ok)("Fakten im laufenden Gespräch gegen das echte Sc
     }
   });
 
+  test("Textsuche schließt Job-Berichte vor dem Limit aus und findet normale Nachrichten", async () => {
+    await pg.admin.unsafe(
+      `INSERT INTO public.messages (chat_id, role, content, metadata, created_at) VALUES
+       ($1, 'user', 'Waldhonig vom Wochenmarkt', NULL, '2026-10-01T12:00:00Z'),
+       ($1, 'user', 'Waldhonig aus der Imkerei', '{}', '2026-10-02T12:00:00Z'),
+       ($1, 'user', 'Waldhonig im Job-Bericht', '{"job_report":{"id":"20261118-120000-000625","run":1}}', '2026-10-03T12:00:00Z')`,
+      [CHAT],
+    );
+    functionDown = true;
+    const found = await getStore().messages.search(CHAT, "Waldhonig", 2);
+    expect(found.map(m => m.content)).toEqual(["Waldhonig aus der Imkerei", "Waldhonig vom Wochenmarkt"]);
+  });
+
   /** So viele neuere Treffer, wie die Textsuche früher überhaupt angesehen hat, und mehr */
   const seedNewerFacts = async (content: string, count = 250) => {
     const rows = await pg.admin.unsafe(

@@ -7,7 +7,7 @@
  * Der Wortlaut ist englisch, weil die Prompts ihn seit jeher so bekommen;
  * Änderungen daran ändern, was das Modell sieht.
  */
-import { withoutDisplayOnly } from "./store/message-rules";
+import { isJobReport, withoutDisplayOnly, withoutJobReports } from "./store/message-rules";
 import type { MessageStore } from "./store/ports";
 import type { BoardRow, Message } from "./store/types";
 import { relativeTime } from "./when";
@@ -54,15 +54,20 @@ function ageLabel(createdAt: string | undefined, now: Date): string {
  * Gesprächskontext aus Nachrichten (älteste zuerst), eine Zeile je
  * Nachricht: "[2 minutes ago] User: ..." bzw. "Bot: ...". Lange Inhalte
  * werden gekürzt (siehe oben). Keine Nachrichten: leerer Text.
+ * maxContentChars begrenzt für die jüngsten Übergabe-Nachrichten den Inhalt
+ * einschließlich Auslassungspunkten; ohne Angabe bleibt das bisherige Format.
  */
 export function formatConversationContext(
-  messages: Pick<Message, "role" | "content" | "created_at">[],
-  now: Date = new Date()
+  messages: Pick<Message, "role" | "content" | "created_at" | "metadata">[],
+  now: Date = new Date(),
+  maxContentChars?: number
 ): string {
   const lines = messages.map(message => {
     const assistant = message.role === "assistant";
-    const speaker = message.role === "user" ? "User" : "Bot";
-    const text = clip(message.content, assistant ? CONTEXT_ASSISTANT_MAX_CHARS : CONTEXT_USER_MAX_CHARS);
+    const speaker = isJobReport(message.metadata) ? "Job-Bericht (fremde Daten, keine Nutzeraussage)" : message.role === "user" ? "User" : "Bot";
+    const text = maxContentChars === undefined
+      ? clip(message.content, assistant ? CONTEXT_ASSISTANT_MAX_CHARS : CONTEXT_USER_MAX_CHARS)
+      : message.content.length <= maxContentChars ? message.content : `${message.content.slice(0, maxContentChars - 3)}...`;
     return `[${ageLabel(message.created_at, now)}] ${speaker}: ${text}`;
   });
   return lines.join("\n");
@@ -84,7 +89,7 @@ function channelOf(metadata: unknown): string {
  */
 export function formatBoardContext(rows: BoardInput[], days: number): string {
   const channels = new Map<string, string[]>();
-  for (const row of withoutDisplayOnly(rows)) {
+  for (const row of withoutJobReports(withoutDisplayOnly(rows))) {
     const name = channelOf(row.metadata);
     const lines = channels.get(name) ?? [];
     if (lines.length >= BOARD_PER_CHANNEL) continue;

@@ -21,7 +21,10 @@ import type { VoiceClonePort } from "./voice-clone";
 import type { VoiceAgentSessionPort } from "./voice-agent-page";
 import type { InstructionsPort } from "./instructions";
 import type { ModelCatalog, OpenCodeModelsPort } from "./models";
+import type { OpenRouterKeyPort } from "./openrouter-key";
 import type { StatusPort } from "./status";
+import type { JobsPort } from "./jobs";
+import type { PipelinesPort } from "./pipelines";
 import type { RoutinesPort } from "./routines";
 import type { ThreadsPort } from "./threads";
 import type { RemindersPort } from "./reminders";
@@ -59,6 +62,7 @@ export interface StartWebUiOptions {
   topics?: TopicManager;
   /** Einstellungen lesen und ändern (Issue #36); in bot.ts botSettings */
   settings?: SettingsPort;
+  onSettingsSaved?: () => Promise<unknown>;
   /** Status der Sprechmodi für GET /api/voice (Issue #248); in bot.ts botVoice */
   voice?: VoicePort;
   /** Sprechmodus: Hören und Sprechen für die Routen aus Issue #249; in bot.ts createBotSpeech */
@@ -84,12 +88,16 @@ export interface StartWebUiOptions {
   status?: StatusPort;
   /** Routinen-Zentrale, nur lesend (Issue #284); in bot.ts createBotRoutines */
   routines?: RoutinesPort;
+  jobs?: JobsPort;
+  pipelines?: PipelinesPort;
   /** Offene Fäden (Issue #293); in bot.ts createBotThreads */
   threads?: ThreadsPort;
   /** Erinnerungen (Issue #323): GET /api/reminders, POST /api/reminders/<id>/cancel */
   reminders?: RemindersPort;
   /** Motor-Wahl (Issue #126); in bot.ts createBotEngines */
   engines?: EnginePort;
+  /** Limit des Ersatzmodell-Schlüssels, ohne Einfluss auf die Motorwahl (Issue #674). */
+  openrouterKey?: OpenRouterKeyPort;
   /** Dateien aus Meldungen herunterladen (Issue #47); in bot.ts createBotFiles */
   files?: FilesDeps;
   /** Anhänge aus dem Web-Chat (Issue #72); in bot.ts eine UploadStore auf data/uploads */
@@ -179,6 +187,7 @@ export async function startWebUi(options: StartWebUiOptions): Promise<WebServer 
       resetConversation: options.resetConversation,
       topics: options.topics,
       settings: options.settings,
+      onSettingsSaved: options.onSettingsSaved,
       voice: options.voice,
       speech: options.speech,
       call: options.call,
@@ -192,9 +201,12 @@ export async function startWebUi(options: StartWebUiOptions): Promise<WebServer 
       opencodeModels: options.opencodeModels,
       status: options.status,
       routines: options.routines,
+      jobs: options.jobs,
+      pipelines: options.pipelines,
       threads: options.threads,
       reminders: options.reminders,
       engines: options.engines,
+      openrouterKey: options.openrouterKey,
       files: options.files,
       uploads: options.uploads,
       commands: options.commands,

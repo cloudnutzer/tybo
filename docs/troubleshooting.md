@@ -1572,13 +1572,16 @@ bis drei Sekunden die Antwort.
 …), in einer Antwort von tybo nicht. Oder es fehlt nur, wenn ein Ersatzmodell
 antwortet.
 
-**Nachsehen:** Wer antwortet gerade? Claude Code, Codex und OpenCode lesen je
-ihre eigene MCP-Konfiguration; die Ersatzmodelle bekommen die Server von tybo.
+**Nachsehen:** Wer antwortet gerade? Claude Code und OpenCode lesen ihre
+eigene MCP-Konfiguration. Codex bekommt zusätzlich die übertragbaren Server
+von tybo, aber nur mit vollem Zugriff. Die Ersatzmodelle bekommen die Server
+von tybo über einen eigenen Weg.
 
 | Wer antwortet | Woher die Server kommen |
 |---|---|
 | Claude Code | `~/.claude.json` (global oder der Eintrag für den Projektordner von tybo) und `.mcp.json` im Projektordner. Claude Code startet immer im Projektordner. |
-| Codex, OpenCode | eigene Dateien, siehe die Abschnitte zu den Motoren unten |
+| Codex | eigene Codex-Dateien; mit vollem Zugriff zusätzlich `config/mcp-servers.json`, `MCP_CONFIG_PATH`, der Projekt-Eintrag in `~/.claude.json`, freigegebene `.mcp.json` und globale Claude-Server |
+| OpenCode | eigene Dateien, siehe den Abschnitt zum Motor unten |
 | Ersatzmodelle | `config/mcp-servers.json`, dann `MCP_CONFIG_PATH`, dann `~/.claude.json` (lokale Server dort nur, wenn sie mit Bun laufen) |
 
 **Abhilfe:**
@@ -1586,15 +1589,198 @@ ihre eigene MCP-Konfiguration; die Ersatzmodelle bekommen die Server von tybo.
 - Nur im Projekt eines anderen Ordners eingetragen: den Server global oder
   für den Projektordner von tybo eintragen.
 - Server braucht einen Schlüssel: Er erreicht den Subprozess nur, wenn die
-  MCP-Konfiguration ihn als `${NAME}` nennt, siehe nächster Abschnitt.
+  MCP-Konfiguration ihn als `${NAME}` nennt; bei Codex auch als Wert in `env`
+  oder einer HTTP-Kopfzeile des mitgegebenen Servers, siehe nächster Abschnitt.
 - Für die Ersatzmodelle: `bun run test:tools` zeigt, welche Werkzeuge sie
   bekommen. Der Bot liest die Liste nur beim Start; nach einer Änderung neu
   starten (WebUI: Neustart anfordern).
+
+Bei Codex die Zeile `[Codex] MCP-Server: …` ansehen: „mitgegeben“ sind
+Server von tybo, „in Codex selbst“ sind eigene Server mit Vorrang,
+„übersprungen“ nennt den Grund. Die Zeile enthält keine Adressen oder Werte.
+
+| Grund im Log | Bedeutung und Abhilfe |
+|---|---|
+| `disabled`, `user_skip` | Übergabe unter `engine.codex.mcp.enabled` abgeschaltet oder Name in `skip`; gewünschte Einstellung prüfen. |
+| `sandbox` | Chat läuft mit „Projekt schreiben“ oder „Nur lesen“. MCP würde diese Grenze umgehen und bleibt deshalb aus. |
+| `codex_config_unreadable` | Eine Codex-Konfigurationsdatei ist nicht lesbar oder fehlerhaft. Dateirechte und TOML berichtigen; bis dahin gibt tybo keine Server mit. |
+| `claude_disabled`, `not_approved` | Server in Claude abgeschaltet oder `.mcp.json` dort noch nicht freigegeben. Zuerst die gewünschte Freigabe in Claude klären. |
+| `unsupported_source`, `transport` | Quelle wird nicht unterstützt (etwa Claude-Einstellungen statt MCP-Konfiguration) oder Server nutzt SSE. Unterstützte Quelle bzw. HTTP oder stdio verwenden. |
+| `invalid_name`, `invalid_value` | Name oder Eintrag ist ungültig; Format der MCP-Datei prüfen. |
+| `secret_in_command`, `secret_in_url` | Befehl, Argumente oder Adresse enthalten einen Schlüssel oder Platzhalter. Zugangsdaten in `env` oder HTTP-Kopfzeilen legen. |
+| `placeholder_unresolved` | Ein Platzhalter lässt sich nicht auflösen. Benötigten Schlüssel einrichten. |
+| `reserved_env` | Der Server versucht eine geschützte Variable oder einen geschützten Wert zu übernehmen. Der Schutz lässt sich über einen MCP-Eintrag nicht aufheben. |
+| `env_conflict` | Eine Variable ist bereits anders belegt oder zwei HTTP-Kopfzeilen erzeugen denselben Variablennamen. Widersprüchliche Belegungen berichtigen. |
+| `auth_unknown` | HTTP-Server aus Claude ohne bekannte Zugangsdaten. Nur wenn er wirklich offen ist, seinen Namen in `engine.codex.mcp.public` eintragen. Eine Claude-Browseranmeldung wird nicht übertragen. |
+
+Bei „MCP-Plan fehlgeschlagen“ antwortet Codex ohne die Server von tybo weiter;
+die Meldung enthält absichtlich keine Quelldaten. Die MCP-Dateien werden je
+Lauf neu gelesen, auch beim Fortsetzen. Ein nicht startbarer Server muss die
+Antwort nicht verhindern; ein langsam startender Server kann aber jede
+Antwort verzögern und das Leerlauf-Zeitlimit erreichen.
+
+Für Codex-Jobs gibt es Server nur mit `--full-access`, unabhängig von der
+Chat-Einstellung. Ohne diesen Schalter sind auch eigene Codex-Server
+abgeschaltet. Pipeline-Worker bekommen keine Server von tybo.
 
 **Danach:** Eine Frage, die das Werkzeug braucht, wird mit ihm beantwortet.
 Mehr: [erweiterungen.md](erweiterungen.md#mcp-server).
 
 ---
+
+### Der Motor hat gewechselt
+
+**Woran erkennbar:** `/motor` nennt den Motor dieses Gesprächs, den Grund,
+die Reihenfolge und die Stände. In der WebUI zeigt die Pille im Chat den
+antwortenden Motor oder „Kein Motor frei“; ihr Menü erklärt die Wahl.
+Einstellungen, „Modelle“, „Motor“ zeigt die allgemeine Reihenfolge. Unter
+„Status“ steht je Motor „Werkzeuge“ mit Bestand und Lücken.
+
+**Warum:** Mit eingestellten Ersatzstufen nimmt tybo beim Start einer
+Nachricht die erste freie und bereite Stufe. Ein Limit oder Ausfall während
+des Versuchs kann die nächste Stufe noch für dieselbe Nachricht aufrufen.
+Höchstens drei Stufen werden versucht, danach die Ersatzmodelle mit
+eingeschränktem Werkzeugumfang. Eine fertige oder laufende Antwort wird
+nicht nachträglich umgeschaltet. `/stop` und ein Zeitlimit starten keinen
+Ersatzversuch. Ein von Hand mit `/motor` gewählter Motor steht als Wunsch
+vorn, seine Sperre gilt trotzdem.
+
+**„Gesperrt bis“ und „pausiert bis“:** Ersteres nennt einen bekannten Reset,
+Letzteres eine Pause ohne bekannten Reset oder nach einem Ausfall. Mehrere
+Fenster können dieselbe Stufe sperren; erst wenn keines mehr trifft, ist sie
+frei. Die drei Ursachen stehen in `data/engine-switch.json`:
+
+| Ursache | Was sperrt und was wieder freigibt |
+|---|---|
+| `threshold` | Messung ab der Schwelle, Standard 95 %. Das Fenster bleibt bis zum Reset gesperrt, ohne Reset 60 Minuten ab Messung. Eine jüngere Messung unter der Rückkehrschwelle, Standard 80 %, hebt es auf. `/motor auto aus` hebt nur diese Sperren sofort auf. |
+| `limit` | Ein echter Limit-Fehler sperrt das belegte Fenster bis zum Reset. Ohne belegtes Fenster pausiert die Claude-Modellfamilie, bei anderen Motoren der Motor, zunächst 60 Minuten, bei Wiederholung doppelt bis 6 Stunden. Eine jüngere niedrige Messung löst nur eine Fenstersperre, keine Familienpause. |
+| `outage` | Ein Ausfall pausiert den ganzen Motor 10 Minuten, bei Wiederholung doppelt bis 60 Minuten. Niedrige Prozentwerte oder Automatik aus heben das nicht auf. |
+
+Jede Sperre endet durch Ablauf. `/motor pruefen` oder „Jetzt messen“ messen
+zuerst neu: Eine frische Messung bei oder über der Rückkehrschwelle hält die
+Fenstersperre fest, darunter wird sie frei. Ohne frische Messung wird die
+Sperre freigegeben; dann entscheidet der nächste Lauf. Ausfallsperren werden
+bei dieser Prüfung nur bei bestätigter Bereitschaft aufgehoben. Eine Prüfung
+setzt die Fehlerzähler nicht zurück, das tut ein erfolgreicher Lauf.
+
+**Zurückwechseln:** Es gilt der Vorrang Gespräch, Agent, Standard.
+`/motor standard` entfernt nur die Gesprächswahl. Ein unter Einstellungen,
+„Agenten“ gesetzter Motor bleibt Wunschmotor, sonst gilt der Standard.
+Ist der Wunschmotor gesperrt oder nicht bereit, antwortet die nächste freie
+Stufe der allgemeinen Reihenfolge. Ein Motorwechsel beginnt eine neue
+Session mit Verlaufsübergabe. Automatik ausschalten lässt Limit- und
+Ausfallsperren bestehen. Die Schwelle auf 95 zurückzustellen gibt 96 % nicht
+frei: Für eine frühere Rückkehr muss der jüngere echte Wert unter
+`engine.auto.returnBelow` liegen. Messungen von Claude Code können eine
+Sperre von selbst früher lösen, siehe
+[Teil-Limits und Messung während einer Sperre](#claude-code-teil-limits-und-messung-während-einer-sperre).
+
+**Meldungen:** Die folgenden Beispiele verwenden Platzhalter für Motor,
+Fenster und Zeit. Sie kommen einmal je Wechsel der allgemeinen Reihenfolge
+über den Meldeweg in Direktchat und WebUI. Bei Änderungen durch `limits set`
+bemerkt der Wächter die Sperre in der Regel nach rund 15 Sekunden, auch ohne
+Nachricht im Gespräch. Bei gescheiterter Zustellung versucht tybo es nach
+1, 5 und 15 Minuten erneut. Nach drei erfolglosen Wiederholungen oder sechs
+Stunden wird die Meldung verworfen; im Log steht ein Hinweis.
+
+| Anlass | Wortlaut |
+|---|---|
+| Schwelle erreicht | „Motorwechsel: Claude Code steht bei 96 % (Woche, alle Modelle). Ab der nächsten Nachricht antwortet Codex. Zurück geht es von selbst nach dem Reset am … Uhr. Stand und Wahl: /motor“ |
+| Limit-Fehler | „Motorwechsel: Claude Code hat das Limit erreicht (Woche, alle Modelle). Ab sofort antwortet Codex. Zurück geht es von selbst ab … Uhr. Stand und Wahl: /motor“ |
+| Rückkehr nach Schwelle oder Limit | „Motorwechsel: Claude Code ist wieder frei. Ab der nächsten Nachricht antwortet wieder Claude Code.“ |
+| Ausfall | „Claude Code antwortet gerade nicht (Fehler beim letzten Lauf). Codex springt ein.“ Bei belegter fehlender Installation oder Anmeldung steht stattdessen „nicht installiert“ oder „nicht angemeldet“. Höchstens einmal je Motor und Stunde; die Rückkehr nach einem Ausfall wird hier nicht gemeldet. |
+| Keine Stufe frei | „Alle Motoren sind am Limit oder nicht bereit. Bis … Uhr antworten Ersatzmodelle mit eingeschränktem Werkzeugumfang.“ Ohne bekannte Freigabezeit: „Es antworten Ersatzmodelle mit eingeschränktem Werkzeugumfang.“ |
+
+Ohne bekannte Reset-Zeit lautet der letzte Zeitsatz bei Schwelle und Limit
+„Ich versuche es um … Uhr wieder.“ Im betroffenen Gespräch steht vor der
+ersten Ersatzantwort einmal „Hier antwortet jetzt Codex statt Claude Code
+(Limit erreicht).“, beim Ausfall entsprechend „(Ausfall).“. Beim Rückwechsel
+steht „Hier antwortet wieder Claude Code.“ Mit übergebenem Verlauf folgt
+„Der Verlauf ist übergeben.“ Ein Wechsel von Hand braucht diese
+Automatikmeldung nicht; der Befehl bestätigt die Wahl selbst.
+
+**Keine Stufe frei:** Nur bei einer nichtleeren Ersatzliste und ausschließlich
+gesperrten oder nicht bereiten Stufen startet kein Motor. Einmal im Gespräch
+steht „Gerade ist kein Motor frei (Limit erreicht oder nicht bereit). Es
+antwortet ein Ersatzmodell mit eingeschränktem Werkzeugumfang. Frühestens
+wieder frei: … Uhr.“ Der letzte Satz entfällt ohne bekannte Zeit. Die
+Fallback-Kette überspringt gesperrtes Claude Code. Die Antwort trägt etwa
+„(Antwort über openrouter)“; auch diese Ersatzmodelle haben MCP-Werkzeuge und
+eingebaute Werkzeuge. Scheitern sie alle, folgt eine feste Antwort mit der
+frühesten bekannten Freigabe. Ohne zwischenzeitliche Rückkehr eines Motors
+erscheinen Hinweis und Meldung bei der zweiten Nachricht nicht erneut.
+Alle Ersatzstufen zu entfernen führt nicht in diesen Zustand, sondern
+schaltet die Wechselregel ab.
+
+**Schon ausgeführte Arbeit:** Ein abgebrochener Versuch kann eine Datei
+bereits gesendet oder einen Eintrag angelegt haben. Der Ersatzmotor bekommt
+eine Bitte zur Prüfung samt höchstens 20 bisherigen Werkzeugaufrufen je
+Versuch, jeweils maskiert und auf 80 Zeichen begrenzt. Bei unlesbarer
+Geheimnisquelle stehen nur Werkzeugnamen darin. Das mindert doppelte
+Wirkungen, verhindert sie aber nicht. Vor erneutem Senden oder Anlegen den
+vorhandenen Stand prüfen. Bei fehlenden Werkzeugen weiter unter
+[Der Ersatzmotor kennt ein Werkzeug nicht](#der-ersatzmotor-kennt-ein-werkzeug-nicht).
+
+### Claude Code: Teil-Limits und Messung während einer Sperre
+
+Das Claude-Abo kann neben der Woche für alle Modelle ein eigenes Wochenlimit
+für eine Modellfamilie führen, etwa Fable. Diese Teil-Limits liest tybo aus
+dem Verbrauchsbericht von Claude Code (`/usage`, strukturiertes Feld
+`usage_report`). Dabei läuft kein Modell, und es entstehen keine Modellkosten.
+Die Werte liegen mit Quelle `report` in `data/engine-usage.json`; `/motor`
+zeigt ihren Stand und ihr Alter. Mit `CLAUDE_AUTH=apiKey` entfällt diese
+Abo-Messung.
+
+Nach einem Chat-Lauf und nach einer Knopf-Fortsetzung misst tybo im Hintergrund,
+wenn der letzte Bericht und der letzte Versuch mehr als zehn Minuten alt
+sind. Während einer noch geltenden Limit- oder Schwellen-Sperre prüft ein
+Zeitgeber alle fünf Minuten, ob die letzte Messung und der letzte Versuch
+mindestens 30 Minuten zurückliegen. Ohne solche Sperre gibt es keine
+Messung im Leerlauf. `/motor pruefen` und „Jetzt messen“ fordern sofort einen
+Bericht an. Eine frische Messung unter der Rückkehrschwelle kann die
+Fenstersperre schon vor der angekündigten Reset-Zeit aufheben; eine
+Familienpause ohne belegtes Fenster bleibt beim Hintergrundmessen bestehen.
+
+Der Bericht ist laut Dokumentation experimentell und kann seine Form ändern.
+Bleibt er aus, meldet das Log „[Motor] Messlauf Claude Code ohne Ergebnis“
+mit einem festen Grund. Alte Messwerte und Fehlerzähler bleiben erhalten.
+Ohne verwertbaren Stand des Teil-Limits kann tybo dessen Schwelle nicht
+erkennen und wechselt erst nach einem Limit-Fehler. Eine bestehende Sperre
+endet dann mit ihrer Reset-Zeit oder wird durch die Prüfung von Hand neu
+bewertet. Bei `/motor pruefen` bedeutet „der alte Stand bleibt“ nur, dass
+keine neuen Messwerte vorliegen: Sperren ohne frische Messung werden dabei
+trotzdem aufgehoben, und der nächste Lauf entscheidet. tybo liest dafür kein
+Anmelde-Token und fragt keinen Endpunkt außerhalb von Claude Code ab.
+
+### Der Ersatzmotor kennt ein Werkzeug nicht
+
+Nach einem Motorwechsel fehlt ein MCP-Server, Skill oder eine Notiz, die
+Claude Code verwenden konnte.
+
+1. Im betroffenen Chat `/motor` schreiben. Unter den verfügbaren Motoren
+   stehen die Anzahl der Werkzeuge und die bekannten Lücken.
+2. `/motor werkzeuge` schreiben. Den Namen suchen: „von tybo“ bezeichnet die
+   Weitergabe, „im Motor“ einen eigenen Eintrag. Fehlende Werkzeuge und
+   Hinweise nennen den Grund. Ein HTTP-Server ohne Zugangsdaten braucht
+   möglicherweise eine eigene OAuth-Anmeldung in Codex. Nur nachweislich
+   öffentliche Server gehören in `engine.codex.mcp.public`.
+3. Im eigenen Terminal `tybo pruefen` ausführen. „Werkzeuge Codex“ prüft
+   zusätzlich, ob vorgesehene Server und Skill-Links bei Codex ankommen.
+   „Nicht angekommen“ ist eine Warnung. „Nicht geprüft“ heißt, dass die
+   Prüfung nicht möglich war, und behauptet keine fehlenden Werkzeuge.
+
+Fehlt ein Link von tybo, wird er beim nächsten Bot-Start oder vor einer
+neuen Codex-Session wiederhergestellt. Fremde Links und eigene
+Motor-Konfigurationen ändert tybo nicht. Die Prüfung repariert nichts.
+Unlesbarer Bestand und eine unbekannte Plugin-Zahl werden ausdrücklich
+genannt. Bei langen Chat-Ausgaben stehen für Skills nur Zahlen.
+
+MCP-Weitergabe gilt nur bei vollem Zugriff im Chat und in Jobs mit
+`--full-access`; eingeschränkte Jobs und Pipeline-Worker erhalten diese
+Server nicht. Claude-Konnektoren, Claude-Plugins und Hooks lassen sich nicht
+automatisch mitnehmen. Gründe, manuelle Abhilfen und die Unterschiede der
+eingebauten Werkzeuge stehen unter
+[Werkzeuge im Ersatzmotor](erweiterungen.md#werkzeuge-im-ersatzmotor).
 
 ### Subprozess vermisst eine Variable
 
@@ -1617,6 +1803,18 @@ Ohne Zutun durch kommen:
   nennt, für Claude in `mcpServers` von `~/.claude.json`, `.mcp.json`,
   `.claude/settings.json`, `.claude/settings.local.json` oder
   `~/.claude/settings.json` (Hooks und Rechte-Regeln zählen nicht).
+
+Für einen mitgegebenen Codex-MCP-Server nimmt tybo zusätzlich die erlaubten
+Werte aus dessen `env` und HTTP-Kopfzeilen in die Prozessumgebung auf. Der
+Plan gibt für stdio nur die Namen über `env_vars` weiter. HTTP-Kopfzeilen
+bekommen eigene `TYBO_MCP_`-Variablen und Verweise über
+`bearer_token_env_var` bzw. `env_http_headers`. Diese Namen legt ausschließlich
+der Plan an; ein `env`-Eintrag des Servers darf sie nicht selbst setzen.
+
+Das gilt nur mit vollem Zugriff, bei Jobs nur mit `--full-access`. Ein
+Konflikt mit der Basis-Umgebung oder eine geschützte Variable überspringt
+den Server, siehe Gründe oben. In Codex kann auch ein Shell-Befehl des
+Modells die mitgegebenen Werte lesen, weil sie in dessen Umgebung liegen.
 
 Immer entfernt werden `WEB_PASSWORD`, `CLAUDECODE` und geerbte Werte von
 `TYBO_CHAT_ID`, `TYBO_TOPIC_ID` und `TYBO_CONVERSATION_ID`; gesetzt wird
@@ -1645,9 +1843,36 @@ Variablen, und der Befehl in der Antwort läuft durch.
 
 ### Codex als Motor
 
-Codex liest nichts aus der Claude-Konfiguration: keine Hooks, keine
-Claude-Skills, keine MCP-Server aus `~/.claude.json` oder `.mcp.json`. tybo
-schreibt nichts in die Codex-Konfiguration; alles hier richtest du selbst ein.
+Codex lädt Claude-Hooks und Claude-Skills nicht selbst. Die übertragbaren
+MCP-Server aus der Claude-Konfiguration gibt tybo ihm mit vollem Zugriff je
+Lauf mit, siehe [MCP-Werkzeuge fehlen](#mcp-werkzeuge-fehlen-in-einer-antwort).
+Eigene Codex-Server gehen bei gleichem Namen vor. tybo schreibt nichts in
+die Codex-Konfiguration; eigene Server richtest du dort weiterhin selbst ein.
+Claude-Skills macht tybo über Links im Projekt sichtbar, siehe
+[Skills für Codex](erweiterungen.md#skills-für-codex). Neue Sessions bekommen
+außerdem die gekürzte, maskierte Übersicht der Claude-Projektnotizen als
+Kontext. Anmeldungen eigener Server, nicht übertragbare Konnektoren und
+Erweiterungen bleiben Handarbeit. Bestand, Lücken und Abhilfe:
+[Werkzeuge im Ersatzmotor](erweiterungen.md#werkzeuge-im-ersatzmotor).
+
+**Stand der Limits:** Nach einem regulär beendeten Chat-Lauf über Codex,
+auch bei einem Limit-Fehler, liest tybo das letzte brauchbare `token_count`
+aus der Sitzungsdatei unter `CODEX_HOME/sessions` (ohne `CODEX_HOME` unter
+`~/.codex/sessions`). Woche und Fünf-Stunden-Fenster erkennt tybo an ihrer
+Dauer. Stand, Reset und Messzeit stehen mit Quelle `session-file` in
+`data/engine-usage.json`; `/motor` zeigt etwa „Woche, alle Modelle: NN %, Reset
+<Tag Uhrzeit>, gerade gemessen“. Die Messzeit kommt aus der gelesenen Zeile,
+deshalb bleibt eine jüngere Messung aus einer anderen Quelle erhalten.
+Fehlen Datei oder passende Werte, hat sich das nicht zugesicherte Dateiformat
+geändert oder dauert das Lesen länger als zwei Sekunden, bleibt der bisherige
+Stand unverändert; ohne bisherigen Wert bleibt er unbekannt. Dazu erscheint
+nur beim ersten Mal je Bot-Prozess eine Logzeile. Bei `/stop`, Prozess-Zeitlimit
+oder gescheiterter Prompt-Übergabe wird nicht nachgemessen. Die Suche reicht
+vom heutigen Tagesordner bis sieben Tage zurück, jeweils nach Ortszeit.
+Ältere fortgesetzte Gespräche können nach einem Bot-Neustart deshalb ohne
+Messung bleiben; `/new` in diesem Gespräch beginnt eine neue Sitzung.
+Jobs und Pipeline-Worker auf Codex verbrauchen dasselbe Limit, aktualisieren
+diesen Stand aber nicht: tybo erfährt davon erst beim nächsten Chat-Lauf.
 
 **Symptom:** „Codex ist nicht angemeldet“, „Codex ist nicht installiert“,
 oder Codex antwortet ohne Werkzeuge, Skills oder Projektwissen.
@@ -1682,7 +1907,7 @@ Zeile dort ein Fehler. Die Rechte-Stufe steht beim ersten Aufruf im Log:
   | `workspace-write` | schreiben im Projektordner, mit Netz |
   | `read-only` | nur lesen |
 
-- **MCP-Server:** in `~/.codex/config.toml` (oder `$CODEX_HOME/config.toml`):
+- **Eigene MCP-Server:** in `~/.codex/config.toml` (oder `$CODEX_HOME/config.toml`):
 
   ```toml
   [mcp_servers.notion]
@@ -1700,8 +1925,17 @@ Zeile dort ein Fehler. Die Rechte-Stufe steht beim ersten Aufruf im Log:
   durch, `WEB_PASSWORD` nie. Codex wartet 10 Sekunden auf den Start eines
   Servers; braucht er länger (etwa `bunx` beim ersten Mal),
   `startup_timeout_sec` erhöhen.
-- **Skills:** Codex liest `~/.agents/skills` und `.agents/skills`, nicht
-  `~/.claude/skills`. Einen Skill für beide Motoren in beide Ordner legen.
+- **Skills:** tybo verlinkt die unmittelbaren Skills aus `.claude/skills/`
+  im Projekt und `~/.claude/skills/` unter `.agents/skills/`. Die Anleitung
+  bleibt an einer Stelle. Nach Änderungen `/new` in einem Codex-Gespräch
+  senden. `engine.codex.skills` darf nicht `false` sein; die `SKILL.md`
+  braucht einen lesbaren Kopf mit Beschreibung. Eigene Einträge unter
+  `.agents/skills/` und gleichnamige Skills in der Codex-Konfiguration gehen
+  vor. Ist `.agents` oder `.agents/skills` selbst ein Link oder eine Datei,
+  ändert tybo dort nichts und meldet es im Log. Nach Verlust von
+  `data/codex-skill-links.json` bleiben vorhandene Links fremd, auch beim
+  Abschalten. Hintergründe und Grenzen:
+  [Skills für Codex](erweiterungen.md#skills-für-codex).
 
 **Danach:** `/motor codex` in einem Gespräch, und die nächste Antwort kommt
 von Codex mit den erwarteten Werkzeugen.
@@ -1782,7 +2016,7 @@ OpenCode im Projektordner (`--dir`, `PWD`) und setzt dafür nichts.
 dir gesetzt, schalten das Lesen der `CLAUDE.md` ab.
 
 **Auswählen:** als Standard mit `TYBO_ENGINE=opencode` oder in den
-Einstellungen (Reiter Agenten, Abschnitt Motor), für ein Gespräch mit
+Einstellungen (Reiter Modelle, Abschnitt Motor), für ein Gespräch mit
 `/motor opencode`. Im Abschnitt OpenCode stehen Modell, Variante und Rechte
 (`engine.opencode` in `config/settings.json`). Die Modell-Liste kommt aus
 `opencode models` (10 Sekunden Zeitlimit, 10 Minuten gemerkt),

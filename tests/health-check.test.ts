@@ -228,6 +228,24 @@ describe("Hintergrund-Jobs", () => {
     expect(r.running).toBe(3);
     expect(r.stuck).toEqual(["Alt (über der Frist)", "Waise (Wächter tot)"]);
   });
+
+  test("Fortsetzen beginnt die Frist auch vor dem Start des Motors neu", () => {
+    const resumed = job({
+      phase: "starting", run: 2, createdAt: new Date(NOW - 99 * H).toISOString(),
+      startedAt: undefined, runCreatedAt: new Date(NOW - 1_000).toISOString(),
+    });
+    expect(findStuckJobs([resumed], NOW, () => true)).toEqual({ running: 1, stuck: [] });
+  });
+
+  test("wartender Job braucht keinen Wächter und verbraucht keine Arbeitszeit", () => {
+    const waiting = job({ phase: "waiting", startedAt: new Date(NOW - 50 * H).toISOString(), watcher: { pid: 7, identity: "tot" } });
+    expect(findStuckJobs([waiting], NOW, () => false)).toEqual({ running: 0, stuck: [] });
+  });
+
+  test("nach einer Antwort gilt nur der Rest des Arbeitszeitbudgets", () => {
+    const resumed = job({ title: "Antwort", run: 2, budgetUsedMs: 2.5 * H });
+    expect(findStuckJobs([resumed], NOW, () => true).stuck).toEqual(["Antwort (über der Frist)"]);
+  });
 });
 
 test("df: freier Platz in Bytes", () => {

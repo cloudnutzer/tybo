@@ -93,7 +93,10 @@ function scriptSources(name: string): string {
 }
 
 /** Skripte, die ihre Optionen in einem anderen Modul auswerten */
-const DELEGATES: Record<string, string[]> = { job: ["src/lib/jobs/cli.ts"] };
+const DELEGATES: Record<string, string[]> = {
+  job: ["src/lib/jobs/cli.ts"],
+  limits: ["src/lib/engines/usage-cli.ts", "src/lib/engines/usage-input.ts"],
+};
 
 function tyboHelp(...args: string[]): string {
   const r = Bun.spawnSync([process.execPath, "--no-env-file", join(ROOT, "scripts/tybo.ts"), ...args, "help"], {

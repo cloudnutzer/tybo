@@ -19,6 +19,10 @@ import { dmChatId, isWebChatId, outboxDelivered, telegramConfigured } from "../l
 import { abortEngineCalls } from "../lib/engines";
 import { getGoal, onGoalChange } from "../lib/goal-engine";
 import { createGoalChoices } from "../lib/goal-choices";
+import { createJobDeps } from "../lib/jobs/default-deps";
+import { jobChoiceHandler } from "../lib/jobs/choices";
+import { settleJobReply } from "../lib/jobs/question-choices";
+import type { TextUpdate } from "../channels/telegram/text-inbox";
 import { decideReview } from "../lib/intent-gate";
 import { setMemoryAsker, setMemoryFailureNotice } from "../lib/memory";
 import { createMemoryAsker, createMemoryChoices, MEMORY_SOURCE } from "../lib/memory/choices";
@@ -93,6 +97,7 @@ interface ChoiceParts {
   callAux: typeof callAux;
   /** Hintergrund-Jobs der Entwürfe (Issue #493) */
   createDraftJobs: typeof createDraftJobs;
+  createJobDeps: typeof createJobDeps;
 }
 
 /** Prozessweite Anmeldungen der Rückfragen; Tests ersetzen sie, damit nichts im Prozess hängen bleibt */
@@ -161,7 +166,7 @@ export function aftercallNotify(send: (input: SendAndRecordInput) => Promise<Sen
   };
 }
 
-const CHOICE_PARTS: ChoiceParts = { decideReview, createRoutine: createRoutineFromSession, sendAndRecord, saveMessage, applyThreadButton, callAux, createDraftJobs };
+const CHOICE_PARTS: ChoiceParts = { decideReview, createRoutine: createRoutineFromSession, sendAndRecord, saveMessage, applyThreadButton, callAux, createDraftJobs, createJobDeps };
 
 export function wireBotChoices(deps: BotChoicesDeps) {
   const { env, runtime } = deps;
@@ -175,7 +180,7 @@ export function wireBotChoices(deps: BotChoicesDeps) {
     runtime.bot ? refreshChoiceMessages(choice, runtime.bot.api, undefined, refs) : Promise.resolve([]);
 
   const install = { ...CHOICE_INSTALLERS, ...deps.installers };
-  const { decideReview, createRoutine, sendAndRecord, saveMessage, applyThreadButton, callAux, createDraftJobs } = { ...CHOICE_PARTS, ...deps.parts };
+  const { decideReview, createRoutine, sendAndRecord, saveMessage, applyThreadButton, callAux, createDraftJobs, createJobDeps } = { ...CHOICE_PARTS, ...deps.parts };
   /** Wirft, wenn die Outbox die Meldung nicht zugestellt hat */
   const deliverOrThrow = async (input: Parameters<typeof sendAndRecord>[0]): Promise<void> => {
     const result = await sendAndRecord(input);
@@ -228,6 +233,18 @@ export function wireBotChoices(deps: BotChoicesDeps) {
     },
   });
   onChoiceDecided("routine", routineChoices.handler);
+
+  // Nur der Bot entscheidet Fortsetzungen; Wächter legen lediglich die Frage an.
+  const jobDeps = createJobDeps({ root: deps.root, env });
+  onChoiceDecided("job", jobChoiceHandler(jobDeps));
+  const jobReply = async (ctx: TextUpdate): Promise<boolean> => {
+    const quoted = ctx.message?.reply_to_message as { message_id?: number } | undefined;
+    const text = await settleJobReply({ userId: String(ctx.from?.id ?? ""), chatId: String(ctx.chat?.id ?? ""),
+      topicId: ctx.message?.message_thread_id, messageId: quoted?.message_id, text: ctx.message?.text ?? "" }, owner, jobDeps);
+    if (text === undefined) return false;
+    await ctx.reply(text, { message_thread_id: ctx.message?.message_thread_id });
+    return true;
+  };
 
   // Offene Fäden (Issue #292): Antwort im Gespräch der Rückfrage, nie als Kopie
   const threadChoices = createThreadChoices({
@@ -374,7 +391,7 @@ export function wireBotChoices(deps: BotChoicesDeps) {
     install.installAskOffer(createAskOffer(ways));
   };
 
-  return { postWeb, sendChoice, voiceAgents, voiceDrafts, stopDraftPolling, threadChoices, memoryChoices, askChoices, reminderChoices, reviewResults, goalChoices, topicChoices, routineChoices, proactiveChoices, phone, aftercall, taskReminders, approvalTurns, refresh, installNotifiers };
+  return { postWeb, sendChoice, jobReply, voiceAgents, voiceDrafts, stopDraftPolling, threadChoices, memoryChoices, askChoices, reminderChoices, reviewResults, goalChoices, topicChoices, routineChoices, proactiveChoices, phone, aftercall, taskReminders, approvalTurns, refresh, installNotifiers };
 }
 
 export type BotChoices = ReturnType<typeof wireBotChoices>;

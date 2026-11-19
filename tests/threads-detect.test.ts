@@ -350,6 +350,9 @@ describe("Zeitüberschreitung über den echten callAux-Weg", () => {
     // Einmaliger Hinweis des Env-Filters beim ersten Subprozess, hängt von der Umgebung ab, nicht vom Aufruf
     setSubprocessEnvLoggerForTests(() => {});
     setSettingsPath(join(dir, "fehlt.json"));
+    // Auch die Buchung des Aux-Laufs darf keinen echten Alt-Zähler importieren.
+    const savedRoot = process.env.GO_PROJECT_ROOT;
+    process.env.GO_PROJECT_ROOT = dir;
     const savedAux = process.env.AUX_MODEL_THREADS;
     delete process.env.AUX_MODEL_THREADS;
     setSpawnForTests(((options: { cmd: string[] }) => {
@@ -390,6 +393,8 @@ describe("Zeitüberschreitung über den echten callAux-Weg", () => {
       setMcpReaderForTests(null);
       setSubprocessEnvLoggerForTests(null);
       setSettingsPath();
+      if (savedRoot === undefined) delete process.env.GO_PROJECT_ROOT;
+      else process.env.GO_PROJECT_ROOT = savedRoot;
       if (savedAux !== undefined) process.env.AUX_MODEL_THREADS = savedAux;
     }
   });

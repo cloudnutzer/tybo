@@ -21,6 +21,21 @@ import { dirname, join } from "path";
 import { mkdir, readFile } from "fs/promises";
 import type { EngineId } from "./engines/types";
 
+export type HandoverReason = "limit" | "outage" | "user" | "changed";
+/** Nur Herkunft und Beginn, niemals eine fortsetzbare Session-ID. */
+export interface SessionHandover {
+  agentName: string;
+  engine: EngineId;
+  model: string;
+  since: number;
+  reason: HandoverReason;
+  notedAt: number;
+}
+
+export interface ResetSessionOptions {
+  preserveHandover?: boolean;
+}
+
 export interface BotSession {
   key: string; // "{sessionKey}:{agentName}"
   agentName: string;
@@ -54,6 +69,103 @@ const IDLE_HOURS = parseFloat(process.env.SESSION_IDLE_HOURS || "18");
 export const SESSION_IDLE_MS = IDLE_HOURS * 3_600_000;
 
 let cache: Record<string, BotSession> | null = null;
+const DEFAULT_HANDOVER_FILE = join(process.cwd(), "data", "session-handover.json");
+let handoverFile = DEFAULT_HANDOVER_FILE;
+let handovers: Record<string, SessionHandover> | undefined;
+let handoverQueue: Promise<unknown> = Promise.resolve();
+
+export function setHandoverFileForTests(path: string | null): void {
+  handoverFile = path ?? DEFAULT_HANDOVER_FILE;
+  handovers = undefined;
+  handoverQueue = Promise.resolve();
+}
+
+/** Ein Schreiber im Bot-Prozess; auch ein fehlgeschlagenes Löschen gilt im Speicher. */
+function withHandovers<T>(action: (notes: Record<string, SessionHandover>) => Promise<T>): Promise<T | undefined> {
+  const run = handoverQueue.then(async () => {
+    if (!handovers) {
+      handovers = {};
+      try {
+        const raw = JSON.parse(await readFile(handoverFile, "utf8"));
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Ungültige Übergabenotizen");
+        for (const [key, value] of Object.entries(raw)) {
+          const note = value as SessionHandover;
+          if (!note || typeof note.agentName !== "string" || !["claude", "codex", "opencode", "api"].includes(note.engine)
+            || typeof note.model !== "string" || !Number.isFinite(note.since) || !Number.isFinite(note.notedAt)
+            || !["limit", "outage", "user", "changed"].includes(note.reason)) throw new Error("Ungültige Übergabenotiz");
+          const { agentName, engine, model, since, reason, notedAt } = note;
+          handovers[key] = { agentName, engine, model, since, reason, notedAt };
+        }
+      } catch (error: any) {
+        handovers = {};
+        if (error.code !== "ENOENT") console.error("[SessionManager] Übergabenotizen nicht lesbar:", error);
+      }
+    }
+    return action(handovers);
+  }).catch(error => {
+    console.error("[SessionManager] Übergabenotizen nicht schreibbar:", error);
+    return undefined;
+  });
+  handoverQueue = run;
+  return run;
+}
+
+const persistHandovers = (notes: Record<string, SessionHandover>) => atomicWriteFile(handoverFile, JSON.stringify(notes, null, 2));
+
+/** Hält auch automatisch übergebene Herkunft bis zur ersten gespeicherten neuen Session fest. */
+export async function retainHandover(sessionKey: string, note: SessionHandover, epoch = sessionEpoch(sessionKey)): Promise<void> {
+  await withHandovers(async notes => {
+    if (sessionEpoch(sessionKey) !== epoch) return;
+    const key = storageKey(sessionKey, note.agentName);
+    const { agentName, engine, model, since, reason, notedAt } = note;
+    notes[key] = { agentName, engine, model, since, reason, notedAt };
+    try { await persistHandovers(notes); }
+    catch (error) { delete notes[key]; throw error; }
+  });
+}
+
+/** Vor dem Motor-Reset unter dessen Gesprächssperre; fehlende Sessions lassen Notizen stehen. */
+export async function noteHandover(sessionKey: string, reason: HandoverReason): Promise<void> {
+  const epoch = sessionEpoch(sessionKey);
+  const sessions = await getSessionsForKey(sessionKey);
+  const now = Date.now();
+  for (const session of sessions) {
+    if (now - session.lastActivity > SESSION_IDLE_MS) continue;
+    await retainHandover(sessionKey, {
+      agentName: session.agentName, engine: session.engine, model: session.model,
+      since: session.startedAt, reason, notedAt: now,
+    }, epoch);
+  }
+}
+
+/** Standard: einmal entnehmen. Der Chat hält sie bis recordSessionTurn, auch bei /stop oder Ersatzmodell. */
+export async function takeHandover(
+  sessionKey: string, agentName: string, options: { preserveUntilRecorded?: boolean } = {}
+): Promise<SessionHandover | undefined> {
+  return withHandovers(async notes => {
+    const key = storageKey(sessionKey, agentName);
+    const note = notes[key];
+    if (!note) return undefined;
+    const expired = Date.now() - note.notedAt > SESSION_IDLE_MS;
+    if (expired || !options.preserveUntilRecorded) {
+      delete notes[key];
+      await persistHandovers(notes);
+    }
+    return expired ? undefined : { ...note };
+  });
+}
+
+async function clearHandovers(sessionKey: string, agentName?: string, epoch?: number): Promise<void> {
+  await withHandovers(async notes => {
+    if (epoch !== undefined && sessionEpoch(sessionKey) !== epoch) return;
+    const keys = agentName ? [storageKey(sessionKey, agentName)] : Object.keys(notes).filter(key => key.startsWith(`${sessionKey}:`));
+    let changed = false;
+    for (const key of keys) {
+      if (notes[key]) { delete notes[key]; changed = true; }
+    }
+    if (changed) await persistHandovers(notes);
+  });
+}
 
 /**
  * Epoche je Session-Schlüssel (Issue #189): jedes Zurücksetzen aller Agenten
@@ -115,6 +227,7 @@ export function setSessionsFileForTests(path: string | null): void {
   sessionsFile = path ?? DEFAULT_SESSIONS_FILE;
   cache = null;
   initialLoad = undefined;
+  setHandoverFileForTests(path ? join(dirname(path), "session-handover.json") : null);
 }
 
 let initialLoad: ReturnType<typeof loadUncached> | undefined;
@@ -257,6 +370,7 @@ export async function recordSessionTurn(
   epoch?: number,
   shownFactIds?: string[]
 ): Promise<boolean> {
+  const recordEpoch = epoch ?? sessionEpoch(sessionKey);
   try {
     const sessions = await load();
     // Nach dem Laden ohne weiteres await prüfen und schreiben: ein /new
@@ -279,7 +393,9 @@ export async function recordSessionTurn(
       messageCount: sameSession ? existing.messageCount + 1 : 1,
       ...(shown ? { shownFactIds: shown } : {}),
     };
-    return await persist();
+    const saved = await persist();
+    if (saved) await clearHandovers(sessionKey, agentName, recordEpoch);
+    return saved;
   } catch (err) {
     console.error("[SessionManager] recordSessionTurn failed:", err);
     return false;
@@ -293,11 +409,13 @@ export async function recordSessionTurn(
  */
 export async function resetSession(
   sessionKey: string,
-  agentName?: string
+  agentName?: string,
+  options: ResetSessionOptions = {}
 ): Promise<number> {
   // Vor dem ersten await, auch ohne gespeicherte Session: ein laufender
   // erster Turn des Schlüssels darf danach nichts mehr speichern
   if (!agentName) bumpEpoch(sessionKey);
+  if (!agentName && !options.preserveHandover) await clearHandovers(sessionKey);
   try {
     const sessions = await load();
     const keys = agentName
@@ -321,8 +439,9 @@ export async function resetSession(
  * Wie resetSession ohne Agent, wirft aber Lese- und Schreibfehler (WebUI,
  * Issue #29: Löschen eines Topics meldet ein unvollständiges Aufräumen).
  */
-export async function resetSessionOrThrow(sessionKey: string): Promise<number> {
+export async function resetSessionOrThrow(sessionKey: string, options: ResetSessionOptions = {}): Promise<number> {
   bumpEpoch(sessionKey);
+  if (!options.preserveHandover) await clearHandovers(sessionKey);
   const sessions = await load();
   const keys = Object.keys(sessions).filter((k) => k.startsWith(`${sessionKey}:`));
   if (!keys.length) return 0;

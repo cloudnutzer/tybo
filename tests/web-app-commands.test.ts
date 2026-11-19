@@ -203,6 +203,37 @@ function all(n: Node): Node[] {
 }
 const byClass = (n: Node, cls: string) => all(n).find(c => String(c.className).split(" ").includes(cls));
 
+describe("Motor-Abfragen während einer Antwort (Issue #666)", () => {
+  test.each(["/motor", "/motor werkzeuge", "/engine", "/ENGINE@tybo_bot WERKZEUGE", "/motor auto aus", "/motor auto an", "/motor pruefen", "/motor prüfen", "/ENGINE PRU\u0308FEN", "/motor auto falsch", "/motor  AUTO  AUS"])("%s lässt sich über die Eingabebox senden", async text => {
+    const app = setup();
+    await settle();
+    FakeEventSource.all.find(s => s.url === "/api/conversations/topic-8/events")!.emit("status", { data: JSON.stringify({ running: true }) });
+    app.server.postReply = { status: 202, data: { message: { id: "motor-abfrage", role: "user", text }, running: true } };
+    app.type(text);
+    await settle();
+    expect(app.elements.send.hidden).toBe(false);
+    expect(app.elements.send.disabled).toBe(false);
+    app.key("Enter");
+    await settle();
+    expect(app.server.posts).toEqual([{ text }]);
+    expect(app.elements.stop.hidden).toBe(false);
+    expect(app.server.calls.some(call => call.endsWith("/stop"))).toBe(false);
+  });
+  test("Motorwechsel und unbekannte Unterbefehle bleiben während einer Antwort gesperrt", async () => {
+    const app = setup();
+    await settle();
+    FakeEventSource.all.find(s => s.url === "/api/conversations/topic-8/events")!.emit("status", { data: JSON.stringify({ running: true }) });
+    for (const text of ["/motor codex", "/motor werkzeuge jetzt"]) {
+      app.type(text);
+      await settle();
+      expect(app.elements.send.disabled).toBe(true);
+      app.key("Enter");
+      await settle();
+    }
+    expect(app.server.posts).toEqual([]);
+  });
+});
+
 describe("Befehlsliste: Öffnen und Filtern", () => {
   test("/ am Anfang öffnet die Liste mit Name und Kurzbeschreibung, lädt /api/commands genau einmal", async () => {
     const app = setup();

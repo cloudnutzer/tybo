@@ -222,10 +222,27 @@ describe("GET /api/files/<id>", () => {
     expect(csp).not.toContain("allow-same-origin");
     expect(csp).toContain("default-src 'none'");
     expect(csp).not.toContain("connect-src");
+    // Kein Wechsel der äußeren Seite aus der Datei heraus
+    expect(csp).not.toContain("allow-top-navigation");
     const plain = await ctx.get(`/api/files/${id}`);
     expect(plain.headers.get("content-disposition")).toStartWith("attachment;");
     expect(plain.headers.get("content-type")).toBe("application/octet-stream");
     expect(plain.headers.get("content-security-policy")).toStartWith("default-src 'self'");
+  });
+
+  test("einbetten darf HTML aus Meldungen nur die eigene Seite, alles andere niemand (Issue #708)", async () => {
+    const ctx = await start();
+    const html = await ctx.add("report.html", "<h1>Report</h1>", "text/html");
+    const png = await ctx.add("bild.png", new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]), "image/png");
+    const framed = await ctx.get(`/api/files/${html}?inline=1`);
+    expect(framed.headers.get("content-security-policy")).toContain("frame-ancestors 'self'");
+    expect(framed.headers.get("x-frame-options")).toBe("SAMEORIGIN");
+    // Download derselben Datei, Bild inline, unbekannte Datei und die Seite selbst: weiter gar nicht
+    for (const path of [`/api/files/${html}`, `/api/files/${png}?inline=1`, `/api/files/${png}`, "/api/files/00000000-0000-4000-8000-000000000000", "/"]) {
+      const res = await ctx.get(path);
+      expect(res.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+      expect(res.headers.get("x-frame-options")).toBe("DENY");
+    }
   });
 
   test("HTML-Endung mit anderem Typ und Typ text/html mit anderer Endung: kein inline", async () => {

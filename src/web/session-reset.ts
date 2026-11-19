@@ -10,7 +10,9 @@
  * Antwort ihre Session danach wieder zurück. Die Sperre des Hubs im Server
  * deckt Turns aus Web und Terminal ab, isActive und block die übrigen:
  * Prüfen und Sperren geschehen ohne await dazwischen, und die Sperre hält
- * bis nach dem Reset. Eine Telegram-Ausführung, die währenddessen startet,
+ * bis nach dem Reset. Beim Motorwechsel hält beforeReset die Herkunft fest,
+ * preserveHandover erhält sie beim Löschen, whileBlocked schreibt danach die Wahl.
+ * Eine Telegram-Ausführung, die währenddessen startet,
  * endet sofort wie nach /stop (wie beim Löschen eines Topics, Issue #29).
  *
  * Importiert nichts aus src/lib; die echten Funktionen reicht
@@ -25,10 +27,16 @@ export type SessionResetResult =
 
 /**
  * Setzt die Session eines Gesprächs zurück; wirft bei Lese- oder
- * Schreibfehlern. whileBlocked (/motor, Issue #125) läuft nach dem Reset,
- * solange neue Ausführungen noch gesperrt sind; wirft es, wirft der Reset.
+ * Schreibfehlern der Sessions. beforeReset läuft vor dem Löschen, whileBlocked
+ * danach, beide unter der Sperre; Fehler der Rückrufe werden weitergegeben.
  */
-export type ConversationSessionReset = (conversationId: string, whileBlocked?: () => Promise<void>) => Promise<SessionResetResult>;
+export interface ConversationSessionResetOptions {
+  beforeReset?(): Promise<void>;
+  whileBlocked?(): Promise<void>;
+  preserveHandover?: boolean;
+}
+
+export type ConversationSessionReset = (conversationId: string, options?: ConversationSessionResetOptions) => Promise<SessionResetResult>;
 
 export interface SessionResetDeps<S> {
   /** Session-Schlüssel wie bei einer Nachricht in diesem Gespräch; null, wenn keiner ermittelbar ist */
@@ -42,7 +50,7 @@ export interface SessionResetDeps<S> {
   /** Läuft im Hintergrund weiter, wirft nie in den Reset hinein */
   distill(session: S): Promise<void>;
   /** Alle Sessions des Schlüssels entfernen, Anzahl zurück; wirft bei Fehlern */
-  reset(sessionKey: string): Promise<number>;
+  reset(sessionKey: string, options?: { preserveHandover?: boolean }): Promise<number>;
   sessionModeEnabled(): boolean;
   log?(message: string): void;
 }
@@ -66,19 +74,20 @@ export function sessionResetNote(result: { reset: number; sessionMode: boolean }
 
 export function createConversationSessionReset<S>(deps: SessionResetDeps<S>): ConversationSessionReset {
   const log = deps.log ?? ((m: string) => console.log(`[web] ${m}`));
-  return async (conversationId, whileBlocked) => {
+  return async (conversationId, options) => {
     const key = deps.sessionKey(conversationId);
     if (!key) return { status: "unavailable" };
     // Prüfen und Sperren ohne await dazwischen: keine Ausführung schlüpft durch
     if (deps.isActive(key)) return { status: "busy" };
     const release = deps.block(key);
     try {
+      await options?.beforeReset?.();
       for (const session of await deps.sessionsForKey(key)) {
         if (!deps.shouldDistill(session)) continue;
         void deps.distill(session).catch(e => log(`Session-Rückblick fehlgeschlagen (${e instanceof Error ? e.name : typeof e})`));
       }
-      const reset = await deps.reset(key);
-      if (whileBlocked) await whileBlocked();
+      const reset = await deps.reset(key, { preserveHandover: options?.preserveHandover });
+      await options?.whileBlocked?.();
       return { status: "done", reset, sessionMode: deps.sessionModeEnabled() };
     } finally {
       release();

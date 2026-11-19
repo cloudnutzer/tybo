@@ -324,6 +324,16 @@ export function forgetEngineCheck(): void {
   forgetOpenCodeVersion();
 }
 
+/** Gezielte frische Prüfung von Hand, einschließlich Claude Code (M14-05). */
+export function forgetEngineCheckFor(id: EngineId): void {
+  if (id === "claude") claudeCache = undefined;
+  if (id === "codex") cache = undefined;
+  if (id === "opencode") {
+    opencodeCache = undefined;
+    forgetOpenCodeVersion();
+  }
+}
+
 /** Motor api: nichts zu installieren, „angemeldet" heißt Schlüssel vorhanden */
 function checkApi(): EngineStatus {
   const base = { engine: "api" as const, checked: true, installed: true };

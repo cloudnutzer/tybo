@@ -74,6 +74,7 @@ export const CHOICE_KIND_LABELS: Record<ChoiceKindName, string> = {
   core: "Kern",
   secret: "Geheimnis im Gedächtnis",
   sprachagent: "Sprachagent",
+  job: "Job fortsetzen",
 };
 
 /** Anzeigenamen der Absender wie NOTICE_SOURCES in public/app.js; unbekannte groß geschrieben */

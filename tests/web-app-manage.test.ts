@@ -5,6 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import type { ConversationEngineStage } from "../src/web/engines";
 import { TYBO_BRAND } from "./brand-fixture";
 
 const source = await readFile(resolve(import.meta.dir, "..", "src", "web", "public", "app.js"), "utf8");
@@ -67,6 +68,8 @@ interface Options {
   deleteStatus?: number;
   /** Antwort auf POST /api/conversations (Issue #29: Topic oder Fehler); Standard: Web-Gespräch neu<n> */
   create?: { status: number; body: any };
+  /** Vorschau nur in der Liste, nicht in der Antwort auf das Anlegen */
+  engineStage?: ConversationEngineStage;
   /** Antwort auf GET /api/telegram/rights; Standard: alle Rechte */
   rights?: { status: number; body: any };
 }
@@ -116,6 +119,12 @@ function setup(options: Options = {}) {
     patchStatus: 200,
     /** Status für GET /api/conversations, Standard 200 */
     listStatus: 200,
+    running: false,
+    messageReply: null as null | { status: number; body: any },
+    holdMessage: false,
+    releaseMessage: null as null | (() => void),
+    overrides: [] as { conversationId: string; engine: string }[],
+    omitFromList: null as string | null,
     /** Telegram-Teil der Liste, veränderlich wie auf dem Server */
     telegram: JSON.parse(JSON.stringify(options.telegram ?? { dm: null, topics: [] })) as { dm: any; topics: any[] },
     create: options.create,
@@ -134,6 +143,9 @@ function setup(options: Options = {}) {
     const method = init?.method ?? "GET";
     const body = init?.body ? JSON.parse(init.body) : undefined;
     server.requests.push({ method, path, body });
+    if (path === "/api/engines") return Response.json({ engines: [
+      { id: "claude", label: "Claude Code" }, { id: "codex", label: "Codex" }, { id: "opencode", label: "OpenCode" }, { id: "api", label: "Anthropic API" },
+    ], overrides: server.overrides });
     if (path === "/api/agents") {
       if (server.agents === null) return Response.json({ error: "kaputt" }, { status: 500 });
       return Response.json({ agents: server.agents, defaultAgent: "general" });
@@ -146,13 +158,16 @@ function setup(options: Options = {}) {
     }
     if (path === "/api/conversations" && method === "GET") {
       if (server.listStatus !== 200) return Response.json({ error: "kaputt" }, { status: server.listStatus });
-      return Response.json({ conversations: server.conversations, telegram: server.telegram });
+      const listed = (entries: Conv[]) => entries.filter(c => c.id !== server.omitFromList)
+        .map(c => options.engineStage ? { ...c, engine: "claude", engineStage: options.engineStage } : c);
+      return Response.json({ conversations: listed(server.conversations), telegram: { ...server.telegram, topics: listed(server.telegram.topics) } });
     }
     if (path === "/api/telegram/rights") return Response.json(server.rights.body, { status: server.rights.status });
     if (path === "/api/conversations" && method === "POST") {
       if (server.create) {
         const { conversation } = server.create.body ?? {};
         if (conversation?.id?.startsWith("topic-")) server.telegram.topics = [{ ...conversation }, ...server.telegram.topics];
+        else if (conversation) server.conversations = [{ ...conversation }, ...server.conversations];
         return Response.json(server.create.body, { status: server.create.status });
       }
       // Wie der Server seit Issue #29: immer ein Telegram-Topic, ab topic-900
@@ -170,14 +185,14 @@ function setup(options: Options = {}) {
         if (!t) return Response.json({ error: "Gespräch nicht gefunden" }, { status: 404 });
         if (action === "close") t.closed = true;
         else delete t.closed;
-        return Response.json({ conversation: { ...t } });
+        return Response.json({ conversation: { ...t, engineStage: undefined } });
       }
       if (method === "PATCH") {
         if (server.topicPatch) return Response.json(server.topicPatch.body, { status: server.topicPatch.status });
         if (!t) return Response.json({ error: "Gespräch nicht gefunden" }, { status: 404 });
         t.title = body.title;
         delete t.exactTitle;
-        return Response.json({ conversation: { ...t } });
+        return Response.json({ conversation: { ...t, engineStage: undefined } });
       }
       if (method === "DELETE") {
         if (server.topicDelete) return Response.json(server.topicDelete.body, { status: server.topicDelete.status });
@@ -194,7 +209,7 @@ function setup(options: Options = {}) {
       const c = server.conversations.find(x => x.id === one[1]);
       if (!c) return Response.json({ error: "Gespräch nicht gefunden" }, { status: 404 });
       c.title = body.title;
-      return Response.json({ conversation: { ...c, customTitle: true } });
+      return Response.json({ conversation: { ...c, customTitle: true, engineStage: undefined } });
     }
     if (one && method === "DELETE") {
       if (server.deleteStatus !== 200) return Response.json({ error: "läuft" }, { status: server.deleteStatus });
@@ -205,14 +220,16 @@ function setup(options: Options = {}) {
     if (messages) {
       const telegramEntry = messages[1] === "dm" ? server.telegram.dm : topic(messages[1]);
       if (!server.conversations.some(c => c.id === messages[1]) && !telegramEntry) return Response.json({ error: "Gespräch nicht gefunden" }, { status: 404 });
+      if (method === "POST" && server.holdMessage) await new Promise<void>(resolve => { server.releaseMessage = resolve; });
+      if (method === "POST" && server.messageReply) return Response.json(server.messageReply.body, { status: server.messageReply.status });
       if (method === "POST" && telegramEntry?.closed) {
         return Response.json({ error: "Das Topic ist geschlossen. Erst wieder öffnen.", closed: true }, { status: 409 });
       }
-      if (telegramEntry && method === "GET") return Response.json({ messages: [], hasMore: false, running: false });
+      if (telegramEntry && method === "GET") return Response.json({ messages: [], hasMore: false, running: server.running });
       if (method === "POST") {
         return Response.json({ message: { id: "u1", role: "user", text: body.text, createdAt: "2026-09-23T11:00:00.000Z" } }, { status: 202 });
       }
-      return Response.json({ messages: [], running: false });
+      return Response.json({ messages: [], running: server.running });
     }
     return Response.json({ error: "unbekannt" }, { status: 404 });
   };
@@ -848,6 +865,115 @@ describe("Startverhalten ohne automatisches Anlegen (Issue #30)", () => {
   });
 });
 
+describe("Motor-Vorschau beim Anlegen (Issue #675)", () => {
+  const stages: ConversationEngineStage[] = [
+    { engine: "codex", label: "Codex", model: "gpt-6-astra", role: "backup" },
+    { engine: null, label: null, role: "none" },
+  ];
+  for (const id of ["neu1", "topic-900"]) {
+    for (const stage of stages) test(`neues Gespräch ${id} zeigt ${stage.role} ohne gesendete Nachricht`, async () => {
+      const conversation = { id, title: "Neues Gespräch", agent: "general" };
+      const app = setup({
+        create: { status: 201, body: { conversation } },
+        engineStage: { ...stage, reason: { label: "Claude Code", kind: "threshold", resetKnown: true } },
+      });
+      await settle();
+      const before = app.requests("GET").filter(r => r.path === "/api/conversations").length;
+      app.elements["new-chat"].dispatch("click");
+      app.press(app.elements["agent-options"], "Enter");
+      await settle();
+      const pill = app.elements["engine-name"];
+      const title = "Claude Code ist gesperrt. " + (stage.role === "backup"
+        ? "Codex springt ein."
+        : "Kein Motor ist frei. Es antworten Ersatzmodelle mit eingeschränktem Werkzeugumfang.");
+      expect(app.store["tybo-last-conversation"]).toBe(id);
+      expect(pill.hidden).toBe(false);
+      expect(pill.textContent).toBe(stage.role === "backup" ? "Codex · springt ein" : "Kein Motor frei");
+      expect(pill.attributes["data-engine"]).toBe(stage.engine ?? "");
+      expect(pill.attributes.title).toBe(title);
+      expect(app.elements["engine-status"].textContent).toBe(title);
+      expect(app.elements["messages"].children).toHaveLength(0);
+      expect(app.requests("POST")).toEqual([{ method: "POST", path: "/api/conversations", body: { agent: "general" } }]);
+      expect(app.requests("GET").filter(r => r.path === "/api/conversations")).toHaveLength(before + 1);
+      expect(id.startsWith("topic-") ? app.topicTitles("topic-list") : app.titles()).toContain("Neues Gespräch");
+    });
+
+    test(`neues Gespräch ${id} bleibt in der Seitenleiste, wenn die frische Liste es noch nicht enthält`, async () => {
+      const conversation = { id, title: "Neues Gespräch", agent: "general" };
+      const app = setup({ create: { status: 201, body: { conversation } }, engineStage: stages[0] });
+      await settle();
+      app.server.omitFromList = id;
+      const before = app.requests("GET").filter(r => r.path === "/api/conversations").length;
+      app.elements["new-chat"].dispatch("click");
+      app.press(app.elements["agent-options"], "Enter");
+      await settle();
+      expect(app.requests("GET").filter(r => r.path === "/api/conversations")).toHaveLength(before + 1);
+      expect(app.store["tybo-last-conversation"]).toBe(id);
+      expect(id.startsWith("topic-") ? app.topicTitles("topic-list") : app.titles()).toContain("Neues Gespräch");
+      // Der noch fehlende Listeneintrag erhält beim nächsten Ereignis seine Vorschau.
+      app.server.omitFromList = null;
+      FakeEventSource.all.find(s => s.url === "/api/telegram/events" && !s.closed)!.emit("engine");
+      await settle();
+      expect(app.elements["engine-name"].textContent).toBe("Codex · springt ein");
+      expect(app.elements["messages"].children).toHaveLength(0);
+      expect(app.requests("POST")).toHaveLength(1);
+    });
+  }
+});
+
+describe("Motor-Vorschau bei Teilständen (Issue #675)", () => {
+  for (const [id, action] of [
+    ["c1", "Umbenennen"],
+    ["topic-443", "Umbenennen"],
+    ["topic-443", "Schließen"],
+    ["topic-443", "Wieder öffnen"],
+  ]) test(`${action} von ${id} behält die Ersatzstufe beim erneuten Zeichnen`, async () => {
+    const conversation = {
+      id, title: "Recherche", agent: "research", closed: action === "Wieder öffnen",
+      engineStage: {
+        engine: "codex", label: "Codex", model: "gpt-6-astra", role: "backup",
+        reason: { label: "Claude Code", kind: "threshold", resetKnown: true },
+      },
+    };
+    const app = setup({
+      stored: id,
+      conversations: [
+        ...(id === "c1" ? [conversation] : []),
+        { id: "c2", title: "Anderes Gespräch", agent: "general" },
+      ],
+      telegram: { dm: null, topics: id === "topic-443" ? [conversation] : [] },
+    });
+    await settle();
+    const pill = app.elements["engine-name"];
+    expect(pill.textContent).toBe("Codex · springt ein");
+    const listRequests = app.requests("GET").filter(r => r.path === "/api/conversations").length;
+    if (action === "Umbenennen") {
+      app.elements["chat-title"].dispatch("click");
+      app.elements["title-input"].value = "Neuer Titel";
+      app.press(app.elements["title-input"], "Enter");
+      await settle();
+      expect(app.elements["chat-title"].textContent).toBe("Neuer Titel");
+    } else {
+      app.elements["conversation-menu"].dispatch("click");
+      await settle();
+      app.panelButtons(app.headerPanel()).find(b => b.textContent === action)!.dispatch("click");
+      await settle();
+      expect(app.elements["input"].disabled).toBe(action === "Schließen");
+    }
+    // Gesprächswechsel zeichnet die Pille aus dem Listeneintrag neu, ohne Listenabgleich.
+    app.row("c2").children[0].dispatch("click");
+    await settle();
+    (id === "c1" ? app.row(id) : app.topicRow(id)).children[0].dispatch("click");
+    await settle();
+    expect(pill.hidden).toBe(false);
+    expect(pill.textContent).toBe("Codex · springt ein");
+    expect(pill.attributes["data-engine"]).toBe("codex");
+    expect(pill.attributes.title).toBe("Claude Code ist gesperrt. Codex springt ein.");
+    expect(app.elements["engine-status"].textContent).toBe(pill.attributes.title);
+    expect(app.requests("GET").filter(r => r.path === "/api/conversations")).toHaveLength(listRequests);
+  });
+});
+
 describe("Topics umbenennen, schließen, wieder öffnen (Issue #30)", () => {
   const TOPICS = () => ({
     dm: DM,
@@ -1381,5 +1507,81 @@ describe("Topic löschen mit Namensbestätigung (Issue #30)", () => {
     expect(byClass(panel, "danger-button")).toHaveLength(0);
     expect(byClass(panel, "confirm-input")).toHaveLength(0);
     expect(app.server.requests.some(r => r.path === "/api/telegram/rights")).toBe(false);
+  });
+});
+
+describe("Menü an der Motor-Pille (Issue #676)", () => {
+  test("öffnet ohne Rechteprüfung, schließt mit Escape und teilt den Platz mit dem Gesprächsmenü", async () => {
+    const app = setup();
+    await settle();
+    const pill = app.elements["engine-name"];
+    const rights = app.requests("GET").filter(r => r.path === "/api/telegram/rights").length;
+    pill.dispatch("click");
+    expect(pill.attributes["aria-expanded"]).toBe("true");
+    expect(app.elements["engine-menu"].hidden).toBe(false);
+    expect(app.elements["conversation-actions"].hidden).toBe(true);
+    app.pressWindow("Escape");
+    expect(pill.attributes["aria-expanded"]).toBe("false");
+    expect(pill.focused).toBeGreaterThan(0);
+    pill.dispatch("click");
+    expect(app.requests("GET").filter(r => r.path === "/api/telegram/rights")).toHaveLength(rights);
+    app.elements["conversation-menu"].dispatch("click");
+    expect(app.elements["engine-menu"].hidden).toBe(true);
+    expect(app.elements["conversation-actions"].hidden).toBe(false);
+  });
+});
+
+describe("Motorwahl über Nachrichten (Issue #676)", () => {
+  const choice = (app: ReturnType<typeof setup>, engine: string) => app.elements["engine-menu"].children.find(n => n.attributes["data-engine-choice"] === engine)!;
+  const open = async (app: ReturnType<typeof setup>) => { app.elements["engine-name"].dispatch("click"); await settle(); };
+  test("sendet nur text, lässt den Entwurf stehen, keine Reset-Route", async () => {
+    const app = setup(); await settle();
+    app.elements.input.value = "Noch nicht senden";
+    await open(app);
+    choice(app, "codex").dispatch("click"); await settle();
+    expect(app.requests("POST")).toEqual([{ method: "POST", path: "/api/conversations/c1/messages", body: { text: "/motor codex" } }]);
+    expect(app.elements.input.value).toBe("Noch nicht senden");
+    expect(app.elements["engine-menu"].hidden).toBe(true);
+    expect(app.elements["engine-name"].focused).toBeGreaterThan(0);
+  });
+  test("gleiche Wahl schließt ohne Nachricht", async () => {
+    const app = setup(); await settle(); await open(app);
+    choice(app, "standard").dispatch("click"); await settle();
+    expect(app.requests("POST")).toEqual([]);
+    expect(app.elements["engine-menu"].hidden).toBe(true);
+    app.server.overrides = [{ conversationId: "c1", engine: "codex" }];
+    await open(app); choice(app, "codex").dispatch("click"); await settle();
+    expect(app.requests("POST")).toEqual([]);
+    await open(app); choice(app, "standard").dispatch("click"); await settle();
+    expect(app.requests("POST")[0].body).toEqual({ text: "/motor standard" });
+  });
+  test("Senden sperrt die Wahl auch nach erneutem Öffnen, kein doppelter Befehl", async () => {
+    const app = setup(); await settle(); await open(app);
+    app.server.holdMessage = true;
+    choice(app, "codex").dispatch("click"); await settle();
+    await open(app);
+    expect(choice(app, "claude").attributes["aria-disabled"]).toBe("true");
+    choice(app, "claude").dispatch("click");
+    expect(app.requests("POST")).toHaveLength(1);
+    app.server.releaseMessage!(); await settle();
+  });
+  test("Wettlauf: 409 öffnet den Hinweis; laufende Antwort sperrt alle Zeilen", async () => {
+    const app = setup(); await settle(); await open(app);
+    app.server.running = true;
+    app.server.messageReply = { status: 409, body: { error: "Läuft" } };
+    choice(app, "codex").dispatch("click"); await settle();
+    expect(app.elements["engine-menu"].hidden).toBe(false);
+    expect(app.elements["engine-menu"].children.some(n => n.textContent === "Erst die laufende Antwort abwarten oder stoppen.")).toBe(true);
+    expect(["standard", "claude", "codex", "opencode", "api"].every(id => choice(app, id).attributes["aria-disabled"] === "true")).toBe(true);
+    choice(app, "api").dispatch("click");
+    expect(app.requests("POST")).toHaveLength(1);
+  });
+  test("geschlossenes Topic sperrt die Wahl, lässt Link und Zustand zugänglich", async () => {
+    const app = setup({ conversations: [], telegram: { dm: null, topics: [{ id: "topic-443", title: "Alt", agent: "research", closed: true }] } });
+    await settle(); await open(app);
+    expect(choice(app, "codex").attributes["aria-disabled"]).toBe("true");
+    choice(app, "codex").dispatch("click");
+    expect(app.requests("POST")).toEqual([]);
+    expect(app.elements["engine-menu"].children.at(-1)!.textContent).toBe("Reihenfolge und Limits");
   });
 });

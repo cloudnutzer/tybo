@@ -450,7 +450,7 @@ export function createBotCommands(deps: BotCommandDeps): CommandPort {
       if (isAborted()) throw new DOMException("Befehl gestoppt", "AbortError");
       committed = true;
       req.commit();
-      const result = await deps.resetConversation(conversationId, options?.whileBlocked);
+      const result = await deps.resetConversation(conversationId, options);
       return result.status === "done" ? { status: "done", reset: result.reset, sessionMode: result.sessionMode } : result;
     }
 

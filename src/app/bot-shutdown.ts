@@ -54,6 +54,7 @@ export interface BotShutdownParts {
   threadReminders(): Stoppable | null;
   /** hält den Planer an; true, wenn ein begonnener Versand rechtzeitig fertig wurde */
   stopReminders(): Promise<boolean> | null;
+  stopSwitchNotices?(): void;
   /** ohne Telegram ein Stopp, der nichts tut */
   telegram: Stoppable;
   web(): { stop(options: { graceMs: number; abortText: string }): Promise<void> } | null;
@@ -75,6 +76,7 @@ export function registerBotShutdown(lifecycle: Pick<Lifecycle, "onShutdown">, pa
   });
   lifecycle.onShutdown("Routinen-Prüfung", () => parts.routineWatch()?.stop());
   lifecycle.onShutdown("Fäden-Erinnerungen", () => parts.threadReminders()?.stop());
+  if (parts.stopSwitchNotices) lifecycle.onShutdown("Motorwechsel-Meldungen", () => parts.stopSwitchNotices!());
   // Nicht abwarten: der Versand läuft parallel zum restlichen Beenden weiter
   lifecycle.onShutdown("Erinnerungsplaner", () => {
     remindersSettled = parts.stopReminders();

@@ -6,6 +6,7 @@
  */
 
 import type { RunTurnOptions, WebChat } from "./chat";
+import type { ReplyInfo } from "./store";
 
 export const FAKE_REPLY = [
   "## Antwort der Attrappe",
@@ -30,6 +31,9 @@ export interface FakeChatOptions {
   delayMs?: number;
   /** Abstand zwischen Fortschritten und Antwort, Standard 0,5 Sekunden */
   stepMs?: number;
+  /** Beispiel eines Turn-Hinweises und einer Ersatzantwort, etwa beim Motorwechsel. */
+  notice?: string;
+  replyInfo?: Pick<ReplyInfo, "engine" | "model">;
 }
 
 export function createFakeChat(options: FakeChatOptions = {}): WebChat {
@@ -64,10 +68,10 @@ export function createFakeChat(options: FakeChatOptions = {}): WebChat {
         await sink.progress({ kind: "tool", text: "Read" });
         if (!(await wait(stepMs, signal))) return { text: "", aborted: true };
         await sink.progress({ kind: "snippet", text: `Ich denke über "${text.slice(0, 40)}" nach` });
-        await sink.notice("Hinweis der Attrappe: kein echter Claude-Aufruf.");
+        await sink.notice(options.notice ?? "Hinweis der Attrappe: kein echter Claude-Aufruf.");
         if (!(await wait(stepMs, signal))) return { text: "", aborted: true };
         // Angaben unter der Antwort (Issue #22): echte Dauer, als Modell die Attrappe selbst
-        return { text: FAKE_REPLY, info: { agent, model: FAKE_MODEL, durationMs: Date.now() - startedAt } };
+        return { text: FAKE_REPLY, info: { agent, model: FAKE_MODEL, ...options.replyInfo, durationMs: Date.now() - startedAt } };
       } finally {
         if (running.get(conversationId) === controller) running.delete(conversationId);
       }

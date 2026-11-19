@@ -33,6 +33,7 @@ const quiet = {
   restartMarker: "/nicht/vorhanden/restart-requested",
   requestRestart: async () => {},
   // Nie ein echtes claude oder codex (Issue #126)
+  toolParity: () => { throw new Error("Test ohne Werkzeug-Quelle"); },
   inspectEngine: async (id: "claude" | "codex" | "opencode") => ({ engine: id, checked: true, installed: true, loggedIn: true }),
   now: () => 1000,
 };

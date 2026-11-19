@@ -14,6 +14,7 @@
  */
 
 import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { auxPlan, withoutClaudeSentence } from "../lib/claude-availability";
 import { filterSubprocessEnv, SUBPROCESS_MARKER } from "../lib/subprocess-env";
 import { SELECTABLE_ENGINES, settingsSchema, type SelectableEngine, type Settings } from "../lib/settings";
@@ -68,12 +69,16 @@ const PATH_VAR: Record<CheckedEngine, string | undefined> = { codex: "CODEX_PATH
  * path ersetzt den PATH (Issue #567: PATH aus der Dienstdatei des Bots),
  * ohne path gilt im Prüfbericht ctx.enginePath.
  */
-export async function engineItem(ctx: SetupContext, engine: CheckedEngine, path?: string): Promise<StatusItem> {
+export async function engineItem(ctx: SetupContext, engine: CheckedEngine, path?: string, signal?: AbortSignal): Promise<StatusItem> {
   const env = await readSetupEnv(ctx);
   const source: Record<string, string | undefined> = { ...process.env };
   for (const [k, v] of Object.entries(env)) if (presentValue(env, k) !== undefined) source[k] = v;
   const servicePath = path ?? ctx.enginePath;
   if (servicePath !== undefined) source.PATH = servicePath;
+  source.HOME = ctx.home;
+  for (const key of ["CODEX_HOME", "OPENCODE_CONFIG_DIR"] as const) {
+    if (source[key]) source[key] = resolve(ctx.root, source[key]);
+  }
   const filtered = { ...filterSubprocessEnv({ env: source, cwd: ctx.root, home: ctx.home, engine: engine === "api" ? "claude" : engine }).env, ...SUBPROCESS_MARKER };
   // Der Motor api braucht den Schlüssel selbst; geprüft wird nur, ob er da ist
   if (engine === "api") {
@@ -83,7 +88,7 @@ export async function engineItem(ctx: SetupContext, engine: CheckedEngine, path?
   }
   const pathVar = PATH_VAR[engine];
   const command = pathVar ? presentValue(env, pathVar) : undefined;
-  const result = await ctx.providers.engineCheck(engine, { cwd: ctx.root, env: filtered, ...(command ? { path: command } : {}) });
+  const result = await ctx.providers.engineCheck(engine, { cwd: ctx.root, env: filtered, ...(command ? { path: command } : {}), ...(signal ? { signal } : {}) });
   return {
     label: SETUP_ENGINE_LABELS[engine],
     ok: result.ok,

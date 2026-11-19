@@ -46,7 +46,7 @@ import { getStore } from "./store";
 import type { TaskStore } from "./store/ports";
 import type { AsyncTask, TaskChanges } from "./store/types";
 import { placeOfTask, samePlace, type TaskPlace } from "./task-place";
-import { resumeMacTask, taskResumeRecord, type MacResumeOutcome } from "./task-resume";
+import { resumeMacTask, taskEngine, taskResumeRecord, type MacResumeOutcome } from "./task-resume";
 import type { TurnTools } from "./turn-tools";
 import { scanForQuestion } from "./turn-questions";
 
@@ -260,7 +260,7 @@ export async function resumeLegacyMacTask(task: AsyncTask, answer: string, place
     return { status: "ended" };
   }
 
-  const done = outcome;
+  const done = { ...outcome, engine: outcome.engine ?? taskEngine(task).engine, model: outcome.model ?? taskEngine(task).model ?? "" };
   // Rückfrage-Tag lesbar machen, bevor irgendetwas gespeichert oder gezeigt wird
   const scan = scanForQuestion(done.result.text || "");
   const response = scan.text || LEGACY_TASK_TEXT.completed;

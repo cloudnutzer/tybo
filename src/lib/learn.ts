@@ -15,6 +15,7 @@ import { callAux, parseAuxJSON } from "./aux-model";
 import { addKnowledge, type KnowledgeCategory } from "./knowledge-base";
 import { checkAborted, executionSignal } from "./execution-context";
 import { sanitizeModelOutput } from "./telegram";
+import { formatSwitchTime } from "./engine-switch-text";
 
 const VALID_CATEGORIES: KnowledgeCategory[] = [
   "project",
@@ -123,6 +124,10 @@ Antworte AUSSCHLIESSLICH mit einem JSON-Objekt:
 }`;
 
   const result = await callAux("review", prompt, { timeoutMs: 180_000 });
+  if (result.disabled && result.blockedUntil) {
+    const until = formatSwitchTime(result.blockedUntil, process.env.USER_TIMEZONE || "UTC");
+    return { ok: false, message: `Lernen ist derzeit nicht möglich: Claude Code ist bis ${until} am Limit. Abhilfe: ein anderes Nebenmodell für Review einstellen (WebUI, Modelle) oder nach dem Reset /learn erneut senden.` };
+  }
   if (result.isError) {
     return { ok: false, message: "Die Destillation ist fehlgeschlagen (Aux-Modell nicht erreichbar)." };
   }

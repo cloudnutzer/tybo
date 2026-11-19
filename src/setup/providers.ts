@@ -46,6 +46,7 @@ export interface ClaudeRunContext {
  * der Shell der Einrichtung
  */
 export interface EngineRunContext {
+  signal?: AbortSignal;
   path?: string;
   cwd?: string;
   env?: Record<string, string>;
@@ -355,7 +356,7 @@ export function createProviders(deps: ProviderDeps): Providers {
       }
       const name = engine === "codex" ? "Codex" : "OpenCode";
       const path = context.path || engine;
-      const options = { timeoutMs: ENGINE_CHECK_TIMEOUT_MS, env, ...(context.cwd ? { cwd: context.cwd } : {}) };
+      const options = { timeoutMs: ENGINE_CHECK_TIMEOUT_MS, env, ...(context.cwd ? { cwd: context.cwd } : {}), ...(context.signal ? { signal: context.signal } : {}) };
       const version = await run([path, "--version"], options);
       if (version.code === -1 && version.spawnError === "ENOENT") return { ok: false, message: engine === "codex" ? CODEX_MISSING : OPENCODE_MISSING };
       if (version.timedOut) return { ok: false, message: `${name} antwortet nicht („${engine} --version“ brauchte zu lange).` };

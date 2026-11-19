@@ -81,7 +81,7 @@ function setup(
   const engine = fakeEngine("claude");
   const turnDeps: Partial<ChatTurnDeps> = {
     getEngine: () => engine,
-    resolveEngine: (key, d) => resolveEngine(key, { ...d, env: () => ({}), checkEngine: async id => ({ engine: id, checked: true, installed: true, loggedIn: true }), log: () => {} }),
+    resolveEngine: (key, d, turn) => resolveEngine(key, { ...d, env: () => ({}), checkEngine: async id => ({ engine: id, checked: true, installed: true, loggedIn: true }), log: () => {} }, turn),
     forgetEngineCheck: () => {},
     runFallbackChain: async () => ({ text: "Ersatz.", source: "none" }),
     buildPromptContext: async o => ({ fullPrompt: `voll: ${o.userMessage}`, fallbackContext: "kontext" }),

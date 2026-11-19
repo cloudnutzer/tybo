@@ -204,6 +204,27 @@ function turnOpts(s: ReturnType<typeof setup>, userMessage = "Frage?") {
 const ok = (text: string, sessionId = "sid-1"): ClaudeResult => ({ text, sessionId, isError: false });
 const fail = (sessionId?: string): ClaudeResult => ({ text: "", sessionId, isError: true });
 
+test("Claude-Verbrauch erst nach Turnabschluss anfordern; Antwort wartet nicht auf die Messung", async () => {
+  const s = setup({ results: [ok("Antwort")] });
+  let requested = 0;
+  s.deps.scheduleClaudeUsageAfterChat = () => {
+    expect(s.r.events).toContain("finish"); expect(s.r.events).toContain("info"); requested++;
+    // Der Aufrufer darf selbst bei einer langsamen Messung nicht warten.
+    return new Promise<void>(() => {});
+  };
+  expect(await runStreamingTurn(turnOpts(s))).toBe("Antwort");
+  expect(requested).toBe(1);
+});
+
+test("abgebrochener Claude-Turn und anderer Motor fordern keine Claude-Messung an", async () => {
+  for (const engine of ["claude", "codex"] as const) {
+    const s = setup({ results: [] }); let requested = 0;
+    s.deps.scheduleClaudeUsageAfterChat = () => { requested++; };
+    s.deps.getEngine = () => ({ id: engine, run: async () => ({ engine, text: "Antwort", isError: false, aborted: engine === "claude" }) });
+    await runStreamingTurn({ ...turnOpts(s), engine }); expect(requested).toBe(0);
+  }
+});
+
 describe("runStreamingTurn", () => {
   test("Erfolg: Antwort zurueck, Session gespeichert, onSessionId aufgerufen", async () => {
     const s = setup({ results: [ok("Antwort", "sid-neu")] });

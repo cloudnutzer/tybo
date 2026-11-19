@@ -188,6 +188,19 @@ describe("Anzeige", () => {
     expect(part(footer(old)!, "msg-meta")!.textContent).toBe("General");
   });
 
+  test("Ersatzstufen nennen ihren eigenen Motor und ihr Modell auch nach einem weiteren Wechsel", () => {
+    const { app } = load();
+    const replies = [
+      { ...REPLY, engine: "claude", model: "claude-opus-5-5", stage: "claude:claude-opus-5-5", reason: "threshold" },
+      { ...REPLY, engine: "codex", model: "gpt-6-astra", stage: "codex", reason: "limit" },
+    ];
+    for (const conversationAgent of ["general", "research"]) {
+      expect(replies.map(reply => part(footer(app.messageElement(reply, conversationAgent))!, "msg-meta")!.textContent)).toEqual([
+        "General · Claude Code · claude-opus-5-5 · 42 s", "General · Codex · gpt-6-astra · 42 s",
+      ]);
+    }
+  });
+
   test("HTML-artige Modellnamen und Agenten landen als Text", () => {
     const { app } = load();
     const hostile = '<img src=x onerror="alert(1)">';

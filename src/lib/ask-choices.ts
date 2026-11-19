@@ -108,7 +108,7 @@ import type { PostWeb } from "./review-choices";
 import { getStore } from "./store";
 import type { TaskStore } from "./store/ports";
 import type { AsyncTask, TaskChanges } from "./store/types";
-import { resumeMacTask, taskEngine, taskResumeRecord, type MacResumeOutcome } from "./task-resume";
+import { resumeMacTask, taskEngine, taskResumeRecord, type MacResumeOutcome, type TaskHandover } from "./task-resume";
 import type { TurnTools } from "./turn-tools";
 import { processTurnIntents, type IntentTarget } from "./intent-gate";
 import { scanForQuestion } from "./turn-questions";
@@ -584,7 +584,7 @@ export interface AskChoicesDeps {
   /** Standard getStore().tasks */
   tasks?: () => TaskStore;
   /** Standard resumeMacTask; channel ist der Kanal des Klicks (Kanalregeln im Prompt) */
-  resume?: (task: AsyncTask, fallbackChatId: string, answer: string, channel: PromptChannel) => Promise<MacResumeOutcome>;
+  resume?: (task: AsyncTask, fallbackChatId: string, answer: string, channel: PromptChannel, handover?: TaskHandover) => Promise<MacResumeOutcome>;
   /** Folgefrage anbieten; Standard offerAsk */
   offer?: (offer: AskOffer) => Promise<AskOfferOutcome>;
   log?: Log;
@@ -610,7 +610,7 @@ export function createAskChoices(deps: AskChoicesDeps): { handler: ChoiceHandler
   const log = deps.log ?? defaultLog;
   const tasks = deps.tasks ?? (() => getStore().tasks);
   const processIntents = deps.processIntents ?? processTurnIntents;
-  const resume = deps.resume ?? ((task, chatId, answer, channel) => resumeMacTask(task, chatId, answer, undefined, channel));
+  const resume = deps.resume ?? ((task, chatId, answer, channel, handover) => resumeMacTask(task, chatId, answer, undefined, channel, handover));
   const offerFollowUp = deps.offer ?? offerAsk;
 
   /** true, wenn die Meldung zugestellt ist */
@@ -746,7 +746,12 @@ export function createAskChoices(deps: AskChoicesDeps): { handler: ChoiceHandler
     };
     let outcome: MacResumeOutcome;
     try {
-      outcome = await resume(task, place.chatId, answer, clickChannel(picked.via));
+      outcome = await resume(task, place.chatId, answer, clickChannel(picked.via), {
+        question: task.pending_question ?? "",
+        options: Array.isArray(task.pending_options)
+          ? task.pending_options.flatMap(option => typeof option?.label === "string" && option.label.trim() ? [option.label] : []) : [],
+        originalPrompt: task.original_prompt,
+      });
     } catch (e) {
       if (await lostToText()) return;
       await finish(store, choice, task.id, ref.askId, () => ({ status: "failed", result: `Fortsetzen gescheitert (${errorName(e)})` }));
@@ -755,6 +760,7 @@ export function createAskChoices(deps: AskChoicesDeps): { handler: ChoiceHandler
     }
 
     if (outcome.status === "aborted") {
+      if (await lostToText()) return;
       const stored = await finish(store, choice, task.id, ref.askId, () => ({ status: "failed", result: "Abgebrochen" }));
       await say(choice, ASK_TEXT.aborted);
       log(`[Rückfrage] ${choice.id}: Fortsetzen abgebrochen`);
@@ -769,8 +775,12 @@ export function createAskChoices(deps: AskChoicesDeps): { handler: ChoiceHandler
       return;
     }
     // Vom Motor gemeldeter Fehler oder Zeitlimit: keine Antwort, keine Merk-Tags
-    if (outcome.result.isError || outcome.result.timedOut) {
+    const showNotices = async () => {
+      if (outcome.via === "handover") for (const notice of outcome.notices ?? []) await say(choice, notice);
+    };
+    if (outcome.result.isError || outcome.result.timedOut || (outcome.via === "handover" && !outcome.engine && !outcome.model)) {
       if (await lostToText()) return;
+      await showNotices();
       const why = outcome.result.timedOut ? "Zeitlimit" : "Motorfehler";
       await finish(store, choice, task.id, ref.askId, () => ({ status: "failed", result: `Fortsetzen gescheitert (${why})` }));
       await say(choice, outcome.result.timedOut ? ASK_TEXT.timedOut : ASK_TEXT.failed);
@@ -778,8 +788,12 @@ export function createAskChoices(deps: AskChoicesDeps): { handler: ChoiceHandler
     }
 
     const done = outcome;
+    await showNotices();
     // Tag einer Folgefrage lesbar machen, bevor irgendetwas gespeichert oder gezeigt wird
-    const scan = scanForQuestion(done.result.text || "");
+    // Übergabe-Text ist schon gescannt; eine Folgefrage kommt ausschließlich vom Turn.
+    const scan = done.via === "handover"
+      ? { text: done.result.text || "", found: done.engine ? done.followUp : undefined }
+      : scanForQuestion(done.result.text || "");
     const response = scan.text || ASK_TEXT.empty;
     const record = taskResumeRecord(task, place.chatId, {
       taskId: task.id,
@@ -821,14 +835,16 @@ export function createAskChoices(deps: AskChoicesDeps): { handler: ChoiceHandler
       // Gezeigt gilt als erledigt; nirgends gezeigt als gescheitert, die Antwort bleibt im Ergebnis
       status: shown ? "completed" : "failed",
       result: (shown ? response : `Antwort nicht zugestellt: ${response}`).slice(0, RESULT_MAX),
-      session_id: done.result.sessionId || done.resumeId,
-      // Folgefragen erben Motor und Modell der Fortsetzung ("" bleibt Standard des Motors)
-      metadata: { ...(current.metadata ?? {}), engine: done.engine, model: done.model },
+      // Ersatzmodelle haben keine Session: alte Angaben bleiben zusammen erhalten.
+      ...(done.engine ? {
+        session_id: done.result.sessionId || done.resumeId,
+        metadata: { ...(current.metadata ?? {}), engine: done.engine, model: done.model ?? "" },
+      } : {}),
     }));
     if (!finished) problems.push(STATUS_NOT_SAVED);
     log(`[Rückfrage] ${choice.id}: fortgesetzt über ${done.engine} (${picked.via})`);
     // Folgefrage nur unter einer gezeigten Antwort, sonst stünde sie ohne Zusammenhang da
-    if (scan.found && shown) {
+    if (scan.found && shown && done.engine) {
       try {
         const next = await offerFollowUp({
           conversation: choice.conversation,
@@ -837,7 +853,7 @@ export function createAskChoices(deps: AskChoicesDeps): { handler: ChoiceHandler
           originalPrompt: task.original_prompt,
           agent: done.agent,
           engine: done.engine,
-          model: done.model,
+          model: done.model ?? "",
           ...(done.result.sessionId || done.resumeId ? { sessionId: done.result.sessionId || done.resumeId } : {}),
         });
         log(`[Rückfrage] ${choice.id}: Folgefrage ${next.status}`);

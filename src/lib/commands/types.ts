@@ -49,7 +49,7 @@ export interface ReplyOptions {
 
 export type SessionResetOutcome =
   | { status: "done"; reset: number; sessionMode: boolean }
-  /** Im Gespräch läuft gerade eine Antwort: Browser und Terminal immer, Telegram nur mit whileBlocked */
+  /** Im Gespräch läuft gerade eine Antwort: Browser und Terminal immer, Telegram mit Reset-Optionen */
   | { status: "busy" }
   /** Kein Session-Schlüssel ermittelbar */
   | { status: "unavailable" };
@@ -63,6 +63,9 @@ export interface SessionResetOptions {
    * eine Antwort läuft. Wirft sie, gibt resetSession den Fehler weiter.
    */
   whileBlocked?(): Promise<void>;
+  /** Unter derselben Sperre, vor dem Löschen: Herkunft für einen Motorwechsel festhalten. */
+  beforeReset?(): Promise<void>;
+  preserveHandover?: boolean;
 }
 
 /** Laufende Session eines Gesprächs für /routine (gleich welcher Motor); Aufbau kennt nur der Dienst */
@@ -180,7 +183,7 @@ export interface MemoryCommandServices {
 }
 
 /** Woher der Motor eines Gesprächs kommt: /motor, Einstellungsdatei, .env oder eingebaut */
-export type EngineChoiceSource = "topic" | "settings" | "env" | "code";
+export type EngineChoiceSource = "topic" | "agent" | "settings" | "env" | "code";
 
 /** Ein wählbarer Motor mit Bereitschaft (src/lib/engine-choice.ts) */
 export interface EngineAvailability {
@@ -193,10 +196,17 @@ export interface EngineAvailability {
 
 /** src/lib/engine-choice.ts, für /motor in allen Kanälen */
 export interface EngineCommandServices {
+  preview(sessionKey: string, agent: string): Promise<import("../engine-choice").EnginePreview>;
+  setAuto(enabled: boolean): Promise<{ enabled: boolean; auto: import("../engine-switch").SwitchAuto; hasBackups: boolean }>;
+  check(sessionKey: string, agent: string): Promise<import("../engine-check-now").EngineCheckNowResult & { preview: import("../engine-choice").EnginePreview }>;
+  /** Bereinigte Daten; derselbe Abrufschlüssel teilt einen Snapshot für mehrere Motoren. */
+  tools?(engine: import("../engines/types").EngineId, request?: object): import("../../web/tool-parity-types").EngineTools;
   /** Eingestellter Motor des Gesprächs, ohne Verfügbarkeitsprüfung */
-  configured(sessionKey: string): { engine: string; source: EngineChoiceSource };
+  configured(sessionKey: string, agent: string): { engine: string; source: EngineChoiceSource };
   /** Standard ohne Ausnahme */
-  standard(): { engine: string; source: Exclude<EngineChoiceSource, "topic"> };
+  standard(): { engine: string; source: Exclude<EngineChoiceSource, "topic" | "agent"> };
+  /** Motor nach Entfernen der Gesprächswahl: Agent, sonst Standard. */
+  inherited(agent: string): { engine: string; source: Exclude<EngineChoiceSource, "topic"> };
   /** Wählbare Motoren mit Bereitschaft */
   available(): Promise<EngineAvailability[]>;
   /** Ausnahme setzen (engine) oder entfernen (null); wirft SettingsFileInvalidError bei ungültiger Datei */

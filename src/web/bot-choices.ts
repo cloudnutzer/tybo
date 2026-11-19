@@ -10,6 +10,8 @@ import { decideChoice, getChoiceChecked, listChoices, onChoiceChange } from "../
 import { createChoicePort, type ChoicePort } from "./choices";
 import { dmChatId } from "../lib/channels";
 import { botGroupId } from "./bot-telegram";
+import { PROJECT_ROOT } from "../lib/env";
+import { jobChoiceStaleText } from "../lib/jobs/choices";
 
 type Env = Record<string, string | undefined>;
 
@@ -18,6 +20,7 @@ export function createBotChoices(env: Env, log?: (message: string) => void): Cho
     register: { get: getChoiceChecked, list: listChoices, decide: decideChoice, onChange: onChoiceChange },
     userId: dmChatId(env),
     groupId: () => botGroupId(env),
+    staleText: choice => jobChoiceStaleText(PROJECT_ROOT, choice),
     log,
   });
 }

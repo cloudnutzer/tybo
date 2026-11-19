@@ -22,7 +22,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { shapeHits } from "../../../../supabase/functions/_shared/chunks";
 import { containsPattern } from "../../../../supabase/functions/_shared/like-pattern";
 import { supabaseHeaders } from "../../supabase-keys";
-import { isDisplayOnly, sessionKeyFor, withoutDisplayOnly } from "../message-rules";
+import { isDisplayOnly, sessionKeyFor, withoutDisplayOnly, withoutJobReports } from "../message-rules";
 import type { MessageStore } from "../ports";
 import type {
   DisplayOnlyHead,
@@ -38,7 +38,7 @@ import type {
   TopicActivityChanges,
 } from "../types";
 import { factFromRow } from "./memory";
-import { edgeKey, NOT_DISPLAY_ONLY_FILTER, type ClientSource } from "./messages";
+import { edgeKey, NOT_DISPLAY_ONLY_FILTER, NOT_JOB_REPORT_FILTER, type ClientSource } from "./messages";
 
 const TABLE = "messages";
 const SEARCH_FUNCTION = "search-memory";
@@ -135,7 +135,7 @@ async function edgeAnswer(chatId: string, query: string, limit: number, facts?: 
   }
   const combined = !Array.isArray(body) && body !== null && typeof body === "object" ? (body as { messages?: unknown; facts?: unknown }) : null;
   const rows = combined ? combined.messages : body;
-  const messages = Array.isArray(rows) && !rows.some(row => isDisplayOnly(row?.metadata)) ? (rows as Message[]) : null;
+  const messages = Array.isArray(rows) && !rows.some(row => isDisplayOnly(row?.metadata)) ? withoutJobReports(rows as Message[]) : null;
   return { messages, facts: Array.isArray(combined?.facts) ? combined.facts.map(factFromRow) : null };
 }
 
@@ -146,13 +146,13 @@ async function edgeAnswer(chatId: string, query: string, limit: number, facts?: 
  */
 function textQuery(client: SupabaseClient, chatId: string, query: string, limit: number) {
   const matching = client.from(TABLE).select("*").eq("chat_id", chatId).ilike("content", containsPattern(query));
-  return matching.or(NOT_DISPLAY_ONLY_FILTER).order("created_at", { ascending: false }).limit(limit);
+  return matching.or(NOT_DISPLAY_ONLY_FILTER).or(NOT_JOB_REPORT_FILTER).order("created_at", { ascending: false }).limit(limit);
 }
 
 /** Textsuche; Fehler ergeben eine leere Liste */
 async function textHits(client: SupabaseClient, chatId: string, query: string, limit: number): Promise<Message[]> {
   const outcome = await readRows<Message>(() => textQuery(client, chatId, query, limit));
-  return outcome.ok ? withoutDisplayOnly(outcome.rows) : [];
+  return outcome.ok ? withoutJobReports(withoutDisplayOnly(outcome.rows)) : [];
 }
 
 /**
@@ -176,7 +176,7 @@ export async function searchChatChecked(client: SupabaseClient, chatId: string, 
   const { messages } = await edgeAnswer(chatId, query, limit);
   if (messages?.length) return shapeHits(messages, query);
   const rows = await rowsOrThrow<Message>("Nachrichten suchen", () => textQuery(client, chatId, query, limit));
-  return shapeHits(withoutDisplayOnly(rows), query);
+  return shapeHits(withoutJobReports(withoutDisplayOnly(rows)), query);
 }
 
 /** Wie searchChat, dazu Fakten aus demselben Vektor; der Bot rechnet dafür keinen eigenen */

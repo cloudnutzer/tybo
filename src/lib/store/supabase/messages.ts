@@ -12,7 +12,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { acceptedCreatedAt } from "../../../../supabase/functions/_shared/created-at";
 import { supabaseHeaders } from "../../supabase-keys";
-import { isDisplayOnly, saveAndAnnounce, sessionKeyFor, topicOf, withoutDisplayOnly } from "../message-rules";
+import { isDisplayOnly, isJobReport, saveAndAnnounce, sessionKeyFor, topicOf, withoutDisplayOnly, withoutJobReports } from "../message-rules";
 import type { MessageStore } from "../ports";
 import type { BoardRow, Message } from "../types";
 import { noteEdgeResult, reportEdgeFallback } from "./edge-warning";
@@ -24,6 +24,7 @@ import { noteEdgeResult, reportEdgeFallback } from "./edge-warning";
  * dem Limit drängen.
  */
 export const NOT_DISPLAY_ONLY_FILTER = "metadata->>display_only.is.null,metadata->>display_only.neq.true";
+export const NOT_JOB_REPORT_FILTER = "metadata->>job_report.is.null";
 
 const TABLE = "messages";
 const EDGE_FUNCTION = "store-telegram-message";
@@ -118,7 +119,7 @@ async function storeViaEdge(row: Record<string, unknown>): Promise<boolean> {
  * Function, bei jedem Problem dort direkt ohne Embedding.
  */
 export async function writeMessage(message: Message, client: InsertClient): Promise<boolean> {
-  if (isDisplayOnly(message.metadata)) return insertRow(message, client);
+  if (isDisplayOnly(message.metadata) || isJobReport(message.metadata)) return insertRow(message, client);
   const stored = await storeViaEdge(rowFor(message));
   return stored || insertRow(message, client);
 }
@@ -162,9 +163,10 @@ export async function boardRowsSince(client: SupabaseClient, days: number, now: 
     .select(BOARD_COLUMNS)
     .gte("created_at", daysBefore(now, days).toISOString())
     .or(NOT_DISPLAY_ONLY_FILTER)
+    .or(NOT_JOB_REPORT_FILTER)
     .order("created_at", { ascending: false }).limit(BOARD_ROW_LIMIT);
   if (error || !Array.isArray(data)) return [];
-  return withoutDisplayOnly(data as BoardRow[]);
+  return withoutJobReports(withoutDisplayOnly(data as BoardRow[]));
 }
 
 /**
@@ -180,12 +182,13 @@ export async function strictBoardRowsSince(client: SupabaseClient, days: number,
       .select(BOARD_COLUMNS)
       .gte("created_at", daysBefore(now, days).toISOString())
       .or(NOT_DISPLAY_ONLY_FILTER)
+      .or(NOT_JOB_REPORT_FILTER)
       .order("created_at", { ascending: false }).limit(BOARD_ROW_LIMIT);
   } catch {
     throw new Error("Beiträge lesen fehlgeschlagen");
   }
   if (result.error || !Array.isArray(result.data)) throw new Error("Beiträge lesen fehlgeschlagen");
-  return withoutDisplayOnly(result.data as BoardRow[]);
+  return withoutJobReports(withoutDisplayOnly(result.data as BoardRow[]));
 }
 
 /**
@@ -203,6 +206,7 @@ export async function newestUserMessageAt(client: SupabaseClient): Promise<strin
       .select("created_at")
       .eq("role", "user")
       .or(NOT_DISPLAY_ONLY_FILTER)
+      .or(NOT_JOB_REPORT_FILTER)
       .order("created_at", { ascending: false })
       .limit(1);
   } catch {

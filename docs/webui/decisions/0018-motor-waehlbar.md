@@ -29,3 +29,13 @@ Datum: 25.09.2026. Entschieden von: Maintainer, Umsetzungsdetails Plan-Session.
   angemeldet, antwortet Claude Code mit einem Hinweis.
 - Bleiben bei Claude: VPS-Modus (`src/vps-gateway.ts`, Agent SDK),
   Hintergrund-Jobs, Check-in, Aux-Modelle, WhatsApp.
+
+## Nachtrag 16.11.2026 (Entscheidung 0027)
+
+Zwei Punkte gelten so nicht mehr. Erstens: „MCP-Server und Skills kommen aus
+der Konfiguration von Codex“ ist fortgeschrieben. tybo gibt Codex im Chat und
+in Hintergrund-Jobs mit vollem Zugriff die MCP-Server, Skills und Notizen von
+Claude Code je Lauf mit und schreibt weiterhin nichts in `~/.codex`
+(Entscheidung 0027, „Werkzeug-Gleichstand“). Zweitens: Hintergrund-Jobs
+bleiben nicht mehr allein bei Claude, seit Issue #618 laufen sie mit
+`bun run job start --engine codex` auch auf Codex.

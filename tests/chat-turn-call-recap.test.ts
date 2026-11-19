@@ -69,8 +69,8 @@ function setup() {
   const engines: Record<EngineId, Engine> = { claude: fakeEngine("claude"), codex: fakeEngine("codex"), opencode: fakeEngine("opencode") };
   const deps: Partial<ChatTurnDeps> = {
     getEngine: id => engines[id],
-    resolveEngine: (key, d?: Partial<EngineChoiceDeps>) =>
-      resolveEngine(key, { ...d, env: () => ({}), checkEngine: async id => ({ ...READY, engine: id }), log: () => {} }),
+    resolveEngine: (key, d: Partial<EngineChoiceDeps> | undefined, turn) =>
+      resolveEngine(key, { ...d, env: () => ({}), checkEngine: async id => ({ ...READY, engine: id }), log: () => {} }, turn),
     forgetEngineCheck: () => {},
     runFallbackChain: async () => ({ text: "ersatz", source: "openrouter", model: "ersatz" }),
     buildPromptContext: async o => ({ fullPrompt: `voll: ${o.userMessage}`, fallbackContext: "kontext" }),

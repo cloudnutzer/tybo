@@ -7,6 +7,7 @@
 import type { RunStep } from "../claude";
 import type { TurnTools } from "../turn-tools";
 import type { StallPhase } from "../stream-phase";
+import type { UsageWindow } from "./usage";
 
 export type EngineId = "claude" | "codex" | "opencode" | "api";
 
@@ -72,6 +73,18 @@ export interface EngineUsage {
   reasoningOutputTokens?: number;
 }
 
+/** Letzte Limit-Meldung mit den je Kennung zuletzt gemessenen Fenstern des Laufs. */
+export interface EngineRateLimit {
+  status?: string;
+  rateLimitType?: string;
+  /** Reset der Meldung, unabhängig von einem gemessenen Prozentfenster */
+  resetsAt?: string;
+  errorCode?: string;
+  overageStatus?: string;
+  isUsingOverage?: boolean;
+  windows: UsageWindow[];
+}
+
 /**
  * Art eines Motor-Fehlers, soweit erkennbar (Codex, Issue #123): Grundlage
  * für Hinweise wie „Nutzungsgrenze erreicht" oder „nicht angemeldet".
@@ -97,10 +110,11 @@ export interface EngineResult {
    */
   answeredQuestion?: string;
   isError: boolean;
-  /** Nur bei isError und nur, wenn der Motor sie meldet (Codex, OpenCode) */
+  /** Nur bei isError und nur, wenn der Motor sie meldet (auch Claude: Start- und Limit-Fehler) */
   errorKind?: EngineErrorKind;
   costUsd?: number;
   usage?: EngineUsage;
+  rateLimit?: EngineRateLimit;
   /** Per /stop oder Shutdown beendet: kein Retry, kein Fallback */
   aborted?: boolean;
   /** Zeitlimit gegriffen: kein Retry, kein Fallback, Session bleibt fortsetzbar */

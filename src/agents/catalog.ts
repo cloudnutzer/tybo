@@ -465,10 +465,12 @@ function withJobAvailability(prompt: string): string {
   return withoutJobRule(prompt);
 }
 
-/** Erkennt den Block aus dem Code mit beliebigen Minutenwerten */
+/** Erkennt beide Code-Fassungen (vor und seit --zurueck), mit beliebigen Minutenwerten. */
 function staleLongTaskRules(rules: string): RegExp {
-  const escaped = rules.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(escaped.replace(/\d+/g, "\\d+(?:\\.\\d+)?"));
+  const { JOB_RULES, LEGACY_JOB_RULES } = require("./prompt-parts") as typeof import("./prompt-parts");
+  const variants = [rules, rules.replace(JOB_RULES, LEGACY_JOB_RULES)];
+  return new RegExp(variants.map(text => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    .replace(/\d+/g, "\\d+(?:\\.\\d+)?")).join("|"));
 }
 
 /** Zusatz fuer General: eigene Agenten, die er fragen kann (leer ohne eigene Agenten) */

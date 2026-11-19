@@ -60,6 +60,7 @@ const STATE = [
   "CLAUDE.local.md",
   "data/restart-requested",
   "data/jobs/x/status.json",
+  ".agents/skills/tagesgruss/SKILL.md",
   "data/voice-agents/jarvis/state.json",
   "logs/telegram-relay.log",
   "uploads/bild.jpg",

@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getAgentConfig } from "../src/agents/base";
 import { createAgent, setAgentCatalogPaths } from "../src/agents/catalog";
-import { JOB_RULES, NO_JOBS_RULE, withoutJobRule } from "../src/agents/prompt-parts";
+import { JOB_RULES, LEGACY_JOB_RULES, NO_JOBS_RULE, withoutJobRule } from "../src/agents/prompt-parts";
 import { checkClaudeBeforeWork, startBackground, type BackgroundServices } from "../src/app/bot-start";
 import { setSpawnForTests } from "../src/lib/claude";
 import { auxDisabled, callAux } from "../src/lib/aux-model";
@@ -143,6 +143,10 @@ describe("Prüfung beim Start", () => {
     let inspected = 0;
     const services: Partial<BackgroundServices> = {
       inspectClaude: async () => (inspected++, MISSING),
+      checkCodex: async () => ({ engine: "codex", checked: true, installed: false, loggedIn: false }),
+      installCodexSkillSync: () => {},
+      installCodexUsageReader: () => {},
+      syncCodexSkills: () => ({ linked: [], foreign: [], skipped: [] }),
       getSettings: () => ({}),
       probeSchema: async () => null,
       checkEmbedding: async () => null as never,
@@ -154,6 +158,10 @@ describe("Prüfung beim Start", () => {
       startRoutineWatch: (() => ({})) as never,
       startThreadReminders: (() => ({})) as never,
       startReminderPlanner: (() => ({})) as never,
+      setSwitchNotifier: () => {},
+      startSwitchWatch: () => () => {},
+      installClaudeUsageMeasurement: () => () => {},
+      startClaudeUsageWatch: () => () => {},
       every: () => {},
       log: l => void lines.push(l),
       warn: l => void lines.push(`WARN ${l}`),
@@ -340,6 +348,7 @@ describe("Job-Regel im Prompt", () => {
   test("withoutJobRule ersetzt genau die Job-Regel", () => {
     const prompt = `Anfang\n${JOB_RULES}\nEnde`;
     expect(withoutJobRule(prompt)).toBe(`Anfang\n${NO_JOBS_RULE}\nEnde`);
+    expect(withoutJobRule(`Anfang\n${LEGACY_JOB_RULES}\nEnde`)).toBe(`Anfang\n${NO_JOBS_RULE}\nEnde`);
     expect(withoutJobRule("ohne Regel")).toBe("ohne Regel");
     expect(NO_JOBS_RULE).toContain("never run `bun run job start`");
   });

@@ -6,7 +6,7 @@
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { readFileSync, writeFileSync, chmodSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { commandRegistry, HELP_TEXT } from "../src/lib/commands/builtin";
 import { runTelegramCommand } from "../src/lib/commands/telegram";
@@ -75,6 +75,20 @@ async function childPid(id: string): Promise<number> {
 }
 
 describe("job list", () => {
+  test("Motor, Modell und Effort, auch für alte Statusdateien ohne Motor", async () => {
+    const { root: r, cleanup: done } = tempRoot("jobs-motor-liste-");
+    try {
+      const legacy = await makeJob({ model: "claude-alt", effort: "medium" }, r);
+      const codex = await makeJob({ engine: "codex", model: "gpt-6-astra", effort: "high" }, r);
+      const config = await makeJob({ engine: "codex", model: undefined }, r);
+      expect(await readStatus(r, legacy)).not.toHaveProperty("engine");
+      const text = await formatJobList(fakeDeps(r));
+      expect(text.split("\n").find(l => l.includes(legacy))).toEndWith("claude, claude-alt, medium");
+      expect(text.split("\n").find(l => l.includes(codex))).toEndWith("codex, gpt-6-astra, high");
+      expect(text.split("\n").find(l => l.includes(config))).toEndWith("codex");
+    } finally { done(); }
+  });
+
   test("laufende Jobs und die letzten 20 beendeten, neueste zuerst, Titel ohne Geheimnisse", async () => {
     const { root: listRoot, cleanup: done } = tempRoot("jobs-list-");
     try {
@@ -107,8 +121,8 @@ describe("job list", () => {
 });
 
 describe("job stop", () => {
-  test("beendet den ganzen Prozessbaum und meldet genau einmal „gestoppt“; der Wächter schweigt", async () => {
-    const id = await makeJob({ phase: "starting" });
+  test.each(["claude", "codex"] as const)("%s: beendet den ganzen Prozessbaum und meldet genau einmal „gestoppt“; der Wächter schweigt", async engine => {
+    const id = await makeJob({ phase: "starting", engine });
     const deps = fakeDeps(root);
     deps.proc = realProcessOps;
     let treePid = 0;
@@ -128,6 +142,7 @@ describe("job stop", () => {
     for (const pid of [treePid, kid]) expect(realProcessOps.alive(pid)).toBe(false);
     expect(realProcessOps.groupAlive(treePid)).toBe(false);
     expect(deps.sent).toHaveLength(1);
+    expect(deps.sent[0].text).toContain(`(${engine},`);
     expect(deps.sent[0]).toMatchObject({ source: "job", topicId: 443, text: expect.stringContaining("Job gestoppt") });
     expect((await readStatus(root, id))!).toMatchObject({ outcome: "stopped", notice: { state: "sent" } });
   }, 20_000);
@@ -296,12 +311,12 @@ describe("job log", () => {
 });
 
 describe("Bot-Start: verwaiste Jobs", () => {
-  test("Wächter weg, Claude lebt noch: Claude beendet, genau eine Meldung „abgebrochen“; zweiter Lauf meldet nichts", async () => {
+  test.each(["claude", "codex"] as const)("%s: Wächter weg, Motor lebt noch, Motor beendet und genau eine Meldung „abgebrochen“", async engine => {
     const { root: r, cleanup: done } = tempRoot("jobs-recover-");
     try {
       const deps = fakeDeps(r);
       deps.procs.spawn(90_001);
-      const orphan = await makeJob({ watcher: { pid: 90_000, identity: "start-90000" }, claude: { pid: 90_001, identity: "start-90001" } }, r);
+      const orphan = await makeJob({ engine, watcher: { pid: 90_000, identity: "start-90000" }, claude: { pid: 90_001, identity: "start-90001" } }, r);
       await Bun.write(jobFile(r, orphan, "log"), "letzte Zeile vor dem Absturz\n");
       deps.procs.spawn(91_000);
       const alive = await makeJob({ watcher: { pid: 91_000, identity: "start-91000" } }, r);
@@ -318,6 +333,7 @@ describe("Bot-Start: verwaiste Jobs", () => {
       expect(deps.sent).toHaveLength(3);
       const orphanText = deps.sent.find(s => s.text!.includes("Job 1"))?.text ?? deps.sent.map(s => s.text).join("\n");
       expect(orphanText).toContain("Job abgebrochen");
+      expect(deps.sent.find(s => s.text?.includes(orphan))?.text).toContain(`(${engine},`);
       // Issue #561: der Neustart des Bots steht als möglicher Grund in der Meldung
       expect(orphanText).toContain("Neustart des Bots");
       expect((await readStatus(r, orphan))!.detail).toBe(LOST_WATCHER_DETAIL);
@@ -741,20 +757,25 @@ describe("Befehlseinstiege: bun run job und tybo job", () => {
     }
   }, 30_000);
 
-  test("Ende zu Ende mit Claude-Attrappe: losgelöster Wächter, Bericht, Meldung ohne Telegram nur für die WebUI", async () => {
+  test.each(["claude", "codex"] as const)("%s-Attrappe: Einstellungen aus TYBO_ROOT trotz fremdem Aufruferordner, Wächter und Bericht", async engine => {
     const { root: r, cleanup: done } = tempRoot("jobs-e2e-");
     let watcherPid: number | undefined;
     try {
       // Kein Token (Issue #227): sendAndRecord will nur für die WebUI festhalten, geht nie ins
       // Netz; ohne Datenbank scheitert das Festhalten, der Wächter versucht es später erneut
       writeFileSync(join(r, ".env"), "TELEGRAM_USER_ID=4242\n");
-      const fake = join(r, "fake-claude.sh");
-      writeFileSync(fake, `#!/bin/sh\ncat > auftrag-gelesen.txt\necho "Attrappe arbeitet"\nprintf 'Alles erledigt.' > "data/jobs/$TYBO_JOB_ID/report.md"\n`);
+      mkdirSync(join(r, "config"));
+      writeFileSync(join(r, "config", "settings.json"), JSON.stringify({ defaults: { model: "claude-einstellung", effort: "medium" }, engine: { codex: { model: "gpt-6-astra", effort: "high" } } }));
+      const caller = join(r, "aufrufer");
+      mkdirSync(join(caller, "config"), { recursive: true });
+      writeFileSync(join(caller, "config", "settings.json"), JSON.stringify({ defaults: { model: "falscher-ordner", effort: "low" }, engine: { codex: { model: "auch-falsch", effort: "low" } } }));
+      const fake = join(r, `fake-${engine}.sh`);
+      writeFileSync(fake, `#!/bin/sh\ncase "$1" in\n  --version) echo 'codex-cli 0.169.0'; exit 0 ;;\n  login) exit 0 ;;\n  app-server)\n    IFS= read -r initialize\n    printf '%s\\n' '{"id":1,"result":{}}'\n    IFS= read -r initialized\n    IFS= read -r config\n    printf '%s\\n' '{"id":2,"result":{"config":{"mcp_servers":{"lokal.test":{"enabled":true}}}}}'\n    exit 0 ;;\nesac\nprintf '%s\\n' "$@" > aufruf.txt\ncat > auftrag-gelesen.txt\necho "Attrappe arbeitet"\nprintf 'Alles erledigt.' > "data/jobs/$TYBO_JOB_ID/report.md"\n`);
       chmodSync(fake, 0o755);
       const p = Bun.spawn({
-        cmd: [process.execPath, "--no-env-file", "scripts/tybo.ts", "job", "start", "--title", "E2E", "--text", "Tu so als ob."],
-        cwd: repo,
-        env: env(r, { CLAUDE_PATH: fake }),
+        cmd: [process.execPath, "--no-env-file", join(repo, "scripts/tybo.ts"), "job", "start", "--engine", engine, "--title", "E2E", "--text", "Tu so als ob."],
+        cwd: caller,
+        env: env(r, { HOME: r, CODEX_HOME: join(r, "codex"), CLAUDE_PATH: fake, CODEX_PATH: fake }),
         stdout: "pipe",
         stderr: "pipe",
       });
@@ -770,6 +791,9 @@ describe("Befehlseinstiege: bun run job und tybo job", () => {
       }
       watcherPid = status?.watcher?.pid;
       expect(status).toMatchObject({
+        engine,
+        model: engine === "codex" ? "gpt-6-astra" : "claude-einstellung",
+        effort: engine === "codex" ? "high" : "medium",
         phase: "ended",
         outcome: "success",
         exitCode: 0,
@@ -778,6 +802,16 @@ describe("Befehlseinstiege: bun run job und tybo job", () => {
       expect(status!.watcher!.pid).not.toBe(p.pid);
       expect(readFileSync(join(r, "auftrag-gelesen.txt"), "utf8")).toContain(`Tu so als ob.\n\n---\nSchreibe am Ende einen kurzen Bericht nach data/jobs/${id}/report.md`);
       expect(readFileSync(jobFile(r, id, "log"), "utf8")).toContain("Attrappe arbeitet");
+      const args = readFileSync(join(r, "aufruf.txt"), "utf8");
+      expect(args).toContain(status!.model!);
+      expect(args).toContain(status!.effort!);
+      expect(args).not.toContain("falsch");
+      if (engine === "codex") {
+        expect(args).toContain('mcp_servers={"lokal.test"={enabled=false}}');
+        expect(args).toContain('web_search="disabled"');
+        expect(args).toContain("code_mode_host");
+      }
+      expect(readFileSync(jobFile(r, id, "watcherLog"), "utf8")).toContain(`läuft (${engine}, ${status!.model}, ${status!.effort})`);
     } finally {
       // Der eigene Wächter dieses Tests wartet sonst noch auf die weiteren Versuche
       if (watcherPid) {

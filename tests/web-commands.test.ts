@@ -6,6 +6,7 @@
  * und die Dienste hinter den Befehlen sind Attrappen; src/bot.ts wird nie
  * geladen.
  */
+import { createEngineCommandServices } from "../src/lib/engine-choice";
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -48,6 +49,8 @@ import { runChatApp } from "../src/terminal/app";
 import { FakeStdin, FakeStdout } from "./terminal-fixture";
 import { htmlFixture, mp3FrameFixture, mp3Id3Fixture, oggOpusFixture, svgFixture, wavFixture } from "./audio-fixture";
 import { createVoiceSynthesis } from "../src/lib/voice-message";
+import { getSessionsForKey, recordSessionTurn, resetSessionOrThrow, setSessionsFileForTests, takeHandover } from "../src/lib/session-manager";
+import { handoverProbe } from "./handover-fixture";
 
 const PASSWORD = "test-passwort-lang";
 const GROUP = "-1001234567890";
@@ -61,6 +64,7 @@ afterEach(async () => {
   abortAllExecutions();
   setAgentOverridesPath();
   for (const s of servers.splice(0)) await s.stop();
+  setSessionsFileForTests(null);
 });
 
 /** Claude, das bis zum Abbruch arbeitet und dann wie der Chat-Kern ABORT_REPLY liefert */
@@ -148,6 +152,7 @@ interface Ctx {
 
 async function start(options: { realReset?: boolean; realWebChat?: boolean; gatedOverrides?: boolean } = {}): Promise<Ctx> {
   const dir = join(root, `case-${++counter}`);
+  setSessionsFileForTests(join(dir, "sessions.json"));
   setAgentOverridesPath(join(dir, "agent-overrides.json"));
   const ctx = {
     approvals: createApprovalTurns(),
@@ -287,8 +292,15 @@ async function start(options: { realReset?: boolean; realWebChat?: boolean; gate
     createRoutine: () => ctx.createRoutine(),
     // /motor (Issue #125): Einstellungen im Speicher statt config/settings.json
     engines: {
+      ...createEngineCommandServices({ getSettings: () => ({ engine: { topics: ctx.engineTopics as Record<string, "claude" | "codex"> } }), env: () => ({}),
+        checkEngine: async engine => ({ engine, checked: true, installed: true, loggedIn: true }) }),
+      setAuto: async enabled => ({ enabled, auto: { enabled: false, threshold: 95, returnBelow: 80 }, hasBackups: false }),
+      check: async (key, agent) => ({ notMeasured: ["claude", "codex"], measured: { claude: false, codex: false, opencode: false, api: false },
+        measurementResults: { claude: "not-measurable", codex: "not-measurable", opencode: "not-measurable", api: "not-measurable" },
+        before: 0, lifted: 0, remaining: 0, liftedWithoutMeasurement: 0, statuses: {}, preview: await services.engines!.preview(key, agent) }),
       configured: key => (ctx.engineTopics[key] ? { engine: ctx.engineTopics[key], source: "topic" } : { engine: "claude", source: "code" }),
       standard: () => ({ engine: "claude", source: "code" }),
+      inherited: () => ({ engine: "claude", source: "code" }),
       available: async () => [
         { engine: "claude", label: "Claude Code", ready: true },
         { engine: "codex", label: "Codex", ready: true },
@@ -332,15 +344,22 @@ async function start(options: { realReset?: boolean; realWebChat?: boolean; gate
           sessionKey: id => conversationSessionKey(id, telegramDeps),
           isActive: isExecutionActive,
           block: blockExecutions,
-          sessionsForKey: async () => [],
+          sessionsForKey: getSessionsForKey,
           shouldDistill: () => false,
           distill: async () => {},
-          reset: async key => (ctx.resets.push(key), 1),
+          reset: async (key, options) => {
+            ctx.resets.push(key);
+            return resetSessionOrThrow(key, options);
+          },
           sessionModeEnabled: () => true,
         })
-      : async id => {
+      : async (id, options) => {
           await ctx.resetGate();
           ctx.resets.push(id);
+          if (ctx.resetResult.status === "done") {
+            await options?.beforeReset?.();
+            await options?.whileBlocked?.();
+          }
           return ctx.resetResult;
         },
   });
@@ -583,6 +602,9 @@ describe("/new aus dem Browser", () => {
 describe("/new mit dem echten Reset-Baustein", () => {
   test("scheitert nicht an der eigenen Sperre: Topic, General, Direktchat und älteres Web-Gespräch", async () => {
     const ctx = await start({ realReset: true });
+    for (const key of [`topic:${GROUP}:443`, `group:${GROUP}`, `dm:${USER}`, `web:${ctx.webId}`]) {
+      await recordSessionTurn(key, "general", "m", "claude", "alt");
+    }
     for (const id of ["topic-443", "topic-1", "dm", ctx.webId]) {
       const sse = await listen(ctx, id);
       expect((await post(ctx, id, "/new")).status).toBe(202);
@@ -597,6 +619,44 @@ describe("/new mit dem echten Reset-Baustein", () => {
 });
 
 describe("/motor aus Browser und Terminal (Issue #125)", () => {
+  for (const terminal of [false, true]) test(`${terminal ? "Terminal" : "Browser"}: Motoranzeige, Automatik und Prüfen erreichen den Handler während eines Turns`, async () => {
+    const ctx = await start({ realReset: true });
+    let release!: () => void;
+    ctx.core = () => new Promise(resolve => (release = () => resolve("fertig")));
+    await post(ctx, "topic-443", "Lange Frage");
+    await waitUntil(() => ctx.claudeStarted === 1);
+    try {
+      for (const text of ["/motor", "/motor werkzeuge", "/motor auto aus", "/motor auto an", "/motor pruefen", "/engine PRU\u0308FEN", "/motor auto falsch"]) {
+        const before = ctx.records.length;
+        expect((await post(ctx, "topic-443", text, terminal)).status).toBe(202);
+        await waitUntil(() => ctx.records.length > before);
+        const result = ctx.records.at(-1)!.text;
+        expect(result).toContain(text.includes("werkzeuge") ? "Werkzeuge: nicht ermittelbar" : text.includes("auto falsch") ? "Möglich:" : text.includes("auto") ? "Automatik" : text === "/motor" ? "Motor dieses Gesprächs" : "Geprüft:");
+      }
+      expect(ctx.claudeStarted).toBe(1);
+      expect(ctx.resets).toEqual([]);
+    } finally { release(); }
+  });
+  for (const terminal of [false, true]) for (const command of ["/motor codex", "/motor standard"]) {
+    test(`${terminal ? "Terminal" : "Browser"}: ${command} bis zum Übergabe-Prompt (Issue #658)`, async () => {
+      const ctx = await start({ realReset: true });
+      const key = `topic:${GROUP}:443`;
+      if (command.endsWith("standard")) ctx.engineTopics[key] = "codex";
+      await recordSessionTurn(key, "general", "claude-modell", command.endsWith("standard") ? "codex" : "claude", "private-id");
+      const old = (await getSessionsForKey(key))[0]!;
+      const events = await listen(ctx, "topic-443");
+      expect((await post(ctx, "topic-443", command, terminal)).status).toBe(202);
+      await events.settled(); await events.close();
+      expect(await getSessionsForKey(key)).toEqual([]);
+      expect(await takeHandover(key, "general", { preserveUntilRecorded: true })).toMatchObject({ since: old.startedAt, reason: "user" });
+      const calls = await handoverProbe({ chatId: GROUP, topicId: 443, since: old.startedAt, engine: command.endsWith("standard") ? "claude" : "codex" });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.prompt).toContain("Grund (Wahl des Nutzers)");
+      expect(calls[0]!.prompt).toContain("Erste Frage mit der Zahl 7319");
+      expect(await takeHandover(key, "general")).toBeUndefined();
+    });
+  }
+
   test("Browser im Topic: Ausnahme unter dem Topic-Schlüssel, neue Session, Antwort als Meldung", async () => {
     const ctx = await start();
     const sse = await listen(ctx, "topic-443");
@@ -607,7 +667,7 @@ describe("/motor aus Browser und Terminal (Issue #125)", () => {
     expect(ctx.resets).toEqual(["topic-443"]);
     expect(ctx.claudeStarted).toBe(0);
     expect(ctx.plain).toEqual([{ chatId: GROUP, text: "Du (Web): /motor codex", threadId: 443 }]);
-    expect(ctx.records.map(r => r.text)).toEqual(["Dieses Gespräch läuft jetzt mit Codex. Das beginnt eine neue Session, das Gedächtnis bleibt."]);
+    expect(ctx.records.map(r => r.text)).toEqual(["Dieses Gespräch läuft jetzt mit Codex. Das beginnt eine neue Session; die letzten Nachrichten gehen mit."]);
   });
 
   test("Terminal im Direktchat: /engine codex, dann /motor zeigt es, /motor standard nimmt es zurück", async () => {
@@ -621,9 +681,9 @@ describe("/motor aus Browser und Terminal (Issue #125)", () => {
     expect(ctx.engineTopics).toEqual({});
     expect(ctx.resets).toEqual(["dm", "dm"]);
     expect(ctx.records.map(r => r.text.split("\n")[0])).toEqual([
-      "Dieses Gespräch läuft jetzt mit Codex. Das beginnt eine neue Session, das Gedächtnis bleibt.",
+      "Dieses Gespräch läuft jetzt mit Codex. Das beginnt eine neue Session; die letzten Nachrichten gehen mit.",
       "Motor dieses Gesprächs: Codex (mit /motor für dieses Gespräch gesetzt)",
-      "Ausnahme entfernt: dieses Gespräch nimmt wieder den Standard, Claude Code. Das beginnt eine neue Session, das Gedächtnis bleibt.",
+      "Ausnahme entfernt: dieses Gespräch nimmt wieder den Standard, Claude Code. Das beginnt eine neue Session; die letzten Nachrichten gehen mit. Es gilt wieder die Reihenfolge aus den Einstellungen.",
     ]);
     expect(ctx.plain.map(p => p.text)).toEqual(["Du (Terminal): /engine codex", "Du (Terminal): /motor", "Du (Terminal): /motor standard"]);
   });
